@@ -492,6 +492,40 @@ routes:
 #     poweroff_command: "ssh gateway poweroff-host executor-1"
 #     idle_timeout_secs: 600
 #     command_timeout_secs: 60       # default 60; a command still running then counts as failed
+#
+# One machine, two engines, one GPU. A normally-off machine runs a text
+# engine and ComfyUI; both stay up, but only one may hold the GPU at a time.
+# `host:` makes the two lanes share the machine's power (one wake, busy while
+# either lane has work, one power-off after both are idle). `exclusive_group:`
+# makes them take turns on the GPU: work for the holder runs at once; work for
+# the other lane waits (up to `group_wait_secs`, before the first byte for a
+# text request) until the holder has nothing in flight, then the holder's
+# `release_command` runs once and the waiting lane takes the GPU. While a
+# switch is pending, new work of the holder waits behind it, so neither side
+# starves. A text request whose wait runs out falls through to the route's
+# next target (or gets a retryable 503); a media job fails. A failed release
+# does not hand the GPU over and counts against `retry_budget`.
+# local_executors:
+#   - name: llamacpp                 # provider: openai_compatible, engine: llama_cpp
+#     host: gpu-box                  # lanes naming one host share its power
+#     base_url: "http://executor-1.example:8080"
+#     health_endpoint: "http://executor-1.example:8080/health"
+#     route_health: true
+#     wake_on_request: true
+#     wake_command: "ssh gateway wake-host executor-1"        # the host's, set once
+#     poweroff_command: "ssh gateway poweroff-host executor-1"
+#     idle_timeout_secs: 600
+#     exclusive_group: gpu0          # lanes naming one group share one GPU
+#     release_command: "curl -fsS -X POST http://executor-1.example:8080/models/unload"
+#     group_wait_secs: 60            # default 120
+#   - name: comfy                    # provider: comfyui
+#     host: gpu-box
+#     base_url: "http://executor-1.example:8188"
+#     health_endpoint: "http://executor-1.example:8188/system_stats"
+#     idle_timeout_secs: 600
+#     exclusive_group: gpu0
+#     release_command: "curl -fsS -X POST http://executor-1.example:8188/free -d '{\"unload_models\":true,\"free_memory\":true}'"
+#     group_wait_secs: 300           # a media job may wait for long text streams
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

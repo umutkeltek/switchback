@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use sb_core::{AiRequest, ClientProfileConfig};
 
-use super::profiles::{plan_candidates, CandidateResolution};
-use super::{Engine, ExecError, LaneBusy, LaneWake, Snapshot};
+use super::profiles::{plan_candidates, plan_resolved_route, CandidateResolution};
+use super::{Engine, ExecError, LaneAcquire, LaneBusy, LaneWake, Snapshot};
 
 /// The provider's lane is listed in the pinned config with `wake_on_request`
 /// (which config validation only accepts together with `route_health`).
@@ -20,6 +20,39 @@ pub(crate) fn wakes_on_request(snap: &Snapshot, provider_id: &str) -> bool {
         .local_executors
         .iter()
         .any(|lane| lane.name == provider_id && lane.route_health && lane.wake_on_request)
+}
+
+/// The provider's lane is listed in the pinned config with an
+/// `exclusive_group` (a GPU it shares with other lanes of its host).
+pub(crate) fn in_gpu_group(snap: &Snapshot, provider_id: &str) -> bool {
+    snap.config
+        .local_executors
+        .iter()
+        .any(|lane| lane.name == provider_id && lane.exclusive_group.is_some())
+}
+
+/// What taking the first choice's GPU group did, plus the busy guard that
+/// holds the group from here until the dispatch loop reaches that lane.
+pub(crate) struct LaneGpuNote {
+    note: LaneWakeNote,
+    busy: Option<LaneBusy>,
+}
+
+impl LaneGpuNote {
+    /// Say on the decision what happened; a 503 when the lane did not get
+    /// its group and the plan still selected it (see [`LaneWakeNote::apply`]).
+    pub(crate) fn apply(&self, plan: &mut sb_router::RoutePlan) -> Result<(), ExecError> {
+        self.note.apply(plan)
+    }
+
+    /// The held guard, for the first dispatch to the lane it was taken for.
+    pub(crate) fn take_busy(&mut self, provider_id: &str) -> Option<LaneBusy> {
+        if self.note.provider_id == provider_id {
+            self.busy.take()
+        } else {
+            None
+        }
+    }
 }
 
 /// What a request-triggered wake did, kept until the plan is known.
@@ -74,14 +107,110 @@ impl LaneWakeNote {
 }
 
 impl Engine {
-    /// Count one dispatch as in-flight work on the target's lane. `None` for
-    /// a lane that did not opt in (the default), so nothing is held.
-    pub(crate) fn lane_busy(&self, snap: &Snapshot, provider_id: &str) -> Option<LaneBusy> {
+    /// Count one dispatch as in-flight work on the target's lane. `Ok(None)`
+    /// for a lane that did not opt in (the default), so nothing is held.
+    /// `Err(reason)` when the lane is in an exclusive GPU group it does not
+    /// hold right now: the target is skipped (never waits here; only the
+    /// route's first choice waits, before planning).
+    pub(crate) fn lane_busy(
+        &self,
+        snap: &Snapshot,
+        provider_id: &str,
+    ) -> Result<Option<LaneBusy>, String> {
+        let Some(lanes) = self.lanes.as_deref() else {
+            return Ok(None);
+        };
+        if !wakes_on_request(snap, provider_id) && !in_gpu_group(snap, provider_id) {
+            return Ok(None);
+        }
+        lanes.try_begin_request(provider_id)
+    }
+
+    /// Before planning, after any wake: when the target this route would
+    /// choose first sits on a lane in an exclusive GPU group, wait (bounded
+    /// by the lane's `group_wait_secs`) until the lane holds the group. On
+    /// success the guard holds the group until the dispatch uses it; on
+    /// expiry or a failed release the lane's targets are skipped with the
+    /// reason. At most one group wait per request.
+    pub(crate) async fn take_gpu_before_dispatch(
+        &self,
+        snap: &Snapshot,
+        req: &AiRequest,
+        client_profile: Option<&ClientProfileConfig>,
+        resolved: &mut CandidateResolution,
+    ) -> Option<LaneGpuNote> {
         let lanes = self.lanes.as_deref()?;
-        if !wakes_on_request(snap, provider_id) {
+        // Lanes outside a GPU group (the default) cost nothing here.
+        if !resolved
+            .candidates
+            .iter()
+            .any(|candidate| in_gpu_group(snap, &candidate.provider_id))
+        {
             return None;
         }
-        lanes.begin_request(provider_id)
+        let (_, would_be) = plan_resolved_route(
+            &self.combo_rr,
+            snap,
+            req,
+            client_profile,
+            resolved.clone(),
+            false,
+        )
+        .ok()?;
+        let first = would_be.decision.selected.as_ref()?.target_id.clone();
+        // A first choice still known down is the wake note's answer.
+        if resolved
+            .lane_down
+            .iter()
+            .any(|(target_id, _)| *target_id == first)
+        {
+            return None;
+        }
+        let provider_id = resolved
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == first)?
+            .provider_id
+            .clone();
+        if !in_gpu_group(snap, &provider_id) {
+            return None;
+        }
+        match lanes.acquire_for_request(&provider_id).await {
+            LaneAcquire::Ready { busy, detail } => Some(LaneGpuNote {
+                note: LaneWakeNote {
+                    wake: LaneWake::Ready {
+                        detail: detail.unwrap_or_else(|| "holds its gpu group".to_string()),
+                    },
+                    provider_id,
+                },
+                busy,
+            }),
+            LaneAcquire::NotReady {
+                detail,
+                retry_after,
+            } => {
+                for candidate in &resolved.candidates {
+                    if candidate.provider_id == provider_id {
+                        resolved.lane_down.push((
+                            candidate.id.clone(),
+                            format!(
+                                "local lane `{provider_id}` {detail}; skipped before dispatch, not counted as a failure"
+                            ),
+                        ));
+                    }
+                }
+                Some(LaneGpuNote {
+                    note: LaneWakeNote {
+                        wake: LaneWake::NotReady {
+                            detail,
+                            retry_after,
+                        },
+                        provider_id,
+                    },
+                    busy: None,
+                })
+            }
+        }
     }
 
     /// Before planning: when the target this route would choose first sits

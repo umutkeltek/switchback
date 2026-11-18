@@ -736,7 +736,7 @@ impl WorkloadStore {
         validate_comfyui_request(&request)?;
 
         let result = executor
-            .run_job(|_attempt| {
+            .run_job_noted(|_attempt| {
                 comfyui_dispatch_once(
                     cfg,
                     provider,
@@ -749,7 +749,13 @@ impl WorkloadStore {
             .await;
 
         match result {
-            Ok((job, stored)) => self.insert_job(job, stored),
+            Ok(((mut job, stored), gpu_note)) => {
+                if let Some(note) = gpu_note {
+                    job.route_decision
+                        .add_reason(format!("local lane `{}` {note}", provider.id));
+                }
+                self.insert_job(job, stored)
+            }
             Err(JobError::Queued) => self.persist_queued_comfy_job(
                 provider,
                 &request,
@@ -775,6 +781,10 @@ impl WorkloadStore {
                 )))
             }
             Err(JobError::Dispatch(error)) => Err(error),
+            Err(JobError::GpuUnavailable(detail)) => Err(WorkloadError::Upstream(format!(
+                "local executor `{}` {detail}",
+                provider.id
+            ))),
         }
     }
 

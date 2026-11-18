@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use sb_core::{Config, LocalExecutorConfig, ProviderKind};
-use sb_runtime::{LaneBusy, LaneWake};
+use sb_runtime::{LaneAcquire, LaneBusy, LaneWake, LANE_GROUP_RETRY_AFTER};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -175,6 +175,12 @@ pub struct LocalLaneReport {
     /// absent for a lane with a machine of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The GPU group the lane shares (`exclusive_group` in config).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_group: Option<String>,
+    /// Whether the lane holds its GPU group now; absent outside a group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holds_gpu: Option<bool>,
     pub state: LaneState,
     pub level: LaneLevel,
     /// Callers currently blocked waiting for capacity (queue depth).
@@ -197,6 +203,7 @@ pub struct LocalLaneReport {
     /// Power-off attempts that failed in the machine's current idle period.
     /// Non-zero while the power-off is retried (`level` warn) and after the
     /// retries ran out (`level` fail, `escalated`).
+    #[serde(skip_serializing_if = "is_zero")]
     pub poweroff_failures: u32,
     pub detail: String,
     /// Most recent health probe result; text routing skips the lane's
@@ -240,6 +247,9 @@ pub enum JobError<E> {
     /// The dispatch itself failed while the service was healthy (a real job
     /// error, not a capacity problem) — propagated loud, unretried.
     Dispatch(E),
+    /// The lane's GPU group stayed with another lane past `group_wait_secs`,
+    /// or the holder's release command failed.
+    GpuUnavailable(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +301,8 @@ struct LaneRuntime {
     /// since: a host may still answer while it shuts down, so a healthy
     /// answer is not trusted until a probe has failed once or a wake ran.
     down_unconfirmed: bool,
+    /// Failed `release_command` runs since the last one that worked.
+    release_failures: u32,
 }
 
 impl LaneRuntime {
@@ -318,6 +330,7 @@ impl LaneRuntime {
             wake_cycle_started_ms: None,
             last_request_wake_ended_ms: None,
             down_unconfirmed: false,
+            release_failures: 0,
         }
     }
 }
@@ -573,6 +586,198 @@ impl LocalExecutor {
             rt.idle_since_ms = None;
         }
         LaneJobGuard::new(self.clone())
+    }
+
+    /// A text or embeddings request on a lane in an exclusive GPU group,
+    /// before its first byte: wait up to `group_wait_secs` for the group
+    /// (counted as queued, so the machine stays busy), then hold the group
+    /// and the lane until the returned guard is dropped.
+    pub async fn acquire_for_request(self: &Arc<Self>) -> LaneAcquire {
+        let wait_ms = self.cfg().group_wait_secs.saturating_mul(1000);
+        let queued = QueuedSlot::new(self.clone());
+        let taken = self.take_group(wait_ms).await;
+        let outcome = match taken {
+            Ok((permit, detail)) => LaneAcquire::Ready {
+                busy: Some(Box::new((self.begin_request(), permit))),
+                detail: Some(detail),
+            },
+            Err((detail, retry_after)) => LaneAcquire::NotReady {
+                detail,
+                retry_after,
+            },
+        };
+        drop(queued);
+        outcome
+    }
+
+    /// Take the lane's GPU group without waiting: only while the lane holds
+    /// it and no other lane waits for it. `Err` says why not.
+    fn try_take_group(&self) -> Result<GroupPermit, String> {
+        let Some(group) = self.cfg().exclusive_group.clone() else {
+            return Err("is in no gpu group".to_string());
+        };
+        let host = self.host();
+        let mut groups = host.groups();
+        let state = groups.entry(group.clone()).or_default();
+        if state.holder.as_deref() == Some(self.name.as_str()) && state.switch_to.is_none() {
+            state.active += 1;
+            drop(groups);
+            return Ok(GroupPermit { host, group });
+        }
+        Err(match (&state.holder, &state.switch_to) {
+            (_, Some(next)) => {
+                format!("does not take gpu group `{group}` now (lane `{next}` is next for it)")
+            }
+            (Some(holder), None) => {
+                format!("does not hold gpu group `{group}` (lane `{holder}` does)")
+            }
+            (None, None) => format!(
+                "does not hold gpu group `{group}` yet (only a route's first choice takes it)"
+            ),
+        })
+    }
+
+    /// Take the lane's GPU group, waiting up to `wait_ms` on the clock seam.
+    /// Work for the holder takes it at once. Otherwise the first waiter
+    /// asks for a switch (once), waits until the holder has nothing in
+    /// flight, runs the holder's `release_command` once (every other group
+    /// lane's when the holder is unknown, after start-up or a power-off)
+    /// and becomes the holder. Fairness: while a switch is pending, new work
+    /// of the holder waits behind it, so the holder cannot starve the
+    /// waiter; once the switch is done, the old holder's waiting work asks
+    /// for the next one, so the new holder cannot starve it either. With
+    /// three or more lanes the next switch goes to whichever lane asks first.
+    async fn take_group(
+        self: &Arc<Self>,
+        wait_ms: u64,
+    ) -> Result<(GroupPermit, String), (String, Duration)> {
+        let Some(group) = self.cfg().exclusive_group.clone() else {
+            return Err(("is in no gpu group".to_string(), LANE_GROUP_RETRY_AFTER));
+        };
+        let host = self.host();
+        let others: Vec<String> = host
+            .lanes()
+            .iter()
+            .filter(|lane| {
+                lane.name != self.name
+                    && lane.cfg().exclusive_group.as_deref() == Some(group.as_str())
+            })
+            .map(|lane| lane.name.clone())
+            .collect();
+        let started = self.clock.now_ms();
+        let mut changes = host.group_changes.subscribe();
+        let mut claim = SwitchClaim {
+            host: host.clone(),
+            group: group.clone(),
+            lane: self.name.clone(),
+            claimed: false,
+        };
+        loop {
+            changes.borrow_and_update();
+            let step = host.group_step(&group, &self.name, &others, &mut claim.claimed);
+            let waited = self.clock.now_ms().saturating_sub(started);
+            match step {
+                GroupStep::Took => {
+                    let detail = if waited == 0 {
+                        format!("holds gpu group `{group}`")
+                    } else {
+                        format!(
+                            "waited {} for gpu group `{group}`, then held it",
+                            fmt_ms(waited)
+                        )
+                    };
+                    return Ok((GroupPermit { host, group }, detail));
+                }
+                GroupStep::Release { from, lanes } => {
+                    tracing::info!(lane = %self.name, group = %group, "taking the gpu group: releasing its holder");
+                    let released = host.release(&lanes).await;
+                    claim.claimed = false;
+                    host.finish_switch(&group, &self.name, released.is_ok());
+                    let waited = self.clock.now_ms().saturating_sub(started);
+                    return match released {
+                        Ok(()) => {
+                            let how = match from {
+                                Some(holder) => format!("took it from lane `{holder}`"),
+                                None if lanes.is_empty() => "took it".to_string(),
+                                None => format!(
+                                    "took it (holder unknown, released lane `{}`)",
+                                    lanes.join("`, `")
+                                ),
+                            };
+                            Ok((
+                                GroupPermit {
+                                    host,
+                                    group: group.clone(),
+                                },
+                                format!("waited {} for gpu group `{group}`, {how}", fmt_ms(waited)),
+                            ))
+                        }
+                        Err(error) => Err((
+                            format!("{error}; gpu group `{group}` not handed over"),
+                            LANE_GROUP_RETRY_AFTER,
+                        )),
+                    };
+                }
+                GroupStep::Wait(why) => {
+                    if waited >= wait_ms {
+                        return Err((
+                            format!("waited {} for gpu group `{group}`; {why}", fmt_ms(wait_ms)),
+                            LANE_GROUP_RETRY_AFTER,
+                        ));
+                    }
+                    tokio::select! {
+                        _ = changes.changed() => {}
+                        () = self.clock.sleep_ms(wait_ms - waited) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run this lane's `release_command` so its engine frees the GPU. A
+    /// failure counts against the lane's `retry_budget`; past it the lane
+    /// is escalated and later switches away from it fail at once, so the
+    /// GPU stays with it until an operator acts.
+    async fn release_gpu(&self) -> Result<(), String> {
+        let cfg = self.cfg();
+        let failures = self.lock().release_failures;
+        if failures > cfg.retry_budget {
+            return Err(format!(
+                "lane `{}` could not release the gpu ({failures} failed release commands); needs operator attention",
+                self.name
+            ));
+        }
+        let Some(command) = cfg.release_command.clone() else {
+            return Err(format!("lane `{}` has no release_command", self.name));
+        };
+        match self.run_command("release", &command).await {
+            Ok(()) => {
+                self.lock().release_failures = 0;
+                Ok(())
+            }
+            Err(error) => {
+                let failures = {
+                    let mut rt = self.lock();
+                    rt.release_failures += 1;
+                    rt.release_failures
+                };
+                let message = format!("release command of lane `{}` failed: {error}", self.name);
+                if failures > cfg.retry_budget {
+                    tracing::error!(
+                        lane = %self.name,
+                        failures,
+                        "release command failed and its retries ran out; the gpu stays with this lane"
+                    );
+                    self.escalate(format!(
+                        "release command failed {failures} times (last: {error}); the gpu group stays with this lane until an operator acts"
+                    ));
+                } else {
+                    tracing::warn!(lane = %self.name, attempt = failures, "release command failed; gpu not handed over");
+                    self.lock().last_error = Some(message.clone());
+                }
+                Err(message)
+            }
+        }
     }
 
     /// Wake the lane for a request that routing was about to skip, and wait
@@ -884,7 +1089,23 @@ impl LocalExecutor {
     /// Run a job under managed capacity: wake if needed, then dispatch with
     /// self-heal. `op(attempt)` is the real dispatch; it runs at least once and
     /// is requeued (fresh attempt) after a health loss, up to `retry_budget`.
-    pub async fn run_job<T, E, F, Fut>(self: &Arc<Self>, mut op: F) -> Result<T, JobError<E>>
+    pub async fn run_job<T, E, F, Fut>(self: &Arc<Self>, op: F) -> Result<T, JobError<E>>
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        self.run_job_noted(op).await.map(|(value, _)| value)
+    }
+
+    /// [`Self::run_job`], plus what taking the lane's GPU group did, for the
+    /// job's decision (`None` outside a group). A job on a lane in an
+    /// exclusive GPU group waits for the group after its wake, up to the
+    /// lane's `group_wait_secs`, and holds it until it ends.
+    pub async fn run_job_noted<T, E, F, Fut>(
+        self: &Arc<Self>,
+        mut op: F,
+    ) -> Result<(T, Option<String>), JobError<E>>
     where
         F: FnMut(u32) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
@@ -904,11 +1125,24 @@ impl LocalExecutor {
             }
             Err(EnsureError::WakeFailed(error)) => return Err(JobError::WakeFailed(error)),
         };
+        let mut note = None;
+        let _permit = if self.cfg().exclusive_group.is_some() {
+            let wait_ms = self.cfg().group_wait_secs.saturating_mul(1000);
+            match self.take_group(wait_ms).await {
+                Ok((permit, detail)) => {
+                    note = Some(detail);
+                    Some(permit)
+                }
+                Err((detail, _)) => return Err(JobError::GpuUnavailable(detail)),
+            }
+        } else {
+            None
+        };
 
         loop {
             let attempt = self.lock().retries_used;
             match op(attempt).await {
-                Ok(value) => return Ok(value),
+                Ok(value) => return Ok((value, note)),
                 Err(error) => {
                     // Classify: is the service still healthy? If so this is a
                     // real job error — loud, unretried. If not, the service was
@@ -1012,6 +1246,12 @@ impl LocalExecutor {
         let poweroff_configured = host.poweroff_command().is_some();
         let poweroff_failures = host.power().failures;
         let restart_configured = self.cfg().restart_command.is_some();
+        let gpu_group = self.cfg().exclusive_group.clone();
+        let holds_gpu = gpu_group.as_ref().map(|group| {
+            host.groups()
+                .get(group)
+                .is_some_and(|state| state.holder.as_deref() == Some(self.name.as_str()))
+        });
         let rt = self.lock();
         let level = lane_level(&rt, wake_configured, poweroff_failures);
         let detail = lane_detail(
@@ -1024,6 +1264,8 @@ impl LocalExecutor {
         LocalLaneReport {
             name: self.name.clone(),
             host: host.shared.then(|| host.id.clone()),
+            gpu_group,
+            holds_gpu,
             state: rt.state,
             level,
             queue_depth: rt.waiting,
@@ -1111,6 +1353,79 @@ pub(crate) struct Host {
     /// The lanes on the machine, in config order.
     members: RwLock<Vec<Weak<LocalExecutor>>>,
     power: Mutex<HostPower>,
+    /// The machine's exclusive GPU groups, by `exclusive_group` id.
+    groups: Mutex<BTreeMap<String, GroupState>>,
+    /// Bumped whenever a group changes, so waiters wake without polling.
+    group_changes: tokio::sync::watch::Sender<u64>,
+}
+
+/// One exclusive GPU group on a machine.
+#[derive(Debug, Default)]
+struct GroupState {
+    /// The lane whose engine may hold the GPU. `None` = unknown (after
+    /// start-up or a power-off): taking the group then releases every other
+    /// lane of the group once.
+    holder: Option<String>,
+    /// Work of the holder (requests, jobs) that holds the group now.
+    active: u32,
+    /// The lane a switch was asked for (set once, by its first waiter).
+    switch_to: Option<String>,
+    /// The switcher is running release commands.
+    releasing: bool,
+}
+
+/// What one look at a GPU group told a lane that wants it.
+enum GroupStep {
+    /// The lane holds the group; one unit of work was counted.
+    Took,
+    /// This waiter runs the switch now: release these lanes.
+    Release {
+        from: Option<String>,
+        lanes: Vec<String>,
+    },
+    /// Not yet; why, for the decision if the wait runs out.
+    Wait(String),
+}
+
+/// One unit of work holding a GPU group; dropping it lets a waiting lane
+/// take the group once the holder has nothing left in flight.
+struct GroupPermit {
+    host: Arc<Host>,
+    group: String,
+}
+
+impl Drop for GroupPermit {
+    fn drop(&mut self) {
+        if let Some(state) = self.host.groups().get_mut(&self.group) {
+            state.active = state.active.saturating_sub(1);
+        }
+        self.host.group_changed();
+    }
+}
+
+/// The switch a waiter asked for; a waiter that goes away (wait over,
+/// client gone, task dropped mid-release) withdraws it, so the holder's
+/// work can flow again.
+struct SwitchClaim {
+    host: Arc<Host>,
+    group: String,
+    lane: String,
+    claimed: bool,
+}
+
+impl Drop for SwitchClaim {
+    fn drop(&mut self) {
+        if !self.claimed {
+            return;
+        }
+        if let Some(state) = self.host.groups().get_mut(&self.group) {
+            if state.switch_to.as_deref() == Some(self.lane.as_str()) {
+                state.switch_to = None;
+                state.releasing = false;
+            }
+        }
+        self.host.group_changed();
+    }
 }
 
 /// Power-off failures of the machine's current idle period.
@@ -1134,7 +1449,92 @@ impl Host {
             tick_lock: tokio::sync::Mutex::new(()),
             members: RwLock::new(members),
             power: Mutex::new(HostPower::default()),
+            groups: Mutex::new(BTreeMap::new()),
+            group_changes: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    fn groups(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, GroupState>> {
+        self.groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn group_changed(&self) {
+        self.group_changes
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// One look at `group` for `lane` (see [`LocalExecutor::take_group`]).
+    fn group_step(
+        &self,
+        group: &str,
+        lane: &str,
+        others: &[String],
+        claimed: &mut bool,
+    ) -> GroupStep {
+        let mut groups = self.groups();
+        let state = groups.entry(group.to_string()).or_default();
+        if state.holder.as_deref() == Some(lane) && state.switch_to.is_none() {
+            state.active += 1;
+            return GroupStep::Took;
+        }
+        match state.switch_to.as_deref() {
+            None => {
+                state.switch_to = Some(lane.to_string());
+                *claimed = true;
+            }
+            Some(next) if next == lane && *claimed => {}
+            Some(next) if next == lane => {
+                return GroupStep::Wait("a switch to this lane is under way".to_string())
+            }
+            Some(next) => return GroupStep::Wait(format!("lane `{next}` is next for it")),
+        }
+        if state.releasing || state.active > 0 {
+            return GroupStep::Wait(match &state.holder {
+                Some(holder) => {
+                    format!(
+                        "lane `{holder}` still holds it ({} in flight)",
+                        state.active
+                    )
+                }
+                None => "it is being released".to_string(),
+            });
+        }
+        state.releasing = true;
+        GroupStep::Release {
+            from: state.holder.clone(),
+            lanes: match &state.holder {
+                Some(holder) => vec![holder.clone()],
+                None => others.to_vec(),
+            },
+        }
+    }
+
+    /// The switcher is done: on success `lane` holds the group with one
+    /// unit of work counted; otherwise the holder keeps it.
+    fn finish_switch(&self, group: &str, lane: &str, released: bool) {
+        if let Some(state) = self.groups().get_mut(group) {
+            state.releasing = false;
+            state.switch_to = None;
+            if released {
+                state.holder = Some(lane.to_string());
+                state.active += 1;
+            }
+        }
+        self.group_changed();
+    }
+
+    /// Run the release command of each named lane on this machine, in
+    /// order; the first failure stops the switch.
+    async fn release(&self, names: &[String]) -> Result<(), String> {
+        for name in names {
+            let Some(lane) = self.lanes().into_iter().find(|lane| lane.name == *name) else {
+                continue;
+            };
+            lane.release_gpu().await?;
+        }
+        Ok(())
     }
 
     /// The machine's lanes still alive, in config order.
@@ -1289,6 +1689,13 @@ impl Host {
         match carrier.run_command("poweroff", &poweroff_command).await {
             Ok(()) => {
                 let had_failures = std::mem::take(&mut *self.power()).failures > 0;
+                // The machine is off: after the next boot nobody is known to
+                // hold its GPU.
+                for state in self.groups().values_mut() {
+                    if state.active == 0 && state.switch_to.is_none() {
+                        state.holder = None;
+                    }
+                }
                 for lane in &lanes {
                     let mut rt = lane.lock();
                     // Work that arrived during the poweroff keeps its state;
@@ -1359,6 +1766,12 @@ impl Host {
             }
         }
     }
+}
+
+/// Serde helper: leave a zero count out of the report, so a lane that
+/// never failed reports exactly what it did before the count existed.
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// Short human duration for decisions and errors: `850 ms`, `41 s`.
@@ -1764,11 +2177,46 @@ impl sb_runtime::LaneStatus for CapacityActivator {
     }
 
     fn begin_request(&self, provider_id: &str) -> Option<LaneBusy> {
-        let executor = self.executor(provider_id)?;
-        if !executor.cfg().wake_on_request {
-            return None;
+        self.try_begin_request(provider_id).ok().flatten()
+    }
+
+    /// A lane in an exclusive GPU group counts the request only while it
+    /// holds its group (no waiting here); any other opted-in lane always.
+    fn try_begin_request(&self, provider_id: &str) -> Result<Option<LaneBusy>, String> {
+        let Some(executor) = self.executor(provider_id) else {
+            return Ok(None);
+        };
+        let cfg = executor.cfg();
+        if cfg.exclusive_group.is_some() {
+            let permit = executor.try_take_group()?;
+            return Ok(Some(Box::new((executor.begin_request(), permit))));
         }
-        Some(Box::new(executor.begin_request()))
+        if !cfg.wake_on_request {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(executor.begin_request())))
+    }
+
+    /// Bounded by the lane's `group_wait_secs` on the [`Clock`] seam.
+    fn acquire_for_request<'a>(
+        &'a self,
+        provider_id: &'a str,
+    ) -> sb_runtime::BoxFuture<'a, LaneAcquire> {
+        let executor = self.executor(provider_id);
+        Box::pin(async move {
+            match executor {
+                Some(executor) if executor.cfg().exclusive_group.is_some() => {
+                    executor.acquire_for_request().await
+                }
+                _ => match self.try_begin_request(provider_id) {
+                    Ok(busy) => LaneAcquire::Ready { busy, detail: None },
+                    Err(detail) => LaneAcquire::NotReady {
+                        detail,
+                        retry_after: LANE_GROUP_RETRY_AFTER,
+                    },
+                },
+            }
+        })
     }
 
     fn config_published(&self, config: &Config) {
@@ -1824,6 +2272,9 @@ mod tests {
         restart_makes_healthy: bool,
         fail_wake: bool,
         fail_poweroff: bool,
+        fail_release: bool,
+        /// Every release command run, in order.
+        releases: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -1846,6 +2297,13 @@ mod tests {
     impl CommandRunner for FakeHost {
         async fn run(&self, command: &str) -> Result<(), String> {
             let mut sim = self.sim.lock().unwrap();
+            if command.contains("release") {
+                sim.releases.push(command.to_string());
+                if sim.fail_release {
+                    return Err("exit 1".to_string());
+                }
+                return Ok(());
+            }
             if command.contains("restart") {
                 sim.restart += 1;
                 if sim.restart_makes_healthy {
@@ -1951,6 +2409,9 @@ mod tests {
             wake_wait_secs: 90,
             command_timeout_secs: 60,
             host: None,
+            exclusive_group: None,
+            release_command: None,
+            group_wait_secs: 120,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -2084,6 +2545,9 @@ mod tests {
             wake_wait_secs: 90,
             command_timeout_secs: 60,
             host: None,
+            exclusive_group: None,
+            release_command: None,
+            group_wait_secs: 120,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -2588,6 +3052,9 @@ local_executors:
             wake_wait_secs: 90,
             command_timeout_secs: 60,
             host: None,
+            exclusive_group: None,
+            release_command: None,
+            group_wait_secs: 120,
         };
         LocalExecutor::new(
             cfg,
@@ -3574,7 +4041,12 @@ local_executors:
         assert_eq!(host.sim().poweroff, 2);
         assert!(activator.reports().iter().all(|r| r.host.is_none()));
         let json = serde_json::to_value(activator.reports()).unwrap();
-        assert!(json[0].get("host").is_none(), "absent, not null: {json}");
+        for absent in ["host", "gpu_group", "holds_gpu", "poweroff_failures"] {
+            assert!(
+                json[0].get(absent).is_none(),
+                "{absent} absent, not null: {json}"
+            );
+        }
     }
 
     // A reload that puts two lanes on one host moves them onto it, and a
@@ -3599,5 +4071,341 @@ local_executors:
         activator.reconcile(&separate);
         assert!(!Arc::ptr_eq(&text.host(), &comfy.host()));
         assert!(activator.reports().iter().all(|r| r.host.is_none()));
+    }
+
+    // --- Exclusive GPU group (`exclusive_group`) ----------------------------
+
+    const RELEASE_TEXT: &str = "ssh gateway release-gpu text";
+    const RELEASE_COMFY: &str = "ssh gateway release-gpu comfy";
+
+    /// The machine of [`shared_host_config`] with both lanes in GPU group
+    /// `gpu0`, each with its own release command; a lane waits up to 30 s.
+    fn gpu_group_config() -> Config {
+        let mut cfg = shared_host_config("");
+        for lane in &mut cfg.local_executors {
+            lane.exclusive_group = Some("gpu0".to_string());
+            lane.group_wait_secs = 30;
+            lane.release_command = Some(format!("ssh gateway release-gpu {}", lane.name));
+        }
+        cfg
+    }
+
+    /// The machine is up; both engines answer.
+    fn gpu_group_activator() -> (FakeHost, Arc<ManualClock>, Arc<CapacityActivator>) {
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = shared_activator(&gpu_group_config(), &host, clock.clone());
+        (host, clock, activator)
+    }
+
+    /// A media job on `comfy` whose dispatch runs until `gate` gets a
+    /// permit; `started` counts dispatches that began.
+    fn media_job(
+        activator: &Arc<CapacityActivator>,
+        gate: Arc<tokio::sync::Semaphore>,
+        started: Arc<AtomicU64>,
+    ) -> tokio::task::JoinHandle<Result<(&'static str, Option<String>), String>> {
+        let comfy = activator.executor("comfy").unwrap();
+        tokio::spawn(async move {
+            comfy
+                .run_job_noted(|_attempt| {
+                    let gate = gate.clone();
+                    let started = started.clone();
+                    async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        gate.acquire().await.unwrap().forget();
+                        Ok::<_, String>("image")
+                    }
+                })
+                .await
+                .map_err(|error| format!("{error:?}"))
+        })
+    }
+
+    fn acquire(
+        activator: &Arc<CapacityActivator>,
+        lane: &'static str,
+    ) -> tokio::task::JoinHandle<LaneAcquire> {
+        let activator = activator.clone();
+        tokio::spawn(
+            async move { sb_runtime::LaneStatus::acquire_for_request(&*activator, lane).await },
+        )
+    }
+
+    fn ready(acquired: LaneAcquire) -> (LaneBusy, String) {
+        match acquired {
+            LaneAcquire::Ready {
+                busy: Some(busy),
+                detail: Some(detail),
+            } => (busy, detail),
+            LaneAcquire::Ready { .. } => panic!("ready without a guard or a detail"),
+            LaneAcquire::NotReady { detail, .. } => panic!("not ready: {detail}"),
+        }
+    }
+
+    fn releases(host: &FakeHost) -> Vec<String> {
+        host.sim().releases.clone()
+    }
+
+    // A text request that arrives while a media job holds the GPU waits;
+    // when the job ends the media lane's release command runs exactly once,
+    // the text lane takes the GPU, and the detail says what happened.
+    #[tokio::test]
+    async fn a_text_request_waits_for_a_media_job_then_one_release_runs() {
+        let (host, clock, activator) = gpu_group_activator();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let job = media_job(&activator, gate.clone(), Arc::new(AtomicU64::new(0)));
+        settle().await;
+        assert_eq!(
+            releases(&host),
+            [RELEASE_TEXT],
+            "the first holder after start-up releases the other lane"
+        );
+        assert_eq!(
+            activator.executor("comfy").unwrap().report().holds_gpu,
+            Some(true)
+        );
+
+        let request = acquire(&activator, "text");
+        settle().await;
+        assert!(!request.is_finished(), "waits while the job holds the GPU");
+        assert_eq!(activator.executor("text").unwrap().report().queue_depth, 1);
+        clock.advance(12_000);
+        settle().await;
+        assert!(!request.is_finished());
+
+        gate.add_permits(1); // the image is done
+        let (job_result, job_note) = job.await.unwrap().expect("the job succeeds");
+        assert_eq!(job_result, "image");
+        assert!(
+            job_note
+                .as_deref()
+                .unwrap()
+                .contains("released lane `text`"),
+            "{job_note:?}"
+        );
+        let (busy, detail) = ready(request.await.unwrap());
+        assert_eq!(
+            detail,
+            "waited 12 s for gpu group `gpu0`, took it from lane `comfy`"
+        );
+        assert_eq!(
+            releases(&host),
+            [RELEASE_TEXT, RELEASE_COMFY],
+            "exactly one release for the switch"
+        );
+        let text = activator.executor("text").unwrap().report();
+        assert_eq!((text.holds_gpu, text.in_flight), (Some(true), 1));
+        drop(busy);
+        assert_eq!(activator.executor("text").unwrap().report().in_flight, 0);
+    }
+
+    // The reverse: a media job that arrives while text streams are open
+    // waits until the last one ends; new text work waits behind the switch.
+    #[tokio::test]
+    async fn a_media_job_waits_until_the_last_text_stream_ends() {
+        use sb_runtime::LaneStatus;
+        let (host, _clock, activator) = gpu_group_activator();
+        let (first, _) = ready(acquire(&activator, "text").await.unwrap());
+        let second = activator
+            .try_begin_request("text")
+            .expect("the holder's work runs at once")
+            .expect("counted");
+        assert_eq!(releases(&host), [RELEASE_COMFY]);
+
+        let started = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let job = media_job(&activator, gate, started.clone());
+        settle().await;
+        assert!(!job.is_finished(), "two streams are open");
+        drop(first);
+        settle().await;
+        assert!(!job.is_finished(), "one stream is still open");
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        let refused = activator
+            .try_begin_request("text")
+            .err()
+            .expect("waits behind the switch");
+        assert!(refused.contains("lane `comfy` is next"), "{refused}");
+
+        drop(second); // the last stream ends
+        let (_, note) = job.await.unwrap().expect("the job runs");
+        assert!(
+            note.as_deref()
+                .unwrap()
+                .contains("took it from lane `text`"),
+            "{note:?}"
+        );
+        assert_eq!(releases(&host), [RELEASE_COMFY, RELEASE_TEXT]);
+        assert_eq!(
+            activator.executor("comfy").unwrap().report().holds_gpu,
+            Some(true)
+        );
+    }
+
+    // Fairness: a switch is asked once; new work of the holder that arrives
+    // after it waits behind it, and the lane that lost the GPU gets the
+    // next turn. Neither side starves the other.
+    #[tokio::test]
+    async fn the_gpu_group_alternates_between_waiting_lanes() {
+        let (host, _clock, activator) = gpu_group_activator();
+        let (text_stream, _) = ready(acquire(&activator, "text").await.unwrap());
+
+        let gate_a = Arc::new(tokio::sync::Semaphore::new(0));
+        let started_a = Arc::new(AtomicU64::new(0));
+        let job_a = media_job(&activator, gate_a.clone(), started_a.clone());
+        settle().await;
+        let next_text = acquire(&activator, "text"); // after job A's switch
+        settle().await;
+        assert!(
+            !next_text.is_finished(),
+            "new holder work waits behind the switch"
+        );
+        drop(text_stream);
+        settle().await;
+        assert_eq!(started_a.load(Ordering::SeqCst), 1, "job A got the GPU");
+        assert!(!next_text.is_finished());
+
+        let gate_b = Arc::new(tokio::sync::Semaphore::new(1));
+        let started_b = Arc::new(AtomicU64::new(0));
+        let job_b = media_job(&activator, gate_b, started_b.clone()); // after the text switch
+        settle().await;
+        assert_eq!(
+            started_b.load(Ordering::SeqCst),
+            0,
+            "job B waits behind the text turn"
+        );
+
+        gate_a.add_permits(1);
+        job_a.await.unwrap().expect("job A");
+        let (text_busy, detail) = ready(next_text.await.unwrap());
+        assert!(detail.ends_with("took it from lane `comfy`"), "{detail}");
+        settle().await;
+        assert_eq!(started_b.load(Ordering::SeqCst), 0, "still the text turn");
+        drop(text_busy);
+        job_b.await.unwrap().expect("job B");
+        assert_eq!(
+            releases(&host),
+            [RELEASE_COMFY, RELEASE_TEXT, RELEASE_COMFY, RELEASE_TEXT]
+        );
+    }
+
+    // A wait that runs out says why, and withdraws its switch so the
+    // holder's work flows again; no release command ran for it.
+    #[tokio::test]
+    async fn a_group_wait_that_runs_out_says_so_and_withdraws_the_switch() {
+        use sb_runtime::LaneStatus;
+        let (host, clock, activator) = gpu_group_activator();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let job = media_job(&activator, gate.clone(), Arc::new(AtomicU64::new(0)));
+        settle().await;
+        let request = acquire(&activator, "text");
+        settle().await;
+        clock.advance(30_000);
+        match request.await.unwrap() {
+            LaneAcquire::NotReady {
+                detail,
+                retry_after,
+            } => {
+                assert_eq!(
+                    detail,
+                    "waited 30 s for gpu group `gpu0`; lane `comfy` still holds it (1 in flight)"
+                );
+                assert_eq!(retry_after, LANE_GROUP_RETRY_AFTER);
+            }
+            LaneAcquire::Ready { .. } => panic!("the bound passed"),
+        }
+        assert_eq!(activator.executor("text").unwrap().report().queue_depth, 0);
+        assert!(
+            activator
+                .try_begin_request("comfy")
+                .expect("the switch is withdrawn")
+                .is_some(),
+            "the holder's work flows again"
+        );
+        gate.add_permits(1);
+        job.await.unwrap().expect("job");
+        assert_eq!(
+            releases(&host),
+            [RELEASE_TEXT],
+            "no release for the expired wait"
+        );
+    }
+
+    // A failed release command is reported, does not hand the GPU over,
+    // and counts against the holder's retry budget (2): the third failure
+    // escalates the lane, and later switches fail without running it.
+    #[tokio::test]
+    async fn a_failed_release_does_not_hand_the_gpu_over() {
+        let (host, _clock, activator) = gpu_group_activator();
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        media_job(&activator, gate, Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap()
+            .expect("comfy holds the GPU");
+        host.sim().fail_release = true;
+        for attempt in 1..=3 {
+            match acquire(&activator, "text").await.unwrap() {
+                LaneAcquire::NotReady { detail, .. } => assert_eq!(
+                    detail,
+                    "release command of lane `comfy` failed: exit 1; gpu group `gpu0` not handed over",
+                    "attempt {attempt}"
+                ),
+                LaneAcquire::Ready { .. } => panic!("handed over after a failed release"),
+            }
+        }
+        let comfy = activator.executor("comfy").unwrap().report();
+        assert_eq!(comfy.holds_gpu, Some(true), "the GPU stays with comfy");
+        assert!(comfy.escalated, "{comfy:?}");
+        assert_eq!(comfy.level, LaneLevel::Fail);
+        assert!(
+            comfy.detail.contains("release command failed 3 times"),
+            "{}",
+            comfy.detail
+        );
+        assert_eq!(
+            activator.executor("text").unwrap().report().holds_gpu,
+            Some(false)
+        );
+
+        let runs = releases(&host).len();
+        match acquire(&activator, "text").await.unwrap() {
+            LaneAcquire::NotReady { detail, .. } => {
+                assert!(detail.contains("needs operator attention"), "{detail}")
+            }
+            LaneAcquire::Ready { .. } => panic!("handed over"),
+        }
+        assert_eq!(releases(&host).len(), runs, "not run again past the budget");
+    }
+
+    // Opt-out: lanes without `exclusive_group` never touch a GPU group and
+    // never run a release command.
+    #[tokio::test]
+    async fn lanes_without_a_gpu_group_never_wait_or_release() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            ..Default::default()
+        });
+        let activator = shared_activator(&shared_host_config(""), &host, ManualClock::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let job = media_job(&activator, gate.clone(), Arc::new(AtomicU64::new(0)));
+        settle().await;
+        let request = activator.try_begin_request("text").expect("never refused");
+        assert!(request.is_some(), "counted, as before");
+        assert!(matches!(
+            activator.acquire_for_request("text").await,
+            LaneAcquire::Ready { detail: None, .. }
+        ));
+        gate.add_permits(1);
+        let (_, note) = job.await.unwrap().expect("job");
+        assert_eq!(note, None);
+        assert!(releases(&host).is_empty());
+        let host_of = activator.executor("text").unwrap().host();
+        assert!(host_of.groups().is_empty(), "no group state");
+        assert!(activator.reports().iter().all(|r| r.gpu_group.is_none()));
     }
 }

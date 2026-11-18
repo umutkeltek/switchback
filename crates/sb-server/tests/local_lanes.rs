@@ -737,3 +737,231 @@ async fn a_lane_added_by_a_reload_is_used_without_a_restart() {
         .unwrap();
     assert_eq!(report["data"][0]["name"], "lane", "{report}");
 }
+
+// --- One machine, one GPU: a text lane and a ComfyUI lane -----------------
+
+fn tiny_png() -> Vec<u8> {
+    vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1,
+        13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ]
+}
+
+/// A ComfyUI stand-in: accepts a prompt, reports it complete, serves one
+/// image, and answers its health endpoint.
+async fn spawn_comfy() -> String {
+    use axum::extract::Path;
+    async fn prompt() -> Json<Value> {
+        Json(json!({"prompt_id": "prompt-1", "number": 1, "node_errors": {}}))
+    }
+    async fn history(Path(prompt_id): Path<String>) -> Json<Value> {
+        Json(json!({ prompt_id: {
+            "status": {"completed": true},
+            "outputs": {"9": {"images": [{"filename": "out.png", "subfolder": "", "type": "output"}]}}
+        }}))
+    }
+    async fn view() -> Response {
+        ([("content-type", "image/png")], tiny_png()).into_response()
+    }
+    async fn stats() -> Json<Value> {
+        Json(json!({"system": {"os": "test"}, "devices": []}))
+    }
+    let app = Router::new()
+        .route("/prompt", post(prompt))
+        .route("/history/{prompt_id}", get(history))
+        .route("/view", get(view))
+        .route("/system_stats", get(stats));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+fn lines_in(path: &std::path::Path, line: &str) -> usize {
+    std::fs::read_to_string(path)
+        .map(|text| text.lines().filter(|l| *l == line).count())
+        .unwrap_or(0)
+}
+
+/// One host with a text lane and a ComfyUI lane sharing GPU group `gpu0`.
+/// A media job that arrives while a text stream is open waits for it; when
+/// the client goes away the text lane's release command runs once and the
+/// job is served, its decision saying so. The next text request then takes
+/// the GPU back from ComfyUI with one release command.
+#[tokio::test]
+async fn a_text_lane_and_a_comfy_lane_take_turns_on_one_gpu() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir();
+    let up = dir.join(format!("sb-gpu-up-{}-{nanos}.marker", std::process::id()));
+    let released = dir.join(format!("sb-gpu-release-{}-{nanos}.log", std::process::id()));
+    std::fs::write(&up, "up\n").unwrap();
+    let (lane_url, _lane) = spawn_wakeable_lane(up.clone()).await;
+    let comfy_url = spawn_comfy().await;
+    let released_path = released.display();
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: lane
+    type: openai_compatible
+    base_url: "{lane_url}"
+    accounts:
+      - {{ id: a1, auth: {{ kind: none }} }}
+  - id: comfy
+    type: comfyui
+    base_url: "{comfy_url}"
+    workflows:
+      - id: txt2img
+        kind: image_generation
+        version: test
+        graph:
+          "3": {{ class_type: EmptyLatentImage, inputs: {{ width: 1, height: 1, batch_size: 1 }} }}
+          "4": {{ class_type: KSampler, inputs: {{ seed: 0 }} }}
+          "6": {{ class_type: CLIPTextEncode, inputs: {{ text: "" }} }}
+          "9": {{ class_type: SaveImage, inputs: {{ filename_prefix: "switchback" }} }}
+        bindings:
+          prompt: {{ path: ["6", "inputs", "text"] }}
+          seed: {{ path: ["4", "inputs", "seed"] }}
+          width: {{ path: ["3", "inputs", "width"] }}
+          height: {{ path: ["3", "inputs", "height"] }}
+        output_node_ids: ["9"]
+routes:
+  - name: local-text
+    match: {{ model: "local-text" }}
+    targets:
+      - "lane/qwen3"
+local_executors:
+  - name: lane
+    host: gpu-box
+    base_url: "{lane_url}"
+    health_endpoint: "{lane_url}/health"
+    route_health: true
+    wake_on_request: true
+    wake_command: "true"
+    exclusive_group: gpu0
+    release_command: "echo release-text >> '{released_path}'"
+    group_wait_secs: 20
+  - name: comfy
+    host: gpu-box
+    base_url: "{comfy_url}"
+    health_endpoint: "{comfy_url}/system_stats"
+    exclusive_group: gpu0
+    release_command: "echo release-comfy >> '{released_path}'"
+    group_wait_secs: 20
+"#
+    );
+    let parsed = sb_core::Config::from_yaml(&cfg).unwrap();
+    sb_runtime::Engine::validate_config(&parsed).expect("the example shape is valid");
+    let state = build_state(&cfg);
+    let capacity = state.capacity.clone();
+    let traces = state.traces.clone();
+    let sb = serve(state).await;
+    let client = reqwest::Client::new();
+
+    // A long text stream takes the GPU (nobody held it yet: ComfyUI is
+    // released once).
+    let mut stream = client
+        .post(format!("{sb}/v1/chat/completions"))
+        .json(&json!({"model":"local-text","stream":true,
+                      "messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 200);
+    let mut seen = String::new();
+    while !seen.contains("lane-token") {
+        let chunk = stream.chunk().await.unwrap().expect("stream open");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(lines_in(&released, "release-comfy"), 1);
+
+    // A media job arrives while the stream is open: it waits.
+    let job = tokio::spawn({
+        let client = client.clone();
+        let sb = sb.clone();
+        async move {
+            client
+                .post(format!("{sb}/v1/images/generations"))
+                .json(&json!({"model":"comfy/txt2img","prompt":"a lighthouse",
+                              "size":"768x512","n":1,"response_format":"url"}))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!job.is_finished(), "the job waits for the open stream");
+    assert_eq!(lines_in(&released, "release-text"), 0);
+    let report: Value = reqwest::get(format!("{sb}/v1/workloads/capacity"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let lanes = report["data"].as_array().unwrap();
+    assert!(
+        lanes
+            .iter()
+            .all(|lane| lane["host"] == "gpu-box" && lane["gpu_group"] == "gpu0"),
+        "{report}"
+    );
+
+    drop(stream); // the client goes away: the last stream ends
+    let created = tokio::time::timeout(std::time::Duration::from_secs(10), job)
+        .await
+        .expect("the job is served once the stream ends")
+        .unwrap();
+    assert_eq!(created["job"]["status"], "succeeded", "{created}");
+    let job_id = created["job"]["id"].as_str().unwrap();
+    let record: Value = reqwest::get(format!("{sb}/v1/jobs/{job_id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reasons = record["route_decision"]["reason"].to_string();
+    assert!(
+        reasons.contains("local lane `comfy` waited")
+            && reasons.contains("took it from lane `lane`"),
+        "{reasons}"
+    );
+    assert_eq!(
+        lines_in(&released, "release-text"),
+        1,
+        "one release for the switch"
+    );
+
+    // The next text request takes the GPU back with one release command.
+    let response = chat(
+        &sb,
+        json!({"model":"local-text","messages":[{"role":"user","content":"hi"}]}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(lines_in(&released, "release-comfy"), 2);
+    let trace = traces.recent(1).pop().expect("trace recorded");
+    assert!(
+        trace
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("local lane `lane` waited")
+                && r.ends_with("took it from lane `comfy`")),
+        "{:?}",
+        trace.decision.reason
+    );
+    let text = capacity.executor("lane").unwrap().report();
+    assert_eq!(text.holds_gpu, Some(true));
+    let _ = std::fs::remove_file(&up);
+    let _ = std::fs::remove_file(&released);
+}

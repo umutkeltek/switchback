@@ -2505,3 +2505,237 @@ fn lanes_on_one_host_must_not_carry_different_power_commands() {
         "no lane of the host can wake it: {error}"
     );
 }
+
+// --- exclusive GPU group: the first choice waits, others never ----------
+
+/// A lane view where `lane` is in GPU group `gpu0`: the first choice's
+/// bounded wait is scripted (`Some(detail)` = took it, `None` = the wait
+/// ran out), and a dispatch that does not wait is refused unless allowed.
+struct GroupLanes {
+    took: Option<&'static str>,
+    try_allowed: bool,
+    acquired: AtomicUsize,
+    tried: AtomicUsize,
+    active: Arc<AtomicUsize>,
+}
+
+impl GroupLanes {
+    fn new(took: Option<&'static str>, try_allowed: bool) -> Arc<Self> {
+        Arc::new(Self {
+            took,
+            try_allowed,
+            acquired: AtomicUsize::new(0),
+            tried: AtomicUsize::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn busy(&self) -> crate::LaneBusy {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Box::new(Busy(self.active.clone()))
+    }
+}
+
+impl crate::LaneStatus for GroupLanes {
+    fn known_down(&self, _provider_id: &str) -> Option<String> {
+        None
+    }
+
+    fn try_begin_request(&self, provider_id: &str) -> Result<Option<crate::LaneBusy>, String> {
+        assert_eq!(provider_id, "lane");
+        self.tried.fetch_add(1, Ordering::SeqCst);
+        if self.try_allowed {
+            Ok(Some(self.busy()))
+        } else {
+            Err("does not hold gpu group `gpu0` (lane `comfy` does)".to_string())
+        }
+    }
+
+    fn acquire_for_request<'a>(
+        &'a self,
+        provider_id: &'a str,
+    ) -> crate::BoxFuture<'a, crate::LaneAcquire> {
+        assert_eq!(provider_id, "lane");
+        self.acquired.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(match self.took {
+            Some(detail) => crate::LaneAcquire::Ready {
+                busy: Some(self.busy()),
+                detail: Some(detail.to_string()),
+            },
+            None => crate::LaneAcquire::NotReady {
+                detail:
+                    "waited 120 s for gpu group `gpu0`; lane `comfy` still holds it (1 in flight)"
+                        .to_string(),
+                retry_after: crate::LANE_GROUP_RETRY_AFTER,
+            },
+        }))
+    }
+}
+
+/// [`wake_lane_config`] with the lane in GPU group `gpu0` on `gpu-box`.
+fn gpu_group_lane_config(wake_on_request: bool) -> Config {
+    let mut cfg = wake_lane_config(wake_on_request);
+    let lane = &mut cfg.local_executors[0];
+    lane.host = Some("gpu-box".to_string());
+    lane.exclusive_group = Some("gpu0".to_string());
+    lane.release_command = Some("ssh gateway release-gpu lane".to_string());
+    cfg
+}
+
+const TOOK_FROM_COMFY: &str = "waited 12 s for gpu group `gpu0`, took it from lane `comfy`";
+
+#[tokio::test]
+async fn a_first_choice_that_waited_for_its_gpu_group_is_served_and_the_decision_says_so() {
+    let lanes = GroupLanes::new(Some(TOOK_FROM_COMFY), false);
+    let engine = engine_from_config(gpu_group_lane_config(false)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", true), Instant::now())
+        .await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("expected a stream from the lane");
+    };
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        1,
+        "held while streaming"
+    );
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        0,
+        "released at the end"
+    );
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lanes.tried.load(Ordering::SeqCst),
+        0,
+        "the held guard is used for the dispatch"
+    );
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(
+        trace.decision.selected.as_ref().unwrap().target_id,
+        "lane/echo"
+    );
+    assert!(
+        trace
+            .decision
+            .reason
+            .iter()
+            .any(|r| r == &format!("local lane `lane` {TOOK_FROM_COMFY}")),
+        "{:?}",
+        trace.decision.reason
+    );
+}
+
+#[tokio::test]
+async fn a_gpu_group_wait_that_runs_out_falls_through_with_the_reason() {
+    let lanes = GroupLanes::new(None, false);
+    let engine = engine_from_config(gpu_group_lane_config(false)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(
+        trace.decision.selected.as_ref().unwrap().target_id,
+        "spare/echo"
+    );
+    let rejected = trace
+        .decision
+        .rejected
+        .iter()
+        .find(|r| r.target_id == "lane/echo")
+        .expect("the lane is rejected with a reason");
+    assert!(
+        rejected
+            .reason
+            .contains("waited 120 s for gpu group `gpu0`"),
+        "{}",
+        rejected.reason
+    );
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 0);
+    assert_eq!(lanes.tried.load(Ordering::SeqCst), 0, "never dispatched");
+}
+
+#[tokio::test]
+async fn a_gpu_group_wait_that_runs_out_with_no_other_target_is_a_retryable_503() {
+    let lanes = GroupLanes::new(None, false);
+    let engine = engine_from_config(gpu_group_lane_config(false)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("lane/echo", false), Instant::now())
+        .await;
+    let ExecOutcome::Error(error) = outcome else {
+        panic!("expected a retryable error");
+    };
+    assert_eq!(error.status, 503);
+    assert_eq!(error.error_type, "local_lane_unavailable");
+    assert_eq!(error.retry_after, Some(crate::LANE_GROUP_RETRY_AFTER));
+    assert!(
+        error.message.contains("gpu group `gpu0`"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn a_gpu_group_lane_that_is_not_the_first_choice_never_waits() {
+    // Route [spare, lane]: the spare fails, the lane is reached as a
+    // fallback; it does not hold its group, so it is skipped at once.
+    let mut cfg = gpu_group_lane_config(false);
+    cfg.routes[0].targets = vec!["spare/always-error".to_string(), "lane/echo".to_string()];
+    let lanes = GroupLanes::new(Some(TOOK_FROM_COMFY), false);
+    let engine = engine_from_config(cfg).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Error(_)));
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 0, "no wait");
+    assert_eq!(
+        lanes.tried.load(Ordering::SeqCst),
+        1,
+        "refused without waiting"
+    );
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert!(
+        trace
+            .warnings
+            .iter()
+            .any(|w| w
+                .contains("target lane/echo skipped: local lane `lane` does not hold gpu group")),
+        "{:?}",
+        trace.warnings
+    );
+}
+
+#[tokio::test]
+async fn a_lane_outside_a_gpu_group_is_never_asked_for_one() {
+    let lanes = GroupLanes::new(Some(TOOK_FROM_COMFY), true);
+    let engine = engine_from_config(wake_lane_config(false)).with_lane_status(lanes.clone());
+    engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        lanes.tried.load(Ordering::SeqCst),
+        0,
+        "no busy guard either"
+    );
+}
+
+#[test]
+fn a_gpu_group_needs_a_host_and_a_release_command() {
+    assert!(Engine::validate_config(&gpu_group_lane_config(true)).is_ok());
+    let mut cfg = gpu_group_lane_config(true);
+    cfg.local_executors[0].host = None;
+    cfg.local_executors[0].release_command = None;
+    let error = Engine::validate_config(&cfg).unwrap_err();
+    assert!(
+        error.contains("local_executors[0].exclusive_group needs host"),
+        "{error}"
+    );
+    assert!(
+        error.contains("local_executors[0].exclusive_group needs a release_command"),
+        "{error}"
+    );
+}

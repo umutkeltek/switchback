@@ -197,6 +197,20 @@ idle only when no lane has work in flight or queued and every lane's own
 idle countdown has passed; one power-off then takes every lane offline. A
 lane without `host` has a `Host` of its own, so it behaves as before.
 
+Lanes of one host may also share an `exclusive_group` (one GPU). The `Host`
+keeps each group's holder, the holder's work count and at most one pending
+switch. Text work waits for the group only for a route's first choice, in the
+same pre-dispatch step as the wake (bounded by the lane's `group_wait_secs`,
+before the first byte, explained on the `RouteDecision`); the guard taken then
+is the one the dispatch uses. Any other dispatch (a fallback target, a hedge
+racer) takes the group only if its lane already holds it and no switch is
+pending, otherwise the target is skipped. A media job waits after its wake. A
+switch waits until the holder has nothing in flight, runs the holder's
+`release_command` once (every other lane's when the holder is unknown after
+start-up or a power-off) and hands the group over; while it is pending new
+holder work waits behind it. So a request waits at most `wake_wait_secs` plus
+`group_wait_secs`, and a media job its wake plus `group_wait_secs`.
+
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability
 locks with cooldowns, an **age-encrypted vault** (key in the OS keychain or

@@ -106,6 +106,31 @@ pub trait LaneStatus: Send + Sync {
         None
     }
 
+    /// Like [`Self::begin_request`] for a dispatch that must not wait: a
+    /// lane in an exclusive GPU group (`exclusive_group`) that does not hold
+    /// its group right now refuses with `Err(reason)`, and the target is
+    /// skipped. Never waits. The runtime calls this, not `begin_request`.
+    fn try_begin_request(&self, provider_id: &str) -> Result<Option<LaneBusy>, String> {
+        Ok(self.begin_request(provider_id))
+    }
+
+    /// For a lane in an exclusive GPU group: wait, bounded by the lane's
+    /// `group_wait_secs`, until the lane holds the group (the previous
+    /// holder's `release_command` runs once when it has nothing in flight),
+    /// then hold the lane busy like [`Self::try_begin_request`]. Called
+    /// before the first byte for the target a route would choose first.
+    fn acquire_for_request<'a>(&'a self, provider_id: &'a str) -> BoxFuture<'a, LaneAcquire> {
+        Box::pin(std::future::ready(
+            match self.try_begin_request(provider_id) {
+                Ok(busy) => LaneAcquire::Ready { busy, detail: None },
+                Err(detail) => LaneAcquire::NotReady {
+                    detail,
+                    retry_after: LANE_GROUP_RETRY_AFTER,
+                },
+            },
+        ))
+    }
+
     /// The engine published a new config (reload or control-plane publish).
     /// Lanes added, changed or removed by it take effect from here.
     fn config_published(&self, _config: &Config) {}
@@ -115,6 +140,26 @@ pub trait LaneStatus: Send + Sync {
 /// it releases the lane. Type-erased so the runtime never sees lifecycle
 /// internals.
 pub type LaneBusy = Box<dyn Send + Sync>;
+
+/// `Retry-After` hint for a request refused because a lane's GPU group is
+/// busy: about one short media job.
+pub const LANE_GROUP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What waiting for a lane's GPU group ended with.
+pub enum LaneAcquire {
+    /// The lane holds its group; `busy` holds it (and the lane) until
+    /// dropped. `detail` says how, for the `RouteDecision` (for example
+    /// `waited 12 s for gpu group `gpu0`, took it from lane `comfy``).
+    Ready {
+        busy: Option<LaneBusy>,
+        detail: Option<String>,
+    },
+    /// The lane did not get its group; `detail` says why.
+    NotReady {
+        detail: String,
+        retry_after: std::time::Duration,
+    },
+}
 
 /// What a request-triggered wake found within its bound.
 #[derive(Debug, Clone, PartialEq, Eq)]

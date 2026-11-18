@@ -210,9 +210,15 @@ impl Engine {
         let lane_wake = self
             .wake_lane_before_dispatch(snap, &req, None, &mut resolved)
             .await;
+        let mut lane_gpu = self
+            .take_gpu_before_dispatch(snap, &req, None, &mut resolved)
+            .await;
         let planned = plan_resolved_route(&self.combo_rr, snap, &req, None, resolved, true)
             .and_then(|(route_name, mut plan)| {
                 if let Some(note) = &lane_wake {
+                    note.apply(&mut plan)?;
+                }
+                if let Some(note) = &lane_gpu {
                     note.apply(&mut plan)?;
                 }
                 Ok((route_name, plan))
@@ -295,7 +301,22 @@ impl Engine {
 
             // Opt-in lanes (`wake_on_request`) count this request as
             // in-flight work until this target's attempts end.
-            let _lane_busy = self.lane_busy(snap, &target.provider_id);
+            let held = lane_gpu
+                .as_mut()
+                .and_then(|note| note.take_busy(&target.provider_id));
+            let _lane_busy = match held {
+                Some(busy) => Some(busy),
+                None => match self.lane_busy(snap, &target.provider_id) {
+                    Ok(busy) => busy,
+                    Err(reason) => {
+                        tracing::info!(
+                            request_id = %req.id, target = %target.id,
+                            "target skipped: local lane {reason}"
+                        );
+                        continue 'targets;
+                    }
+                },
+            };
             let mut tried_accounts = HashSet::new();
             let allowed_accounts = req
                 .tenant

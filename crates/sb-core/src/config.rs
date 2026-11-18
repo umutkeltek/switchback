@@ -166,6 +166,31 @@ pub struct LocalExecutorConfig {
     /// machine of its own, as before.
     #[serde(default)]
     pub host: Option<String>,
+    /// The GPU this lane shares with other lanes of its host. Lanes that
+    /// name the same group take turns: at most one holds the GPU. Work for
+    /// the holder runs at once; work for another lane of the group waits
+    /// (up to `group_wait_secs`) until the holder has nothing in flight,
+    /// then the holder's `release_command` runs once and the waiting lane
+    /// takes the GPU. Needs `host` and a `release_command`. Unset (the
+    /// default): the lane never waits for a GPU.
+    #[serde(default)]
+    pub exclusive_group: Option<String>,
+    /// Shell command that makes this lane's engine free the GPU (for
+    /// example a call that unloads its model). Runs once per switch away
+    /// from this lane, bounded by `command_timeout_secs`. A failed one does
+    /// not hand the GPU over and counts against `retry_budget`.
+    #[serde(default)]
+    pub release_command: Option<String>,
+    /// The longest one request or media job of this lane waits for its GPU
+    /// group. A text request then falls through to the route's next target
+    /// (or gets a retryable 503); a media job fails. `0` never waits.
+    /// Default 120.
+    #[serde(default = "default_group_wait_secs")]
+    pub group_wait_secs: u64,
+}
+
+fn default_group_wait_secs() -> u64 {
+    120
 }
 
 fn default_wake_wait_secs() -> u64 {
@@ -1032,12 +1057,36 @@ impl Config {
             });
             if executor.wake_on_request && executor.wake_command.is_none() && !host_wakes {
                 problems.push(format!(
-                    "local_executors[{i}].wake_on_request needs a wake_command (a request can only wake the lane by running it); set wake_command on this lane or on another lane of its host, or remove wake_on_request"
+                    "local_executors[{i}].wake_on_request needs a wake_command (a request can only wake the lane by running it): set wake_command on this lane or on another lane of its host, or remove wake_on_request"
                 ));
             }
             if let Some(host) = &executor.host {
                 if host.trim().is_empty() {
                     problems.push(format!("local_executors[{i}].host is empty"));
+                }
+            }
+            if let Some(group) = &executor.exclusive_group {
+                if group.trim().is_empty() {
+                    problems.push(format!("local_executors[{i}].exclusive_group is empty"));
+                }
+                if executor.host.is_none() {
+                    problems.push(format!(
+                        "local_executors[{i}].exclusive_group needs host: the lanes of a GPU group run on one machine, so give every lane of group `{group}` the same host"
+                    ));
+                }
+                if executor.release_command.is_none() {
+                    problems.push(format!(
+                        "local_executors[{i}].exclusive_group needs a release_command (the command that makes this lane free the GPU)"
+                    ));
+                }
+                if let Some(other) = self.local_executors.iter().find(|other| {
+                    other.exclusive_group.as_deref() == Some(group.as_str())
+                        && other.host != executor.host
+                }) {
+                    problems.push(format!(
+                        "local_executors[{i}].exclusive_group `{group}` spans more than one host (lane `{}` is on another): give every lane of the group the same host",
+                        other.name
+                    ));
                 }
             }
         }
@@ -1057,7 +1106,7 @@ impl Config {
                 };
                 match host_commands.get(&(host, field)) {
                     Some((first, lane, set)) if *set != command => problems.push(format!(
-                        "local_executors[{i}].{field} differs from the one on lane `{lane}` (local_executors[{first}]) of host `{host}`; lanes on one host share its power commands: set {field} on one lane of the host, or make it identical on every lane that sets it"
+                        "local_executors[{i}].{field} differs from the one on lane `{lane}` (local_executors[{first}]) of host `{host}`: lanes on one host share its power commands, so set {field} on one lane of the host, or make it identical on every lane that sets it"
                     )),
                     Some(_) => {}
                     None => {

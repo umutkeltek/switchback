@@ -293,6 +293,11 @@ impl Engine {
         let lane_wake = self
             .wake_lane_before_dispatch(snap, &req, client_profile.as_ref(), &mut resolved)
             .await;
+        // Opt-in (`exclusive_group`): the first choice's lane takes its GPU
+        // group, bounded, before the first byte.
+        let mut lane_gpu = self
+            .take_gpu_before_dispatch(snap, &req, client_profile.as_ref(), &mut resolved)
+            .await;
 
         let planned = plan_resolved_route(
             &self.combo_rr,
@@ -304,6 +309,9 @@ impl Engine {
         )
         .and_then(|(route_name, mut plan)| {
             if let Some(note) = &lane_wake {
+                note.apply(&mut plan)?;
+            }
+            if let Some(note) = &lane_gpu {
                 note.apply(&mut plan)?;
             }
             Ok((route_name, plan))
@@ -546,7 +554,30 @@ impl Engine {
             // collected response is complete, or the stream ends (the guard
             // then moves into the stream finalizer). Drop releases it on every
             // path, unwinding included. `None` for any other target.
-            let mut lane_busy = self.lane_busy(snap, &target.provider_id);
+            // A lane in an exclusive GPU group it does not hold right now is
+            // skipped here (only the first choice waits for it, above).
+            let held = lane_gpu
+                .as_mut()
+                .and_then(|note| note.take_busy(&target.provider_id));
+            let mut lane_busy = match held {
+                Some(busy) => Some(busy),
+                None => match self.lane_busy(snap, &target.provider_id) {
+                    Ok(busy) => busy,
+                    Err(reason) => {
+                        trace.warning(format!(
+                            "target {} skipped: local lane `{}` {reason}",
+                            target.id, target.provider_id
+                        ));
+                        unavailable_retry_after = Some(
+                            unavailable_retry_after
+                                .map_or(crate::LANE_GROUP_RETRY_AFTER, |current| {
+                                    current.min(crate::LANE_GROUP_RETRY_AFTER)
+                                }),
+                        );
+                        continue 'targets;
+                    }
+                },
+            };
             let mut tried_accounts: HashSet<String> = HashSet::new();
             let allowed_accounts = req
                 .tenant

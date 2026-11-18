@@ -231,7 +231,7 @@ pub(crate) async fn run_hedge(
     candidates: &[sb_core::ExecutionTarget],
     scorecard: &Scorecard,
     scorecard_cfg: &ScorecardConfig,
-    lane_busy: &(dyn Fn(&str) -> Option<LaneBusy> + Sync),
+    lane_busy: &(dyn Fn(&str) -> Result<Option<LaneBusy>, String> + Sync),
 ) -> Option<HedgeWin> {
     let hedge = &snap.config.server.hedge;
     let n = (hedge.max_parallel.max(1) as usize).min(candidates.len());
@@ -253,7 +253,11 @@ pub(crate) async fn run_hedge(
             }
             // Opt-in lanes count each launched racer as in-flight work
             // until it finishes or loses the race (its future is dropped).
-            let _lane_busy = lane_busy(&target.provider_id);
+            // A lane in a GPU group it does not hold right now sits the
+            // race out.
+            let Ok(_lane_busy) = lane_busy(&target.provider_id) else {
+                return None;
+            };
             hedge_attempt(snap, req, target, scorecard, scorecard_cfg).await
         });
     }

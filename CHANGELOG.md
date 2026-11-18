@@ -58,6 +58,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   lane goes offline with it. Power commands are set on one lane of the host
   (or identical); `GET /v1/workloads/capacity` shows each lane's `host`. Off
   unless set.
+- **One GPU, several engines** (`exclusive_group`, `release_command`,
+  `group_wait_secs` on `local_executors`): lanes of one host that share a GPU
+  take turns. Work for the holder runs at once; work for another lane waits
+  (text: the route's first choice only, before the first byte; media: after
+  its wake) until the holder has nothing in flight, then the holder's
+  `release_command` runs once and the waiting lane takes the GPU. A pending
+  switch holds new holder work back, so neither side starves. The
+  `RouteDecision` (or the job's decision) says what happened; a wait that runs
+  out falls through or answers a retryable 503 (`Retry-After: 10`); a failed
+  release does not hand the GPU over and counts against `retry_budget`. The
+  capacity report shows `gpu_group` and `holds_gpu`. Off unless set.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates

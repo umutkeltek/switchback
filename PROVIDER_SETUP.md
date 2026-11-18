@@ -275,6 +275,30 @@ lanes set one, it must be identical; config validation names the lane to
 fix). The capacity report shows each lane's `host`. A lane without `host`
 has a machine of its own, as before.
 
+When those engines share one GPU, put their lanes in one `exclusive_group`
+and give each a `release_command`, the shell command that makes that engine
+free the GPU (for example a call that unloads its model). At most one lane of
+the group holds the GPU. Work for the holder runs at once. Work for another
+lane waits, up to that lane's `group_wait_secs` (default 120), until the
+holder has nothing in flight; then the holder's `release_command` runs once
+and the waiting lane takes the GPU. A text request waits only when its lane
+is the route's first choice, before the first byte; its `RouteDecision` says
+`local lane `llamacpp` waited 12 s for gpu group `gpu0`, took it from lane
+`comfy``. If the wait runs out it falls through to the next target, or gets a
+retryable 503 when nothing else can serve. A group lane reached as a later
+fallback is used only while it already holds the GPU. A media job waits after
+its wake and fails if the wait runs out. Fairness: while a switch is pending,
+new work for the holder waits behind it, and the lane that lost the GPU gets
+the next turn. After start-up or a power-off nobody is known to hold the GPU,
+so the first lane to take it runs every other group lane's `release_command`
+once. A failed or timed-out release does not hand the GPU over and counts
+against the holder's `retry_budget`; past it the holder is escalated and
+keeps the GPU until an operator acts. The capacity report shows `gpu_group`
+and `holds_gpu`. The group's lanes must share one `host`. A request that waits
+for the GPU keeps its admission, tenant and idempotency slots, like a request
+that waits for a wake: size `server.max_concurrency` for it. See the commented
+`gpu-box` example in `config/switchback.example.yaml`.
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:
