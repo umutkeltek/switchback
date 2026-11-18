@@ -450,6 +450,10 @@ struct LaneRuntime {
     /// (clock ms), so a burst of waiting work cannot spend the lane's
     /// whole retry budget within seconds.
     release_retry_at_ms: Option<u64>,
+    /// The latest trusted probe saw the engine up (any lane, routed or
+    /// not). A lane offline to the lifecycle whose engine answers (its
+    /// machine was woken outside Switchback) reads `healthy` in the report.
+    answered_up: bool,
 }
 
 impl LaneRuntime {
@@ -481,6 +485,7 @@ impl LaneRuntime {
             release_failures: 0,
             refused: None,
             release_retry_at_ms: None,
+            answered_up: false,
         }
     }
 }
@@ -776,6 +781,7 @@ impl LocalExecutor {
             rt.observed_seq = ticket;
             rt.observed_healthy = Some(healthy);
         }
+        rt.answered_up = healthy;
         rt.refused = match answer {
             ProbeAnswer::Refused(status) => Some(status),
             _ => None,
@@ -1790,7 +1796,11 @@ impl LocalExecutor {
             host: host.shared.then(|| host.id.clone()),
             gpu_group,
             holds_gpu,
-            state: rt.state,
+            state: if rt.state == LaneState::Offline && rt.answered_up {
+                LaneState::Healthy
+            } else {
+                rt.state
+            },
             level,
             queue_depth: rt.waiting,
             in_flight: rt.in_flight,
@@ -1851,6 +1861,9 @@ fn lane_detail(
         return format!("{name} poweroff unconfigured; idle machine will not be powered off");
     }
     match rt.state {
+        LaneState::Offline if rt.answered_up => format!(
+            "{name} healthy, idle; its machine was woken outside Switchback, so no idle countdown runs (adopt_external_wake adopts it)"
+        ),
         LaneState::Offline => format!("{name} offline; will wake on next job"),
         LaneState::Waking => format!("{name} waking"),
         LaneState::Healthy => format!("{name} healthy, idle"),
@@ -2537,6 +2550,7 @@ impl Host {
                         rt.state = LaneState::Offline;
                         rt.idle_since_ms = None;
                         rt.down_unconfirmed = true;
+                        rt.answered_up = false;
                         rt.poweroff_returned_ms = Some(clock.now_ms());
                         // A clean power-off is a fresh start for the next
                         // boot, as for the release budget above: an error of
@@ -3041,11 +3055,7 @@ impl CapacityActivator {
     /// [`LocalExecutor::observe`]). A lane without `route_health: true`, and
     /// a media-only lane, is not probed.
     pub async fn observe_all(&self) {
-        for executor in self.all() {
-            if executor.is_routed() {
-                executor.observe().await;
-            }
-        }
+        observe_lanes(&self.all()).await;
     }
 
     /// Ask for a background supervisor that periodically probes each routed
@@ -3082,14 +3092,33 @@ impl CapacityActivator {
                     .values()
                     .cloned()
                     .collect();
-                for executor in &pass {
-                    if executor.is_routed() {
-                        executor.observe().await;
-                    }
-                }
+                observe_lanes(&pass).await;
                 tick_hosts(&pass, &holds).await;
             }
         });
+    }
+}
+
+/// One probe pass of the supervisor. Probed: every lane routing reads
+/// (`route_health`), and then any other lane of a shared machine
+/// where one lane was just seen up, so the report shows which engines run.
+/// Any other lane (the default media lane, a lane without opt-in) is never
+/// probed by the supervisor, as before.
+async fn observe_lanes(lanes: &[Arc<LocalExecutor>]) {
+    let probed = |lane: &Arc<LocalExecutor>| lane.is_routed();
+    for lane in lanes.iter().filter(|lane| probed(lane)) {
+        lane.observe().await;
+    }
+    for lane in lanes.iter().filter(|lane| !probed(lane)) {
+        let host = lane.host();
+        let sibling_up = host.shared
+            && host
+                .lanes()
+                .iter()
+                .any(|other| other.name != lane.name && other.lock().answered_up);
+        if sibling_up {
+            lane.observe().await;
+        }
     }
 }
 
@@ -3486,7 +3515,10 @@ mod tests {
         host.sim().healthy = true;
         activator.observe_all().await;
         assert_eq!(activator.known_down("comfy-local"), None);
-        assert_eq!(executor.report().state, LaneState::Offline);
+        // The engine answers: the report reads healthy, but the lifecycle
+        // has not moved (no wake of ours, no idle countdown).
+        assert_eq!(executor.report().state, LaneState::Healthy);
+        assert_eq!(executor.lock().state, LaneState::Offline);
         assert_eq!(activator.known_down("not-a-lane"), None);
     }
 
@@ -3527,7 +3559,12 @@ mod tests {
         assert_eq!(activator.known_down("comfy-local"), None, "fresh evidence");
         let report = executor.report();
         assert_eq!(report.observed_healthy, Some(true));
-        assert_eq!(report.state, LaneState::Offline, "a refresh never wakes");
+        assert_eq!(
+            executor.lock().state,
+            LaneState::Offline,
+            "a refresh never wakes or moves the lifecycle"
+        );
+        assert_eq!(report.state, LaneState::Healthy, "the engine answers");
         assert_eq!(host.sim().wake, 0);
     }
 
@@ -6965,5 +7002,43 @@ local_executors:
         clock.advance(5_000);
         activator.tick_all().await;
         assert_eq!(host.sim().poweroff, 1, "powers off once the work is done");
+    }
+
+    // --- Machines woken outside Switchback -----------------------------------
+
+    /// The machine of [`shared_host_config`], already on (woken by another
+    /// tool); `extra` goes on both lanes.
+    fn woken_outside(extra: &str) -> (FakeHost, Arc<FakeClock>, Arc<CapacityActivator>) {
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(extra), &host, clock.clone());
+        (host, clock, activator)
+    }
+
+    // A lane whose engine answers although Switchback never woke its
+    // machine reads `healthy` (it read `offline`), and so does the media
+    // lane on the same machine once the supervisor sees the machine up.
+    // Without adoption nothing else changes: no countdown, no power-off.
+    #[tokio::test]
+    async fn a_directly_woken_lane_reads_healthy_and_without_adoption_stays_on() {
+        let (host, clock, activator) = woken_outside("");
+        activator.observe_all().await;
+        for lane in ["text", "comfy"] {
+            let report = report_of(&activator, lane);
+            assert_eq!(report.state, LaneState::Healthy, "{report:?}");
+            assert_eq!(report.poweroff_in_secs, None, "no countdown");
+            assert!(
+                report.detail.contains("woken outside Switchback"),
+                "{report:?}"
+            );
+        }
+        clock.advance(6 * 60 * 60 * 1000);
+        activator.observe_all().await;
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 0, "as before: it stays on");
+        assert_eq!(host.sim().wake, 0);
     }
 }
