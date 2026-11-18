@@ -192,6 +192,7 @@ impl ArtifactStore {
     /// load the records, delete bodies no record names, and apply the
     /// retention policy.
     pub fn open_disk(root: &Path, policy: RetentionPolicy) -> std::io::Result<Self> {
+        claim_root(root)?;
         for dir in [
             root.to_path_buf(),
             root.join("blobs"),
@@ -694,6 +695,44 @@ impl Drop for ArtifactWriter {
     }
 }
 
+/// Marks a directory as an artifact store, so start-up never cleans up a
+/// directory that holds anything else.
+const MARKER: &str = ".switchback-artifacts";
+
+/// The subdirectories a store keeps; start-up removes stray files in them.
+const STORE_SUBDIRS: [&str; 4] = ["blobs", "records", "jobs", "tmp"];
+
+/// Make sure `root` is this store's own: absent or empty (claimed with a
+/// marker file), or marked already. A directory with anything else in it
+/// (a mis-set `server.artifacts.dir`) is refused, so start-up's clean-up
+/// of unknown records, bodies and half-written files never deletes another
+/// program's data. A store from before the marker (only its own four
+/// subdirectories) is claimed.
+fn claim_root(root: &Path) -> std::io::Result<()> {
+    let marker = root.join(MARKER);
+    if marker.is_file() {
+        return Ok(());
+    }
+    if root.exists() {
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let own = name
+                .to_str()
+                .is_some_and(|name| STORE_SUBDIRS.contains(&name))
+                && entry.file_type()?.is_dir();
+            if !own {
+                return Err(std::io::Error::other(format!(
+                    "{} holds other files and no {MARKER} marker; not an artifact store, refusing to use it",
+                    root.display()
+                )));
+            }
+        }
+    }
+    create_private_dir(root)?;
+    create_private_file(&marker)?.write_all(b"switchback artifact store\n")
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1043,6 +1082,34 @@ mod tests {
         assert!(!root.join("records").join("art_bad.json").exists());
         assert_eq!(std::fs::read_dir(root.join("tmp")).unwrap().count(), 0);
         assert_eq!(body(&store, "art_keep"), b"kept");
+    }
+
+    #[test]
+    fn a_directory_with_other_data_is_refused_and_left_untouched() {
+        let root = temp_root("foreign");
+        std::fs::create_dir_all(root.join("records")).unwrap();
+        std::fs::write(root.join("notes.txt"), b"keep").unwrap();
+        std::fs::write(root.join("records").join("other.json"), b"keep").unwrap();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        std::fs::write(root.join("tmp").join("draft.part"), b"keep").unwrap();
+        assert!(ArtifactStore::open_disk(&root, policy(1 << 20)).is_err());
+        assert!(root.join("notes.txt").is_file());
+        assert!(root.join("records").join("other.json").is_file());
+        assert!(root.join("tmp").join("draft.part").is_file());
+        let cfg = ArtifactsConfig {
+            dir: Some(root.display().to_string()),
+            ..ArtifactsConfig::default()
+        };
+        assert_eq!(
+            ArtifactStore::from_config(&cfg, None).storage_label(),
+            "process_memory"
+        );
+
+        // An empty (or new) directory is claimed with a marker.
+        let fresh = temp_root("fresh");
+        ArtifactStore::open_disk(&fresh, policy(1 << 20)).unwrap();
+        assert!(fresh.join(MARKER).is_file());
+        ArtifactStore::open_disk(&fresh, policy(1 << 20)).unwrap();
     }
 
     #[test]
