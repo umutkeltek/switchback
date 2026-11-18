@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """A saved Claude account starts with the default profile's setup."""
+import fcntl
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 CLI = Path(__file__).resolve().parents[1]
@@ -142,6 +144,29 @@ class MirrorTests(unittest.TestCase):
         self.assertNotIn("mcpServers", report["copied"])
         self.assertTrue(any("MCP servers not copied" in note for note in report["notes"]))
         self.assertNotIn("mcpServers", json.loads((self.seat / ".claude.json").read_text()))
+
+    def test_a_held_mirror_lock_is_waited_on_briefly_then_skipped(self):
+        before = (self.seat / "settings.json").read_bytes()
+        with open(self.seat / ".switchback-default-mirror.lock", "a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            started = time.monotonic()
+            result = subprocess.run([sys.executable, "-B", str(MIRROR), "--slot", "seat1"],
+                                    env=self.env, capture_output=True, text=True, timeout=15)
+            waited = time.monotonic() - started
+            rc, report, _ = self.mirror()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(waited, 12)
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn("default setup not copied to seat1", lines[0])
+        self.assertEqual(rc, 0)
+        self.assertTrue(report["busy"])
+        self.assertEqual(report["copied"], [])
+        self.assertEqual((self.seat / "settings.json").read_bytes(), before)
+        rc, report, err = self.mirror()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("busy", report)
+        self.assertIn("settings.json", report["copied"])
 
     def test_default_env_is_linked_only_where_the_account_has_nothing(self):
         source = self.default / ".env"

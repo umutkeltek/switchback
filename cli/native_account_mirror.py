@@ -272,6 +272,24 @@ def claude_config_lock(path, wait=2.0):
             os.rmdir(lock)
 
 
+# How long a launch waits for another launch that is copying into the same
+# account. Past it, this launch goes ahead without the copy.
+MIRROR_LOCK_WAIT = 5.0
+
+
+def hold_lock(stream, wait):
+    """Take an exclusive flock on `stream`, waiting at most `wait` seconds."""
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
 def mirror_mcp(home, report):
     source = read_owned(default_global_config())
     if source is None:
@@ -341,7 +359,9 @@ def mirror(runtime, slot):
         return report
     with open(home / ".switchback-default-mirror.lock", "a") as guard:
         os.chmod(guard.name, 0o600)
-        fcntl.flock(guard, fcntl.LOCK_EX)
+        if not hold_lock(guard, MIRROR_LOCK_WAIT):
+            report["busy"] = True
+            return report
         state = load_state(home)
         before = dict(state)
         try:
@@ -359,6 +379,9 @@ def mirror(runtime, slot):
 
 
 def summary(report):
+    if report.get("busy"):
+        return ("default setup not copied to %s: another launch is copying it; this launch goes ahead without it"
+                % report["slot"])
     if report.get("skipped"):
         return ""
     parts = list(report["copied"])
