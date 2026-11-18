@@ -122,6 +122,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Changed
 
+- ComfyUI image jobs wait up to 15 minutes for ComfyUI to finish (was about
+  30 s, so a cold model load after a wake or a slow workflow failed with
+  502 while ComfyUI kept rendering, and the lane counted as idle). A job
+  that ComfyUI reports as failed ends the request at once, naming the
+  failing node and exception type.
 - Managed lanes (`local_executors`): operator commands no longer run
   unbounded. A power-off or restart command still running after
   `command_timeout_secs` (default 60) is stopped and counts as failed (a

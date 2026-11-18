@@ -55,6 +55,13 @@ async fn spawn_with_config(config: &str) -> String {
 #[derive(Clone, Default)]
 struct FakeComfyState {
     prompt_body: Arc<Mutex<Option<serde_json::Value>>>,
+    /// History calls answered so far.
+    history_calls: Arc<Mutex<usize>>,
+    /// Answer `{}` (the job is still queued or running) to this many history
+    /// calls before the job's entry appears.
+    pending_history_calls: usize,
+    /// The job's entry reports a failure in ComfyUI instead of outputs.
+    fail: bool,
 }
 
 #[derive(Clone)]
@@ -192,7 +199,37 @@ async fn fake_comfy_prompt(
     }))
 }
 
-async fn fake_comfy_history(Path(prompt_id): Path<String>) -> Json<serde_json::Value> {
+async fn fake_comfy_history(
+    State(state): State<FakeComfyState>,
+    Path(prompt_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let calls = {
+        let mut calls = state.history_calls.lock().unwrap();
+        *calls += 1;
+        *calls
+    };
+    if calls <= state.pending_history_calls {
+        return Json(json!({}));
+    }
+    if state.fail {
+        return Json(json!({
+            prompt_id.clone(): {
+                "status": {
+                    "status_str": "error",
+                    "completed": false,
+                    "messages": [
+                        ["execution_start", {"prompt_id": prompt_id}],
+                        ["execution_error", {
+                            "node_type": "KSampler",
+                            "exception_type": "torch.OutOfMemoryError",
+                            "exception_message": "quoted job input that must not leak"
+                        }]
+                    ]
+                },
+                "outputs": {}
+            }
+        }));
+    }
     Json(json!({
         prompt_id: {
             "status": {"completed": true},
@@ -218,7 +255,10 @@ async fn fake_comfy_system_stats() -> Json<serde_json::Value> {
 }
 
 async fn spawn_fake_comfy() -> (String, FakeComfyState) {
-    let state = FakeComfyState::default();
+    spawn_fake_comfy_with(FakeComfyState::default()).await
+}
+
+async fn spawn_fake_comfy_with(state: FakeComfyState) -> (String, FakeComfyState) {
     let app = Router::new()
         .route("/prompt", post(fake_comfy_prompt))
         .route("/history/{prompt_id}", get(fake_comfy_history))
@@ -600,6 +640,99 @@ providers:
     assert_eq!(usage["unknown_cost_requests"], 1);
     assert_eq!(usage["recent"][0]["provider_id"], "comfy");
     assert!(usage["recent"][0]["cost_micros"].is_null());
+}
+
+/// A gateway with one ComfyUI workflow, `comfy/txt2img`, at `comfy_url`.
+fn one_comfy_workflow(comfy_url: &str) -> String {
+    format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  api_keys:
+    - key: "sk-operator"
+      tenant: test
+      role: operator
+tenants:
+  - id: test
+providers:
+  - id: comfy
+    type: comfyui
+    base_url: "{comfy_url}"
+    workflows:
+      - id: txt2img
+        kind: image_generation
+        graph:
+          "6":
+            class_type: CLIPTextEncode
+            inputs: {{ text: "" }}
+          "9":
+            class_type: SaveImage
+            inputs: {{ filename_prefix: "switchback" }}
+        bindings:
+          prompt: {{ path: ["6", "inputs", "text"] }}
+        output_node_ids: ["9"]
+"#
+    )
+}
+
+async fn generate_one_image(base: &str) -> reqwest::Response {
+    authed(
+        &reqwest::Client::new(),
+        reqwest::Method::POST,
+        format!("{base}/v1/images/generations"),
+    )
+    .json(&json!({"model": "comfy/txt2img", "prompt": "a lighthouse"}))
+    .send()
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn comfyui_job_running_longer_than_thirty_seconds_still_delivers_its_image() {
+    // ComfyUI answers `{}` while a job is queued or running. 65 such answers
+    // at the 500 ms poll are about 33 s, as long as a cold model load after a
+    // wake; the poll used to give up after 60 answers and fail the request
+    // while ComfyUI kept rendering.
+    let (comfy_url, comfy) = spawn_fake_comfy_with(FakeComfyState {
+        pending_history_calls: 65,
+        ..FakeComfyState::default()
+    })
+    .await;
+    let base = spawn_with_config(&one_comfy_workflow(&comfy_url)).await;
+
+    let response = generate_one_image(&base).await;
+    assert_eq!(response.status(), 200);
+    let created: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(created["job"]["status"], "succeeded");
+    assert_eq!(created["data"].as_array().unwrap().len(), 1);
+    assert_eq!(*comfy.history_calls.lock().unwrap(), 66);
+}
+
+#[tokio::test]
+async fn comfyui_job_that_failed_in_comfyui_ends_the_request_at_once() {
+    let (comfy_url, comfy) = spawn_fake_comfy_with(FakeComfyState {
+        fail: true,
+        ..FakeComfyState::default()
+    })
+    .await;
+    let base = spawn_with_config(&one_comfy_workflow(&comfy_url)).await;
+
+    let started = std::time::Instant::now();
+    let response = generate_one_image(&base).await;
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("failed in ComfyUI (KSampler: torch.OutOfMemoryError)"),
+        "{message}"
+    );
+    assert!(!message.contains("quoted job input"), "{message}");
+    assert_eq!(*comfy.history_calls.lock().unwrap(), 1);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "waited {:?} for a job ComfyUI had already failed",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]

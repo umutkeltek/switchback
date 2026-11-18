@@ -1505,6 +1505,15 @@ async fn send_json<T: for<'de> Deserialize<'de>>(
         .map_err(|e| WorkloadError::Upstream(format!("{action}: invalid JSON: {e}")))
 }
 
+/// How long one ComfyUI job may take, queue time included, before
+/// Switchback stops waiting for it. A cold model load after a wake, a slow
+/// sampler or a video run each take well over a minute; a job that ComfyUI
+/// itself reports as failed ends the wait at once (see [`comfy_job_failure`]).
+const COMFYUI_JOB_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Pause between two looks at a ComfyUI job's history.
+const COMFYUI_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 async fn poll_comfyui_history(
     cfg: &Config,
     client: &reqwest::Client,
@@ -1514,18 +1523,60 @@ async fn poll_comfyui_history(
 ) -> Result<Vec<ComfyOutputRef>, WorkloadError> {
     let history_url = comfy_endpoint(base_url, &format!("history/{prompt_id}"))?;
     guard_provider_url(cfg, history_url.as_str()).await?;
-    for _ in 0..60 {
+    let deadline = std::time::Instant::now() + COMFYUI_JOB_TIMEOUT;
+    loop {
         let history: Json =
             send_json(client.get(history_url.clone()), "poll comfyui history").await?;
         let outputs = extract_comfy_outputs(&history, prompt_id, output_node_ids);
         if !outputs.is_empty() {
             return Ok(outputs);
         }
-        sleep(Duration::from_millis(500)).await;
+        if let Some(failure) = comfy_job_failure(&history, prompt_id) {
+            return Err(WorkloadError::Upstream(format!(
+                "comfyui prompt `{prompt_id}` {failure}"
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(WorkloadError::Upstream(format!(
+                "comfyui prompt `{prompt_id}` did not produce artifacts within {} s",
+                COMFYUI_JOB_TIMEOUT.as_secs()
+            )));
+        }
+        sleep(COMFYUI_POLL_INTERVAL).await;
     }
-    Err(WorkloadError::Upstream(format!(
-        "comfyui prompt `{prompt_id}` did not produce artifacts before timeout"
-    )))
+}
+
+/// Why a ComfyUI job that has finished will never produce an artifact: an
+/// execution error, or a run that completed without outputs. `None` while
+/// the job is still queued or running (ComfyUI answers `{}` until then).
+/// Metadata only: the failing node's type and the exception's type, never
+/// the exception's message, which can quote the job's inputs.
+fn comfy_job_failure(history: &Json, prompt_id: &str) -> Option<String> {
+    let status = history.get(prompt_id)?.get("status")?;
+    if status.get("status_str").and_then(Json::as_str) == Some("error") {
+        let error = status
+            .get("messages")
+            .and_then(Json::as_array)
+            .and_then(|messages| {
+                messages.iter().find(|message| {
+                    message.get(0).and_then(Json::as_str) == Some("execution_error")
+                })
+            })
+            .and_then(|message| message.get(1));
+        let field = |name: &str| {
+            error
+                .and_then(|error| error.get(name))
+                .and_then(Json::as_str)
+                .map(str::to_string)
+        };
+        let node = field("node_type").unwrap_or_else(|| "unknown node".to_string());
+        let kind = field("exception_type").unwrap_or_else(|| "unknown error".to_string());
+        return Some(format!("failed in ComfyUI ({node}: {kind})"));
+    }
+    if status.get("completed").and_then(Json::as_bool) == Some(true) {
+        return Some("completed in ComfyUI without artifacts".to_string());
+    }
+    None
 }
 
 fn extract_comfy_outputs(
