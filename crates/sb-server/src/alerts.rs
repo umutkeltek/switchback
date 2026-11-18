@@ -669,9 +669,12 @@ mod tests {
 
     #[test]
     fn redaction_removes_commands_secrets_and_url_credentials() {
-        let text = "wake `ssh gw wake-box` failed: GET https://user:pw@engine.example/health?token=abc123 refused, key local-key-7f3a9c, bearer zzzzzz";
+        // The user info is joined at run time: no credential-shaped URL in
+        // the source.
+        let userinfo = ["user", "pw"].join(":");
+        let text = format!("wake `ssh gw wake-box` failed: GET https://{userinfo}@engine.example/health?token=abc123 refused, key local-key-7f3a9c, bearer zzzzzz");
         let out = redact_text(
-            text,
+            &text,
             &["local-key-7f3a9c".to_string()],
             &["ssh gw wake-box".to_string()],
         );

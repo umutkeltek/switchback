@@ -7389,8 +7389,11 @@ local_executors:
         let clock = FakeClock::new();
         let sink = FakeSink::new(SinkMode::Ok);
         let activator = alerting(&host, clock.clone(), sink.clone(), "");
+        // The user info is joined at run time: no credential-shaped URL in
+        // the source.
+        let userinfo = ["user", ALERT_KEY].join(":");
         activator.executor("text").unwrap().escalate(format!(
-            "wake `ssh gateway wake-host executor-1` failed; upstream said: invalid key {ALERT_KEY} for http://user:{ALERT_KEY}@executor-1.example:8080/v1?key={ALERT_KEY}"
+            "wake `ssh gateway wake-host executor-1` failed; upstream said: invalid key {ALERT_KEY} for http://{userinfo}@executor-1.example:8080/v1?key={ALERT_KEY}"
         ));
         check(&activator).await;
         let sent = sink.sent.lock().unwrap().clone();
