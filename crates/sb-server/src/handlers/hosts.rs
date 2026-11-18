@@ -207,3 +207,20 @@ pub(crate) async fn delete(
         None => no_hold(),
     }
 }
+
+/// `POST /v1/admin/alerts/test` (admin keys only): send one `kind: "test"`
+/// alert through `server.alert_command` now and answer with its exit code,
+/// to prove the delivery path on a live gateway.
+pub(crate) async fn alerts_test(State(state): State<AppState>) -> Response {
+    match state.capacity.alerts().send_test().await {
+        Ok(code) => Json(json!({"sent": code == 0, "exit_code": code})).into_response(),
+        Err(message) if message.contains("not set") => {
+            error(StatusCode::CONFLICT, "invalid_request_error", message)
+        }
+        Err(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"sent": false, "exit_code": null, "error": {"message": message, "type": "alert_error"}})),
+        )
+            .into_response(),
+    }
+}

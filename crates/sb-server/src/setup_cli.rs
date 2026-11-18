@@ -2096,7 +2096,7 @@ fn redact_line_value(line: &str) -> String {
     }
 }
 
-fn sanitize_inline_secret_text(text: &str, redactions: &mut usize) -> String {
+pub(crate) fn sanitize_inline_secret_text(text: &str, redactions: &mut usize) -> String {
     let words = text.split_whitespace().collect::<Vec<_>>();
     let mut out = Vec::with_capacity(words.len());
     let mut redact_next = false;

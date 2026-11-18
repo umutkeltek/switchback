@@ -509,6 +509,7 @@ pub(crate) async fn capacity(
             "durable": holds.durable(),
             "last_save_error": holds.last_save_error(),
         },
+        "alerts": state.capacity.alerts().status(),
     }))
     .into_response()
 }

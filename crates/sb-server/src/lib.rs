@@ -1,5 +1,6 @@
 mod activator;
 mod admission;
+mod alerts;
 mod app;
 mod artifact_store;
 mod auth;

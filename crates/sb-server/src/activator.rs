@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use sb_core::{Config, LocalExecutorConfig, ProviderKind};
 
+use crate::alerts::{AlertSink, Alerter, CommandAlertSink};
 use crate::holds::{Hold, HoldError, HoldState, HoldView, Holds};
 use crate::scheme_auth::SchemeCredential;
 use sb_runtime::{LaneAcquire, LaneBusy, LaneWake, LANE_GROUP_RETRY_AFTER};
@@ -328,6 +329,10 @@ pub struct LocalLaneReport {
     /// guard answers again. Absent at zero.
     #[serde(skip_serializing_if = "is_zero")]
     pub poweroff_guard_failures: u32,
+    /// The guard gave no answer `retry_budget` times in a row (for alerts;
+    /// the detail says so).
+    #[serde(skip)]
+    pub poweroff_guard_broken: bool,
     pub detail: String,
     /// Most recent health probe result; text routing skips the lane's
     /// targets while this is `false`. Absent until the first probe, and
@@ -1829,6 +1834,7 @@ impl LocalExecutor {
             poweroff_guard_busy: guard.busy,
             poweroff_guard_busy_since_ms: guard.busy_since_ms,
             poweroff_guard_failures: guard.failures,
+            poweroff_guard_broken: guard.broken,
             detail,
             observed_healthy: rt.observed_healthy,
             poweroff_in_secs,
@@ -2786,6 +2792,9 @@ pub struct CapacityActivator {
     /// Host holds (`/v1/hosts/{host}/holds`): an active one keeps its
     /// machine on.
     holds: Arc<Holds>,
+    /// Lane alerts (`server.alert_command`), checked after every
+    /// supervisor pass.
+    alerts: Arc<Alerter>,
 }
 
 /// The lane is read by routing: it opted in and its provider can be a routed
@@ -2821,7 +2830,20 @@ impl CapacityActivator {
         runner: Arc<dyn CommandRunner>,
         probe: Arc<dyn HealthProbe>,
     ) -> Arc<Self> {
+        Self::with_alert_sink(cfg, clock, runner, probe, Arc::new(CommandAlertSink))
+    }
+
+    /// [`Self::with_seams`] with the program that delivers alerts as a
+    /// seam too.
+    pub fn with_alert_sink(
+        cfg: &Config,
+        clock: Arc<dyn Clock>,
+        runner: Arc<dyn CommandRunner>,
+        probe: Arc<dyn HealthProbe>,
+        sink: Arc<dyn AlertSink>,
+    ) -> Arc<Self> {
         let activator = Self {
+            alerts: Arc::new(Alerter::new(clock.clone(), sink)),
             executors: Arc::new(RwLock::new(BTreeMap::new())),
             clock,
             runner,
@@ -2859,6 +2881,7 @@ impl CapacityActivator {
     /// keeps holding the idle poweroff off; once it has ended, re-adding
     /// starts a fresh lane.
     pub fn reconcile(&self, cfg: &Config) {
+        self.alerts.configure(cfg);
         {
             let mut lanes = self
                 .executors
@@ -2969,6 +2992,18 @@ impl CapacityActivator {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Lane alerts: delivery state for the report, and the test send.
+    pub fn alerts(&self) -> &Arc<Alerter> {
+        &self.alerts
+    }
+
+    /// Check every lane for alerts and start delivering the due ones in
+    /// the background (what the supervisor does after each pass).
+    pub fn check_alerts(&self) {
+        self.alerts.check(&self.reports());
+        self.alerts.kick();
     }
 
     /// The host holds and whether they survive a restart.
@@ -3103,6 +3138,7 @@ impl CapacityActivator {
         // reload left, not the ones that existed when it started.
         let lanes = self.executors.clone();
         let holds = self.holds.clone();
+        let alerts = self.alerts.clone();
         handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
@@ -3114,6 +3150,14 @@ impl CapacityActivator {
                     .collect();
                 observe_lanes(&pass).await;
                 tick_hosts(&pass, &holds).await;
+                // Alerts last: delivery runs in its own task, so a hanging
+                // alert command never delays the next probe or power-off.
+                let reports: Vec<LocalLaneReport> = pass
+                    .iter()
+                    .map(|lane| lane.report_with(Some(&holds)))
+                    .collect();
+                alerts.check(&reports);
+                alerts.kick();
             }
         });
     }
@@ -3444,6 +3488,7 @@ mod tests {
             supervisor_started: AtomicBool::new(false),
             credentials: RwLock::new(None),
             holds: Arc::new(Holds::new()),
+            alerts: Arc::new(Alerter::new(FakeClock::new(), Arc::new(CommandAlertSink))),
         }
     }
 
@@ -7126,5 +7171,256 @@ local_executors:
         clock.advance(5_000);
         activator.tick_all().await;
         assert_eq!(host.sim().poweroff, 1);
+    }
+
+    // --- Lane alerts (`server.alert_command`) --------------------------------
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum SinkMode {
+        Ok,
+        Hang,
+    }
+
+    /// Records every alert delivery: (payload, summary).
+    struct FakeSink {
+        mode: Mutex<SinkMode>,
+        sent: Mutex<Vec<(serde_json::Value, String)>>,
+    }
+
+    impl FakeSink {
+        fn new(mode: SinkMode) -> Arc<Self> {
+            Arc::new(Self {
+                mode: Mutex::new(mode),
+                sent: Mutex::new(Vec::new()),
+            })
+        }
+        fn kinds(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(payload, _)| payload["kind"].as_str().unwrap().to_string())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl crate::alerts::AlertSink for FakeSink {
+        async fn deliver(
+            &self,
+            _argv: &[String],
+            payload: &str,
+            summary: &str,
+            _timeout_ms: u64,
+        ) -> Result<i32, String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((serde_json::from_str(payload).unwrap(), summary.to_string()));
+            if *self.mode.lock().unwrap() == SinkMode::Hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(0)
+        }
+    }
+
+    const ALERT_KEY: &str = "local-key-7f3a9c2b";
+
+    /// The shared machine with alerts on (after 180 s, repeat 6 h) and an
+    /// inline provider key; `extra` goes on both lanes.
+    fn alerting(
+        host: &FakeHost,
+        clock: Arc<dyn Clock>,
+        sink: Arc<FakeSink>,
+        extra: &str,
+    ) -> Arc<CapacityActivator> {
+        let mut cfg = shared_host_config(extra);
+        cfg.server.alert_command = Some(vec!["/usr/local/bin/lane-alert".to_string()]);
+        if let ProviderKind::OpenaiCompatible { api_key, .. } = &mut cfg.providers[0].kind {
+            *api_key = Some(ALERT_KEY.to_string());
+        }
+        CapacityActivator::with_alert_sink(
+            &cfg,
+            clock,
+            Arc::new(host.clone()),
+            Arc::new(host.clone()),
+            sink,
+        )
+    }
+
+    async fn check(activator: &CapacityActivator) {
+        activator.check_alerts();
+        settle().await;
+    }
+
+    // A normal wake shows `warn` for a minute or two: that sends nothing.
+    #[tokio::test]
+    async fn a_normal_wake_shorter_than_alert_after_sends_no_alert() {
+        let host = FakeHost::new(Sim::default());
+        let clock = FakeClock::new();
+        let sink = FakeSink::new(SinkMode::Ok);
+        let activator = alerting(&host, clock.clone(), sink.clone(), "");
+        let text = activator.executor("text").unwrap();
+        text.lock().state = LaneState::Waking;
+        assert_eq!(text.report().level, LaneLevel::Warn);
+        for _ in 0..12 {
+            check(&activator).await;
+            clock.advance(10_000); // 120 s of waking in all
+        }
+        text.lock().state = LaneState::IdleCountdown;
+        check(&activator).await;
+        assert!(sink.kinds().is_empty(), "{:?}", sink.kinds());
+    }
+
+    // A lasting failure sends exactly one alert, repeats it after
+    // `alert_repeat_secs` (not before), and one `recovered` when it ends.
+    #[tokio::test]
+    async fn a_persistent_failure_alerts_once_repeats_and_recovers_once() {
+        let host = FakeHost::new(Sim::default());
+        let clock = FakeClock::new();
+        let sink = FakeSink::new(SinkMode::Ok);
+        let activator = alerting(&host, clock.clone(), sink.clone(), "");
+        let text = activator.executor("text").unwrap();
+        text.lock().state = LaneState::Degraded;
+        for _ in 0..30 {
+            check(&activator).await;
+            clock.advance(60_000); // 30 min of checks
+        }
+        assert_eq!(sink.kinds(), ["escalated"]);
+        clock.advance(6 * 60 * 60 * 1000);
+        check(&activator).await;
+        check(&activator).await;
+        assert_eq!(sink.kinds(), ["escalated", "escalated"], "one repeat");
+        text.lock().state = LaneState::IdleCountdown;
+        check(&activator).await;
+        check(&activator).await;
+        assert_eq!(sink.kinds(), ["escalated", "escalated", "recovered"]);
+        let (recovered, _) = sink.sent.lock().unwrap()[2].clone();
+        assert_eq!(recovered["level"], "ok");
+        assert_eq!(recovered["previous_level"], "fail");
+        let status = activator.alerts().status();
+        assert!(status.last_sent_at.is_some() && status.last_error.is_none());
+        assert_eq!(status.pending, 0);
+    }
+
+    // An alert command that hangs never delays a due power-off: delivery
+    // runs in its own task, and its state shows in the report.
+    #[tokio::test]
+    async fn a_hanging_alert_command_does_not_delay_a_due_poweroff() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let sink = FakeSink::new(SinkMode::Hang);
+        let activator = alerting(&host, clock.clone(), sink.clone(), "");
+        drop(
+            activator
+                .executor("comfy")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("capacity"),
+        );
+        activator
+            .executor("text")
+            .unwrap()
+            .escalate("probe refused".to_string());
+        check(&activator).await;
+        assert_eq!(sink.kinds(), ["escalated"], "delivery started and hangs");
+        clock.advance(5_000);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            activator.check_alerts();
+            activator.tick_all().await;
+        })
+        .await
+        .expect("never waits for the alert command");
+        assert_eq!(host.sim().poweroff, 1, "the power-off ran on time");
+        assert_eq!(activator.alerts().status().pending, 1, "still pending");
+    }
+
+    // A guard that stays broken alerts once it has been broken for
+    // `alert_after_secs`, once for the machine (not once per lane).
+    #[tokio::test]
+    async fn a_broken_guard_alerts() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            guard: GuardAnswer::Broken,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let sink = FakeSink::new(SinkMode::Ok);
+        let activator = alerting(
+            &host,
+            clock.clone(),
+            sink.clone(),
+            "    poweroff_guard_command: \"ssh gateway check-idle executor-1\"\n",
+        );
+        drop(
+            activator
+                .executor("comfy")
+                .unwrap()
+                .ensure_ready()
+                .await
+                .expect("capacity"),
+        );
+        for _ in 0..4 {
+            clock.advance(60_000);
+            activator.tick_all().await;
+            check(&activator).await;
+        }
+        assert!(
+            report_of(&activator, "comfy").poweroff_guard_broken,
+            "broken by now"
+        );
+        assert!(sink.kinds().is_empty(), "not before alert_after_secs");
+        clock.advance(180_000);
+        check(&activator).await;
+        assert_eq!(sink.kinds(), ["guard_broken"], "one event for the machine");
+        assert_eq!(host.sim().poweroff, 0);
+    }
+
+    // The payload never carries a key, a credential in a URL or an operator
+    // command line, even when the lane's error text holds them. Its fields
+    // follow the documented schema.
+    #[tokio::test]
+    async fn the_alert_payload_carries_no_key_and_no_command() {
+        let host = FakeHost::new(Sim::default());
+        let clock = FakeClock::new();
+        let sink = FakeSink::new(SinkMode::Ok);
+        let activator = alerting(&host, clock.clone(), sink.clone(), "");
+        activator.executor("text").unwrap().escalate(format!(
+            "wake `ssh gateway wake-host executor-1` failed; upstream said: invalid key {ALERT_KEY} for http://user:{ALERT_KEY}@executor-1.example:8080/v1?key={ALERT_KEY}"
+        ));
+        check(&activator).await;
+        let sent = sink.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        let (payload, summary) = &sent[0];
+        for text in [payload.to_string(), summary.clone()] {
+            assert!(!text.contains(ALERT_KEY), "{text}");
+            assert!(!text.contains("ssh gateway"), "{text}");
+            assert!(!text.contains("user:"), "{text}");
+        }
+        assert!(payload["detail"].as_str().unwrap().contains("<command>"));
+        for field in [
+            "schema",
+            "kind",
+            "lane",
+            "host",
+            "level",
+            "previous_level",
+            "detail",
+            "since",
+            "sent_at",
+            "gateway",
+        ] {
+            assert!(payload.get(field).is_some(), "{field}: {payload}");
+        }
+        assert_eq!(payload["schema"], "switchback/lane-alert@1");
+        assert_eq!(payload["kind"], "escalated");
+        assert_eq!(payload["lane"], "text");
+        assert_eq!(payload["host"], "gpu-box");
+        assert_eq!(payload["level"], "fail");
+        assert!(summary.starts_with("switchback escalated: text on gpu-box is fail"));
     }
 }
