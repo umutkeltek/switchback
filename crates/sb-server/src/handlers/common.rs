@@ -80,6 +80,30 @@ pub(crate) fn attach_session_metadata(req: &mut sb_core::AiRequest, headers: &He
     }
 }
 
+/// For an ingress format whose clients send thinking back next turn and
+/// whose parser has no input form for it (`/v1/messages`, `/v1/responses`):
+/// thinking from OpenAI-compatible engines is dropped for this request, as
+/// before those engines' thinking was decoded, unless
+/// `server.openai_compatible_thinking_on_all_formats` is on. Thinking from
+/// other upstreams is shown as before.
+pub(crate) fn drop_chat_wire_thinking_unless_enabled(
+    state: &crate::AppState,
+    req: &mut sb_core::AiRequest,
+) {
+    if !state
+        .engine
+        .snapshot()
+        .config
+        .server
+        .openai_compatible_thinking_on_all_formats
+    {
+        req.metadata.insert(
+            sb_adapters::codec::DROP_CHAT_WIRE_THINKING.to_string(),
+            "drop".to_string(),
+        );
+    }
+}
+
 pub(crate) fn attach_native_client_metadata(
     req: &mut sb_core::AiRequest,
     headers: &HeaderMap,

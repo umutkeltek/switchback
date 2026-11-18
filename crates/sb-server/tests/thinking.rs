@@ -21,6 +21,8 @@ struct Engine {
     field: &'static str,
     answer: Vec<&'static str>,
     finish: &'static str,
+    /// Every request body the engine received.
+    seen: Arc<std::sync::Mutex<Vec<Value>>>,
 }
 
 fn chunk(delta: Value, finish: Value) -> String {
@@ -35,6 +37,7 @@ fn chunk(delta: Value, finish: Value) -> String {
 }
 
 async fn engine_chat(State(engine): State<Engine>, Json(body): Json<Value>) -> Response {
+    engine.seen.lock().unwrap().push(body.clone());
     if body["stream"].as_bool().unwrap_or(false) {
         let mut frames = chunk(json!({"role": "assistant"}), Value::Null);
         for text in &engine.thinking {
@@ -68,6 +71,11 @@ async fn engine_chat(State(engine): State<Engine>, Json(body): Json<Value>) -> R
 
 /// A gateway in front of a fake engine that answers as `engine` says.
 async fn gateway(engine: Engine) -> String {
+    gateway_with(engine, "").await
+}
+
+/// [`gateway`] with extra `server:` settings (one indented YAML line).
+async fn gateway_with(engine: Engine, server: &str) -> String {
     let upstream = Router::new()
         .route("/v1/chat/completions", post(engine_chat))
         .with_state(engine);
@@ -81,6 +89,7 @@ async fn gateway(engine: Engine) -> String {
         r#"
 server:
   bind: "127.0.0.1:0"
+{server}
 providers:
   - id: engine
     type: openai_compatible
@@ -116,6 +125,7 @@ fn thinking_then_answer() -> Engine {
         field: "reasoning_content",
         answer: vec!["Hi", "!"],
         finish: "stop",
+        seen: Arc::default(),
     }
 }
 
@@ -281,11 +291,148 @@ async fn without_thinking_the_output_is_unchanged() {
     );
 }
 
-// The other ingress formats already had a form for thinking: Anthropic
-// `thinking` blocks and Responses `reasoning` items.
+async fn post_status(base: &str, path: &str, body: Value) -> (u16, Value) {
+    let response = reqwest::Client::new()
+        .post(format!("{base}{path}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+// Thinking is never sent back upstream: a chat client that echoes the
+// `reasoning_content` it got on its assistant message sends the engine only
+// the answer, so a server that refuses it in input (DeepSeek-style) is safe.
 #[tokio::test]
-async fn messages_and_responses_render_it_in_their_own_form() {
+async fn thinking_a_chat_client_echoes_is_not_sent_upstream() {
+    let engine = thinking_then_answer();
+    let seen = engine.seen.clone();
+    let base = gateway(engine).await;
+    let (body, _) = chat(&base, false).await;
+    let answer: Value = serde_json::from_str(&body).unwrap();
+    let echoed = answer["choices"][0]["message"].clone();
+    assert_eq!(echoed["reasoning_content"], "Let me think.", "{body}");
+    let (status, reply) = post_status(
+        &base,
+        "/v1/chat/completions",
+        json!({
+            "model": "engine/engine-model",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                echoed,
+                {"role": "user", "content": "and now?"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply}");
+    let upstream = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(upstream["messages"][1]["content"], "Hi!", "{upstream}");
+    assert!(!upstream.to_string().contains("reasoning"), "{upstream}");
+    assert!(!upstream.to_string().contains("Let me"), "{upstream}");
+}
+
+// A client of `/v1/messages` (Claude Code, an Anthropic SDK) sends the
+// assistant turn it received back on its next turn, as it came. Switchback's
+// own Anthropic ingress has no input form for a `thinking` block, so the
+// first answer must not carry one by default: the second turn must work.
+#[tokio::test]
+async fn a_messages_client_that_replays_the_answer_gets_its_next_turn() {
     let base = gateway(thinking_then_answer()).await;
+    let first = json!({
+        "model": "engine/engine-model",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let (status, answer) = post_status(&base, "/v1/messages", first).await;
+    assert_eq!(status, 200, "{answer}");
+    let (status, error) = post_status(
+        &base,
+        "/v1/messages",
+        json!({
+            "model": "engine/engine-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": answer["content"].clone()},
+                {"role": "user", "content": "and now?"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "first answer {answer}, second {error}");
+}
+
+// The same for `/v1/responses`: a Responses client (Codex) puts the output
+// items of a turn into the input of the next one.
+#[tokio::test]
+async fn a_responses_client_that_replays_the_output_gets_its_next_turn() {
+    let base = gateway(thinking_then_answer()).await;
+    let (status, answer) = post_status(
+        &base,
+        "/v1/responses",
+        json!({"model": "engine/engine-model", "input": "hello"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    let mut input = vec![json!({"role": "user", "content": "hello"})];
+    input.extend(answer["output"].as_array().cloned().unwrap_or_default());
+    input.push(json!({"role": "user", "content": "and now?"}));
+    let (status, error) = post_status(
+        &base,
+        "/v1/responses",
+        json!({"model": "engine/engine-model", "input": input}),
+    )
+    .await;
+    assert_eq!(status, 200, "first answer {answer}, second {error}");
+}
+
+async fn messages_and_responses_streams(base: &str) -> (String, String) {
+    let (messages, _) = post_json(
+        base,
+        "/v1/messages",
+        json!({
+            "model": "engine/engine-model",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}],
+        }),
+    )
+    .await;
+    let (responses, _) = post_json(
+        base,
+        "/v1/responses",
+        json!({"model": "engine/engine-model", "stream": true, "input": "hello"}),
+    )
+    .await;
+    (messages, responses)
+}
+
+// By default `/v1/messages` and `/v1/responses` show no thinking from an
+// OpenAI-compatible engine, as before it was decoded: their clients would
+// send it back, and the next turn would fail. The answer is unchanged.
+#[tokio::test]
+async fn messages_and_responses_keep_engine_thinking_off_by_default() {
+    let base = gateway(thinking_then_answer()).await;
+    let (messages, responses) = messages_and_responses_streams(&base).await;
+    assert!(!messages.contains("thinking"), "{messages}");
+    assert!(messages.contains(r#""text":"Hi""#), "{messages}");
+    assert!(!responses.contains("reasoning"), "{responses}");
+    assert!(responses.contains(r#""delta":"Hi""#), "{responses}");
+}
+
+// With `openai_compatible_thinking_on_all_formats` the other ingress formats
+// render it in their own form: Anthropic `thinking` blocks and Responses
+// `reasoning` items.
+#[tokio::test]
+async fn messages_and_responses_render_it_in_their_own_form_when_enabled() {
+    let base = gateway_with(
+        thinking_then_answer(),
+        "  openai_compatible_thinking_on_all_formats: true",
+    )
+    .await;
     let (body, _) = post_json(
         &base,
         "/v1/messages",

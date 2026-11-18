@@ -53,6 +53,13 @@ pub trait WireCodec: Send + Sync {
         sb_adapter::response_to_events(resp)
     }
 
+    /// Whether `req` keeps the thinking this codec decodes. Default yes;
+    /// the OpenAI chat codecs drop it when the request carries
+    /// [`DROP_CHAT_WIRE_THINKING`].
+    fn keeps_reasoning(&self, _req: &AiRequest) -> bool {
+        true
+    }
+
     /// A fresh stateful stream decoder for one request (`model` is a fallback
     /// for formats whose stream omits it, e.g. Gemini).
     fn decoder(&self, model: &str) -> Box<dyn StreamDecoder>;
@@ -91,6 +98,19 @@ fn string_field_array(
 // --- OpenAI Chat Completions ------------------------------------------------
 
 pub struct OpenAiCodec;
+
+/// Request metadata key (value `"drop"`): the client's wire format has no
+/// input form for the thinking an OpenAI-compatible engine sends, so the
+/// OpenAI chat codecs drop it for this request, as they did before they
+/// decoded it. Set by the `/v1/messages` and `/v1/responses` handlers unless
+/// `server.openai_compatible_thinking_on_all_formats` is on.
+pub const DROP_CHAT_WIRE_THINKING: &str = "chat_wire_thinking";
+
+fn keeps_chat_wire_thinking(req: &AiRequest) -> bool {
+    req.metadata
+        .get(DROP_CHAT_WIRE_THINKING)
+        .is_none_or(|value| value != "drop")
+}
 
 /// [`sb_adapter::response_to_events`] plus the response's thinking as one
 /// `ReasoningDelta` right after `MessageStart`, ahead of the answer, where
@@ -139,6 +159,9 @@ impl WireCodec for OpenAiCodec {
     /// decoder keeps it, so a collected response carries it too.
     fn response_events(&self, resp: &AiResponse) -> Vec<AiStreamEvent> {
         response_events_with_reasoning(resp)
+    }
+    fn keeps_reasoning(&self, req: &AiRequest) -> bool {
+        keeps_chat_wire_thinking(req)
     }
     fn decoder(&self, _model: &str) -> Box<dyn StreamDecoder> {
         Box::new(OpenAiDecoder(
@@ -248,6 +271,9 @@ impl WireCodec for EngineChatCodec {
     }
     fn response_events(&self, resp: &AiResponse) -> Vec<AiStreamEvent> {
         OpenAiCodec.response_events(resp)
+    }
+    fn keeps_reasoning(&self, req: &AiRequest) -> bool {
+        OpenAiCodec.keeps_reasoning(req)
     }
     fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
         OpenAiCodec.decoder(model)

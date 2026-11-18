@@ -159,9 +159,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   `reasoning` from stream deltas and from a collected response into the
   canonical thinking event, and `/v1/chat/completions` renders it as
   `reasoning_content` on stream deltas and on the collected message, only
-  when the upstream produced any. `/v1/messages` (thinking blocks) and
-  `/v1/responses` (reasoning items) render it as they already did for other
-  upstreams. Before, a stream that only thought showed the client nothing
+  when the upstream produced any. `/v1/messages` and `/v1/responses` drop
+  it by default as before (their clients send it back next turn, and that
+  input would fail with 400); `server.openai_compatible_thinking_on_all_formats:
+  true` renders it there as thinking blocks and a reasoning item. Before, a stream that only thought showed the client nothing
   (23 s in a rehearsal) and its trace had no `ttft_ms`; the first thinking
   token now counts. A response without thinking is byte-for-byte unchanged.
 

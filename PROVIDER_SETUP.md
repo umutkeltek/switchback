@@ -228,11 +228,17 @@ Thinking that an OpenAI-compatible engine sends (llama.cpp and vLLM stream
 it as `reasoning_content`, some servers as `reasoning`) is kept, on every
 `engine:` value. `/v1/chat/completions` renders it back as
 `reasoning_content` on the stream deltas, ahead of the answer, and on the
-collected message; a response without thinking is unchanged. `/v1/messages`
-renders it as `thinking` blocks and `/v1/responses` as a `reasoning` item, as
-they already did for other upstreams. A trace's `ttft_ms` counts the first
-thinking token, so a model that thinks for a while before it answers shows
-progress at once and gets a time to first token.
+collected message; a response without thinking is unchanged. A trace's
+`ttft_ms` counts the first thinking token, so a model that thinks for a while
+before it answers shows progress at once and gets a time to first token.
+`/v1/messages` and `/v1/responses` drop this thinking by default, as before:
+their clients send the last answer back on the next turn, and Switchback
+cannot take an unsigned `thinking` block or a `reasoning` item as input yet,
+so that turn would fail with 400. `server.openai_compatible_thinking_on_all_formats:
+true` shows it there too (`thinking` blocks, a `reasoning` item), for
+clients that do not send it back. Thinking from other upstreams (Anthropic,
+Responses) is shown on those two formats as before. Thinking is never sent
+back upstream.
 
 When two engines serve the same model on one route, set `pin_order: true` on
 the route so the declared order wins even after one engine was stopped for a

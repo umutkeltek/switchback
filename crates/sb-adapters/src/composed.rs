@@ -7,7 +7,7 @@
 
 use futures::StreamExt;
 use sb_adapter::{AdapterError, EventStream, PreparedRequest, ProviderAdapter};
-use sb_core::{AuthScheme, CapabilityProfile, ErrorClass};
+use sb_core::{AiStreamEvent, AuthScheme, CapabilityProfile, ErrorClass};
 
 use crate::codec::StreamDecoder;
 use crate::codec::WireCodec;
@@ -106,6 +106,10 @@ fn stream_framing_error(message: String) -> AdapterError {
         ErrorClass::StreamInterrupted
     };
     AdapterError::new(class, message)
+}
+
+fn is_reasoning(event: &AiStreamEvent) -> bool {
+    matches!(event, AiStreamEvent::ReasoningDelta { .. })
 }
 
 fn finish_decoder_if_clean(
@@ -211,6 +215,10 @@ impl ProviderAdapter for ComposedAdapter {
             );
         }
 
+        // Thinking the client's wire format cannot take back is dropped here,
+        // once, for the stream and the collected response alike.
+        let keeps_reasoning = self.codec.keeps_reasoning(&prepared.request);
+        let wanted = move |event: &AiStreamEvent| keeps_reasoning || !is_reasoning(event);
         if stream {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
             let mut upstream = response.bytes_stream();
@@ -244,7 +252,7 @@ impl ProviderAdapter for ComposedAdapter {
                     match framer.push(&bytes) {
                         Ok(values) => {
                             for value in values {
-                                for event in decoder.decode(&value) {
+                                for event in decoder.decode(&value).into_iter().filter(wanted) {
                                     if tx.send(Ok(event)).await.is_err() {
                                         return;
                                     }
@@ -259,7 +267,10 @@ impl ProviderAdapter for ComposedAdapter {
                     }
                 }
 
-                for event in finish_decoder_if_clean(decoder.as_mut(), had_stream_error) {
+                for event in finish_decoder_if_clean(decoder.as_mut(), had_stream_error)
+                    .into_iter()
+                    .filter(wanted)
+                {
                     if tx.send(Ok(event)).await.is_err() {
                         return;
                     }
@@ -280,7 +291,7 @@ impl ProviderAdapter for ComposedAdapter {
                 .map_err(AdapterError::invalid)?;
             let events = self.codec.response_events(&canonical);
 
-            Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+            Ok(futures::stream::iter(events.into_iter().filter(wanted).map(Ok)).boxed())
         }
     }
 

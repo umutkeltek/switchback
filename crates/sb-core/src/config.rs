@@ -1956,6 +1956,15 @@ pub struct ServerConfig {
     /// unspecified literal hosts.
     #[serde(default)]
     pub block_private_networks: bool,
+    /// Thinking from OpenAI-compatible engines (`reasoning_content` /
+    /// `reasoning`) is always shown on `/v1/chat/completions`. `true` also
+    /// shows it on `/v1/messages` (thinking blocks) and `/v1/responses`
+    /// (reasoning items). Off by default: clients of those two formats send
+    /// the thinking back on their next turn, and Switchback cannot take an
+    /// unsigned thinking block or a reasoning item as input yet (the turn
+    /// would fail with 400).
+    #[serde(default)]
+    pub openai_compatible_thinking_on_all_formats: bool,
     /// Resilience: same-target retry on transient errors (before fallover).
     #[serde(default)]
     pub retry: RetryConfig,
@@ -2299,6 +2308,7 @@ impl Default for ServerConfig {
             otel_endpoint: None,
             langfuse: LangfuseConfig::default(),
             block_private_networks: false,
+            openai_compatible_thinking_on_all_formats: false,
             retry: RetryConfig::default(),
             circuit_breaker: BreakerConfig::default(),
             budget: BudgetConfig::default(),
