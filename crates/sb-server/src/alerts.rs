@@ -72,35 +72,51 @@ impl AlertSink for CommandAlertSink {
         let Some((program, args)) = argv.split_first() else {
             return Err("alert_command is empty".to_string());
         };
+        // Its own process group, so the timeout stops what it started too
+        // (a script's `curl` or `sleep`), not only the program itself.
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .env(SUMMARY_ENV, summary)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("could not run the alert command: {error}"))?;
+        let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+        let stdin = child.stdin.take();
         let run = async {
-            let mut child = tokio::process::Command::new(program)
-                .args(args)
-                .env(SUMMARY_ENV, summary)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|error| format!("could not run the alert command: {error}"))?;
-            if let Some(mut stdin) = child.stdin.take() {
+            if let Some(mut stdin) = stdin {
                 // A program that exits without reading its input is not a
                 // failed delivery; its exit code decides.
                 let _ = stdin.write_all(payload.as_bytes()).await;
             }
-            let status = child
+            child
                 .wait()
                 .await
-                .map_err(|error| format!("alert command did not finish: {error}"))?;
-            status
-                .code()
-                .ok_or_else(|| "alert command was killed by a signal".to_string())
+                .map_err(|error| format!("alert command did not finish: {error}"))
         };
-        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), run).await {
-            Ok(result) => result,
-            Err(_) => Err(format!(
-                "alert command timed out after {} s",
-                timeout_ms / 1000
-            )),
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), run).await;
+        match outcome {
+            Ok(status) => status?
+                .code()
+                .ok_or_else(|| "alert command was killed by a signal".to_string()),
+            Err(_) => {
+                if let Some(group) = group {
+                    // SAFETY: a plain kill(2) of the process group the
+                    // command leads; no memory is touched.
+                    unsafe {
+                        libc::kill(-group, libc::SIGKILL);
+                    }
+                }
+                // Reap the program so it leaves no zombie.
+                let _ = child.kill().await;
+                Err(format!(
+                    "alert command timed out after {} s",
+                    timeout_ms / 1000
+                ))
+            }
         }
     }
 }
@@ -807,6 +823,43 @@ providers:
         ] {
             assert_eq!(redact_text(&text, &[], &[]), want, "{text}");
         }
+    }
+
+    // An alert command that hangs is stopped at its timeout together with
+    // everything it started (a script's `curl`, `sleep`, ...), so a month
+    // of hanging deliveries leaves no processes behind.
+    #[tokio::test]
+    async fn a_hanging_alert_command_is_killed_with_its_children_at_the_timeout() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_file =
+            std::env::temp_dir().join(format!("sb-alert-child-{}-{nanos}", std::process::id()));
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        let started = std::time::Instant::now();
+        let result = CommandAlertSink.deliver(&argv, "{}", "summary", 500).await;
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let child: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..50 {
+            // SAFETY: signal 0 only asks whether the process exists.
+            if unsafe { libc::kill(child, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "the command's child {child} still runs after the timeout"
+        );
     }
 
     #[test]
