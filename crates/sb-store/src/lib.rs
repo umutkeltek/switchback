@@ -139,6 +139,11 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy_total_cost_usd: Option<f64>,
     pub created_at_ms: i64,
+    /// The name the caller sent when it differs from `model` (a workflow
+    /// alias recorded under the workflow's public id). Additive nullable
+    /// column; NULL otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
 }
 
 /// One metadata-only request trace, durably recorded for searchable execution
@@ -781,6 +786,7 @@ impl SqliteStore {
                      output_tokens INTEGER NOT NULL,
                      cached_input_tokens INTEGER,
                      cache_savings_micros INTEGER,
+                     requested_model TEXT,
                      latency_ms    INTEGER NOT NULL,
                      streamed      INTEGER NOT NULL,
                      energy_joules REAL,
@@ -1244,6 +1250,17 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
                     "ALTER TABLE usage ADD COLUMN cache_savings_micros INTEGER",
                     [],
                 )?;
+            }
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 19, "usage_requested_model", |tx| {
+            if !Self::table_exists(tx, "usage")? {
+                return Ok(());
+            }
+            // Additive + nullable: the name a caller sent through a workflow
+            // alias. Older rows and direct requests stay NULL.
+            if !Self::column_exists(tx, "usage", "requested_model")? {
+                tx.execute("ALTER TABLE usage ADD COLUMN requested_model TEXT", [])?;
             }
             Ok(())
         })?;
@@ -2186,9 +2203,10 @@ impl StateStore for SqliteStore {
               input_tokens, output_tokens, latency_ms, streamed, energy_joules, energy_kwh,
               energy_duration_seconds, energy_measurement_available, energy_attribution_method,
               energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
-              energy_total_cost_usd, created_at, cached_input_tokens, cache_savings_micros)
+              energy_total_cost_usd, created_at, cached_input_tokens, cache_savings_micros,
+              requested_model)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
             params![
                 e.request_id,
                 e.provider_id,
@@ -2218,6 +2236,7 @@ impl StateStore for SqliteStore {
                 e.created_at_ms,
                 e.cached_input_tokens as i64,
                 e.cache_savings_micros.map(|micros| micros as i64),
+                e.requested_model,
             ],
         )?;
         if rows == 0 {
@@ -2295,7 +2314,7 @@ impl StateStore for SqliteStore {
                     energy_measurement_available, energy_attribution_method,
                     energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
                     energy_total_cost_usd, created_at, cached_input_tokens,
-                    cache_savings_micros
+                    cache_savings_micros, requested_model
              FROM usage ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -2335,6 +2354,7 @@ impl StateStore for SqliteStore {
                     cache_savings_micros: row
                         .get::<_, Option<i64>>(26)?
                         .map(|micros| micros as u64),
+                    requested_model: row.get(27)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3434,12 +3454,12 @@ mod tests {
         #[cfg(feature = "eval")]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
             ]
         }
         #[cfg(not(feature = "eval"))]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19]
         }
     }
 
@@ -4363,6 +4383,37 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].request_id, "r3", "newest first");
         assert_eq!(recent[0].project.as_deref(), Some("globex-api"));
+    }
+
+    #[test]
+    fn usage_keeps_the_name_a_caller_sent_through_an_alias() {
+        let store = SqliteStore::in_memory().unwrap();
+        {
+            // The store has one connection: release it before writing.
+            let conn = store.conn().unwrap();
+            assert!(SqliteStore::column_exists(&conn, "usage", "requested_model").unwrap());
+        }
+        let ev = |rid: &str, requested: Option<&str>| UsageEvent {
+            request_id: rid.into(),
+            provider_id: "media".into(),
+            model: "image/flux".into(),
+            created_at_ms: 1000,
+            requested_model: requested.map(str::to_string),
+            ..UsageEvent::default()
+        };
+        store
+            .record_usage(&ev("by-alias", Some("media/flux")))
+            .unwrap();
+        store.record_usage(&ev("by-public-id", None)).unwrap();
+
+        let recent = store.recent_usage(10).unwrap();
+        let by_id = |rid: &str| recent.iter().find(|e| e.request_id == rid).unwrap();
+        assert_eq!(
+            by_id("by-alias").requested_model.as_deref(),
+            Some("media/flux")
+        );
+        assert_eq!(by_id("by-public-id").requested_model, None);
+        assert!(recent.iter().all(|e| e.model == "image/flux"));
     }
 
     #[test]

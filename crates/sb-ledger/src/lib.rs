@@ -133,6 +133,11 @@ pub struct UsageRecord {
     /// gateway-local metadata and is never sent upstream.
     #[serde(default)]
     pub project: Option<String>,
+    /// The name the caller sent when it differs from `model`: a request
+    /// through a workflow alias, recorded under the workflow's public id.
+    /// Lets the operator see when an old name is no longer used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
 }
 
 impl UsageRecord {
@@ -169,6 +174,7 @@ impl UsageRecord {
             units_consumed: None,
             tenant: None,
             project: None,
+            requested_model: None,
         }
     }
 
@@ -206,6 +212,7 @@ impl UsageRecord {
             units_consumed: None,
             tenant: None,
             project: None,
+            requested_model: None,
         }
     }
 
@@ -241,12 +248,19 @@ impl UsageRecord {
             units_consumed,
             tenant: None,
             project: None,
+            requested_model: None,
         }
     }
 
     /// Attribute this record to a tenant (builder).
     pub fn with_tenant(mut self, tenant: Option<String>) -> Self {
         self.tenant = tenant;
+        self
+    }
+
+    /// The name the caller sent, when it differs from `model` (builder).
+    pub fn with_requested_model(mut self, requested_model: Option<String>) -> Self {
+        self.requested_model = requested_model;
         self
     }
 
@@ -866,6 +880,7 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         energy_accounting_method: energy.and_then(|energy| energy.accounting_method.clone()),
         energy_total_cost_usd: energy.and_then(|energy| energy.total_cost_usd),
         created_at_ms: (r.timestamp_unix as i64).saturating_mul(1000),
+        requested_model: r.requested_model.clone(),
     }
 }
 
@@ -915,6 +930,7 @@ fn event_to_record(event: sb_store::UsageEvent) -> UsageRecord {
         units_consumed: event.units_consumed,
         tenant: event.tenant,
         project: event.project,
+        requested_model: event.requested_model,
     }
 }
 
