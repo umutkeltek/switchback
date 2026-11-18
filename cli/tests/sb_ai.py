@@ -470,9 +470,15 @@ class SbAi(unittest.TestCase):
         self.assertEqual(inputs["size"], "480x864")
         run, inputs = self.video_size(wide, "wide.png", "--size", "512x512")
         self.assertEqual(inputs["size"], "512x512")
-        run, inputs = self.video_size(wide, "wide.png", "--mp", "0.4")  # as before: square at that size
-        self.assertEqual(inputs["size"], "640x640")
-        self.assertNotIn("first frame is", run.stderr)
+        run, inputs = self.video_size(wide, "wide.png", "--mp", "0.4")  # --mp alone keeps the frame's shape
+        self.assertEqual(inputs["size"], "864x480")
+        self.assertIn("first frame is 1920x1080", run.stderr)
+        run, inputs = self.video_size(wide, "wide.png", "--mp", "0.9")  # ...at the asked size
+        width, height = (int(x) for x in inputs["size"].split("x"))
+        self.assertGreater(width, height)
+        self.assertGreater(width * height, 864 * 480)
+        run, inputs = self.video_size(b"\xff\xd8\xff\xe0" + b"jpeg" * 8, "broken.jpg", "--mp", "0.4")
+        self.assertEqual(inputs["size"], "640x640")  # unreadable frame + --mp: square at that size
 
     def test_video_unreadable_header_sends_no_size_and_says_so(self):
         for frame_bytes, name in ((b"\xff\xd8\xff\xe0" + b"jpeg" * 8, "broken.jpg"),

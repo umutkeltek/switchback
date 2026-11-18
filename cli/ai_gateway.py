@@ -40,7 +40,7 @@ sb ai: images, video and machine status through a Switchback gateway
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
 --model takes the full id or its last part (flux for <lane>/flux or image/flux).
-video without --aspect, --mp or --size keeps the first frame's shape at 0.4 MP.
+video without --aspect or --size keeps the first frame's shape (0.4 MP, or --mp).
 Ctrl-C during a video cancels the job on the gateway.
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
@@ -664,8 +664,8 @@ def cmd_video(gw, config, args):
     if args.mp is not None and args.mp <= 0:
         raise Fail(USAGE, "--mp must be above 0")
     size = parse_size(args.size) if args.size else None
-    if args.aspect or args.mp is not None:
-        size = size_for(parse_aspect(args.aspect or "1:1"), args.mp or VIDEO_MP)
+    if args.aspect:
+        size = size_for(parse_aspect(args.aspect), args.mp or VIDEO_MP)
     try:
         with open(args.image, "rb") as handle:
             frame = handle.read()
@@ -675,13 +675,17 @@ def cmd_video(gw, config, args):
     if not media_type:
         raise Fail(USAGE, "--image must be a PNG, JPEG or WebP file")
     model = resolve_model(args.model, "video", catalog(gw), config["SWITCHBACK_AI_VIDEO_MODEL"])
-    if not (args.size or args.aspect or args.mp is not None):
-        # No shape asked for: keep the first frame's, else the workflow
-        # renders its own default (often square).
+    if not (args.size or args.aspect):
+        # No shape asked for: keep the first frame's (at --mp, if given), else
+        # the workflow renders its own default (often square).
+        mp = args.mp or VIDEO_MP
         shape = frame_size(frame)
         if shape:
-            size = size_for(shape[0] / shape[1], VIDEO_MP)
-            log(f"first frame is {shape[0]}x{shape[1]}; sending size {size} (same shape, {VIDEO_MP:g} MP)")
+            size = size_for(shape[0] / shape[1], mp)
+            log(f"first frame is {shape[0]}x{shape[1]}; sending size {size} (same shape, {mp:g} MP)")
+        elif args.mp is not None:
+            size = size_for(1.0, mp)
+            log(f"cannot read the first frame's width and height; sending a square size {size} at {mp:g} MP")
         else:
             log("cannot read the first frame's width and height; sending no size, so the workflow "
                 "uses its default (give --aspect or --size to choose)")
