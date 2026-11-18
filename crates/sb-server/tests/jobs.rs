@@ -663,3 +663,48 @@ async fn an_upstream_content_type_is_never_served_back_as_is() {
     assert_eq!(response.headers()["content-type"], "image/png");
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
 }
+
+#[tokio::test]
+async fn an_unknown_image_model_is_an_error_and_never_a_placeholder_image() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    let base = serve(build_state(&comfy_provider(&comfy_url))).await;
+    let blocking = reqwest::Client::new()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&json!({"model": "comfy/no-such-workflow", "prompt": "a cat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocking.status(), 400);
+    let error: Value = blocking.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "workload_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown image model"),
+        "{error}"
+    );
+    let background = submit(
+        &base,
+        None,
+        json!({"kind": "image_generation", "model": "nobody/knows", "inputs": {"prompt": "a cat"}}),
+    )
+    .await;
+    assert_eq!(background.status(), 400);
+    // The mock stays reachable by its own name.
+    let mock = reqwest::Client::new()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&json!({"model": "mock/image", "prompt": "a cat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mock.status(), 200);
+    let listed: Value = reqwest::get(format!("{base}/v1/jobs"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["data"].as_array().unwrap().len(), 1, "{listed}");
+    assert!(fake.paths().is_empty());
+}

@@ -227,6 +227,7 @@ impl WorkloadStore {
         request: ImageGenerationRequest,
         owner: Owner,
     ) -> Result<JobRecord, WorkloadError> {
+        ensure_known_image_target(&ctx.snapshot.config, &request.model)?;
         if let Some((provider, workflow)) =
             resolve_comfyui_workflow(&ctx.snapshot.config, &request.model)
         {
@@ -268,7 +269,7 @@ impl WorkloadStore {
     ) -> Result<JobRecord, WorkloadError> {
         let cfg = ctx.snapshot.config.clone();
         let target = match (&body.workflow, &body.model) {
-            (Some(workflow), None) if workflow == "mock-image" => "mock/image".to_string(),
+            (Some(workflow), None) if workflow == "mock-image" => MOCK_IMAGE_MODEL.to_string(),
             (Some(workflow), None) => {
                 if resolve_comfyui_workflow(&cfg, workflow).is_none() {
                     return Err(WorkloadError::InvalidRequest(format!(
@@ -348,6 +349,7 @@ impl WorkloadStore {
                 }
             }
             None => {
+                ensure_known_image_target(cfg, &spec.request.model)?;
                 if spec.kind != WorkloadKind::ImageGeneration {
                     return Err(WorkloadError::InvalidRequest(format!(
                         "`{}` is not a {} workflow",
@@ -499,6 +501,7 @@ impl WorkloadStore {
                 .run_comfy(ctx, provider, workflow, inputs, owner, job_id)
                 .await;
         }
+        ensure_known_image_target(cfg, &request.model)?;
         let job = self.create_mock_image_job(request, tenant, project, job_id.to_string())?;
         record_unpriced_image_usage(&ctx.ledger, &job, "switchback-mock", None);
         Ok(job)
@@ -1652,6 +1655,24 @@ struct ComfyOutputRef {
     type_: String,
     /// Frames per second, when the output node reports it (video).
     frame_rate: Option<f64>,
+}
+
+/// The mock image target (`mock-image` in `/v1/workflows`): a 1x1 PNG for
+/// smoke tests. It is never a stand-in for a name that does not resolve.
+const MOCK_IMAGE_MODEL: &str = "mock/image";
+
+/// Refuse an image target that names no ComfyUI workflow, no fal model and
+/// not the mock (400), instead of answering with the mock's placeholder.
+fn ensure_known_image_target(cfg: &Config, model: &str) -> Result<(), WorkloadError> {
+    if model == MOCK_IMAGE_MODEL
+        || resolve_comfyui_workflow(cfg, model).is_some()
+        || resolve_fal_model(cfg, model).is_some()
+    {
+        return Ok(());
+    }
+    Err(WorkloadError::InvalidRequest(format!(
+        "unknown image model or workflow `{model}` (see GET /v1/workflows)"
+    )))
 }
 
 fn resolve_comfyui_workflow<'a>(
