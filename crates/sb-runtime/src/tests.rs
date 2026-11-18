@@ -1963,6 +1963,7 @@ providers:
   - name: lane
     base_url: "http://127.0.0.1:1"
     health_endpoint: "http://127.0.0.1:1/health"
+    route_health: true
 routes:
   - name: local-text
     match: {{ model: "local-text" }}
@@ -1972,6 +1973,36 @@ routes:
 "#
     ))
     .unwrap()
+}
+
+#[test]
+fn a_lane_without_route_health_is_never_skipped() {
+    // Opt-in: a lane that did not set `route_health` is routed exactly as
+    // before managed text lanes, whatever the lane view says about it.
+    let mut cfg = lane_then_spare_config(true, false);
+    cfg.local_executors[0].route_health = false;
+    let engine = engine_from_config(cfg).with_lane_status(Arc::new(DownLanes(&["lane"])));
+    let req = AiRequest::new("local-text", vec![Message::user("hi")]);
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(plan.decision.selected.unwrap().target_id, "lane/m");
+    assert!(
+        !plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.reason.contains("local lane")),
+        "{:?}",
+        plan.decision.rejected
+    );
+    assert!(
+        !plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.contains("local lane")),
+        "{:?}",
+        plan.decision.reason
+    );
 }
 
 #[test]

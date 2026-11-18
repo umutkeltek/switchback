@@ -187,7 +187,8 @@ pub struct LocalLaneReport {
     pub escalated: bool,
     pub detail: String,
     /// Most recent health probe result; text routing skips the lane's
-    /// targets while this is `false`. Absent until the first probe.
+    /// targets while this is `false`. Absent until the first probe, and
+    /// always absent for a lane without `route_health: true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_healthy: Option<bool>,
 }
@@ -245,8 +246,9 @@ struct LaneRuntime {
     wake_attempts: u32,
     escalated: bool,
     poweroff_unconfigured_reported: bool,
-    /// Result of the most recent health probe (`None` = never probed). Read by
-    /// text routing; never drives the lifecycle state.
+    /// Result of the most recent health probe (`None` = never probed, or the
+    /// lane is not routed). Read by text routing; never drives the lifecycle
+    /// state.
     observed_healthy: Option<bool>,
     /// Probes overlap (supervisor, routing refresh, a job's wake poll). Each
     /// takes a ticket when it starts; only a result whose ticket is newer than
@@ -298,9 +300,11 @@ pub struct LocalExecutor {
     /// once (single-flight): the first waker holds this across the whole boot
     /// poll; the rest wait, then find the lane already healthy.
     wake_lock: tokio::sync::Mutex<()>,
-    /// The lane's provider can be a routed (text) target, so the supervisor
-    /// probes it for routing. A media-only lane (ComfyUI, fal) is never a
-    /// routed target and keeps its old behaviour: no periodic probe.
+    /// The lane opted in (`route_health: true`) and its provider can be a
+    /// routed (text) target, so the supervisor probes it for routing and
+    /// routing reads what it saw. Any other lane (the default, and always a
+    /// media-only lane such as ComfyUI or fal) keeps its old behaviour: no
+    /// periodic probe and no routing view.
     routed: bool,
 }
 
@@ -341,10 +345,11 @@ impl LocalExecutor {
         self.cfg.idle_timeout_secs.saturating_mul(1000)
     }
 
-    /// Probe the service's health endpoint and remember what was seen. Every
-    /// probe in this module goes through here, so text routing (which reads
-    /// the observation through [`sb_runtime::LaneStatus`]) always sees the
-    /// latest evidence.
+    /// Probe the service's health endpoint and, on a routed lane, remember
+    /// what was seen. Every probe in this module goes through here, so text
+    /// routing (which reads the observation through
+    /// [`sb_runtime::LaneStatus`]) always sees the latest evidence. On any
+    /// other lane nothing is recorded, so routing never reads it.
     async fn probe_health(&self) -> bool {
         let ticket = {
             let mut rt = self.lock();
@@ -354,7 +359,7 @@ impl LocalExecutor {
         };
         let healthy = self.probe.healthy(&self.cfg.health_endpoint).await;
         let mut rt = self.lock();
-        if ticket > rt.observed_seq {
+        if self.routed && ticket > rt.observed_seq {
             rt.observed_seq = ticket;
             rt.observed_healthy = Some(healthy);
         }
@@ -863,16 +868,17 @@ impl CapacityActivator {
     ) -> Arc<Self> {
         let mut executors = BTreeMap::new();
         for executor_cfg in &cfg.local_executors {
-            let routed = cfg
-                .providers
-                .iter()
-                .find(|provider| provider.id == executor_cfg.name)
-                .is_some_and(|provider| {
-                    !matches!(
-                        provider.kind,
-                        ProviderKind::ComfyUi { .. } | ProviderKind::Fal { .. }
-                    )
-                });
+            let routed = executor_cfg.route_health
+                && cfg
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == executor_cfg.name)
+                    .is_some_and(|provider| {
+                        !matches!(
+                            provider.kind,
+                            ProviderKind::ComfyUi { .. } | ProviderKind::Fal { .. }
+                        )
+                    });
             let executor = LocalExecutor::new(
                 executor_cfg.clone(),
                 clock.clone(),
@@ -904,7 +910,8 @@ impl CapacityActivator {
     }
 
     /// Probe every routed lane once and record what was seen (see
-    /// [`LocalExecutor::observe`]). Media-only lanes are not probed.
+    /// [`LocalExecutor::observe`]). A lane without `route_health: true`, and
+    /// a media-only lane, is not probed.
     pub async fn observe_all(&self) {
         for executor in self.executors.values() {
             if executor.routed {
@@ -937,8 +944,9 @@ impl CapacityActivator {
 }
 
 /// Text routing reads managed-lane state from here: a lane is known down only
-/// when its most recent health probe failed. Not probed yet, or up, is not
-/// down — the router then behaves exactly as without managed lanes. Reporting
+/// when it opted in (`route_health: true`) and its most recent health probe
+/// failed. Not opted in, not probed yet, or up, is not down — the router then
+/// behaves exactly as without managed lanes. Reporting
 /// a lane down also schedules a background refresh of that evidence (see
 /// [`LocalExecutor::schedule_refresh`]); the answer itself never waits on it.
 impl sb_runtime::LaneStatus for CapacityActivator {
@@ -1100,6 +1108,7 @@ mod tests {
             idle_timeout_secs: legs.idle_timeout_secs,
             retry_budget: legs.retry_budget,
             health_poll_interval_ms: legs.health_poll_interval_ms,
+            route_health: true,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -1232,6 +1241,7 @@ mod tests {
             idle_timeout_secs: 5,
             retry_budget: 2,
             health_poll_interval_ms: 400,
+            route_health: true,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = CapacityActivator {
@@ -1269,9 +1279,9 @@ mod tests {
         }
     }
 
-    // No change without config: a media-only lane (powered off on purpose
-    // between jobs) gets no periodic routing probe; only a lane whose
-    // provider can be a routed target is probed.
+    // A media-only lane (powered off on purpose between jobs) gets no
+    // periodic routing probe even with `route_health: true`; only a lane
+    // whose provider can be a routed target is probed.
     #[tokio::test]
     async fn the_supervisor_probes_only_lanes_that_routing_reads() {
         let cfg = Config::from_yaml(
@@ -1287,9 +1297,11 @@ local_executors:
   - name: comfy-local
     base_url: "http://executor-1.example:8188"
     health_endpoint: "http://executor-1.example:8188/system_stats"
+    route_health: true
   - name: lane
     base_url: "http://executor-1.example:8080"
     health_endpoint: "http://executor-1.example:8080/health"
+    route_health: true
 "#,
         )
         .unwrap();
@@ -1312,6 +1324,97 @@ local_executors:
                 .any(|endpoint| endpoint.ends_with("/system_stats")),
             "a media-only lane is never probed by the supervisor: {seen:?}"
         );
+    }
+
+    /// A text lane that opted in (`lane`) and one that did not (`quiet`).
+    fn opted_in_and_default_lanes() -> Config {
+        Config::from_yaml(
+            r#"
+providers:
+  - id: lane
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+  - id: quiet
+    type: openai_compatible
+    base_url: "http://executor-2.example:8080/v1"
+local_executors:
+  - name: lane
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    route_health: true
+  - name: quiet
+    base_url: "http://executor-2.example:8080"
+    health_endpoint: "http://executor-2.example:8080/health"
+"#,
+        )
+        .unwrap()
+    }
+
+    // Opt-in: a text lane without `route_health` gets no health GET from the
+    // supervisor, so a host that wakes on ordinary traffic can still power
+    // off. The opted-in lane on the same supervisor is probed every pass.
+    #[tokio::test]
+    async fn the_supervisor_never_probes_a_lane_without_route_health() {
+        let probe = Arc::new(RecordingProbe::default());
+        let host = FakeHost::new(Sim::default());
+        let activator = CapacityActivator::with_seams(
+            &opted_in_and_default_lanes(),
+            FakeClock::new(),
+            Arc::new(host),
+            probe.clone(),
+        );
+        activator.spawn_supervisor(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        activator.observe_all().await;
+
+        let seen = probe.seen.lock().unwrap().clone();
+        let count = |endpoint: &str| seen.iter().filter(|e| *e == endpoint).count();
+        assert!(
+            count("http://executor-1.example:8080/health") >= 2,
+            "the supervisor ran passes: {seen:?}"
+        );
+        assert_eq!(
+            count("http://executor-2.example:8080/health"),
+            0,
+            "no health GET to a lane without route_health: {seen:?}"
+        );
+    }
+
+    // Opt-in: a lane without `route_health` is never in the routing view,
+    // even after a probe (here a job's wake path) saw it down, and the
+    // capacity report carries no `observed_healthy` for it.
+    #[tokio::test]
+    async fn a_lane_without_route_health_is_never_known_down() {
+        use sb_runtime::LaneStatus;
+        let probe = Arc::new(RecordingProbe::default());
+        let host = FakeHost::new(Sim::default());
+        let activator = CapacityActivator::with_seams(
+            &opted_in_and_default_lanes(),
+            FakeClock::new(),
+            Arc::new(host),
+            probe.clone(),
+        );
+        assert_eq!(activator.known_down("quiet"), None, "never probed");
+
+        let quiet = activator.executor("quiet").unwrap();
+        assert!(
+            quiet.ensure_ready().await.is_err(),
+            "down and no wake command"
+        );
+        assert_eq!(
+            probe.seen.lock().unwrap().as_slice(),
+            ["http://executor-2.example:8080/health"],
+            "the job's own probe ran and failed"
+        );
+        assert_eq!(activator.known_down("quiet"), None, "last probe failed");
+        assert_eq!(quiet.report().observed_healthy, None);
+        let report = serde_json::to_value(quiet.report()).unwrap();
+        assert!(report.get("observed_healthy").is_none(), "{report}");
+
+        // The opted-in lane on the same activator is read by routing.
+        activator.observe_all().await;
+        assert!(activator.known_down("lane").is_some());
+        assert_eq!(activator.known_down("quiet"), None);
     }
 
     // (a) queue-while-offline -> wake -> healthy -> drain

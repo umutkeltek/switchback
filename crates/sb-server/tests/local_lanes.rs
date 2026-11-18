@@ -246,23 +246,74 @@ async fn reasoning_effort_none_reaches_llama_cpp_as_thinking_off() {
 }
 
 /// The same route, unpinned, with the lane declared as a managed local lane
-/// (`local_executors`) whose health endpoint the activator probes.
-fn cfg_managed_lane(lane_url: &str) -> String {
+/// (`local_executors`). With `route_health` the activator probes its health
+/// endpoint for routing; without it (the default) routing never reads it.
+fn cfg_managed_lane(lane_url: &str, route_health: bool) -> String {
     format!(
         r#"{}
 local_executors:
   - name: lane
     base_url: "{lane_url}"
     health_endpoint: "{lane_url}/health"
+    route_health: {route_health}
 "#,
         cfg_lane_then_spare(lane_url, false)
     )
 }
 
 #[tokio::test]
+async fn a_managed_lane_without_route_health_is_dispatched_and_counted_as_before() {
+    // Opt-in: without `route_health` a managed lane is routed exactly as
+    // before managed text lanes, even after a probe of it failed.
+    let (lane_url, lane) = spawn_lane(false).await;
+    let state = build_state(&cfg_managed_lane(&lane_url, false));
+    let capacity = state.capacity.clone();
+    let sb = serve(state).await;
+    let hello = json!({"model":"local-text","messages":[{"role":"user","content":"hi"}]});
+
+    // A supervisor pass sends it nothing; a direct probe does fail.
+    capacity.observe_all().await;
+    capacity.executor("lane").unwrap().observe().await;
+    let preview = route_preview(&sb).await;
+    assert_eq!(
+        preview["decision"]["selected"]["target_id"], "lane/qwen3",
+        "{preview}"
+    );
+    assert!(
+        !preview.to_string().contains("local lane"),
+        "never skipped: {preview}"
+    );
+
+    // Real traffic reaches the lane, fails over to the spare, and the
+    // lane's failures are counted: the scorecard demotes it.
+    let r = chat(&sb, hello).await;
+    assert_eq!(r.status(), 200);
+    assert!(
+        lane.last_body.lock().unwrap().is_some(),
+        "the lane was dispatched to"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+    let preview = route_preview(&sb).await;
+    let demote = reason_starting(&preview, "outcome/demote target=lane/qwen3")
+        .unwrap_or_else(|| panic!("the lane's failures must count: {preview}"));
+    assert!(demote.contains("reason=streak"), "{demote}");
+
+    let report: Value = reqwest::get(format!("{sb}/v1/workloads/capacity"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        report["data"][0].get("observed_healthy").is_none(),
+        "{report}"
+    );
+}
+
+#[tokio::test]
 async fn a_managed_lane_known_down_is_skipped_and_not_counted_as_a_failure() {
     let (lane_url, lane) = spawn_lane(false).await;
-    let state = build_state(&cfg_managed_lane(&lane_url));
+    let state = build_state(&cfg_managed_lane(&lane_url, true));
     let capacity = state.capacity.clone();
     let sb = serve(state).await;
     let hello = json!({"model":"local-text","messages":[{"role":"user","content":"hi"}]});
@@ -329,7 +380,7 @@ async fn a_lane_known_down_is_kept_when_it_is_the_only_candidate() {
     // Fail-open: a stale probe must never turn into a hard outage, so a
     // request with no other candidate still reaches the lane.
     let (lane_url, _lane) = spawn_lane(false).await;
-    let state = build_state(&cfg_managed_lane(&lane_url));
+    let state = build_state(&cfg_managed_lane(&lane_url, true));
     let capacity = state.capacity.clone();
     let sb = serve(state).await;
     capacity.observe_all().await;
@@ -354,7 +405,7 @@ async fn a_lane_that_comes_back_is_used_again_without_waiting_for_the_supervisor
     // itself never waits on it), so the next requests reach the lane again
     // well before the next 10s supervisor probe.
     let (lane_url, lane) = spawn_lane(false).await;
-    let state = build_state(&cfg_managed_lane(&lane_url));
+    let state = build_state(&cfg_managed_lane(&lane_url, true));
     let capacity = state.capacity.clone();
     let sb = serve(state).await;
     let hello = json!({"model":"local-text","messages":[{"role":"user","content":"hi"}]});

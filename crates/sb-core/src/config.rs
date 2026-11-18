@@ -120,6 +120,15 @@ pub struct LocalExecutorConfig {
     /// is prompt; bounded by `boot_timeout_secs`.
     #[serde(default = "default_health_poll_interval_ms")]
     pub health_poll_interval_ms: u64,
+    /// Let routing read this lane's health. When `true` and the lane's
+    /// provider can be a routed target, the supervisor GETs `health_endpoint`
+    /// on every pass, and routing skips the lane's text and embeddings targets
+    /// while the last probe failed (before dispatch, not counted as a failure).
+    /// Default `false`: no routing probe and routing unchanged, so a host whose
+    /// network card wakes on ordinary traffic is never kept awake by it. Wake,
+    /// poweroff, restart, queueing and the retry budget are the same either way.
+    #[serde(default)]
+    pub route_health: bool,
 }
 
 fn default_boot_timeout_secs() -> u64 {

@@ -437,9 +437,10 @@ pub(crate) fn resolve_candidates(
 }
 
 /// Candidates whose managed local lane is known to be down. Only a lane the
-/// request's pinned snapshot still lists in `local_executors` counts: the
-/// lane view is built once at startup, so without this a reload that removes
-/// a lane would keep skipping its provider.
+/// request's pinned snapshot still lists in `local_executors` with
+/// `route_health: true` counts: the lane view is built once at startup, so
+/// without this a reload that removes a lane, or turns the setting off, would
+/// keep skipping its provider.
 fn known_down_lanes(
     snap: &Snapshot,
     candidates: &[ExecutionTarget],
@@ -454,7 +455,7 @@ fn known_down_lanes(
             snap.config
                 .local_executors
                 .iter()
-                .any(|lane| lane.name == candidate.provider_id)
+                .any(|lane| lane.name == candidate.provider_id && lane.route_health)
         })
         .filter_map(|candidate| {
             let detail = lanes.known_down(&candidate.provider_id)?;
