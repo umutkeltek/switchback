@@ -287,9 +287,6 @@ def capacity(gw, quiet=False):
     except GatewayError as error:
         if quiet:
             return None
-        if error.status in (401, 403):
-            raise Fail(GATEWAY_ERROR, "this key may not read the gateway's capacity "
-                                      f"(the gateway said {error.status}: {error.message})")
         raise gateway_fail(error, "reading capacity")
     except Fail:
         if quiet:
@@ -333,32 +330,20 @@ def duration_words(secs):
 
 
 def holds_words(holds):
-    if isinstance(holds, int):
-        return f"{holds} hold{'s' if holds != 1 else ''}"
-    if not isinstance(holds, list) or not holds:
+    """The holds of a capacity lane row: id, reason, owner, expires_at_ms."""
+    if not holds:
         return ""
     parts = []
     for hold in holds:
-        if not isinstance(hold, dict):
-            parts.append(str(hold))
-            continue
         bits = [str(hold.get("id", "?"))]
         if hold.get("reason"):
             bits.append(str(hold["reason"]))
-        left = hold_left(hold)
-        if left is not None:
-            bits.append(f"{duration_words(left)} left")
+        if hold.get("owner"):
+            bits.append(f"by {hold['owner']}")
+        if isinstance(hold.get("expires_at_ms"), (int, float)):
+            bits.append(f"{duration_words(hold['expires_at_ms'] / 1000 - time.time())} left")
         parts.append(" ".join(bits))
     return f"{len(holds)} hold{'s' if len(holds) != 1 else ''} ({'; '.join(parts)})"
-
-
-def hold_left(hold):
-    for key in ("remaining_secs", "expires_in_secs", "ttl_left_secs"):
-        if isinstance(hold.get(key), (int, float)):
-            return hold[key]
-    if isinstance(hold.get("expires_at_ms"), (int, float)):
-        return hold["expires_at_ms"] / 1000 - time.time()
-    return None
 
 
 def lane_line(lane):
@@ -710,35 +695,18 @@ def holds_error(error, doing):
     return gateway_fail(error, doing)
 
 
-def hold_list(answer):
-    if isinstance(answer, list):
-        return answer
-    if isinstance(answer, dict):
-        for key in ("data", "holds"):
-            if isinstance(answer.get(key), list):
-                return answer[key]
-    return []
-
-
-def hold_record(answer):
-    if isinstance(answer, dict) and isinstance(answer.get("hold"), dict):
-        return answer["hold"]
-    return answer if isinstance(answer, dict) else {}
-
-
 def cmd_hold(gw, args):
     ttl = parse_duration(args.duration)
     host = host_for(gw, args)
     body = {"ttl_secs": ttl, "reason": args.reason or "sb ai hold", "wake": bool(args.wake)}
     try:
-        answer = gw.post(holds_path(host), body)
+        hold = gw.post(holds_path(host), body)  # 201 with the hold itself
     except GatewayError as error:
         raise holds_error(error, "the hold was refused")
     if args.json:
-        print(json.dumps(answer, indent=2))
+        print(json.dumps(hold, indent=2))
         return OK
-    hold = hold_record(answer)
-    woke = "; the gateway wakes it" if args.wake else ""
+    woke = "; the gateway wakes it" if hold.get("state") == "waking" else ""
     print(f"holding {host} on for {duration_words(ttl)}: hold {hold.get('id', '?')}{woke}")
     print(f"let it go: sb ai release {hold.get('id', '')}".rstrip())
     return OK
@@ -751,10 +719,10 @@ def cmd_release(gw, args):
     ids = [args.id] if args.id else None
     if ids is None:
         try:
-            holds = hold_list(gw.get(holds_path(host)))
+            holds = gw.get(holds_path(host)).get("data") or []
         except GatewayError as error:
             raise holds_error(error, "listing holds")
-        ids = [str(h.get("id")) for h in holds if isinstance(h, dict) and h.get("id")]
+        ids = [str(h["id"]) for h in holds if h.get("id")]
         if not ids:
             print(f"{host} has no holds")
             return OK

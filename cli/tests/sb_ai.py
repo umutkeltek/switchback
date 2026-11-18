@@ -98,18 +98,25 @@ class Fake:
     def holds_route(self, request):
         if self.holds is None:
             return 404, b"", None
+        # The shapes of the gateway's holds API (`/v1/hosts/{host}/holds`).
         method, path = request["method"], request["path"]
+        host = path.split("/")[3]
         if method == "POST":
-            hold = {"id": f"hold-{len(self.holds) + 1}", **request["json"]}
+            body = request["json"]
+            expires_ms = int((time.time() + body["ttl_secs"]) * 1000)
+            hold = {"id": f"hold-{len(self.holds) + 1}", "host": host, "reason": body["reason"],
+                    "expires_at": "2026-01-01T00:00:00Z", "expires_at_ms": expires_ms,
+                    "state": "waking" if body["wake"] else "active", "owner": "agents",
+                    "wake_detail": None}
             self.holds.append(hold)
             return self.json(hold, 201)
         if method == "GET":
-            return self.json({"object": "list", "data": self.holds})
+            return self.json({"object": "list", "host": host, "data": self.holds, "durable": True})
         hold_id = path.rsplit("/", 1)[-1]
         if not any(h["id"] == hold_id for h in self.holds):
             return self.json({"error": {"message": "hold not found", "type": "not_found"}}, 404)
         self.holds = [h for h in self.holds if h["id"] != hold_id]
-        return 204, b"", None
+        return self.json({"id": hold_id, "host": host, "deleted": True})
 
     def handler(self):
         fake = self
@@ -267,7 +274,8 @@ class SbAi(unittest.TestCase):
     def test_status_reads_only_capacity(self):
         self.fake.lanes = [
             lane("lane-img", "idle_countdown", poweroff_in_secs=420,
-                 holds=[{"id": "hold-9", "reason": "render", "remaining_secs": 600}]),
+                 holds=[{"id": "hold-9", "reason": "render", "owner": "agents", "state": "active",
+                         "expires_at_ms": int((time.time() + 600) * 1000)}]),
             lane("lane-text", "healthy", holds_gpu=False, queue_depth=2),
         ]
         run = self.sb("status")
@@ -276,7 +284,7 @@ class SbAi(unittest.TestCase):
         lines = run.stdout.splitlines()
         self.assertEqual(lines[0], "box: on")
         self.assertIn("lane-img: idle, power-off countdown, level ok, queue 0, powers off in 7 min, "
-                      "1 hold (hold-9 render 10 min left)", lines[1])
+                      "1 hold (hold-9 render by agents 10 min left)", lines[1])
         self.assertIn("lane-text: idle, level ok, queue 2, GPU with another lane", lines[2])
 
     def test_status_says_off_and_json_has_machines(self):
@@ -384,7 +392,7 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
                          {"ttl_secs": 5400, "reason": "render batch", "wake": True})
-        self.assertIn("hold hold-1", run.stdout)
+        self.assertIn("hold hold-1; the gateway wakes it", run.stdout)
         run = self.sb("hold", "30m")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.requests("POST", "/v1/hosts/box/holds")[-1]["json"]["wake"], False)
