@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -48,7 +48,15 @@ struct Inner {
     jobs: HashMap<String, JobRecord>,
     artifacts: HashMap<String, StoredArtifact>,
     fal_runs: HashMap<String, FalRunControl>,
+    /// Ids of the failed ComfyUI jobs kept in `jobs`, oldest first (see
+    /// [`KEPT_FAILED_COMFY_JOBS`]).
+    failed_comfy: VecDeque<String>,
 }
+
+/// How many failed ComfyUI jobs `/v1/jobs` keeps; the oldest go first. A
+/// client that retries a failing job in a loop (a refused credential fails
+/// at once) for a month cannot fill memory with them.
+const KEPT_FAILED_COMFY_JOBS: usize = 256;
 
 #[derive(Clone)]
 struct FalRunControl {
@@ -887,8 +895,19 @@ impl WorkloadStore {
             events,
             prompt_stored: false,
         };
-        if let Err(store_error) = self.insert_job(job, Vec::new()) {
-            tracing::warn!(error = %store_error, "failed comfyui job not kept in the job list");
+        match self.inner.lock() {
+            Ok(mut inner) => {
+                inner.failed_comfy.push_back(job.id.clone());
+                inner.jobs.insert(job.id.clone(), job);
+                while inner.failed_comfy.len() > KEPT_FAILED_COMFY_JOBS {
+                    if let Some(oldest) = inner.failed_comfy.pop_front() {
+                        inner.jobs.remove(&oldest);
+                    }
+                }
+            }
+            Err(_) => tracing::warn!(
+                "failed comfyui job not kept in the job list: workload store lock poisoned"
+            ),
         }
         error
     }
@@ -2075,4 +2094,48 @@ fn validate_comfyui_request(request: &ImageGenerationRequest) -> Result<(), Work
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A ComfyUI job that keeps failing (a client retrying in a loop) keeps
+    // at most `KEPT_FAILED_COMFY_JOBS` failed jobs, the newest.
+    #[test]
+    fn failed_comfyui_jobs_are_bounded_oldest_first() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: comfy
+    type: comfyui
+    base_url: "http://127.0.0.1:8188"
+    workflows:
+      - id: txt2img
+        kind: image_generation
+        graph: {}
+        bindings:
+          prompt: { path: ["6", "inputs", "text"] }
+        output_node_ids: ["9"]
+"#,
+        )
+        .unwrap();
+        let (provider, workflow) = resolve_comfyui_workflow(&cfg, "comfy/txt2img").unwrap();
+        let store = WorkloadStore::new();
+        for n in 0..KEPT_FAILED_COMFY_JOBS + 10 {
+            let failed = FailedComfyJob {
+                provider,
+                workflow,
+                target: "comfy/txt2img".to_string(),
+                tenant: None,
+                project: None,
+                started_at_ms: n as u64,
+            };
+            store.record_comfy_failure(failed, WorkloadError::Upstream(format!("failure {n}")));
+        }
+        let jobs = store.jobs();
+        assert_eq!(jobs.len(), KEPT_FAILED_COMFY_JOBS);
+        let oldest = jobs.iter().map(|job| job.created_at_ms).min();
+        assert_eq!(oldest, Some(10), "the ten oldest are gone");
+    }
 }
