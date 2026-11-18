@@ -147,10 +147,14 @@ route and no strategy reorders it (strategy `pinned_order`; the decision cites
 any ignored demotion as `outcome/pinned target=…`). Use it for routes over
 local engines, where a lane stopped on purpose must not lose its place. A
 provider that is also a managed local lane (`local_executors` entry with the
-same name) is health-probed by the capacity activator; while its last probe
-failed, its targets are rejected before dispatch with an explicit reason and
-nothing is counted against them (no scorecard sample, no account lock). If
-every candidate is on a down lane, none is rejected.
+same name, provider not media-only) is health-probed by the capacity
+activator every 10s; while its last probe failed, its targets are rejected
+before dispatch with an explicit reason and nothing is counted against them
+(no scorecard sample, no account lock). A rejection also starts a background
+re-probe (single-flight, at most once a second), so the evidence refreshes
+under traffic without a network call on the request path. If rejecting them
+would leave no candidate that can serve the request (after tenant, profile and
+capability filters), none is rejected.
 
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability

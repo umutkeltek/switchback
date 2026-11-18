@@ -437,14 +437,21 @@ routes:
   #     - "ollama/qwen3"
 
 # Managed local lanes. An entry whose `name` equals a provider id makes that
-# provider a managed lane: Switchback probes `health_endpoint` every 10s, and
-# while the probe fails, the lane's text targets are rejected BEFORE dispatch
-# ("local lane `llamacpp` is down ...; skipped before dispatch, not counted as
-# a failure"), so stopping an engine on purpose never demotes it. Not probed
-# yet counts as up. If every candidate of a request is on a down lane, none is
-# skipped (a stale probe never becomes an outage). The probe result shows as
-# `observed_healthy` at GET /v1/workloads/capacity. The wake/poweroff/restart
-# commands (optional) are used by media jobs today, not by text requests.
+# provider a managed lane. For a lane whose provider can serve text (not a
+# media-only `comfyui` / `fal` provider) Switchback probes `health_endpoint`
+# every 10s, and while the last probe failed, the lane's targets are rejected
+# BEFORE dispatch ("local lane `llamacpp` is down ...; skipped before
+# dispatch, not counted as a failure"), so an engine stopped on purpose is not
+# demoted once a probe has seen it down (requests in the seconds between the
+# stop and that probe still reach it and count). Not probed yet counts as up.
+# When routing skips a down lane it also re-probes it in the background (at
+# most once a second), so under traffic a lane that comes back is used again
+# within about a second; the first request after a quiet spell can still see
+# the older result. If skipping would leave no candidate that can serve the
+# request, none is skipped (a stale probe never becomes an outage). The probe
+# result shows as `observed_healthy` at GET /v1/workloads/capacity. The
+# wake/poweroff/restart commands (optional) are used by media jobs today, not
+# by text requests.
 # local_executors:
 #   - name: llamacpp
 #     base_url: "http://executor-1.example:8080"
