@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -1178,6 +1178,10 @@ pub struct CapacityActivator {
     clock: Arc<dyn Clock>,
     runner: Arc<dyn CommandRunner>,
     probe: Arc<dyn HealthProbe>,
+    /// Lanes a reload removed, as weak handles: one that still has work
+    /// running on it (a stream, a job, a wake holds a strong handle) is
+    /// taken back, with that work, if a later reload adds it again.
+    retired: Mutex<BTreeMap<String, Weak<LocalExecutor>>>,
     /// Supervisor cadence once [`Self::spawn_supervisor`] asked for one.
     supervisor_interval: OnceLock<Duration>,
     supervisor_started: AtomicBool,
@@ -1221,6 +1225,7 @@ impl CapacityActivator {
             clock,
             runner,
             probe,
+            retired: Mutex::new(BTreeMap::new()),
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
         };
@@ -1246,17 +1251,29 @@ impl CapacityActivator {
     /// and the supervisor no longer see it, so it is never probed, ticked or
     /// powered off again; work already running on it (a stream, a media job,
     /// a wake cycle) holds its own handle and finishes normally. Re-adding
-    /// it later starts a fresh lane.
+    /// it while such work still runs takes that same lane back, so the work
+    /// keeps holding the idle poweroff off; once it has ended, re-adding
+    /// starts a fresh lane.
     pub fn reconcile(&self, cfg: &Config) {
         {
             let mut lanes = self
                 .executors
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut retired = self
+                .retired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            retired.retain(|_, lane| lane.strong_count() > 0);
             let mut next = BTreeMap::new();
             for executor_cfg in &cfg.local_executors {
                 let routed = routed_lane(cfg, executor_cfg);
-                let executor = match lanes.remove(&executor_cfg.name) {
+                let existing = lanes.remove(&executor_cfg.name).or_else(|| {
+                    retired
+                        .remove(&executor_cfg.name)
+                        .and_then(|lane| lane.upgrade())
+                });
+                let executor = match existing {
                     Some(existing) => {
                         existing.update_config(executor_cfg.clone(), routed);
                         existing
@@ -1271,8 +1288,9 @@ impl CapacityActivator {
                 };
                 next.insert(executor_cfg.name.clone(), executor);
             }
-            for removed in lanes.keys() {
-                tracing::info!(lane = %removed, "local lane removed by config; running work finishes, no further poweroff");
+            for (name, removed) in lanes.iter() {
+                tracing::info!(lane = %name, "local lane removed by config; running work finishes, no further poweroff");
+                retired.insert(name.clone(), Arc::downgrade(removed));
             }
             *lanes = next;
         }
@@ -1526,6 +1544,7 @@ mod tests {
             clock: FakeClock::new(),
             runner: Arc::new(host.clone()),
             probe: Arc::new(host),
+            retired: Mutex::new(BTreeMap::new()),
             supervisor_interval: OnceLock::new(),
             supervisor_started: AtomicBool::new(false),
         }
@@ -2679,5 +2698,48 @@ local_executors:
                 .collect::<Vec<_>>(),
             ["added"]
         );
+    }
+
+    // A lane removed by a reload and added back while work still runs on
+    // it is the same lane again: the open stream keeps holding the idle
+    // poweroff off, so the host is not powered off under it.
+    #[tokio::test]
+    async fn a_lane_removed_and_added_back_keeps_the_work_still_running_on_it() {
+        use sb_runtime::LaneStatus;
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let lane_cfg = LANE.replace(
+            "wake_on_request: true",
+            "wake_on_request: true\n    poweroff_command: \"ssh gateway poweroff-host executor-1\"",
+        );
+        let activator = CapacityActivator::with_seams(
+            &lanes_config(&lane_cfg),
+            clock.clone(),
+            Arc::new(host.clone()),
+            Arc::new(host.clone()),
+        );
+        activator.observe_all().await; // the host is up
+        let long_stream = activator.begin_request("lane").expect("opted in");
+
+        activator.config_published(&lanes_config(ADDED));
+        activator.config_published(&lanes_config(&format!("{lane_cfg}{ADDED}")));
+        activator.observe_all().await;
+        let lane = activator.executor("lane").unwrap();
+        assert_eq!(lane.report().in_flight, 1, "the open stream still counts");
+
+        // Another request comes and goes, then the idle timeout passes
+        // while the first stream is still open.
+        drop(activator.begin_request("lane").expect("opted in"));
+        clock.advance(3_600_000);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 0, "never under the open stream");
+
+        drop(long_stream);
+        clock.advance(3_600_000);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 1, "idle once the stream ended");
     }
 }
