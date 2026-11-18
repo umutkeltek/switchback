@@ -536,6 +536,18 @@ impl Config {
         if self.server.artifacts.max_bytes == Some(0) {
             problems.push("server.artifacts.max_bytes must be positive".to_string());
         }
+        for provider in &self.providers {
+            if let ProviderKind::ComfyUi { workflows, .. } = &provider.kind {
+                for workflow in workflows {
+                    if workflow.timeout_secs == Some(0) {
+                        problems.push(format!(
+                            "providers `{}` workflow `{}`: timeout_secs must be positive",
+                            provider.id, workflow.id
+                        ));
+                    }
+                }
+            }
+        }
         if self.server.jobs.max_pending_per_tenant == 0 {
             problems.push("server.jobs.max_pending_per_tenant must be positive".to_string());
         }
@@ -2954,6 +2966,11 @@ pub struct ComfyUiWorkflowConfig {
     pub bindings: BTreeMap<String, ComfyUiBindingConfig>,
     #[serde(default)]
     pub output_node_ids: Vec<String>,
+    /// How long one job of this workflow may take, ComfyUI queue time
+    /// included, before Switchback stops waiting (default 900 s). A video
+    /// workflow often needs longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

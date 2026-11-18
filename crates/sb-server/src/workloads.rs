@@ -697,7 +697,7 @@ impl WorkloadStore {
                         .version
                         .clone()
                         .unwrap_or_else(|| "configured".to_string()),
-                    inputs: workflow_fields_for(workflow.kind),
+                    inputs: workflow_fields_for(workflow),
                     outputs: workflow_outputs_for(workflow.kind),
                 }
             }));
@@ -1284,7 +1284,7 @@ impl WorkloadStore {
         let note = note.map(|note| format!("local lane `{}` {note}", provider.id));
         let job = self.complete_job(job_id, records, note)?;
         if job.status == JobStatus::Succeeded {
-            record_unpriced_image_usage(&ctx.ledger, &job, &provider.id, None);
+            record_unpriced_media_usage(&ctx.ledger, &job, &provider.id);
         }
         Ok(job)
     }
@@ -1763,6 +1763,40 @@ fn record_fal_usage(
     );
 }
 
+/// Usage of a ComfyUI job, by its kind: a video job is recorded as
+/// `video_generation` in `per_video` units (one per video artifact), an
+/// image job as before. ComfyUI has no price: the cost stays unknown.
+fn record_unpriced_media_usage(
+    ledger: &sb_ledger::UsageLedger,
+    job: &JobRecord,
+    provider_id: &str,
+) {
+    if job.kind != WorkloadKind::VideoGeneration {
+        record_unpriced_image_usage(ledger, job, provider_id, None);
+        return;
+    }
+    let videos = job
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::Video)
+        .count();
+    ledger.record(
+        sb_ledger::UsageRecord::workload(
+            &job.id,
+            provider_id,
+            &job.target,
+            None,
+            WorkloadKind::VideoGeneration,
+            Some(PricingUnit::PerVideo),
+            Some(videos as f64),
+            None,
+            job.updated_at_ms.saturating_sub(job.created_at_ms),
+        )
+        .with_tenant(job.tenant.clone())
+        .with_project(job.project.clone()),
+    );
+}
+
 fn record_unpriced_image_usage(
     ledger: &sb_ledger::UsageLedger,
     job: &JobRecord,
@@ -1806,7 +1840,43 @@ fn media_units(price: Option<UnitPrice>, artifacts: &[ArtifactRecord]) -> Option
     }
 }
 
-fn workflow_fields_for(kind: WorkloadKind) -> Vec<WorkflowField> {
+fn workflow_field(
+    name: &str,
+    field_type: &str,
+    required: bool,
+    media_type: Option<&str>,
+) -> WorkflowField {
+    WorkflowField {
+        name: name.to_string(),
+        field_type: field_type.to_string(),
+        required,
+        media_type: media_type.map(str::to_string),
+    }
+}
+
+/// The inputs a configured workflow takes: the image inputs, plus `image`
+/// (an artifact id), `frames` and `fps` where the workflow binds them.
+fn workflow_fields_for(workflow: &ComfyUiWorkflowConfig) -> Vec<WorkflowField> {
+    let mut fields = match workflow.kind {
+        WorkloadKind::VideoGeneration => vec![
+            workflow_field("prompt", "string", true, None),
+            workflow_field("seed", "integer", false, None),
+        ],
+        kind => image_fields_for(kind),
+    };
+    for (name, field_type, media_type) in [
+        ("image", "artifact", Some("image/*")),
+        ("frames", "integer", None),
+        ("fps", "integer", None),
+    ] {
+        if workflow.bindings.contains_key(name) {
+            fields.push(workflow_field(name, field_type, false, media_type));
+        }
+    }
+    fields
+}
+
+fn image_fields_for(kind: WorkloadKind) -> Vec<WorkflowField> {
     match kind {
         WorkloadKind::ImageGeneration | WorkloadKind::WorkflowExecution => vec![
             WorkflowField {
@@ -1836,15 +1906,16 @@ fn workflow_fields_for(kind: WorkloadKind) -> Vec<WorkflowField> {
 
 fn workflow_outputs_for(kind: WorkloadKind) -> Vec<WorkflowField> {
     match kind {
+        WorkloadKind::VideoGeneration => {
+            vec![workflow_field("video", "artifact", true, Some("video/*"))]
+        }
         WorkloadKind::ImageGeneration | WorkloadKind::WorkflowExecution => vec![WorkflowField {
             name: "artifact".to_string(),
             field_type: "artifact".to_string(),
             required: true,
             media_type: None,
         }],
-        WorkloadKind::TextGeneration | WorkloadKind::Embedding | WorkloadKind::VideoGeneration => {
-            Vec::new()
-        }
+        WorkloadKind::TextGeneration | WorkloadKind::Embedding => Vec::new(),
     }
 }
 
@@ -1872,24 +1943,25 @@ fn bind_comfyui_image_inputs(
     Ok(())
 }
 
-/// Bind every input of a ComfyUI job into its graph. `frames` and `fps`
-/// were checked against the workflow's bindings at submission.
+/// Bind every input of a ComfyUI job into its graph. `image`, `frames` and
+/// `fps` were checked against the workflow's bindings at submission;
+/// `uploaded` is the name ComfyUI gave the uploaded input image. It is
+/// bound last, so nothing else can replace it.
 fn bind_comfyui_inputs(
     graph: &mut Json,
     workflow: &ComfyUiWorkflowConfig,
     inputs: &ComfyInputs,
+    uploaded: Option<&str>,
 ) -> Result<(), WorkloadError> {
-    if inputs.image.is_some() {
-        return Err(WorkloadError::InvalidRequest(
-            "input images are not supported yet".to_string(),
-        ));
-    }
     bind_comfyui_image_inputs(graph, workflow, &inputs.request)?;
     if let Some(frames) = inputs.frames {
         bind_required(graph, workflow, "frames", Json::from(frames))?;
     }
     if let Some(fps) = inputs.fps {
         bind_required(graph, workflow, "fps", Json::from(fps))?;
+    }
+    if let Some(name) = uploaded {
+        bind_required(graph, workflow, "image", Json::String(name.to_string()))?;
     }
     Ok(())
 }
@@ -2181,8 +2253,12 @@ const COMFYUI_JOB_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const COMFYUI_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long one ComfyUI job of `workflow` may take, queue time included.
-fn comfy_job_timeout(_workflow: &ComfyUiWorkflowConfig) -> Duration {
-    COMFYUI_JOB_TIMEOUT
+/// `timeout_secs` on the workflow, else [`COMFYUI_JOB_TIMEOUT`].
+fn comfy_job_timeout(workflow: &ComfyUiWorkflowConfig) -> Duration {
+    workflow
+        .timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(COMFYUI_JOB_TIMEOUT)
 }
 
 async fn poll_comfyui_history(
@@ -2294,7 +2370,11 @@ fn extract_comfy_outputs(
 }
 
 fn collect_output_refs(node_id: &str, node: &Json, refs: &mut Vec<ComfyOutputRef>) {
-    for key in ["images", "gifs", "videos"] {
+    // Saved images and core video nodes answer `images` (a video with
+    // `animated`); common video node packs answer `gifs` (with `format` and
+    // `frame_rate`), others `videos` or `video`. Only `filename`,
+    // `subfolder`, `type` and `frame_rate` are read: never a local path.
+    for key in ["images", "gifs", "videos", "video"] {
         let Some(items) = node.get(key).and_then(Json::as_array) else {
             continue;
         };
@@ -2410,17 +2490,21 @@ async fn comfyui_dispatch_once(
         )));
     };
     let credential = run.credential;
-    let mut graph = run.workflow.graph.clone();
-    bind_comfyui_inputs(&mut graph, run.workflow, run.inputs)?;
-
-    let client_id = format!("switchback-{}", run.job_id);
-    let queue_url = comfy_endpoint(base_url, "prompt")?;
-    guard_provider_url(run.cfg, queue_url.as_str()).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .redirect(redirect_policy(credential))
         .build()
         .map_err(|e| WorkloadError::Internal(format!("build comfyui client: {e}")))?;
+    let uploaded = match &run.inputs.image {
+        Some(artifact_id) => Some(upload_input_image(run, &client, base_url, artifact_id).await?),
+        None => None,
+    };
+    let mut graph = run.workflow.graph.clone();
+    bind_comfyui_inputs(&mut graph, run.workflow, run.inputs, uploaded.as_deref())?;
+
+    let client_id = format!("switchback-{}", run.job_id);
+    let queue_url = comfy_endpoint(base_url, "prompt")?;
+    guard_provider_url(run.cfg, queue_url.as_str()).await?;
 
     let queued: ComfyPromptResponse = send_comfy_json(
         client
@@ -2475,11 +2559,16 @@ async fn comfyui_dispatch_once(
     for output in outputs {
         let view_url = comfy_endpoint(base_url, "view")?;
         guard_provider_url(run.cfg, view_url.as_str()).await?;
-        let view = client.get(view_url).query(&[
-            ("filename", output.filename.as_str()),
-            ("subfolder", output.subfolder.as_str()),
-            ("type", output.type_.as_str()),
-        ]);
+        // A video can take minutes to fetch: the body read gets the
+        // workflow's whole timeout, not the client's minute.
+        let view = client
+            .get(view_url)
+            .timeout(comfy_job_timeout(run.workflow))
+            .query(&[
+                ("filename", output.filename.as_str()),
+                ("subfolder", output.subfolder.as_str()),
+                ("type", output.type_.as_str()),
+            ]);
         let mut response = with_credential(view, credential)
             .send()
             .await
@@ -2564,6 +2653,92 @@ async fn comfyui_dispatch_once(
         ));
     }
     Ok(records)
+}
+
+#[derive(Debug, Deserialize)]
+struct ComfyUploadResponse {
+    name: String,
+    #[serde(default)]
+    subfolder: String,
+}
+
+/// Upload a job's input image (an artifact) to ComfyUI with the provider's
+/// credential (`POST /upload/image`, multipart field `image`, into ComfyUI's
+/// input folder) and return the name a `LoadImage` node takes. The file is
+/// named after the artifact id, never after anything the caller wrote.
+async fn upload_input_image(
+    run: &ComfyAttempt<'_>,
+    client: &reqwest::Client,
+    base_url: &str,
+    artifact_id: &str,
+) -> Result<String, WorkloadError> {
+    let (record, _, bytes) = run.store.artifacts.read_all(artifact_id).map_err(|_| {
+        WorkloadError::InvalidRequest(format!(
+            "input artifact `{artifact_id}` is no longer stored"
+        ))
+    })?;
+    let url = comfy_endpoint(base_url, "upload/image")?;
+    guard_provider_url(run.cfg, url.as_str()).await?;
+    let boundary = format!("switchback-{}", sb_core::new_id("part"));
+    let filename = format!(
+        "switchback-{artifact_id}.{}",
+        extension_for_media_type(&record.media_type)
+    );
+    let body = multipart_image(&boundary, &filename, &record.media_type, &bytes);
+    let uploaded: ComfyUploadResponse = send_comfy_json(
+        client
+            .post(url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body),
+        "upload input image to comfyui",
+        run.credential,
+    )
+    .await?;
+    run.store.push_event(
+        run.job_id,
+        JobStatus::Running,
+        "input_uploaded",
+        BTreeMap::from([("artifact_id".to_string(), artifact_id.to_string())]),
+    );
+    Ok(if uploaded.subfolder.is_empty() {
+        uploaded.name
+    } else {
+        format!("{}/{}", uploaded.subfolder, uploaded.name)
+    })
+}
+
+/// A `multipart/form-data` body with one image file (field `image`) and
+/// `type=input`, `overwrite=true`: the form ComfyUI's upload takes.
+fn multipart_image(boundary: &str, filename: &str, media_type: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\nContent-Type: {media_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    for (name, value) in [("type", "input"), ("overwrite", "true")] {
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn extension_for_media_type(media_type: &str) -> &'static str {
+    match media_type {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    }
 }
 
 /// The media type of one ComfyUI output: the `/view` answer's, unless it is

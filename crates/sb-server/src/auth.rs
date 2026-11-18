@@ -23,6 +23,7 @@ fn client_surface(method: &Method, path: &str) -> bool {
                     | "/v1/embeddings"
                     | "/v1/images/generations"
                     | "/v1/jobs"
+                    | "/v1/uploads"
             ) || (path.starts_with("/v1/jobs/") && path.ends_with("/cancel"))))
 }
 

@@ -8,7 +8,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use crate::artifact_store::Owner;
-use crate::artifact_store::{ArtifactBody, Missing};
+use crate::artifact_store::{ArtifactBody, ArtifactError, Missing};
 use crate::workloads::{JobContext, WorkloadError};
 use crate::{tenancy, AppState};
 
@@ -97,6 +97,87 @@ pub(crate) async fn submit_job(
     ) {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
         Err(error) => workload_error(error),
+    }
+}
+
+/// `POST /v1/uploads`: store an input image for a later job. The body is
+/// the image itself (`Content-Type: image/png`, `image/jpeg` or
+/// `image/webp`); the answer (201) is its artifact record, whose
+/// `artifact_id` a job names in `inputs.image`. It belongs to the caller's
+/// tenant and project and follows the artifact retention policy.
+/// A raw body (not base64 inside the job, not a multipart form) keeps the
+/// job request small and typed, lets one upload feed several jobs, and
+/// needs no parser.
+pub(crate) async fn upload(
+    State(state): State<AppState>,
+    Extension(principal): Extension<tenancy::Principal>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+    if !matches!(
+        media_type.as_str(),
+        "image/png" | "image/jpeg" | "image/webp"
+    ) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({"error": {
+                "message": "upload an image: Content-Type image/png, image/jpeg or image/webp",
+                "type": "invalid_request_error"
+            }})),
+        )
+            .into_response();
+    }
+    if body.is_empty() {
+        return workload_error(WorkloadError::InvalidRequest(
+            "the upload is empty".to_string(),
+        ));
+    }
+    let record = sb_core::ArtifactRecord {
+        artifact_id: sb_core::new_id("art"),
+        job_id: String::new(),
+        kind: sb_core::ArtifactKind::Image,
+        media_type,
+        bytes: 0,
+        sha256: String::new(),
+        storage_ref: String::new(),
+        width: None,
+        height: None,
+        duration_ms: None,
+        fps: None,
+        created_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0),
+        retention: String::new(),
+        provenance: std::collections::BTreeMap::from([(
+            "source".to_string(),
+            "upload".to_string(),
+        )]),
+    };
+    match state
+        .workloads
+        .artifacts()
+        .put_bytes(record, owner_of(&principal), &body)
+    {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(error @ ArtifactError::TooLarge { .. }) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": {"message": error.to_string(), "type": "invalid_request_error"}})),
+        )
+            .into_response(),
+        Err(error) => workload_error(WorkloadError::Internal(error.to_string())),
     }
 }
 
