@@ -2049,3 +2049,29 @@ fn a_down_lane_is_kept_when_the_other_candidates_are_filtered_out() {
         .iter()
         .any(|r| r.target_id == "spare/m" && r.reason.contains("tenant policy")));
 }
+
+#[test]
+fn a_reload_that_removes_a_lane_stops_skipping_its_provider() {
+    let engine = engine_from_config(lane_then_spare_config(true, false))
+        .with_lane_status(Arc::new(DownLanes(&["lane"])));
+    let req = AiRequest::new("local-text", vec![Message::user("hi")]);
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(plan.decision.selected.unwrap().target_id, "spare/m");
+
+    // The lane view lives as long as the process; the live config decides
+    // which providers are managed lanes.
+    let mut without_lane = lane_then_spare_config(true, false);
+    without_lane.local_executors.clear();
+    engine.reload(without_lane).unwrap();
+    let (_revision, plan) = engine.preview_route(&req).unwrap();
+    assert_eq!(plan.decision.selected.unwrap().target_id, "lane/m");
+    assert!(
+        !plan
+            .decision
+            .rejected
+            .iter()
+            .any(|r| r.reason.contains("local lane")),
+        "{:?}",
+        plan.decision.rejected
+    );
+}

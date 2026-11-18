@@ -423,7 +423,7 @@ pub(crate) fn resolve_candidates(
             );
         }
     }
-    let lane_down = known_down_lanes(&candidates, lanes);
+    let lane_down = known_down_lanes(snap, &candidates, lanes);
     Ok(CandidateResolution {
         route_name,
         require,
@@ -436,8 +436,12 @@ pub(crate) fn resolve_candidates(
     })
 }
 
-/// Candidates whose managed local lane is known to be down.
+/// Candidates whose managed local lane is known to be down. Only a lane the
+/// request's pinned snapshot still lists in `local_executors` counts: the
+/// lane view is built once at startup, so without this a reload that removes
+/// a lane would keep skipping its provider.
 fn known_down_lanes(
+    snap: &Snapshot,
     candidates: &[ExecutionTarget],
     lanes: Option<&dyn crate::LaneStatus>,
 ) -> Vec<(String, String)> {
@@ -446,6 +450,12 @@ fn known_down_lanes(
     };
     candidates
         .iter()
+        .filter(|candidate| {
+            snap.config
+                .local_executors
+                .iter()
+                .any(|lane| lane.name == candidate.provider_id)
+        })
         .filter_map(|candidate| {
             let detail = lanes.known_down(&candidate.provider_id)?;
             Some((
