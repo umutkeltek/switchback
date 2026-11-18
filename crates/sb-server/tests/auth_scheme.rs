@@ -210,6 +210,149 @@ routes:
     std::fs::remove_file(token_file).ok();
 }
 
+const FAKE_QUERY_SECRET: &str = "fake-query-secret-123";
+
+/// A log sink for one test: everything the gateway logs on this thread.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Accepts connections and never answers.
+async fn spawn_hanging_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    format!("http://{addr}")
+}
+
+// The `query` scheme puts the credential in the URL, and a reqwest error's
+// text quotes the URL: a call that fails before an answer must not carry
+// the credential into the client's error, the trace or the logs.
+#[tokio::test]
+async fn a_failed_call_with_a_query_credential_never_shows_the_credential() {
+    let logs = CapturedLogs::default();
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || sink.clone())
+        .finish();
+    // Scoped to this test, as in `tests/workloads.rs`: a second, empty
+    // dispatcher stays alive and the interest cache is rebuilt, so log sites
+    // other tests registered first still reach this subscriber.
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new());
+    let _logs = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+
+    let hanging = spawn_hanging_upstream().await;
+    let mut request_ids = Vec::new();
+    // Nothing listens on port 1: connection refused.
+    for (upstream, base_url, stream) in [
+        ("refused", "http://127.0.0.1:1", false),
+        ("refused", "http://127.0.0.1:1", true),
+        ("hangs", hanging.as_str(), false),
+        ("hangs", hanging.as_str(), true),
+    ] {
+        // A fresh gateway each time: a failed call locks the account for a
+        // while, and the next call must reach the upstream too.
+        let cfg = format!(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  timeouts: {{ connect_ms: 2000, read_ms: 300 }}
+providers:
+  - id: keyed
+    type: openai_compatible
+    base_url: "{base_url}"
+    auth_scheme: {{ kind: query, name: key }}
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "{FAKE_QUERY_SECRET}" }}
+routes:
+  - name: default
+    match:
+      model: "*"
+    targets:
+      - "keyed/some-model"
+"#
+        );
+        let switchback = spawn_switchback(&cfg).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("{switchback}/v1/chat/completions"))
+            .json(&json!({
+                "model": "some-model",
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let request_id = response
+            .headers()
+            .get("x-switchback-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("request id")
+            .to_string();
+        let body = response.text().await.unwrap();
+        assert!(!status.is_success(), "{upstream} stream={stream}: {body}");
+        // The client sees the failed call's own error, its kind kept.
+        assert!(
+            body.contains("error sending request"),
+            "{upstream} stream={stream}: {body}"
+        );
+        assert!(
+            !body.contains(FAKE_QUERY_SECRET) && !body.contains("key="),
+            "{upstream} stream={stream}: credential in the client's error: {body}"
+        );
+
+        let trace = client
+            .get(format!("{switchback}/v1/traces/{request_id}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            trace.contains(&request_id),
+            "{upstream} stream={stream}: {trace}"
+        );
+        assert!(
+            !trace.contains(FAKE_QUERY_SECRET) && !trace.contains("key="),
+            "{upstream} stream={stream}: credential in the trace: {trace}"
+        );
+        request_ids.push(request_id);
+    }
+
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    for request_id in &request_ids {
+        assert!(
+            logged.contains(request_id.as_str()),
+            "the gateway's lines for {request_id} were captured"
+        );
+    }
+    assert!(
+        !logged.contains(FAKE_QUERY_SECRET),
+        "credential in the logs: {logged}"
+    );
+}
+
 #[tokio::test]
 async fn providers_endpoint_reports_non_secret_auth_kinds() {
     let cfg = r#"
