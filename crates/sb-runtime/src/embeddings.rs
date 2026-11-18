@@ -184,7 +184,7 @@ impl Engine {
             };
         }
 
-        let resolved =
+        let mut resolved =
             match resolve_candidates(snap, &req.model, &self.scorecard, self.lanes.as_deref()) {
                 Ok(resolved) => resolved,
                 Err(e) => {
@@ -207,28 +207,37 @@ impl Engine {
                 }
             };
         let unknown = resolved.unknown.clone();
-        let (route_name, plan) =
-            match plan_resolved_route(&self.combo_rr, snap, &req, None, resolved, true) {
-                Ok(plan) => plan,
-                Err(e) => {
-                    self.record_denial_trace(DenialTrace {
-                        request_id: &req.id,
-                        revision: snap.revision,
-                        tenant: req.tenant.as_deref(),
-                        project: req.project.as_deref(),
-                        inbound_model: &req.model,
-                        status: e.status,
-                        error_type: &e.error_type,
-                        message: &e.message,
-                        started,
-                        streamed: false,
-                    });
-                    return EmbeddingsOutcome::Error {
-                        request_id: req.id,
-                        error: e,
-                    };
+        let lane_wake = self
+            .wake_lane_before_dispatch(snap, &req, None, &mut resolved)
+            .await;
+        let planned = plan_resolved_route(&self.combo_rr, snap, &req, None, resolved, true)
+            .and_then(|(route_name, mut plan)| {
+                if let Some(note) = &lane_wake {
+                    note.apply(&mut plan)?;
                 }
-            };
+                Ok((route_name, plan))
+            });
+        let (route_name, plan) = match planned {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: false,
+                });
+                return EmbeddingsOutcome::Error {
+                    request_id: req.id,
+                    error: e,
+                };
+            }
+        };
         snap.plugins.post_route(&req, &plan.decision);
         let summary = format!("{} embeddings", plan.decision.summary());
         let mut trace = sb_trace::RequestTrace::start(
@@ -284,6 +293,9 @@ impl Engine {
                 }
             }
 
+            // Opt-in lanes (`wake_on_request`) count this request as
+            // in-flight work until this target's attempts end.
+            let _lane_busy = self.lane_busy(snap, &target.provider_id);
             let mut tried_accounts = HashSet::new();
             let allowed_accounts = req
                 .tenant

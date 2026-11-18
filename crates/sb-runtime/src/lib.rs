@@ -28,6 +28,7 @@ mod execution_meta;
 mod finish_attempt;
 mod hedge;
 mod helpers;
+mod lanes;
 mod outcome;
 mod profiles;
 pub(crate) mod quality_eval;
@@ -73,16 +74,65 @@ impl Runtime {
     }
 }
 
-/// Read-only view of managed local lanes (`local_executors`), consulted while
-/// resolving route candidates. The server's capacity activator implements it
-/// from its own health probes; without one, routing is unchanged.
+/// View of managed local lanes (`local_executors`), consulted while resolving
+/// and dispatching route candidates. The server's capacity activator
+/// implements it from its own health probes and lifecycle; without one,
+/// routing is unchanged. Every method except [`LaneStatus::known_down`] has a
+/// do-nothing default, and the runtime calls them only for a lane whose entry
+/// in the request's pinned config sets `wake_on_request: true`.
 pub trait LaneStatus: Send + Sync {
     /// `Some(detail)` only when the provider's managed lane is KNOWN to be
     /// down (a health probe saw it down). Up, not yet probed, or not a managed
     /// lane: `None`. Called on the request path: it must answer from evidence
     /// already held and never wait on I/O (it may start a background refresh).
     fn known_down(&self, provider_id: &str) -> Option<String>;
+
+    /// Start the lane's wake (single-flight: one wake however many requests
+    /// ask) and wait up to the lane's own bound for it to be ready. Called
+    /// before the first byte, so a lane that stays down still allows
+    /// fallback. Must always return within the bound.
+    fn wake_for_request<'a>(&'a self, _provider_id: &'a str) -> BoxFuture<'a, LaneWake> {
+        Box::pin(std::future::ready(LaneWake::NotReady {
+            detail: "wake on request is not available".to_string(),
+            retry_after: std::time::Duration::from_secs(1),
+        }))
+    }
+
+    /// Count one request as in-flight work on the lane until the returned
+    /// guard is dropped (the response is complete, the stream ended, the
+    /// client went away, or the attempt failed). `None` = the lane does not
+    /// track requests. Never waits.
+    fn begin_request(&self, _provider_id: &str) -> Option<LaneBusy> {
+        None
+    }
+
+    /// The engine published a new config (reload or control-plane publish).
+    /// Lanes added, changed or removed by it take effect from here.
+    fn config_published(&self, _config: &Config) {}
 }
+
+/// Holds a managed lane busy while one request is in flight on it; dropping
+/// it releases the lane. Type-erased so the runtime never sees lifecycle
+/// internals.
+pub type LaneBusy = Box<dyn Send + Sync>;
+
+/// What a request-triggered wake found within its bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneWake {
+    /// The lane is ready; `detail` says how, for the `RouteDecision` (for
+    /// example `woken for this request, healthy after 41 s`).
+    Ready { detail: String },
+    /// The lane is not ready; `detail` says why (for example `wake wait of
+    /// 90 s passed`). `retry_after` is a hint for a 503 when no other target
+    /// can serve.
+    NotReady {
+        detail: String,
+        retry_after: std::time::Duration,
+    },
+}
+
+/// Boxed future returned by [`LaneStatus::wake_for_request`].
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// An immutable, revisioned compilation of config into everything a request
 /// needs: the parsed config, the adapter registry, the credential resolver, and

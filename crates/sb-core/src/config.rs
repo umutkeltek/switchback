@@ -129,6 +129,31 @@ pub struct LocalExecutorConfig {
     /// poweroff, restart, queueing and the retry budget are the same either way.
     #[serde(default)]
     pub route_health: bool,
+    /// Let text and embeddings requests manage this lane like media jobs.
+    /// Needs `route_health: true`. When `true`: (1) every request dispatched
+    /// to the lane's provider counts as in-flight work on the lane until its
+    /// response (or stream) ends, so the idle timer and `poweroff_command`
+    /// wait for it, and the idle timer starts when the last request ends;
+    /// (2) when routing would skip the lane's target because the lane is
+    /// known down and that target would otherwise be chosen first, the
+    /// request starts the lane's wake (single-flight with every other
+    /// request and media job) and waits up to `wake_wait_secs` for health
+    /// before the first byte. Default `false`: text requests never wake the
+    /// lane, never hold it busy, and routing is unchanged.
+    #[serde(default)]
+    pub wake_on_request: bool,
+    /// The longest one request waits for a wake started by
+    /// `wake_on_request` before it falls through to the route's next target
+    /// (or gets a retryable 503 when no other target can serve). The wake
+    /// itself keeps going in the background up to `boot_timeout_secs`. `0`
+    /// starts the wake without waiting. Default 90: a powered-off host
+    /// typically answers about a minute after the wake packet.
+    #[serde(default = "default_wake_wait_secs")]
+    pub wake_wait_secs: u64,
+}
+
+fn default_wake_wait_secs() -> u64 {
+    90
 }
 
 fn default_boot_timeout_secs() -> u64 {
@@ -968,6 +993,11 @@ impl Config {
             if executor.health_poll_interval_ms == 0 {
                 problems.push(format!(
                     "local_executors[{i}].health_poll_interval_ms must be greater than 0"
+                ));
+            }
+            if executor.wake_on_request && !executor.route_health {
+                problems.push(format!(
+                    "local_executors[{i}].wake_on_request needs route_health: true (the wake starts when routing sees the lane down)"
                 ));
             }
         }

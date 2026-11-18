@@ -21,7 +21,7 @@ use super::profiles::{
     apply_request_client_profile, client_profile_allowed_accounts, combine_allowed_accounts,
     plan_resolved_route, resolve_candidates, tenant_allowed_accounts,
 };
-use super::stream::{meter_stream, StreamFinish};
+use super::stream::{meter_stream, ttft_ms, watch_first_token, StreamFinish};
 use super::{DenialTrace, Engine, ExecError, ExecOutcome, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,15 +288,27 @@ impl Engine {
             });
         }
         let unknown = resolved.unknown.clone();
+        // Opt-in (`wake_on_request`): wake the first choice's lane if routing
+        // is about to skip it as down, bounded, before the first byte.
+        let lane_wake = self
+            .wake_lane_before_dispatch(snap, &req, client_profile.as_ref(), &mut resolved)
+            .await;
 
-        let (route_name, mut plan) = match plan_resolved_route(
+        let planned = plan_resolved_route(
             &self.combo_rr,
             snap,
             &req,
             client_profile.as_ref(),
             resolved,
             true,
-        ) {
+        )
+        .and_then(|(route_name, mut plan)| {
+            if let Some(note) = &lane_wake {
+                note.apply(&mut plan)?;
+            }
+            Ok((route_name, plan))
+        });
+        let (route_name, mut plan) = match planned {
             Ok(plan) => plan,
             Err(e) => {
                 self.record_denial_trace(DenialTrace {
@@ -394,6 +406,7 @@ impl Engine {
                 &plan.candidates,
                 &self.scorecard,
                 &snap.config.server.scorecard,
+                &|provider_id: &str| self.lane_busy(snap, provider_id),
             )
             .await
             {
@@ -454,6 +467,10 @@ impl Engine {
                     scope.record_success(&win.target_id, cost);
                 }
                 trace.set_usage(win.response.usage.clone(), cost);
+                trace.set_ttft_ms(
+                    win.first_token_at
+                        .map(|at| at.saturating_duration_since(started).as_millis() as u64),
+                );
                 self.traces
                     .record(trace.finish(200, started.elapsed().as_millis() as u64, false));
                 if let Some(capture) = quality_capture.take() {
@@ -524,6 +541,12 @@ impl Engine {
                 }
             }
 
+            // Opt-in lanes (`wake_on_request`): the lane counts this request
+            // as in-flight work from here until the attempt fails over, the
+            // collected response is complete, or the stream ends (the guard
+            // then moves into the stream finalizer). Drop releases it on every
+            // path, unwinding included. `None` for any other target.
+            let mut lane_busy = self.lane_busy(snap, &target.provider_id);
             let mut tried_accounts: HashSet<String> = HashSet::new();
             let allowed_accounts = req
                 .tenant
@@ -828,6 +851,8 @@ impl Engine {
                                     let registry_ttft = registry.clone();
                                     let (pid_ttft, mdl_ttft) =
                                         (target.provider_id.clone(), target.model.clone());
+                                    let (stream, first_token) = watch_first_token(stream);
+                                    let lane_busy = lane_busy.take();
                                     let metered = meter_stream(
                                         stream,
                                         attempt_started,
@@ -835,6 +860,11 @@ impl Engine {
                                             registry_ttft.record_ttft(&pid_ttft, &mdl_ttft, ttft_ms)
                                         },
                                         move |usage, finish_reason, finish| {
+                                            // Released when this finalizer
+                                            // returns: last byte, upstream
+                                            // error or client disconnect.
+                                            let _lane_busy = lane_busy;
+                                            trace.set_ttft_ms(ttft_ms(&first_token, started));
                                             let latency = started.elapsed().as_millis() as u64;
                                             let attempt_ms =
                                                 attempt_started.elapsed().as_millis() as u64;
@@ -1003,6 +1033,7 @@ impl Engine {
                                     };
                                 }
 
+                                let (stream, first_token) = watch_first_token(stream);
                                 match collect_response(
                                     stream,
                                     req.id.clone(),
@@ -1012,6 +1043,7 @@ impl Engine {
                                 .await
                                 {
                                     Ok(response) => {
+                                        trace.set_ttft_ms(ttft_ms(&first_token, started));
                                         snap.resolver
                                             .report_success(&target.provider_id, &account_id);
                                         tracing::info!(

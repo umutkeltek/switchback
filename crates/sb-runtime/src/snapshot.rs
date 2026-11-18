@@ -303,12 +303,19 @@ impl Engine {
             resolver: Arc::new(resolver),
             plugins,
         });
+        let published = next.config.clone();
         if self.store_required {
             self.persist_for_publish(revision, hash, &audit)?;
             self.snapshot.store(next);
         } else {
             self.snapshot.store(next);
+            // Best-effort persistence: logs a failure, never returns one.
             self.persist_for_publish(revision, hash, &audit)?;
+        }
+        // Managed lanes follow the live config: lanes added, changed or
+        // removed by this publish take effect now, without a restart.
+        if let Some(lanes) = &self.lanes {
+            lanes.config_published(&published);
         }
         Ok(revision)
     }

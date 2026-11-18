@@ -533,7 +533,7 @@ pub(crate) fn plan_resolved_route(
     Ok((route_name, plan))
 }
 
-fn plan_candidates(
+pub(crate) fn plan_candidates(
     combo_rr: &Mutex<HashMap<String, usize>>,
     snap: &Snapshot,
     req: &AiRequest,

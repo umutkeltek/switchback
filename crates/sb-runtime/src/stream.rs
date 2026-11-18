@@ -1,3 +1,4 @@
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use futures::StreamExt;
@@ -117,6 +118,47 @@ where
         },
     )
     .boxed()
+}
+
+/// When the first token of a response arrived, filled by [`watch_first_token`].
+pub(crate) type FirstToken = Arc<OnceLock<Instant>>;
+
+/// Note the moment the first token passes through the stream: the first text,
+/// reasoning or tool-call event, or an output image. Framing events
+/// (`MessageStart`, usage, finish) are not tokens, so a response that
+/// produced none leaves the cell empty. Shared by the streaming and the
+/// collected path, so both measure on the one event pipeline.
+pub(crate) fn watch_first_token(stream: EventStream) -> (EventStream, FirstToken) {
+    let first: FirstToken = Arc::new(OnceLock::new());
+    let seen = first.clone();
+    let stream = stream
+        .inspect(move |item| {
+            if seen.get().is_none() && matches!(item, Ok(event) if is_token(event)) {
+                let _ = seen.set(Instant::now());
+            }
+        })
+        .boxed();
+    (stream, first)
+}
+
+fn is_token(event: &AiStreamEvent) -> bool {
+    match event {
+        AiStreamEvent::TextDelta { text } | AiStreamEvent::ReasoningDelta { text } => {
+            !text.is_empty()
+        }
+        AiStreamEvent::ToolCallStart(_)
+        | AiStreamEvent::ToolCallArgsDelta { .. }
+        | AiStreamEvent::OutputImage { .. } => true,
+        _ => false,
+    }
+}
+
+/// Time to first token for a trace, measured from the request's start (the
+/// same origin as the trace's total latency). `None` when no token came.
+pub(crate) fn ttft_ms(first: &FirstToken, request_started: Instant) -> Option<u64> {
+    first
+        .get()
+        .map(|at| at.saturating_duration_since(request_started).as_millis() as u64)
 }
 
 #[cfg(test)]

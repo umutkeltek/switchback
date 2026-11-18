@@ -10,7 +10,8 @@ use super::collect::collect_response;
 use super::finish_attempt::{AttemptFinishCtx, AttemptToken, FinishOutcome};
 use super::helpers::{resolve_egress, session_affinity_key};
 use super::scorecard::{Scorecard, ScorecardConfig};
-use super::{Engine, Snapshot};
+use super::stream::watch_first_token;
+use super::{Engine, LaneBusy, Snapshot};
 
 /// A hedged attempt's winning result + the metadata to record it.
 pub(crate) struct HedgeWin {
@@ -22,6 +23,8 @@ pub(crate) struct HedgeWin {
     pub(crate) egress: String,
     pub(crate) latency_ms: u64,
     pub(crate) canceled: Vec<HedgeCancel>,
+    /// When the winner's first token arrived (`None` = no token).
+    pub(crate) first_token_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -168,6 +171,7 @@ async fn hedge_attempt(
             return None;
         }
     };
+    let (stream, first_token) = watch_first_token(stream);
     let response = match collect_response(
         stream,
         req.id.clone(),
@@ -213,6 +217,7 @@ async fn hedge_attempt(
         egress: egress_eff,
         latency_ms,
         canceled: Vec::new(),
+        first_token_at: first_token.get().copied(),
     })
 }
 
@@ -226,6 +231,7 @@ pub(crate) async fn run_hedge(
     candidates: &[sb_core::ExecutionTarget],
     scorecard: &Scorecard,
     scorecard_cfg: &ScorecardConfig,
+    lane_busy: &(dyn Fn(&str) -> Option<LaneBusy> + Sync),
 ) -> Option<HedgeWin> {
     let hedge = &snap.config.server.hedge;
     let n = (hedge.max_parallel.max(1) as usize).min(candidates.len());
@@ -245,6 +251,9 @@ pub(crate) async fn run_hedge(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+            // Opt-in lanes count each launched racer as in-flight work
+            // until it finishes or loses the race (its future is dropped).
+            let _lane_busy = lane_busy(&target.provider_id);
             hedge_attempt(snap, req, target, scorecard, scorecard_cfg).await
         });
     }

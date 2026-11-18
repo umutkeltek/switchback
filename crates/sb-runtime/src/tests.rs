@@ -2106,3 +2106,339 @@ fn a_reload_that_removes_a_lane_stops_skipping_its_provider() {
         plan.decision.rejected
     );
 }
+
+// --- wake on request, the lane busy guard, time to first token --------------
+
+/// A lane view for a `wake_on_request` lane `lane`: known down until a wake
+/// answers `Ready`; the wake answer is scripted; busy guards are counted.
+struct WakeLanes {
+    down: AtomicBool,
+    wake: crate::LaneWake,
+    wakes: AtomicUsize,
+    begun: AtomicUsize,
+    active: Arc<AtomicUsize>,
+    published: AtomicUsize,
+}
+
+impl WakeLanes {
+    fn new(down: bool, wake: crate::LaneWake) -> Arc<Self> {
+        Arc::new(Self {
+            down: AtomicBool::new(down),
+            wake,
+            wakes: AtomicUsize::new(0),
+            begun: AtomicUsize::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
+            published: AtomicUsize::new(0),
+        })
+    }
+}
+
+struct Busy(Arc<AtomicUsize>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl crate::LaneStatus for WakeLanes {
+    fn known_down(&self, provider_id: &str) -> Option<String> {
+        (provider_id == "lane" && self.down.load(Ordering::SeqCst))
+            .then(|| "last health probe failed".to_string())
+    }
+
+    fn wake_for_request<'a>(
+        &'a self,
+        _provider_id: &'a str,
+    ) -> crate::BoxFuture<'a, crate::LaneWake> {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.wake, crate::LaneWake::Ready { .. }) {
+            self.down.store(false, Ordering::SeqCst);
+        }
+        Box::pin(std::future::ready(self.wake.clone()))
+    }
+
+    fn begin_request(&self, _provider_id: &str) -> Option<crate::LaneBusy> {
+        self.begun.fetch_add(1, Ordering::SeqCst);
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Some(Box::new(Busy(self.active.clone())))
+    }
+
+    fn config_published(&self, _config: &Config) {
+        self.published.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Route `[lane/echo, spare/echo]` over two mock providers, `lane` being a
+/// managed lane with `route_health` and, when asked, `wake_on_request`.
+fn wake_lane_config(wake_on_request: bool) -> Config {
+    Config::from_yaml(&format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: lane
+    type: mock
+  - id: spare
+    type: mock
+local_executors:
+  - name: lane
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    route_health: true
+    wake_on_request: {wake_on_request}
+routes:
+  - name: local-text
+    match: {{ model: "local-text" }}
+    targets:
+      - "lane/echo"
+      - "spare/echo"
+"#
+    ))
+    .unwrap()
+}
+
+fn ready_after_41s() -> crate::LaneWake {
+    crate::LaneWake::Ready {
+        detail: "woken for this request, healthy after 41 s".to_string(),
+    }
+}
+
+fn wait_passed() -> crate::LaneWake {
+    crate::LaneWake::NotReady {
+        detail: "wake wait of 90 s passed, wake still running".to_string(),
+        retry_after: Duration::from_secs(90),
+    }
+}
+
+fn hello(model: &str, stream: bool) -> AiRequest {
+    let mut req = AiRequest::new(model, vec![Message::user("hi")]);
+    req.stream = stream;
+    req
+}
+
+#[tokio::test]
+async fn a_lane_woken_for_a_request_serves_it_and_the_decision_says_why() {
+    let lanes = WakeLanes::new(true, ready_after_41s());
+    let engine = engine_from_config(wake_lane_config(true)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(
+        trace.decision.selected.as_ref().unwrap().target_id,
+        "lane/echo"
+    );
+    assert!(
+        trace
+            .decision
+            .reason
+            .iter()
+            .any(|r| r == "local lane `lane` woken for this request, healthy after 41 s"),
+        "{:?}",
+        trace.decision.reason
+    );
+    assert!(
+        trace.decision.rejected.is_empty(),
+        "{:?}",
+        trace.decision.rejected
+    );
+    assert_eq!(trace.attempts[0].target_id, "lane/echo");
+    assert_eq!(lanes.wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(lanes.begun.load(Ordering::SeqCst), 1, "held while served");
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 0, "released after");
+}
+
+#[tokio::test]
+async fn a_wake_wait_that_passes_falls_through_with_the_reason() {
+    let lanes = WakeLanes::new(true, wait_passed());
+    let engine = engine_from_config(wake_lane_config(true)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(
+        trace.decision.selected.as_ref().unwrap().target_id,
+        "spare/echo"
+    );
+    let rejected = trace
+        .decision
+        .rejected
+        .iter()
+        .find(|r| r.target_id == "lane/echo")
+        .expect("the lane is rejected with a reason");
+    assert!(
+        rejected.reason.contains("wake wait of 90 s passed"),
+        "{}",
+        rejected.reason
+    );
+    assert!(
+        trace
+            .decision
+            .reason
+            .iter()
+            .any(|r| r
+                == "local lane `lane` wake wait of 90 s passed, wake still running, fell through"),
+        "{:?}",
+        trace.decision.reason
+    );
+    assert_eq!(lanes.wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lanes.begun.load(Ordering::SeqCst),
+        0,
+        "the lane was never dispatched"
+    );
+}
+
+#[tokio::test]
+async fn a_wake_wait_that_passes_with_no_other_target_is_a_retryable_503() {
+    let lanes = WakeLanes::new(true, wait_passed());
+    let engine = engine_from_config(wake_lane_config(true)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("lane/echo", false), Instant::now())
+        .await;
+    let ExecOutcome::Error(error) = outcome else {
+        panic!("expected a retryable error, not a dispatch into a lane known down");
+    };
+    assert_eq!(error.status, 503);
+    assert_eq!(error.error_type, "local_lane_unavailable");
+    assert_eq!(error.retry_after, Some(Duration::from_secs(90)));
+    assert!(
+        error.message.contains("wake wait of 90 s passed"),
+        "{}",
+        error.message
+    );
+    assert_eq!(lanes.begun.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn without_wake_on_request_a_down_lane_is_skipped_exactly_as_before() {
+    // Opt-out (the default) equals the behaviour before this setting: no
+    // wake, no busy guard, and the same decision a plain known-down view
+    // produces.
+    let lanes = WakeLanes::new(true, ready_after_41s());
+    let engine = engine_from_config(wake_lane_config(false)).with_lane_status(lanes.clone());
+    let mut req = hello("local-text", false);
+    req.id = "same-request".to_string();
+    engine.execute(req.clone(), Instant::now()).await;
+    let with_wake_view = engine.traces().recent(1).pop().unwrap().decision;
+    assert_eq!(lanes.wakes.load(Ordering::SeqCst), 0, "no wake");
+    assert_eq!(lanes.begun.load(Ordering::SeqCst), 0, "no guard");
+
+    let baseline = engine_from_config(wake_lane_config(false))
+        .with_lane_status(Arc::new(DownLanes(&["lane"])));
+    baseline.execute(req, Instant::now()).await;
+    let before = baseline.traces().recent(1).pop().unwrap().decision;
+    assert_eq!(
+        with_wake_view.selected.as_ref().map(|t| &t.target_id),
+        before.selected.as_ref().map(|t| &t.target_id)
+    );
+    assert_eq!(with_wake_view.reason, before.reason);
+    assert_eq!(
+        serde_json::to_value(&with_wake_view.rejected).unwrap(),
+        serde_json::to_value(&before.rejected).unwrap()
+    );
+    assert_eq!(
+        before.selected.unwrap().target_id,
+        "spare/echo",
+        "the down lane is skipped"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_holds_the_lane_until_its_last_event_and_records_ttft() {
+    let lanes = WakeLanes::new(false, ready_after_41s());
+    let engine = engine_from_config(wake_lane_config(true)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", true), Instant::now())
+        .await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("expected a stream");
+    };
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        1,
+        "busy while streaming"
+    );
+    while stream.next().await.is_some() {
+        assert_eq!(lanes.active.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        0,
+        "released at the end"
+    );
+    drop(stream);
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(trace.final_status, 200);
+    assert!(trace.ttft_ms.is_some(), "streamed trace carries TTFT");
+    assert!(trace.ttft_ms.unwrap() <= trace.total_latency_ms);
+    assert_eq!(
+        lanes.wakes.load(Ordering::SeqCst),
+        0,
+        "an up lane is not woken"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_goes_away_mid_stream_releases_the_lane() {
+    let lanes = WakeLanes::new(false, ready_after_41s());
+    let engine = engine_from_config(wake_lane_config(true)).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", true), Instant::now())
+        .await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("expected a stream");
+    };
+    assert!(stream.next().await.is_some());
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 1);
+    drop(stream); // the client hung up
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 0);
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(trace.final_status, 499);
+}
+
+#[tokio::test]
+async fn a_collected_response_records_ttft_and_a_failure_does_not() {
+    let engine = engine_from_config(wake_lane_config(false));
+    engine
+        .execute(hello("spare/echo", false), Instant::now())
+        .await;
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_eq!(trace.final_status, 200);
+    assert!(!trace.streamed);
+    assert!(trace.ttft_ms.is_some(), "collected trace carries TTFT");
+    let json = serde_json::to_value(&trace).unwrap();
+    assert!(json["ttft_ms"].is_u64(), "{json}");
+
+    engine
+        .execute(hello("spare/always-error", false), Instant::now())
+        .await;
+    let trace = engine.traces().recent(1).pop().unwrap();
+    assert_ne!(trace.final_status, 200);
+    assert_eq!(trace.ttft_ms, None, "no token, no TTFT");
+    let json = serde_json::to_value(&trace).unwrap();
+    assert!(json.get("ttft_ms").is_none(), "absent, not null: {json}");
+}
+
+#[test]
+fn a_reload_tells_the_lane_view() {
+    let lanes = WakeLanes::new(false, ready_after_41s());
+    let engine = engine_from_config(wake_lane_config(true)).with_lane_status(lanes.clone());
+    engine.reload(wake_lane_config(false)).unwrap();
+    assert_eq!(lanes.published.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn wake_on_request_needs_route_health() {
+    let mut cfg = wake_lane_config(true);
+    cfg.local_executors[0].route_health = false;
+    let error = Engine::validate_config(&cfg).unwrap_err();
+    assert!(
+        error.contains("local_executors[0].wake_on_request needs route_health: true"),
+        "{error}"
+    );
+    assert!(Engine::validate_config(&wake_lane_config(true)).is_ok());
+}

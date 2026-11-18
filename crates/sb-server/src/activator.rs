@@ -1109,6 +1109,8 @@ mod tests {
             retry_budget: legs.retry_budget,
             health_poll_interval_ms: legs.health_poll_interval_ms,
             route_health: true,
+            wake_on_request: false,
+            wake_wait_secs: 90,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -1242,6 +1244,8 @@ mod tests {
             retry_budget: 2,
             health_poll_interval_ms: 400,
             route_health: true,
+            wake_on_request: false,
+            wake_wait_secs: 90,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = CapacityActivator {
