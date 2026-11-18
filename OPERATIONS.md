@@ -221,8 +221,10 @@ curl -s localhost:8765/v1/client-profiles \
 curl -s localhost:8765/v1/usage         -H "Authorization: Bearer $KEY" | jq
 
 # Per-request traces (metadata-only: route decision + every account/egress
-# attempt + cost). Recent traces live in memory; server.trace_log appends JSONL;
-# server.state_store persists queryable trace metadata in SQLite.
+# attempt + cost + `ttft_ms`, the time from the request's start to the first
+# token served; absent when no token came). Recent traces live in memory;
+# server.trace_log appends JSONL; server.state_store persists queryable trace
+# metadata in SQLite.
 curl -s localhost:8765/v1/traces        -H "Authorization: Bearer $KEY" | jq
 curl -s 'localhost:8765/v1/traces?session_id=sess-123&model=mock/echo&status=200' \
   -H "Authorization: Bearer $KEY" | jq

@@ -24,6 +24,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
     the background, and its targets are skipped before dispatch while it is known
     down, with a reason in the `RouteDecision` and no failure counted. A lane that
     is the only target able to serve is kept.
+- **Local lanes that wake on request** (`wake_on_request`, `wake_wait_secs`,
+  trace `ttft_ms`): text and embeddings requests can wake a powered-off
+  managed lane and keep it awake while they run, and every trace records its
+  time to first token. Off unless set.
+  - `wake_on_request: true` on a `local_executors` lane (needs
+    `route_health: true`). A request in flight on the lane, to its last
+    streamed byte or the client's disconnect, holds the lane busy in one
+    count shared with media jobs: no idle poweroff while it runs, and the idle
+    timer starts when the last one ends.
+  - When routing would skip the lane as down and its target would be chosen
+    first, the request starts one shared wake (a fresh probe first, so a lane
+    that is already back is used at once) and waits up to `wake_wait_secs`
+    (default 90) before its first byte. It is then served by the lane, or falls
+    through with the reason in `RouteDecision`, or gets a 503
+    `local_lane_unavailable` with `Retry-After` when nothing else can serve.
+  - Managed lanes follow config reloads: lanes added, changed or removed take
+    effect without a restart, and a lane that stays keeps its in-flight work.
+  - Trace records carry an optional `ttft_ms`, from the request's start to the
+    first token, on streamed and collected responses.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates

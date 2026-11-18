@@ -457,13 +457,40 @@ routes:
 # the older result. If skipping would leave no candidate that can serve the
 # request, none is skipped (a stale probe never becomes an outage). The probe
 # result of an opted-in lane shows as `observed_healthy` at
-# GET /v1/workloads/capacity. The wake/poweroff/restart commands (optional)
-# are used by media jobs today, not by text requests.
+# GET /v1/workloads/capacity.
+#
+# `wake_on_request: true` (needs `route_health: true`; default false) lets
+# text and embeddings requests manage the lane like media jobs do:
+#   - A request in flight on the lane, to its last streamed byte or the
+#     client's disconnect, counts as work: the idle timer and
+#     `poweroff_command` wait for it, and the idle timer starts when the
+#     last request (or media job) ends.
+#   - When routing would skip the lane as down and its target would be
+#     chosen first, the request starts the wake (one wake however many
+#     requests arrive, shared with media jobs) and waits up to
+#     `wake_wait_secs` before its first byte. The wake starts with a fresh
+#     probe, so a lane that is already back is used at once. Healthy in
+#     time: the request is served by the lane ("local lane `llamacpp`
+#     woken for this request, healthy after 52 s"). Not in time: it falls
+#     through to the next target ("wake wait of 90 s passed, wake still
+#     running, fell through"), or gets a 503 with Retry-After when no
+#     other target can serve. The wake keeps going up to
+#     `boot_timeout_secs`. `wake_wait_secs: 0` starts the wake without
+#     waiting.
+#   - After its own idle poweroff the lane counts as down for routing at
+#     once, so the next request wakes it.
+# Without it, text requests never wake, hold or power off the lane.
+# A reload applies added, changed and removed lanes without a restart.
 # local_executors:
 #   - name: llamacpp
 #     base_url: "http://executor-1.example:8080"
 #     health_endpoint: "http://executor-1.example:8080/health"
 #     route_health: true   # default false: no routing probe, routing unchanged
+#     wake_on_request: true          # default false
+#     wake_wait_secs: 90             # default 90; a cold host answers in about a minute
+#     wake_command: "ssh gateway wake-host executor-1"
+#     poweroff_command: "ssh gateway poweroff-host executor-1"
+#     idle_timeout_secs: 600
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

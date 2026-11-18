@@ -161,6 +161,23 @@ under traffic without a network call on the request path. If rejecting them
 would leave no candidate that can serve the request (after tenant, profile and
 capability filters), none is rejected.
 
+A lane can also opt into `wake_on_request: true` (with `route_health`), which
+lets text and embeddings requests manage it the way media jobs do. Every
+dispatch to the lane holds a busy guard in the activator's one in-flight count
+(shared with media jobs) until the collected response is complete or the
+stream ends (last event, upstream error or client disconnect); the idle
+countdown, and so `poweroff_command`, waits for it. When the target a route
+would choose first is on such a lane and routing is about to skip it as down,
+the request starts the lane's wake (single-flight across requests and media
+jobs, starting with a fresh probe) and waits up to `wake_wait_secs` before
+its first byte, so fallback stays possible. The decision says what happened
+(`local lane … woken for this request, healthy after 52 s`, or `… wake wait
+of 90 s passed, wake still running, fell through`); when no other target can
+serve, the answer is a retryable 503 (`local_lane_unavailable`, with
+`Retry-After`). The lane view follows every config publish: lanes added,
+changed or removed by a reload take effect without a restart, and a lane that
+stays keeps its in-flight work and queue.
+
 ### Multi-account auth
 Account selection (fill-first / round-robin), per-`(account, model)` availability
 locks with cooldowns, an **age-encrypted vault** (key in the OS keychain or
@@ -182,7 +199,9 @@ re-picks a known-bad account.
 
 ### Observability
 Metadata-only traces for routed requests (route decision + every attempt + egress
-+ cost) at `GET /v1/traces` (+ `/{id}`), session rollups at `GET /v1/sessions`,
++ cost + `ttft_ms`, the time from the request's start to the first token of the
+response served, on streamed and collected responses alike) at `GET /v1/traces`
+(+ `/{id}`), session rollups at `GET /v1/sessions`,
 route replay previews at `GET /v1/traces/{id}/route-preview`, an
 `x-switchback-request-id` header, an append-only usage/cost ledger at
 `GET /v1/usage`, `tracing` request/attempt spans, and optional **OpenTelemetry

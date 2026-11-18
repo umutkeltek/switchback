@@ -228,6 +228,20 @@ When two engines serve the same model on one route, set `pin_order: true` on
 the route so the declared order wins even after one engine was stopped for a
 while (see the `local-text` example in `config/switchback.example.yaml`).
 
+When the engine runs on a host that is normally powered off, declare it as a
+managed lane (`local_executors` entry named after the provider) with
+`route_health: true` and `wake_on_request: true`, plus its `wake_command` and
+`poweroff_command`. A chat or embeddings request whose first choice is that
+lane, while the lane is down, then starts the wake and waits up to
+`wake_wait_secs` (default 90) before falling through to the route's next
+target; the engine is kept awake while any request or stream is still open,
+and powered off `idle_timeout_secs` after the last one ends. Size
+`wake_wait_secs` from the host: a cold host typically answers about a minute
+after the wake is sent, while an engine that is already up loads a sleeping
+model in seconds. Give the route a fast remote target after the lane if
+clients cannot wait that long; with `wake_wait_secs: 0` the request falls
+through at once while the wake keeps going for the next one.
+
 ## Agent-Operable Setup
 
 An agent can discover the command and config contract directly:
