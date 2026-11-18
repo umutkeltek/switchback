@@ -2700,6 +2700,32 @@ local_executors:
         );
     }
 
+    // Opt-out cost: a config without `local_executors` gets an activator
+    // (always attached so a reload can add a lane) but no supervisor task,
+    // no lane and no probe, before and after a reload that keeps it so. A
+    // reload that adds a lane starts the supervisor then.
+    #[tokio::test]
+    async fn no_lanes_means_no_supervisor_until_a_reload_adds_one() {
+        let host = FakeHost::new(Sim::default());
+        let no_lanes = Config::from_yaml("providers:\n  - id: lane\n    type: mock\n").unwrap();
+        let activator = CapacityActivator::with_seams(
+            &no_lanes,
+            FakeClock::new(),
+            Arc::new(host.clone()),
+            Arc::new(host.clone()),
+        );
+        activator.spawn_supervisor(Duration::from_secs(10));
+        assert!(activator.is_empty());
+        assert!(!activator.supervisor_started.load(Ordering::SeqCst));
+        activator.reconcile(&no_lanes);
+        assert!(!activator.supervisor_started.load(Ordering::SeqCst));
+
+        activator.reconcile(&lanes_config(LANE));
+        assert!(activator.supervisor_started.load(Ordering::SeqCst));
+        let sim = host.sim();
+        assert_eq!((sim.wake, sim.poweroff), (0, 0));
+    }
+
     // A lane removed by a reload and added back while work still runs on
     // it is the same lane again: the open stream keeps holding the idle
     // poweroff off, so the host is not powered off under it.
