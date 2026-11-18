@@ -508,7 +508,7 @@ impl WorkloadStore {
         let store = self.clone();
         let id = job_id.clone();
         let handle = tokio::spawn(async move {
-            let result = store.run(&ctx, &id, spec, &owner).await;
+            let result = store.run(&ctx, &id, spec, &owner, background).await;
             store.finish_task(&id, &result, background);
             result
         });
@@ -525,6 +525,7 @@ impl WorkloadStore {
         job_id: &str,
         spec: JobSpec,
         owner: &Owner,
+        background: bool,
     ) -> Result<JobRecord, WorkloadError> {
         let cfg = &ctx.snapshot.config;
         let request = spec.request;
@@ -553,7 +554,7 @@ impl WorkloadStore {
                 fps: spec.fps,
             };
             return self
-                .run_comfy(ctx, provider, workflow, inputs, owner, job_id)
+                .run_comfy(ctx, provider, workflow, inputs, owner, job_id, background)
                 .await;
         }
         ensure_known_image_target(cfg, &request.model)?;
@@ -602,6 +603,22 @@ impl WorkloadStore {
             WorkloadError::Upstream(_) => "upstream",
             WorkloadError::Internal(_) => "internal",
         };
+        self.fail_class_locked(inner, job_id, class, error.message());
+    }
+
+    /// Mark an unfinished job failed with an error class of its own.
+    fn fail_with_class(&self, job_id: &str, class: &str, message: &str) {
+        let mut inner = self.lock_inner();
+        let unfinished = inner
+            .jobs
+            .get(job_id)
+            .is_some_and(|job| !is_terminal(job.status));
+        if unfinished {
+            self.fail_class_locked(&mut inner, job_id, class, message);
+        }
+    }
+
+    fn fail_class_locked(&self, inner: &mut Inner, job_id: &str, class: &str, message: &str) {
         let Some(mut job) = inner.jobs.get(job_id).cloned() else {
             return;
         };
@@ -615,7 +632,7 @@ impl WorkloadStore {
             created_at_ms: now,
             detail: BTreeMap::from([
                 ("error_class".to_string(), class.to_string()),
-                ("error".to_string(), error.message().to_string()),
+                ("error".to_string(), message.to_string()),
             ]),
         });
         self.put_job(inner, job);
@@ -1302,6 +1319,7 @@ impl WorkloadStore {
         inputs: ComfyInputs,
         owner: &Owner,
         job_id: &str,
+        background: bool,
     ) -> Result<JobRecord, WorkloadError> {
         // Validate cheaply before waking a machine for a doomed request.
         validate_comfyui_request(&inputs.request)?;
@@ -1321,24 +1339,58 @@ impl WorkloadStore {
             owner,
             credential: credential.as_ref(),
         };
-        let (records, note) =
-            match ctx.capacity.executor(&provider.id) {
-                Some(executor) => {
-                    self.note_waiting(job_id, &executor);
+        let (records, note) = match ctx.capacity.executor(&provider.id) {
+            Some(executor) => {
+                self.note_waiting(job_id, &executor);
+                let mut unconfigured_until = None;
+                loop {
                     match executor
                         .run_job_noted(|_attempt| comfyui_dispatch_once(&attempt))
                         .await
                     {
-                        Ok(done) => done,
-                        Err(JobError::Queued) => return self.hold_queued(
-                            job_id,
-                            "local executor wake command is unconfigured; awaiting operator wiring",
-                        ),
+                        Ok(done) => break done,
+                        Err(JobError::Queued) if !background => {
+                            // The caller gets the job as `queued`, as
+                            // before; nothing will run it, so its record
+                            // ends `failed` with the reason.
+                            let held = self.hold_queued(job_id, WAKE_UNCONFIGURED)?;
+                            self.fail_with_class(
+                                job_id,
+                                "wake_unconfigured",
+                                &format!(
+                                    "local executor `{}` {WAKE_UNCONFIGURED}; the job was not run",
+                                    provider.id
+                                ),
+                            );
+                            return Ok(held);
+                        }
+                        Err(JobError::Queued) => {
+                            // A background job waits, `queued`, for the
+                            // lane to come up some other way, bounded by
+                            // the workflow's timeout; then it fails.
+                            let timeout = comfy_job_timeout(workflow);
+                            let until = *unconfigured_until.get_or_insert_with(|| {
+                                    if let Err(error) = self.hold_queued(job_id, WAKE_UNCONFIGURED) {
+                                        tracing::debug!(job = %job_id, %error, "queued event not recorded");
+                                    }
+                                    tokio::time::Instant::now() + timeout
+                                });
+                            let now = tokio::time::Instant::now();
+                            if now >= until {
+                                return Err(WorkloadError::Upstream(format!(
+                                        "local executor `{}` {WAKE_UNCONFIGURED}; the lane did not come up within {} s (the workflow's timeout)",
+                                        provider.id,
+                                        timeout.as_secs()
+                                    )));
+                            }
+                            tokio::time::sleep(WAKE_UNCONFIGURED_RECHECK.min(until - now)).await;
+                        }
                         Err(error) => return Err(lane_error(&provider.id, error)),
                     }
                 }
-                None => (comfyui_dispatch_once(&attempt).await?, None),
-            };
+            }
+            None => (comfyui_dispatch_once(&attempt).await?, None),
+        };
         let note = note.map(|note| format!("local lane `{}` {note}", provider.id));
         let job = self.complete_job(job_id, records, note)?;
         if job.status == JobStatus::Succeeded {
@@ -2384,6 +2436,14 @@ fn comfy_status_error(action: &str, status: reqwest::StatusCode) -> WorkloadErro
 /// sampler or a video run each take well over a minute; a job that ComfyUI
 /// itself reports as failed ends the wait at once (see [`comfy_job_failure`]).
 const COMFYUI_JOB_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Why a job on a lane without a wake command cannot start by itself.
+const WAKE_UNCONFIGURED: &str =
+    "local executor wake command is unconfigured; awaiting operator wiring";
+
+/// How often a background job on such a lane looks again whether the lane
+/// came up (powered on by hand, or by another lane on the same machine).
+const WAKE_UNCONFIGURED_RECHECK: Duration = Duration::from_secs(5);
 
 /// Pause between two looks at a ComfyUI job's history.
 const COMFYUI_POLL_INTERVAL: Duration = Duration::from_millis(500);

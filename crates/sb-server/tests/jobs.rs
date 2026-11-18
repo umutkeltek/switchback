@@ -839,3 +839,54 @@ async fn a_blocking_request_whose_client_leaves_cancels_its_job_and_frees_the_la
         json!({"prompt_id": "prompt-7"})
     );
 }
+
+#[tokio::test]
+async fn a_job_on_a_lane_without_a_wake_command_ends_failed_instead_of_queued_forever() {
+    let (comfy_url, fake) = spawn_comfy().await;
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    // No wake command, the lane down, and a one-second workflow timeout.
+    let config = managed_lane(&comfy_url, &format!("http://{closed}/system_stats"), "").replace(
+        "kind: image_generation",
+        "kind: image_generation\n        timeout_secs: 1",
+    );
+    let base = serve(build_state(&config)).await;
+
+    let accepted: Value = submit(&base, None, image_job("never runs"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = accepted["id"].as_str().unwrap().to_string();
+    let queued = wait_for_status(&base, &id, "queued").await;
+    assert!(event_names(&queued).contains(&"waiting_for_lane".to_string()));
+    let failed = wait_for_status(&base, &id, "failed").await;
+    let last = failed["events"].as_array().unwrap().last().unwrap().clone();
+    assert!(
+        last["detail"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("wake command is unconfigured"),
+        "{last}"
+    );
+
+    // The blocking endpoint still answers `queued` at once, as before; its
+    // record ends failed, with the reason, instead of queued forever.
+    let blocking: Value = reqwest::Client::new()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&json!({"model": "comfy/txt2img", "prompt": "never runs"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(blocking["job"]["status"], "queued", "{blocking}");
+    let record = job(&base, blocking["job"]["id"].as_str().unwrap()).await;
+    assert_eq!(record["status"], "failed", "{record}");
+    let last = record["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["detail"]["error_class"], "wake_unconfigured", "{last}");
+    assert!(fake.paths().is_empty(), "{:?}", fake.paths());
+}
