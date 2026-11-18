@@ -527,7 +527,11 @@ impl LocalExecutor {
         let cycles_before = {
             let mut rt = self.lock();
             self.start_request_wake_locked(&mut rt);
+            // A waking cycle already under way (a media job's, or an earlier
+            // request's that outlived its wait) counts as a wake for this
+            // request when it brings the lane up.
             rt.wake_cycles
+                .saturating_sub(u64::from(rt.wake_cycle_started_ms.is_some()))
         };
         // Counted as queued until this future ends, including when it is
         // dropped mid-wait because the client went away.
@@ -2315,6 +2319,40 @@ local_executors:
             "{wake:?}"
         );
         assert_eq!(host.sim().wake, sent, "no second waking cycle");
+    }
+
+    // A request that joins a wake already under way (here an earlier
+    // request's, which outlived that request's wait) is told the lane was
+    // woken, not that it answered a fresh probe without one.
+    #[tokio::test]
+    async fn a_request_that_joins_a_running_wake_is_told_the_lane_was_woken() {
+        let host = FakeHost::new(Sim::default());
+        let clock = ManualClock::new();
+        let lane = text_lane(&host, clock.clone(), true);
+        let first = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.wake_for_request().await }
+        });
+        settle().await;
+        clock.advance(90_000);
+        assert!(matches!(first.await.unwrap(), LaneWake::NotReady { .. }));
+        assert_eq!(lane.report().state, LaneState::Waking);
+
+        let second = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.wake_for_request().await }
+        });
+        settle().await;
+        host.sim().healthy = true; // the host finishes booting
+        clock.advance(400);
+        let wake = second.await.unwrap();
+        assert_eq!(
+            wake,
+            LaneWake::Ready {
+                detail: "woken for this request, healthy after 400 ms".to_string()
+            }
+        );
+        assert_eq!(host.sim().wake, 2, "one waking cycle, re-sent once");
     }
 
     // A request abandoned mid-wait (the client went away) is no longer
