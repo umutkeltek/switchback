@@ -108,6 +108,12 @@ fn stream_framing_error(message: String) -> AdapterError {
     AdapterError::new(class, message)
 }
 
+/// Error text of a failed upstream call. It never quotes the URL: the
+/// `query` auth scheme puts the credential there. The error kind stays.
+fn upstream_error_text(error: reqwest::Error) -> String {
+    error.without_url().to_string()
+}
+
 fn is_reasoning(event: &AiStreamEvent) -> bool {
     matches!(event, AiStreamEvent::ReasoningDelta { .. })
 }
@@ -202,7 +208,7 @@ impl ProviderAdapter for ComposedAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|e| AdapterError::network(e.to_string()))?;
+            .map_err(|e| AdapterError::network(upstream_error_text(e)))?;
         let status = response.status();
 
         if !status.is_success() {
@@ -282,7 +288,7 @@ impl ProviderAdapter for ComposedAdapter {
             let full = response
                 .bytes()
                 .await
-                .map_err(|e| AdapterError::network(e.to_string()))?;
+                .map_err(|e| AdapterError::network(upstream_error_text(e)))?;
             let value = serde_json::from_slice::<serde_json::Value>(&full)
                 .map_err(|e| AdapterError::invalid(e.to_string()))?;
             let canonical = self
@@ -345,7 +351,7 @@ impl ProviderAdapter for ComposedAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|e| AdapterError::network(e.to_string()))?;
+            .map_err(|e| AdapterError::network(upstream_error_text(e)))?;
         let status = response.status();
 
         if !status.is_success() {
@@ -360,7 +366,7 @@ impl ProviderAdapter for ComposedAdapter {
         response
             .json::<serde_json::Value>()
             .await
-            .map_err(|e| AdapterError::invalid(e.to_string()))
+            .map_err(|e| AdapterError::invalid(upstream_error_text(e)))
     }
 
     async fn list_models(
@@ -405,7 +411,7 @@ impl ProviderAdapter for ComposedAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|e| AdapterError::network(e.to_string()))?;
+            .map_err(|e| AdapterError::network(upstream_error_text(e)))?;
         let status = response.status();
         if !status.is_success() {
             let body_text = response.text().await.unwrap_or_default();
@@ -419,7 +425,7 @@ impl ProviderAdapter for ComposedAdapter {
         let value = response
             .json::<serde_json::Value>()
             .await
-            .map_err(|e| AdapterError::invalid(e.to_string()))?;
+            .map_err(|e| AdapterError::invalid(upstream_error_text(e)))?;
         self.codec
             .parse_models_response(&value)
             .map_err(AdapterError::invalid)
@@ -498,6 +504,108 @@ mod tests {
                 finish_reason: FinishReason::Stop
             }]
         ));
+    }
+
+    const FAKE_QUERY_SECRET: &str = "fake-query-secret-123";
+
+    /// A provider whose credential rides in the URL (`?key=…`, the `query`
+    /// auth scheme), with a short idle timeout.
+    fn query_credential_adapter(base_url: String) -> ComposedAdapter {
+        let cfg = sb_core::Config::from_yaml(
+            "server:\n  bind: \"127.0.0.1:0\"\n  timeouts: { connect_ms: 2000, read_ms: 300 }\n",
+        )
+        .expect("config");
+        ComposedAdapter::with_scheme(
+            Box::new(crate::OpenAiCodec),
+            AuthScheme::Query { name: "key".into() },
+            base_url,
+            CapabilityProfile::default(),
+            std::sync::Arc::new(crate::egress::EgressPool::from_config(&cfg).expect("egress")),
+            false,
+        )
+    }
+
+    /// The error of every call the adapter makes: chat (non-stream and
+    /// stream), embeddings and model listing.
+    async fn every_call_error(adapter: &ComposedAdapter) -> Vec<AdapterError> {
+        let lease = || {
+            Some(sb_core::CredentialLease::bearer(
+                "default",
+                FAKE_QUERY_SECRET,
+            ))
+        };
+        let target = sb_core::ExecutionTarget::new(
+            "q",
+            "some-model",
+            sb_core::ExecutionTargetKind::ModelApi,
+        );
+        let mut errors = Vec::new();
+        for stream in [false, true] {
+            let mut req =
+                sb_core::AiRequest::new("q/some-model", vec![sb_core::Message::user("hi")]);
+            req.stream = stream;
+            match adapter
+                .execute(PreparedRequest::new(req, target.clone(), lease()))
+                .await
+            {
+                Ok(_) => panic!("chat call (stream={stream}) did not fail"),
+                Err(error) => errors.push(error),
+            }
+        }
+        errors.push(
+            adapter
+                .embeddings(
+                    serde_json::json!({"model": "some-model", "input": "hi"}),
+                    target,
+                    lease(),
+                    None,
+                )
+                .await
+                .expect_err("embeddings call did not fail"),
+        );
+        errors.push(
+            adapter
+                .list_models(lease(), None)
+                .await
+                .expect_err("model listing did not fail"),
+        );
+        errors
+    }
+
+    // The `query` scheme puts the credential in the URL, and a reqwest
+    // error's text quotes the URL: the error must drop it, and keep the rest.
+    #[tokio::test]
+    async fn a_failed_call_never_quotes_a_url_that_carries_the_credential() {
+        // Nothing listens on port 1: connection refused.
+        let refused = query_credential_adapter("http://127.0.0.1:1/v1".to_string());
+
+        // Accepts and never answers: the idle (read) timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let hangs = query_credential_adapter(format!("http://{addr}/v1"));
+
+        for (upstream, adapter) in [("refused", &refused), ("hangs", &hangs)] {
+            let errors = every_call_error(adapter).await;
+            assert_eq!(errors.len(), 4);
+            for error in errors {
+                let shown = format!("{error} / {error:?}");
+                assert!(!shown.contains(FAKE_QUERY_SECRET), "{upstream}: {shown}");
+                assert!(!shown.contains("key="), "{upstream}: {shown}");
+                assert_eq!(error.class, ErrorClass::Network, "{upstream}: {shown}");
+                assert!(
+                    error.message.contains("error sending request"),
+                    "{upstream}: the error kind stays: {shown}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

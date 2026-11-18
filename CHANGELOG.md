@@ -195,6 +195,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 - Routing and ledger now price from a single function
   (`AdapterRegistry::cost_micros`: cost-map index → catalog fallback).
 
+### Fixed
+
+- A provider whose credential rides in the URL (`auth_scheme: { kind:
+  query }`) no longer shows the credential when a call fails before an
+  answer (connection refused, timeout). The error text of a chat call
+  (stream and non-stream), an embeddings call and a model listing quoted
+  the full URL, query included, and that text reached the client's error
+  reply and the output of `sb provider test`, `sb provider models` and
+  `sb provider doctor`. The error text now drops the URL and keeps the
+  error kind (`error sending request`).
+
 ### Security
 
 - `Secret` is no longer `Serialize`/`Deserialize` — it cannot cross a
