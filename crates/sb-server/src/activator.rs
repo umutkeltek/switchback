@@ -762,10 +762,14 @@ impl LocalExecutor {
         let cfg = self.cfg();
         let failures = self.lock().release_failures;
         if failures > cfg.retry_budget {
-            return Err(format!(
+            let message = format!(
                 "lane `{}` could not release the gpu ({failures} failed release commands); needs operator attention",
                 self.name
-            ));
+            );
+            // Stay loud: new work on the lane clears its escalation
+            // (`admit_locked`), but the GPU is still stuck with it.
+            self.escalate(message.clone());
+            return Err(message);
         }
         let Some(command) = cfg.release_command.clone() else {
             return Err(format!("lane `{}` has no release_command", self.name));
@@ -1718,6 +1722,12 @@ impl Host {
                 }
                 for lane in &lanes {
                     let mut rt = lane.lock();
+                    // The engines restart with the machine and hold no GPU
+                    // memory: release commands that failed before say
+                    // nothing about the next boot, so each gets its full
+                    // budget again (otherwise one bad moment, such as an
+                    // engine still starting, stops switches for good).
+                    rt.release_failures = 0;
                     // Work that arrived during the poweroff keeps its state;
                     // the next wake brings the machine back for it.
                     if rt.state == LaneState::PoweringOff {
@@ -4536,6 +4546,54 @@ local_executors:
             LaneAcquire::Ready { .. } => panic!("handed over"),
         }
         assert_eq!(releases(&host).len(), runs, "not run again past the budget");
+    }
+
+    // Past its budget a stuck release stays loud: a media job clears the
+    // lane's escalation, the next refused switch raises it again. A power-off
+    // restarts the engines, so the next boot gets a fresh budget and the
+    // first taker (holder unknown) runs the release again.
+    #[tokio::test]
+    async fn a_stuck_release_stays_loud_and_a_poweroff_gives_it_a_fresh_budget() {
+        let (host, clock, activator) = gpu_group_activator();
+        let gate = Arc::new(tokio::sync::Semaphore::new(2));
+        media_job(&activator, gate.clone(), Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap()
+            .expect("comfy holds the GPU");
+        host.sim().fail_release = true;
+        for _ in 1..=3 {
+            assert!(matches!(
+                acquire(&activator, "text").await.unwrap(),
+                LaneAcquire::NotReady { .. }
+            ));
+        }
+        media_job(&activator, gate, Arc::new(AtomicU64::new(0)))
+            .await
+            .unwrap()
+            .expect("the holder's work runs");
+        assert!(!activator.executor("comfy").unwrap().report().escalated);
+        assert!(matches!(
+            acquire(&activator, "text").await.unwrap(),
+            LaneAcquire::NotReady { .. }
+        ));
+        let comfy = activator.executor("comfy").unwrap().report();
+        assert!(comfy.escalated, "loud again: {comfy:?}");
+        assert_eq!(comfy.level, LaneLevel::Fail);
+
+        host.sim().fail_release = false;
+        clock.advance(5_000);
+        activator.tick_all().await;
+        assert_eq!(host.sim().poweroff, 1);
+        assert_eq!(
+            activator.executor("comfy").unwrap().report().holds_gpu,
+            Some(false),
+            "nobody is known to hold it after a power-off"
+        );
+        let (_busy, detail) = ready(acquire(&activator, "text").await.unwrap());
+        assert!(
+            detail.ends_with("took it (holder unknown, released lane `comfy`)"),
+            "{detail}"
+        );
     }
 
     // Opt-out: lanes without `exclusive_group` never touch a GPU group and

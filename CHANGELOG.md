@@ -68,8 +68,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   switch holds new holder work back, so neither side starves. The
   `RouteDecision` (or the job's decision) says what happened; a wait that runs
   out falls through or answers a retryable 503 (`Retry-After: 10`); a failed
-  release does not hand the GPU over and counts against `retry_budget`. The
-  capacity report shows `gpu_group` and `holds_gpu`. Off unless set.
+  release does not hand the GPU over and counts against `retry_budget` (reset
+  by the machine's next power-off). The capacity report shows `gpu_group` and
+  `holds_gpu`. Off unless set.
 
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates

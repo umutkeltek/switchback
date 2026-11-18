@@ -294,8 +294,10 @@ new work for the holder waits behind it, and the lane that lost the GPU gets
 the next turn. After start-up or a power-off nobody is known to hold the GPU,
 so the first lane to take it runs every other group lane's `release_command`
 once. A failed or timed-out release does not hand the GPU over and counts
-against the holder's `retry_budget`; past it the holder is escalated and
-keeps the GPU until an operator acts. The capacity report shows `gpu_group`
+against the holder's `retry_budget`; past it the holder is escalated (again
+at every refused switch) and keeps the GPU until an operator acts or the
+machine's next power-off, which restarts the engines and resets the budget.
+The capacity report shows `gpu_group`
 and `holds_gpu`. The group's lanes must share one `host`. A request that waits
 for the GPU keeps its admission, tenant and idempotency slots, like a request
 that waits for a wake: size `server.max_concurrency` for it. See the commented
