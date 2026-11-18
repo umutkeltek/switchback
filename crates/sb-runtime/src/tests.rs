@@ -2743,6 +2743,106 @@ async fn a_lane_outside_a_gpu_group_is_never_asked_for_one() {
     );
 }
 
+/// A lane view whose first wait for the GPU group blocks until `gate`
+/// opens; later waits take the group at once. Dispatch is never refused,
+/// and records how many guards were held when it was asked.
+#[derive(Default)]
+struct GatedLanes {
+    gate: tokio::sync::Notify,
+    waits: AtomicUsize,
+    tried: AtomicUsize,
+    active_when_tried: AtomicUsize,
+    active: Arc<AtomicUsize>,
+}
+
+impl crate::LaneStatus for GatedLanes {
+    fn known_down(&self, _provider_id: &str) -> Option<String> {
+        None
+    }
+
+    fn try_begin_request(&self, _provider_id: &str) -> Result<Option<crate::LaneBusy>, String> {
+        self.tried.fetch_add(1, Ordering::SeqCst);
+        self.active_when_tried
+            .store(self.active.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(Box::new(Busy(self.active.clone()))))
+    }
+
+    fn acquire_for_request<'a>(
+        &'a self,
+        _provider_id: &'a str,
+    ) -> crate::BoxFuture<'a, crate::LaneAcquire> {
+        Box::pin(async move {
+            if self.waits.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.gate.notified().await;
+            }
+            self.active.fetch_add(1, Ordering::SeqCst);
+            crate::LaneAcquire::Ready {
+                busy: Some(Box::new(Busy(self.active.clone()))),
+                detail: Some("holds gpu group `gpu0`".to_string()),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_held_gpu_group_is_let_go_when_another_target_dispatches_first() {
+    // Round robin over [lane, spare]. Request A waits for the GPU as the
+    // first choice; meanwhile request B takes the cursor's turn, so A's
+    // real plan dispatches `spare` first. A's held guard must go as soon as
+    // `spare` is dispatched, not stay held for the whole request; `lane`,
+    // reached as A's fallback, then asks for the group again.
+    let cfg = Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: lane
+    type: mock
+  - id: spare
+    type: mock
+local_executors:
+  - name: lane
+    host: gpu-box
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    route_health: true
+    exclusive_group: gpu0
+    release_command: "ssh gateway release-gpu lane"
+combos:
+  turns:
+    strategy: round_robin
+    models:
+      - "lane/echo"
+      - "spare/always-error"
+"#,
+    )
+    .unwrap();
+    let lanes = Arc::new(GatedLanes::default());
+    let engine = engine_from_config(cfg).with_lane_status(lanes.clone());
+    let (a, ()) = tokio::join!(
+        engine.execute(hello("turns", false), Instant::now()),
+        async {
+            let (_revision, b) = engine.execute(hello("turns", false), Instant::now()).await;
+            assert!(matches!(b, ExecOutcome::Collected { .. }));
+            lanes.gate.notify_one();
+        }
+    );
+    assert!(matches!(a.1, ExecOutcome::Collected { .. }));
+    assert_eq!(lanes.waits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        lanes.tried.load(Ordering::SeqCst),
+        1,
+        "the fallback asked again"
+    );
+    assert_eq!(
+        lanes.active_when_tried.load(Ordering::SeqCst),
+        0,
+        "the held guard went when `spare` was dispatched"
+    );
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn a_gpu_group_needs_a_host_and_a_release_command() {
     assert!(Engine::validate_config(&gpu_group_lane_config(true)).is_ok());

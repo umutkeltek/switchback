@@ -55,10 +55,16 @@ impl LaneGpuNote {
         self.note.apply(plan)
     }
 
-    /// The held guard, for the first dispatch to the lane it was taken for.
+    /// The held guard, for the first dispatch when it goes to the lane it
+    /// was taken for. When the plan dispatches another target first (say,
+    /// other requests moved a round-robin cursor during the wait), the
+    /// guard is let go here, so the lane's GPU group is not held for the
+    /// length of an unrelated request; the lane, reached later as a
+    /// fallback, is then used only while it still holds its group.
     pub(crate) fn take_busy(&mut self, provider_id: &str) -> Option<LaneBusy> {
+        let busy = self.busy.take();
         if self.note.provider_id == provider_id {
-            self.busy.take()
+            busy
         } else {
             None
         }
