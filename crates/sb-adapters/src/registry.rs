@@ -4,13 +4,14 @@ use std::sync::Arc;
 use sb_adapter::ProviderAdapter;
 use sb_core::{
     ApiKind, AuthScheme, Catalog, Config, CostProfile, ExecutionTarget, ExecutionTargetKind,
-    HealthState, OpenAiWire, PricingUnit, ProviderKind, ServerToolProtocol, UnitPrice, Usage,
+    HealthState, OpenAiEngine, OpenAiWire, PricingUnit, ProviderKind, ServerToolProtocol,
+    UnitPrice, Usage,
 };
 use serde::Deserialize;
 
 use crate::{
-    AnthropicCodec, ClaudeCodeNativeRelayCodec, ComposedAdapter, GeminiCodec, MockAdapter,
-    OpenAiCodec, OpenAiResponsesCodec, VertexCodec,
+    AnthropicCodec, ClaudeCodeNativeRelayCodec, ComposedAdapter, EngineChatCodec, GeminiCodec,
+    MockAdapter, OpenAiCodec, OpenAiResponsesCodec, VertexCodec,
 };
 
 struct ProviderEntry {
@@ -137,13 +138,15 @@ impl AdapterRegistry {
                         base_url,
                         auth_scheme,
                         wire,
+                        engine,
                         ..
                     } => (
                         Arc::new(ComposedAdapter::with_scheme(
                             match wire {
-                                OpenAiWire::Chat => {
+                                OpenAiWire::Chat if *engine == OpenAiEngine::Generic => {
                                     Box::new(OpenAiCodec) as Box<dyn crate::codec::WireCodec>
                                 }
+                                OpenAiWire::Chat => Box::new(EngineChatCodec::new(*engine)),
                                 OpenAiWire::Responses => {
                                     Box::new(OpenAiResponsesCodec::openai_compatible())
                                 }

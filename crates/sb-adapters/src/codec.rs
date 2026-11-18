@@ -124,6 +124,107 @@ impl WireCodec for OpenAiCodec {
     }
 }
 
+// --- OpenAI Chat Completions on a named local engine ------------------------
+
+/// OpenAI chat for an endpoint whose engine is named in config
+/// (`engine: llama_cpp | vllm | ollama`). Same wire as [`OpenAiCodec`]; the
+/// only difference is that request controls the engines spell differently
+/// are translated here, at the edge, so a caller writes one request shape.
+pub struct EngineChatCodec {
+    engine: sb_core::OpenAiEngine,
+}
+
+impl EngineChatCodec {
+    pub fn new(engine: sb_core::OpenAiEngine) -> Self {
+        Self { engine }
+    }
+}
+
+/// `reasoning_effort` values that ask for thinking. `none` asks for none; any
+/// other value is not ours to interpret and is forwarded untouched.
+const THINKING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high"];
+
+/// Translate the OpenAI `reasoning_effort` control (carried verbatim in the
+/// canonical request's OpenAI passthrough) into what the engine reads.
+///
+/// - Ollama honors `reasoning_effort` itself: unchanged.
+/// - llama.cpp and vLLM switch thinking through chat-template arguments:
+///   `none` becomes `chat_template_kwargs.enable_thinking = false` (and the
+///   top-level `none` is consumed, because vLLM only accepts low/medium/high
+///   there); a thinking effort becomes `enable_thinking = true` plus the
+///   effort as a template argument (gpt-oss style templates read it).
+/// - An absent or unknown effort adds nothing.
+/// - A caller-sent `chat_template_kwargs` key is never overwritten, and a
+///   non-object `chat_template_kwargs` is left exactly as sent.
+pub fn apply_engine_reasoning(engine: sb_core::OpenAiEngine, body: &mut Value) {
+    use sb_core::OpenAiEngine;
+    if !matches!(engine, OpenAiEngine::LlamaCpp | OpenAiEngine::Vllm) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let Some(effort) = obj
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+    else {
+        return;
+    };
+    let thinking = if effort == "none" {
+        false
+    } else if THINKING_EFFORTS.contains(&effort.as_str()) {
+        true
+    } else {
+        return;
+    };
+    let kwargs = obj
+        .entry("chat_template_kwargs")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(kwargs) = kwargs.as_object_mut() else {
+        return;
+    };
+    kwargs
+        .entry("enable_thinking")
+        .or_insert(Value::Bool(thinking));
+    if thinking {
+        kwargs
+            .entry("reasoning_effort")
+            .or_insert(Value::String(effort));
+    } else {
+        obj.remove("reasoning_effort");
+    }
+}
+
+impl WireCodec for EngineChatCodec {
+    fn id(&self) -> &'static str {
+        OpenAiCodec.id()
+    }
+    fn url(&self, base_url: &str, model: &str, stream: bool) -> String {
+        OpenAiCodec.url(base_url, model, stream)
+    }
+    fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Result<Value, String> {
+        let mut body = OpenAiCodec.request_body(req, model, stream)?;
+        apply_engine_reasoning(self.engine, &mut body);
+        Ok(body)
+    }
+    fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
+        OpenAiCodec.parse_response(body)
+    }
+    fn decoder(&self, model: &str) -> Box<dyn StreamDecoder> {
+        OpenAiCodec.decoder(model)
+    }
+    fn embeddings_url(&self, base_url: &str) -> Option<String> {
+        OpenAiCodec.embeddings_url(base_url)
+    }
+    fn models_url(&self, base_url: &str) -> Option<String> {
+        OpenAiCodec.models_url(base_url)
+    }
+    fn parse_models_response(&self, body: &Value) -> Result<Vec<String>, String> {
+        OpenAiCodec.parse_models_response(body)
+    }
+}
+
 // --- OpenAI Responses / Codex native relay ---------------------------------
 
 pub struct OpenAiResponsesCodec {
@@ -1149,5 +1250,146 @@ mod tests {
             GeminiCodec.parse_models_response(&gemini).unwrap(),
             vec!["gemini-2.0-flash", "gemini-2.5-pro"]
         );
+    }
+
+    // --- reasoning control per local engine ---------------------------------
+
+    use sb_core::OpenAiEngine;
+
+    /// One chat request as a caller writes it, with an optional
+    /// `reasoning_effort`, rendered by the codec for `engine`.
+    fn engine_body(engine: OpenAiEngine, effort: Option<&str>) -> Value {
+        let mut req = AiRequest::new("local-model", vec![sb_core::Message::user("hi")]);
+        req.response_format = Some(sb_core::ResponseFormat::JsonObject);
+        if let Some(effort) = effort {
+            req.passthrough
+                .insert("reasoning_effort".to_string(), serde_json::json!(effort));
+        }
+        EngineChatCodec::new(engine)
+            .request_body(&req, "qwen3", false)
+            .unwrap()
+    }
+
+    #[test]
+    fn llama_cpp_reasoning_none_switches_thinking_off_through_template_kwargs() {
+        let body = engine_body(OpenAiEngine::LlamaCpp, Some("none"));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "`none` is translated, not forwarded: {body}"
+        );
+        assert_eq!(body["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn llama_cpp_reasoning_effort_keeps_thinking_on_and_passes_the_effort() {
+        let body = engine_body(OpenAiEngine::LlamaCpp, Some("high"));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn llama_cpp_absent_reasoning_adds_nothing() {
+        let body = engine_body(OpenAiEngine::LlamaCpp, None);
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn vllm_reasoning_none_switches_thinking_off_through_template_kwargs() {
+        let body = engine_body(OpenAiEngine::Vllm, Some("none"));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "vLLM only accepts low/medium/high at the top level: {body}"
+        );
+    }
+
+    #[test]
+    fn vllm_reasoning_effort_keeps_thinking_on_and_passes_the_effort() {
+        let body = engine_body(OpenAiEngine::Vllm, Some("low"));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], "low");
+        assert_eq!(body["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn vllm_absent_reasoning_adds_nothing() {
+        let body = engine_body(OpenAiEngine::Vllm, None);
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn ollama_reasoning_none_is_forwarded_unchanged() {
+        let body = engine_body(OpenAiEngine::Ollama, Some("none"));
+        assert_eq!(body["reasoning_effort"], "none");
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
+    }
+
+    #[test]
+    fn ollama_reasoning_effort_is_forwarded_unchanged() {
+        let body = engine_body(OpenAiEngine::Ollama, Some("medium"));
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
+    }
+
+    #[test]
+    fn ollama_absent_reasoning_adds_nothing() {
+        let body = engine_body(OpenAiEngine::Ollama, None);
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn engine_codec_matches_generic_openai_chat_when_no_control_is_sent() {
+        let mut req = AiRequest::new("local-model", vec![sb_core::Message::user("hi")]);
+        req.passthrough
+            .insert("top_p".to_string(), serde_json::json!(0.9));
+        let generic = OpenAiCodec.request_body(&req, "qwen3", true).unwrap();
+        for engine in [
+            OpenAiEngine::Ollama,
+            OpenAiEngine::LlamaCpp,
+            OpenAiEngine::Vllm,
+        ] {
+            let codec = EngineChatCodec::new(engine);
+            assert_eq!(codec.request_body(&req, "qwen3", true).unwrap(), generic);
+            assert_eq!(
+                codec.url("http://executor-1.example:8080/v1", "qwen3", true),
+                "http://executor-1.example:8080/v1/chat/completions"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_sent_template_kwargs_are_never_overwritten() {
+        let mut req = AiRequest::new("local-model", vec![sb_core::Message::user("hi")]);
+        req.passthrough
+            .insert("reasoning_effort".to_string(), serde_json::json!("none"));
+        req.passthrough.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({"enable_thinking": true, "custom": 1}),
+        );
+        let body = EngineChatCodec::new(OpenAiEngine::LlamaCpp)
+            .request_body(&req, "qwen3", false)
+            .unwrap();
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["chat_template_kwargs"]["custom"], 1);
+
+        // A non-object value is the caller's business: left exactly as sent.
+        req.passthrough
+            .insert("chat_template_kwargs".to_string(), serde_json::json!("raw"));
+        let body = EngineChatCodec::new(OpenAiEngine::Vllm)
+            .request_body(&req, "qwen3", false)
+            .unwrap();
+        assert_eq!(body["chat_template_kwargs"], "raw");
+    }
+
+    #[test]
+    fn unknown_effort_values_are_forwarded_untouched() {
+        let body = engine_body(OpenAiEngine::LlamaCpp, Some("turbo"));
+        assert_eq!(body["reasoning_effort"], "turbo");
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
     }
 }

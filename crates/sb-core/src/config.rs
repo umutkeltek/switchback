@@ -2468,6 +2468,27 @@ pub enum OpenAiWire {
     Responses,
 }
 
+/// Which local inference engine sits behind an `openai_compatible` endpoint.
+///
+/// Not a wire format — every variant speaks OpenAI chat. It names the engine
+/// so the adapter can translate request controls the engines spell
+/// differently (today: reasoning on/off) at the edge, letting a caller send
+/// one request shape to every local engine. `generic` (the default) changes
+/// nothing, so existing configs behave exactly as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiEngine {
+    /// Any OpenAI-compatible endpoint; the request is forwarded as-is.
+    #[default]
+    Generic,
+    /// Ollama's OpenAI-compatible API (it already honors `reasoning_effort`).
+    Ollama,
+    /// The llama.cpp server (`llama-server`).
+    LlamaCpp,
+    /// The vLLM OpenAI-compatible server.
+    Vllm,
+}
+
 /// A configured provider. `type:` selects the variant; remaining fields are
 /// flattened alongside `id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2490,6 +2511,9 @@ pub enum ProviderKind {
         /// Which OpenAI dialect this endpoint speaks. See [`OpenAiWire`].
         #[serde(default)]
         wire: OpenAiWire,
+        /// Which local engine serves the endpoint. See [`OpenAiEngine`].
+        #[serde(default)]
+        engine: OpenAiEngine,
     },
     /// Anthropic Messages API (`/v1/messages`). A distinct wire format from
     /// OpenAI — `x-api-key` auth, top-level `system`, content-block streaming —
@@ -4044,6 +4068,48 @@ providers:
             }
             other => panic!("expected comfyui provider, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_compatible_engine_defaults_to_generic_and_parses_local_engines() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: plain
+    type: openai_compatible
+    base_url: "http://executor-1.example:8000/v1"
+  - id: llamacpp
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+    engine: llama_cpp
+  - id: vllm
+    type: openai_compatible
+    base_url: "http://executor-1.example:8001/v1"
+    engine: vllm
+  - id: ollama
+    type: openai_compatible
+    base_url: "http://executor-1.example:11434/v1"
+    engine: ollama
+"#,
+        )
+        .expect("parse");
+        let engines: Vec<OpenAiEngine> = cfg
+            .providers
+            .iter()
+            .map(|provider| match &provider.kind {
+                ProviderKind::OpenaiCompatible { engine, .. } => *engine,
+                other => panic!("expected openai_compatible, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            engines,
+            vec![
+                OpenAiEngine::Generic,
+                OpenAiEngine::LlamaCpp,
+                OpenAiEngine::Vllm,
+                OpenAiEngine::Ollama
+            ]
+        );
     }
 
     #[test]

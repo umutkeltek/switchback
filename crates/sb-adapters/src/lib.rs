@@ -17,8 +17,8 @@ pub mod sigv4;
 pub mod transport;
 
 pub use codec::{
-    AnthropicCodec, BedrockCodec, ClaudeCodeNativeRelayCodec, GeminiCodec, OpenAiCodec,
-    OpenAiResponsesCodec, StreamDecoder, VertexCodec, WireCodec,
+    AnthropicCodec, BedrockCodec, ClaudeCodeNativeRelayCodec, EngineChatCodec, GeminiCodec,
+    OpenAiCodec, OpenAiResponsesCodec, StreamDecoder, VertexCodec, WireCodec,
 };
 pub use composed::ComposedAdapter;
 pub use egress::EgressPool;
