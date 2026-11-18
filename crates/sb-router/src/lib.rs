@@ -2714,19 +2714,61 @@ mod tests {
 
     #[test]
     fn pinned_order_still_drops_a_target_with_no_usable_account_to_last_resort() {
-        let request = AiRequest::new("x", vec![Message::user("hi")]);
+        // The usable targets keep their declared order (slow before fast,
+        // which latency ranking would swap); only the target with no usable
+        // account drops to last resort.
+        let mut request = AiRequest::new("x", vec![Message::user("hi")]);
+        request.stream = true;
+        let locked = with_pool("llamacpp", "m", 0);
+        let mut slow = with_pool("ollama", "m", 1);
+        slow.latency_ewma_ms = Some(900.0);
+        slow.ttft_ewma_ms = Some(900.0);
+        let mut fast = with_pool("vllm", "m", 1);
+        fast.latency_ewma_ms = Some(100.0);
+        fast.ttft_ewma_ms = Some(100.0);
+        let candidates = [locked, slow, fast];
+        let policy = RoutingPolicy {
+            latency_aware: true,
+            ..RoutingPolicy::default()
+        };
+
+        // Without the pin, latency ranking puts the fast target first.
+        let adaptive = plan_route(
+            &request,
+            "local",
+            &RouteRequire::default(),
+            &candidates,
+            &policy,
+        );
+        assert_eq!(adaptive.decision.selected.unwrap().target_id, "vllm/m");
+
         let plan = plan_route(
             &request,
             "local",
             &RouteRequire::default(),
-            &[with_pool("llamacpp", "m", 0), with_pool("ollama", "m", 1)],
+            &candidates,
             &RoutingPolicy {
                 pin_order: true,
-                ..RoutingPolicy::default()
+                ..policy
             },
         );
+        assert_eq!(plan.decision.strategy, "pinned_order");
         assert_eq!(plan.decision.selected.unwrap().target_id, "ollama/m");
-        assert_eq!(plan.decision.fallbacks[0].target_id, "llamacpp/m");
+        let fallbacks: Vec<&str> = plan
+            .decision
+            .fallbacks
+            .iter()
+            .map(|t| t.target_id.as_str())
+            .collect();
+        assert_eq!(fallbacks, vec!["vllm/m", "llamacpp/m"]);
+        assert!(
+            plan.decision
+                .reason
+                .iter()
+                .any(|r| r == "demoted 1 target(s) with no healthy accounts"),
+            "{:?}",
+            plan.decision.reason
+        );
     }
 
     #[test]
