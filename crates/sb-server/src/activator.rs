@@ -2327,7 +2327,14 @@ impl Host {
     /// otherwise the lane that carries the wake command wakes it as for a
     /// job, and its idle countdown starts once it is up.
     async fn wake_for_hold(&self) -> (HoldState, String) {
-        for lane in self.lanes() {
+        // A machine whose power-off command runs still answers while it
+        // goes away: that answer is no reason to skip the wake. The wake
+        // below waits for the power-off and wakes it again.
+        let powering_off = self
+            .lanes()
+            .iter()
+            .any(|lane| lane.lock().state == LaneState::PoweringOff);
+        for lane in self.lanes().into_iter().filter(|_| !powering_off) {
             if lane.probe_answer().await != ProbeAnswer::Down {
                 return (
                     HoldState::Active,
@@ -4534,6 +4541,63 @@ local_executors:
         assert_eq!(host.sim().poweroff, 1);
         assert_eq!(host.sim().wake, 2, "woken again after the poweroff");
         assert_eq!(lane.report().state, LaneState::IdleCountdown);
+    }
+
+    // A hold that asks for a wake while the power-off command still runs:
+    // the machine still answers, but it is going away. The hold's wake
+    // waits for the power-off and wakes the machine again, instead of
+    // reading the answer as "already on" and leaving the hold on a machine
+    // that is off.
+    #[tokio::test]
+    async fn a_hold_that_wakes_during_a_poweroff_wakes_the_machine_again() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let cfg = (*text_lane(&host, clock.clone(), true).cfg()).clone();
+        let lane = LocalExecutor::new(
+            cfg,
+            clock.clone(),
+            Arc::new(SlowPoweroff {
+                host: host.clone(),
+                gate: gate.clone(),
+            }),
+            Arc::new(host.clone()),
+            true,
+        );
+        let activator = Arc::new(activator_of(&lane));
+        assert!(matches!(
+            lane.wake_for_request().await,
+            LaneWake::Ready { .. }
+        ));
+        clock.advance(5_000); // idle timeout passes
+        let ticking = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.tick().await }
+        });
+        settle().await;
+        assert_eq!(lane.report().state, LaneState::PoweringOff);
+        let held = hold(&activator, "lane", 3_600_000, true);
+        settle().await;
+        gate.add_permits(1); // the power-off command returns; the host is off
+        ticking.await.unwrap();
+        for _ in 0..20 {
+            settle().await;
+        }
+        assert_eq!(host.sim().poweroff, 1);
+        assert_eq!(host.sim().wake, 2, "the hold woke the machine again");
+        let now = activator
+            .holds()
+            .get("lane", &held.id, clock.now_ms())
+            .unwrap();
+        assert_eq!(now.state, HoldState::Active, "{now:?}");
+        assert!(
+            now.wake_detail.as_deref().unwrap().starts_with("woken"),
+            "{now:?}"
+        );
     }
 
     // Media jobs and requests share one in-flight count.
