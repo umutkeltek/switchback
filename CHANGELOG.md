@@ -9,6 +9,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Local engine lanes for text** (`engine:`, `pin_order`, `route_health`): one
+  request shape for every local engine, and routing that understands an engine
+  that is switched off on purpose. All three are off unless set.
+  - `engine: generic | ollama | llama_cpp | vllm` on an `openai_compatible`
+    provider. For `llama_cpp` and `vllm`, a Chat Completions `reasoning_effort`
+    becomes `chat_template_kwargs` (`none` turns thinking off with
+    `enable_thinking: false`); a `chat_template_kwargs` key the caller sent always
+    wins. `generic` (the default) and `ollama` forward the request unchanged.
+  - `pin_order: true` on a route keeps the declared target order. Outcome
+    demotion and cost/latency ordering are off for that route, and the
+    `RouteDecision` reports `strategy: pinned_order` with the reason.
+  - `route_health: true` on a `local_executors` lane. The lane is health-probed in
+    the background, and its targets are skipped before dispatch while it is known
+    down, with a reason in the `RouteDecision` and no failure counted. A lane that
+    is the only target able to serve is kept.
+
 - **Lane doctor capability coverage** (`sb lane doctor` + `sb provider doctor`):
   the doctor surface now honors `RouteRequire`. `sb lane doctor` enumerates
   every route and combo in the config (was previously hardcoded to 5 stable
