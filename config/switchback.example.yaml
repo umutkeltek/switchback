@@ -277,7 +277,10 @@ providers:
     # (which honors it) and becomes `chat_template_kwargs.enable_thinking:
     # false` for llama.cpp / vLLM (llama.cpp ignores the top-level field and
     # older vLLM releases reject `none`). A caller-sent
-    # `chat_template_kwargs` key always wins.
+    # `chat_template_kwargs` key always wins. Only Chat Completions
+    # `reasoning_effort` is translated: a /v1/responses `reasoning` object and
+    # an Anthropic `thinking` field are not translated yet, and `engine:` has
+    # no effect with `wire: responses`.
     engine: ollama
     # no auth for local Ollama
     #
@@ -437,9 +440,13 @@ routes:
   #     - "ollama/qwen3"
 
 # Managed local lanes. An entry whose `name` equals a provider id makes that
-# provider a managed lane. For a lane whose provider can serve text (not a
-# media-only `comfyui` / `fal` provider) Switchback probes `health_endpoint`
-# every 10s, and while the last probe failed, the lane's targets are rejected
+# provider a managed lane. Routing reads a lane's health only with
+# `route_health: true`. It is off by default: the lane then gets no routing
+# probe and routing treats it as any other provider (a host whose network card
+# wakes on ordinary traffic is not kept awake by a probe every 10s). For an
+# opted-in lane whose provider can serve text (not a media-only `comfyui` /
+# `fal` provider) Switchback probes `health_endpoint` every 10s, and while the
+# last probe failed, the lane's text and embeddings targets are rejected
 # BEFORE dispatch ("local lane `llamacpp` is down ...; skipped before
 # dispatch, not counted as a failure"), so an engine stopped on purpose is not
 # demoted once a probe has seen it down (requests in the seconds between the
@@ -449,13 +456,14 @@ routes:
 # within about a second; the first request after a quiet spell can still see
 # the older result. If skipping would leave no candidate that can serve the
 # request, none is skipped (a stale probe never becomes an outage). The probe
-# result shows as `observed_healthy` at GET /v1/workloads/capacity. The
-# wake/poweroff/restart commands (optional) are used by media jobs today, not
-# by text requests.
+# result of an opted-in lane shows as `observed_healthy` at
+# GET /v1/workloads/capacity. The wake/poweroff/restart commands (optional)
+# are used by media jobs today, not by text requests.
 # local_executors:
 #   - name: llamacpp
 #     base_url: "http://executor-1.example:8080"
 #     health_endpoint: "http://executor-1.example:8080/health"
+#     route_health: true   # default false: no routing probe, routing unchanged
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

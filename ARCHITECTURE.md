@@ -124,7 +124,9 @@ execute loop — only `mock` is bespoke. An `openai_compatible` provider can nam
 its local engine (`engine: ollama | llama_cpp | vllm`); the adapter's
 `EngineChatCodec` then translates controls the engines spell differently (today
 `reasoning_effort` → llama.cpp/vLLM `chat_template_kwargs.enable_thinking`) at
-the edge, so the canonical request stays engine-neutral.
+the edge, so the canonical request stays engine-neutral. `engine:` has no
+effect on a provider with `wire: responses`, and a `/v1/responses` `reasoning`
+object or an Anthropic `thinking` field is not translated yet.
 
 ### Routing
 Every request emits a `RouteDecision` (selected target, ordered fallbacks,
@@ -147,8 +149,11 @@ route and no strategy reorders it (strategy `pinned_order`; the decision cites
 any ignored demotion as `outcome/pinned target=…`). Use it for routes over
 local engines, where a lane stopped on purpose must not lose its place. A
 provider that is also a managed local lane (`local_executors` entry with the
-same name, provider not media-only) is health-probed by the capacity
-activator every 10s; while its last probe failed, its targets are rejected
+same name, provider not media-only) can let routing read its health with
+`route_health: true` on the lane. It is off by default: without it the lane
+gets no routing probe and routing treats it as any other provider. An
+opted-in lane is health-probed by the capacity activator every 10s; while its
+last probe failed, its targets (text and embeddings) are rejected
 before dispatch with an explicit reason and nothing is counted against them
 (no scorecard sample, no account lock). A rejection also starts a background
 re-probe (single-flight, at most once a second), so the evidence refreshes

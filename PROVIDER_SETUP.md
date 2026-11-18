@@ -217,12 +217,12 @@ keeps thinking, and a JSON-mode request can come back with empty content.
 
 Only the Chat Completions field `reasoning_effort` is translated, on
 `/v1/chat/completions` (streaming and not). A `/v1/responses` request's
-`reasoning` object is forwarded as sent, not translated, and the `thinking`
-field of an Anthropic `/v1/messages` request is not sent to OpenAI-shaped
-upstreams at all, so neither of those fields switches thinking off on
-llama.cpp or vLLM today. A caller that needs it there sends
+`reasoning` object and the `thinking` field of an Anthropic `/v1/messages`
+request are not translated yet, so neither of those fields switches thinking
+off on llama.cpp or vLLM today. A caller that needs it there sends
 `chat_template_kwargs` itself (Chat Completions, or `/v1/responses`, whose
-unmodeled fields are forwarded as sent).
+unmodeled fields are forwarded as sent). `engine:` has no effect on a provider
+with `wire: responses`: nothing is translated on that wire.
 
 When two engines serve the same model on one route, set `pin_order: true` on
 the route so the declared order wins even after one engine was stopped for a
