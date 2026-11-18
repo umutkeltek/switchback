@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use sb_core::{Config, LocalExecutorConfig};
+use sb_core::{Config, LocalExecutorConfig, ProviderKind};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -298,6 +298,10 @@ pub struct LocalExecutor {
     /// once (single-flight): the first waker holds this across the whole boot
     /// poll; the rest wait, then find the lane already healthy.
     wake_lock: tokio::sync::Mutex<()>,
+    /// The lane's provider can be a routed (text) target, so the supervisor
+    /// probes it for routing. A media-only lane (ComfyUI, fal) is never a
+    /// routed target and keeps its old behaviour: no periodic probe.
+    routed: bool,
 }
 
 impl LocalExecutor {
@@ -306,6 +310,7 @@ impl LocalExecutor {
         clock: Arc<dyn Clock>,
         runner: Arc<dyn CommandRunner>,
         probe: Arc<dyn HealthProbe>,
+        routed: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             cfg,
@@ -314,6 +319,7 @@ impl LocalExecutor {
             probe,
             runtime: Mutex::new(LaneRuntime::new()),
             wake_lock: tokio::sync::Mutex::new(()),
+            routed,
         })
     }
 
@@ -857,11 +863,22 @@ impl CapacityActivator {
     ) -> Arc<Self> {
         let mut executors = BTreeMap::new();
         for executor_cfg in &cfg.local_executors {
+            let routed = cfg
+                .providers
+                .iter()
+                .find(|provider| provider.id == executor_cfg.name)
+                .is_some_and(|provider| {
+                    !matches!(
+                        provider.kind,
+                        ProviderKind::ComfyUi { .. } | ProviderKind::Fal { .. }
+                    )
+                });
             let executor = LocalExecutor::new(
                 executor_cfg.clone(),
                 clock.clone(),
                 runner.clone(),
                 probe.clone(),
+                routed,
             );
             executors.insert(executor_cfg.name.clone(), executor);
         }
@@ -886,17 +903,20 @@ impl CapacityActivator {
             .collect()
     }
 
-    /// Probe every lane once and record what was seen (see
-    /// [`LocalExecutor::observe`]).
+    /// Probe every routed lane once and record what was seen (see
+    /// [`LocalExecutor::observe`]). Media-only lanes are not probed.
     pub async fn observe_all(&self) {
         for executor in self.executors.values() {
-            executor.observe().await;
+            if executor.routed {
+                executor.observe().await;
+            }
         }
     }
 
-    /// Spawn a background supervisor that periodically probes each lane (so
-    /// text routing knows which lanes are down) and ticks it (so idle
-    /// machines power off autonomously). No-op when there are no managed lanes.
+    /// Spawn a background supervisor that periodically probes each routed
+    /// lane (so text routing knows which lanes are down) and ticks every lane
+    /// (so idle machines power off autonomously). No-op when there are no
+    /// managed lanes.
     pub fn spawn_supervisor(self: &Arc<Self>, interval: Duration) {
         if self.executors.is_empty() {
             return;
@@ -906,7 +926,9 @@ impl CapacityActivator {
             loop {
                 tokio::time::sleep(interval).await;
                 for executor in activator.executors.values() {
-                    executor.observe().await;
+                    if executor.routed {
+                        executor.observe().await;
+                    }
                     executor.tick().await;
                 }
             }
@@ -1082,7 +1104,7 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
         let clock: Arc<dyn Clock> = clock;
-        LocalExecutor::new(cfg, clock, runner, probe)
+        LocalExecutor::new(cfg, clock, runner, probe, true)
     }
 
     // --- Tests -------------------------------------------------------------
@@ -1211,7 +1233,7 @@ mod tests {
             retry_budget: 2,
             health_poll_interval_ms: 400,
         };
-        let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe);
+        let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = CapacityActivator {
             executors: BTreeMap::from([("lane".to_string(), executor.clone())]),
         };
@@ -1231,6 +1253,65 @@ mod tests {
             "the older probe's `down` arrived last but is not recorded"
         );
         assert_eq!(executor.report().observed_healthy, Some(true));
+    }
+
+    /// Records every endpoint it is asked to probe.
+    #[derive(Default)]
+    struct RecordingProbe {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl HealthProbe for RecordingProbe {
+        async fn healthy(&self, endpoint: &str) -> bool {
+            self.seen.lock().unwrap().push(endpoint.to_string());
+            false
+        }
+    }
+
+    // No change without config: a media-only lane (powered off on purpose
+    // between jobs) gets no periodic routing probe; only a lane whose
+    // provider can be a routed target is probed.
+    #[tokio::test]
+    async fn the_supervisor_probes_only_lanes_that_routing_reads() {
+        let cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: comfy-local
+    type: comfyui
+    base_url: "http://executor-1.example:8188"
+  - id: lane
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+local_executors:
+  - name: comfy-local
+    base_url: "http://executor-1.example:8188"
+    health_endpoint: "http://executor-1.example:8188/system_stats"
+  - name: lane
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+"#,
+        )
+        .unwrap();
+        let probe = Arc::new(RecordingProbe::default());
+        let host = FakeHost::new(Sim::default());
+        let activator =
+            CapacityActivator::with_seams(&cfg, FakeClock::new(), Arc::new(host), probe.clone());
+        activator.spawn_supervisor(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let seen = probe.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|endpoint| endpoint == "http://executor-1.example:8080/health"),
+            "{seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|endpoint| endpoint.ends_with("/system_stats")),
+            "a media-only lane is never probed by the supervisor: {seen:?}"
+        );
     }
 
     // (a) queue-while-offline -> wake -> healthy -> drain
