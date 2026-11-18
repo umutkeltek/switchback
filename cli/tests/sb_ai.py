@@ -483,6 +483,17 @@ class SbAi(unittest.TestCase):
         self.assertIn("SWITCHBACK_AI_URL", run.stderr)
         self.assertEqual(self.fake.seen, [])
 
+    def test_runs_through_a_symlink_in_another_folder(self):
+        # The installed `sb` is a symlink to cli/sb, run from PATH.
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "sb").symlink_to(SB)
+        env = dict(self.env, PATH=f"{bin_dir}:{self.env['PATH']}")
+        run = subprocess.run(["sb", "ai", "status"], env=env, cwd=self.root / "home",
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("box: off", run.stdout)
+
     def test_help_and_bad_usage(self):
         run = self.sb("help")
         self.assertEqual(run.returncode, 0)
