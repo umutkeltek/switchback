@@ -82,7 +82,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   `wake_retry_interval_secs`. Busy is not an error (level `ok`). A guard that
   times out or cannot run never counts as free; after `retry_budget` such
   runs in a row the lane reports level `warn` with `poweroff_guard_failures`
-  and says the guard is broken, and new work does not clear it. Needs a
+  and says the guard is broken, and new work does not clear it; a reload
+  that changes or removes the guard drops its old answers. Exit 126 and 127
+  are the shell's own "could not run" and never an answer. Needs a
   `poweroff_command`; with `host`, set once per host or identical. Off unless
   set.
 - **ComfyUI behind a token proxy** (`api_key_env`, `api_key`, `auth_scheme`

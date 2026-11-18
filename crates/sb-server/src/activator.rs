@@ -1953,9 +1953,12 @@ struct HostPower {
 /// What the machine's power-off guard (`poweroff_guard_command`) said
 /// lately. Only the guard's own runs change it, never new work or a new
 /// idle period, so a guard that stays busy or broken for a month stays
-/// visible in the report.
+/// visible in the report. It belongs to one command: a reload that
+/// changes or removes the guard starts it afresh (see [`Host::guard`]).
 #[derive(Debug, Default)]
 struct GuardState {
+    /// The guard command these answers came from.
+    command: Option<String>,
     /// Busy answers in a row, and when the first of them came (clock ms).
     busy: u32,
     busy_since_ms: Option<u64>,
@@ -2156,20 +2159,34 @@ impl Host {
         })
     }
 
-    fn guard(&self) -> std::sync::MutexGuard<'_, GuardState> {
-        self.guard
+    /// The state of the guard `command` (`None`: the machine has no guard
+    /// now). Answers of another command, or of a guard a reload removed,
+    /// are dropped: after an operator fixes a broken guard and reloads, the
+    /// report no longer says it is broken, and the fixed guard is asked at
+    /// the next idle tick instead of after the old one's back-off.
+    fn guard(&self, command: Option<&str>) -> std::sync::MutexGuard<'_, GuardState> {
+        let mut guard = self
+            .guard
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.command.as_deref() != command {
+            *guard = GuardState {
+                command: command.map(str::to_string),
+                ..GuardState::default()
+            };
+        }
+        guard
     }
 
     /// What the guard said, for a lane's report; empty when the machine
     /// has no guard (any more).
     fn guard_view(&self, now: u64) -> GuardView {
-        let Some((carrier, _)) = self.poweroff_guard_command() else {
+        let Some((carrier, command)) = self.poweroff_guard_command() else {
+            drop(self.guard(None));
             return GuardView::default();
         };
         let threshold = carrier.cfg().retry_budget.max(1);
-        let guard = self.guard();
+        let guard = self.guard(Some(&command));
         GuardView {
             busy: guard.busy,
             busy_since_ms: guard.busy_since_ms,
@@ -2193,13 +2210,16 @@ impl Host {
         let cfg = carrier.cfg();
         let gap_ms = cfg.wake_retry_interval_secs.saturating_mul(1000);
         let threshold = cfg.retry_budget.max(1);
-        let mut guard = self.guard();
+        let mut guard = self.guard(Some(command));
         match answer {
             Ok(0) => {
                 if guard.busy > 0 || guard.failures > 0 {
                     tracing::info!(host = %self.id, "power-off guard reports the machine free");
                 }
-                *guard = GuardState::default();
+                *guard = GuardState {
+                    command: guard.command.take(),
+                    ..GuardState::default()
+                };
                 true
             }
             Ok(code) => {
@@ -2330,7 +2350,12 @@ impl Host {
             }
         }
         let guard = self.poweroff_guard_command();
-        if guard.is_some() && self.guard().ask_at_ms.is_some_and(|at| clock.now_ms() < at) {
+        let command = guard.as_ref().map(|(_, command)| command.as_str());
+        if self
+            .guard(command)
+            .ask_at_ms
+            .is_some_and(|at| clock.now_ms() < at)
+        {
             return;
         }
 
@@ -6272,6 +6297,69 @@ local_executors:
         assert_eq!(
             (report.level, report.poweroff_guard_failures),
             (LaneLevel::Ok, 0)
+        );
+    }
+
+    // The guard's answers belong to its command. An operator who fixes a
+    // broken guard and reloads sees the lane `ok` at once, and the fixed
+    // guard is asked at the next idle tick, not after the old one's
+    // back-off. A guard that a reload removed and a later one re-adds
+    // starts afresh too.
+    #[tokio::test]
+    async fn a_reload_that_changes_the_guard_starts_its_answers_afresh() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            poweroff_makes_unhealthy: true,
+            guard: GuardAnswer::Broken,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let executor = guarded(&host, clock.clone());
+        let reload = |guard: Option<String>| {
+            let mut cfg = (*executor.cfg()).clone();
+            cfg.poweroff_guard_command = guard;
+            executor.update_config(cfg, executor.is_routed());
+        };
+        drop(executor.ensure_ready().await.expect("capacity"));
+        clock.advance(5_000);
+        executor.tick().await;
+        clock.advance(30_000);
+        executor.tick().await;
+        assert_eq!(executor.report().level, LaneLevel::Warn);
+
+        reload(None);
+        assert_eq!(executor.report().poweroff_guard_failures, 0);
+        reload(Some(GUARD.to_string()));
+        let report = executor.report();
+        assert_eq!(
+            (report.level, report.poweroff_guard_failures),
+            (LaneLevel::Ok, 0),
+            "re-added: {}",
+            report.detail
+        );
+        clock.advance(1_000);
+        executor.tick().await;
+        clock.advance(30_000);
+        executor.tick().await;
+        assert_eq!(executor.report().level, LaneLevel::Warn, "still broken");
+        assert_eq!(guard_runs_and_poweroffs(&host), (4, 0));
+
+        reload(Some(format!("{GUARD} --fixed")));
+        host.sim().guard = GuardAnswer::Free;
+        let report = executor.report();
+        assert_eq!(
+            (report.level, report.poweroff_guard_failures),
+            (LaneLevel::Ok, 0),
+            "fixed: {}",
+            report.detail
+        );
+        assert!(!report.detail.contains("broken"), "{}", report.detail);
+        clock.advance(1_000);
+        executor.tick().await;
+        assert_eq!(
+            guard_runs_and_poweroffs(&host),
+            (5, 1),
+            "the fixed guard is asked at once"
         );
     }
 

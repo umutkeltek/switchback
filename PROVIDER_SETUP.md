@@ -378,7 +378,11 @@ or cannot run (the shell's exit 126 or 127) never counts as free: there is no
 power-off, and after `retry_budget` such runs in a row the lane reports level
 `warn` and says the guard is broken (`poweroff_guard_failures`), until the
 guard answers again; new work does not clear it, so a machine that stays on
-for a month because of a broken guard stays visible. The guard needs a
+for a month because of a broken guard stays visible. A reload that changes or
+removes the guard drops its old answers, so a fixed guard shows `ok` at once
+and is asked at the next idle tick. Answer busy with any exit code but 126
+and 127: the shell uses those for a command it could not run, so they count
+as no answer. The guard needs a
 `poweroff_command` on its lane or on another lane of its host; set it once per
 host, or identically, like the power commands. For example, with
 `poweroff_guard_command: "ssh executor-1 /usr/local/bin/gpu-idle-check"`, a
