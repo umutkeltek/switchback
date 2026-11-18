@@ -266,36 +266,60 @@ pub(crate) fn redact_text(text: &str, secrets: &[String], commands: &[String]) -
             out = out.replace(command.as_str(), "<command>");
         }
     }
+    // URLs before secrets: a `<redacted>` inside a URL's userinfo would end
+    // the URL early and leave the userinfo in place.
+    let mut out = out
+        .split(' ')
+        .map(strip_url_credentials)
+        .collect::<Vec<_>>()
+        .join(" ");
     for secret in secrets {
         if secret.len() >= 6 {
             out = out.replace(secret.as_str(), "<redacted>");
         }
     }
-    let out = out
-        .split(' ')
-        .map(|word| {
-            match reqwest::Url::parse(
-                word.trim_matches(|c| matches!(c, '`' | '(' | ')' | ',' | ';')),
-            ) {
-                Ok(mut url) if url.has_host() => {
-                    let had_secret = !url.username().is_empty()
-                        || url.password().is_some()
-                        || url.query().is_some();
-                    if !had_secret {
-                        return word.to_string();
-                    }
-                    let _ = url.set_username("");
-                    let _ = url.set_password(None);
-                    url.set_query(None);
-                    url.to_string()
-                }
-                _ => word.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
     let mut redactions = 0;
     crate::setup_cli::sanitize_inline_secret_text(&out, &mut redactions)
+}
+
+/// `word` with the userinfo and the query (and fragment) taken out of
+/// every `scheme://` URL in it, wherever the URL sits in the word: after
+/// `url=`, in quotes, in brackets. The text around each URL is kept.
+fn strip_url_credentials(word: &str) -> String {
+    const ENDS: &[char] = &['"', '\'', '`', '<', '>', '(', ')', '[', ']', '{', '}', ','];
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(at) = rest.find("://") {
+        let scheme_start = rest[..at]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        let after = at + 3;
+        let mut end = rest[after..]
+            .find(ENDS)
+            .map(|i| after + i)
+            .unwrap_or(rest.len());
+        while end > after && rest[..end].ends_with(['.', ':', ';']) {
+            end -= 1;
+        }
+        out.push_str(&rest[..scheme_start]);
+        let scheme = &rest[scheme_start..after];
+        let tail = &rest[after..end];
+        let authority_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+        let (authority, path) = tail.split_at(authority_end);
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        out.push_str(scheme);
+        out.push_str(host);
+        out.push_str(path);
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The kind of problem a lane report shows, and whether it alerts at once
@@ -748,6 +772,41 @@ providers:
             "the value of the env var an account names"
         );
         assert!(!out.contains("http://upstream.example/v1"));
+    }
+
+    // A credentialed URL loses its userinfo and query wherever it sits in
+    // a word, and the text around it stays.
+    #[test]
+    fn url_credentials_are_removed_in_any_position() {
+        let userinfo = ["user", "pw4u"].join(":");
+        for (text, want) in [
+            (
+                format!("url=http://{userinfo}@engine.example/health"),
+                "url=http://engine.example/health",
+            ),
+            (
+                format!("\"https://{userinfo}@engine.example:8188/view?key=abc123\""),
+                "\"https://engine.example:8188/view\"",
+            ),
+            (
+                format!("<http://{userinfo}@engine.example/health>"),
+                "<http://engine.example/health>",
+            ),
+            (
+                format!("[http://{userinfo}@engine.example]"),
+                "[http://engine.example]",
+            ),
+            (
+                "(http://engine.example/health?token=abc123).".to_string(),
+                "(http://engine.example/health).",
+            ),
+            (
+                "see http://engine.example/health now".to_string(),
+                "see http://engine.example/health now",
+            ),
+        ] {
+            assert_eq!(redact_text(&text, &[], &[]), want, "{text}");
+        }
     }
 
     #[test]
