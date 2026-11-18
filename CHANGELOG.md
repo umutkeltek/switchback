@@ -9,6 +9,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Public model ids for workflows** (`model_id`, `aliases` on a ComfyUI
+  workflow): callers see and send a name by job (`image/flux`, `video/i2v`)
+  instead of `<provider>/<workflow>`, in requests, `GET /v1/workflows`, job
+  and artifact records and usage. Aliases (an old id, while callers move)
+  resolve on every request path, are never listed, and are recorded under the
+  public id with the sent name kept as `requested_model`. Load refuses a
+  name used twice (across workflows, routes, combos) naming both owners.
+  Without the keys nothing changes. See "Renaming a lane or model without
+  breaking callers" in `PROVIDER_SETUP.md`.
 - **`sb ai`**: images, video, machine status, models and holds through a
   Switchback gateway (`sb ai image|video|status|models|hold|release`). Config
   from `SWITCHBACK_AI_URL` / `SWITCHBACK_AI_KEY` or

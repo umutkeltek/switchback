@@ -627,6 +627,16 @@ routes:
 #           frames: { path: ["13", "inputs", "length"], round_up: { step: 8, offset: 1 } }
 #           fps:    { path: ["14", "inputs", "fps"] }
 #         output_node_ids: ["20"]
+#
+# Public model ids. Callers see a workflow as `<provider id>/<workflow id>`
+# (`comfy/img2vid` above) unless it sets `model_id`, a name by job that
+# replaces that id in requests, GET /v1/workflows, job and artifact records
+# and usage. `aliases` are other names that still resolve (never listed); a
+# request through one is recorded under `model_id` and keeps the name it
+# sent (`requested_model`). Every model_id and alias is unique across all
+# workflows and differs from route and combo names (checked at load).
+#         model_id: video/i2v
+#         aliases: [comfy/img2vid]   # the old automatic id, while callers move
 
 # Optional typed catalog (§13.3 seams). Distinct provider/model/account/
 # credential/price entities, each with a tenant scope (always 1 today) and

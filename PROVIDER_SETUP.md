@@ -634,6 +634,64 @@ workflow bounds one job, ComfyUI queue included (default 900); give a
 video workflow more. A commented `img2vid` workflow is in
 `config/switchback.example.yaml`.
 
+**Public model ids.** A workflow's id for callers is `<provider id>/<workflow
+id>` by default, so the provider's name shows in every caller's model name.
+Two optional keys on a workflow give it a name by job instead:
+
+```yaml
+providers:
+  - id: media
+    type: comfyui
+    base_url: "http://executor-1.example:8188"
+    workflows:
+      - id: flux
+        kind: image_generation
+        model_id: image/flux        # the id callers see and send
+        aliases: [media/flux]       # other ids that still resolve
+        graph: {...}
+      - id: i2v
+        kind: video_generation
+        model_id: video/i2v
+        graph: {...}
+```
+
+- `model_id`: the public id. It replaces `<provider>/<workflow>` everywhere a
+  caller sees or sends a workflow id: `model` on `/v1/images/generations`,
+  `workflow` or `model` on `POST /v1/jobs`, `GET /v1/workflows`, the job's
+  `target` and route decision, the artifact's `provenance.model`, and the
+  usage record's `model`. Once it is set, the automatic id no longer resolves
+  unless it is listed in `aliases`. Any non-empty name without whitespace or
+  an empty path part; slashes are allowed.
+- `aliases`: other ids for the same workflow, accepted on every request path
+  but never listed in `GET /v1/workflows` or `/v1/models`. A request through
+  an alias runs and is recorded under the public id; the job keeps the name
+  sent as `requested_model` (also in its route decision reasons and
+  `accepted` event), and so does its usage record, so you can see when
+  nobody sends an old name any more.
+
+Config load refuses a name used twice: every `model_id` and alias must be
+unique across all providers' workflows and differ from the automatic id of
+any workflow without `model_id`, from every route `name` and `match.model`,
+every combo, the built-in profiles (`auto`, `auto/...`), the mock image
+(`mock-image`, `mock/image`) and any `<fal provider>/...` name. The error
+names both owners. An alias equal to the workflow's own public id is refused
+too. Credential accounts of a ComfyUI provider are still matched by the
+provider's own `<provider>/<workflow>` name, whatever public id it has.
+
+**Renaming a lane or model without breaking callers.** Text routes target
+`<provider>/<model>`, and a `local_executors` lane is named after its
+provider, so renaming a text lane is config alone: change the provider `id`,
+the lane `name` and every route target together, and callers that send the
+route's name (`match.model`) see no change. A workflow's id carries its
+provider's name, so rename a media provider like this:
+
+1. Rename the provider and its lane (`id: media`, `name: media`).
+2. On each workflow set `model_id` to the name by job (`image/flux`).
+3. List each old id under `aliases` (`aliases: [old-provider/flux]`), so
+   callers that still send it keep working while they move.
+4. Watch `requested_model` in `GET /v1/usage`; when an old name no longer
+   appears, remove it from `aliases`.
+
 **Binding transforms.** A workflow binding can turn what a caller sends into
 what the graph needs, so model-specific rules stay in the config instead of in
 every client. All three are optional; a binding without them binds exactly as
