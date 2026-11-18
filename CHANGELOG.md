@@ -44,7 +44,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   - Trace records carry an optional `ttft_ms`, from the request's start to the
     first token, on streamed and collected responses.
 - **Managed lane hardening** (`command_timeout_secs`): every operator command
-  (wake, power-off, restart) is bounded (default 60 s) and a timed-out command
+  (wake, power-off, restart) is bounded (default 60 s; the wake command by
+  `boot_timeout_secs` when that is longer) and a timed-out command
   counts as failed and frees the wake lock; a failed power-off is retried
   after `wake_retry_interval_secs`, at most `retry_budget` times, then the
   lane is `degraded` with `poweroff_failures` in the capacity report and an
@@ -119,6 +120,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Changed
 
+- Managed lanes (`local_executors`): operator commands no longer run
+  unbounded. A power-off or restart command still running after
+  `command_timeout_secs` (default 60) is stopped and counts as failed (a
+  power-off is then retried); a wake command gets `boot_timeout_secs`
+  (default 180) when that is longer, so a wake that blocks until the
+  machine answers keeps working.
 - **License: Apache-2.0 → Elastic License 2.0** (source-available).
 - Egress identity headers can no longer set or override auth; auth is applied
   last (the lease always wins).

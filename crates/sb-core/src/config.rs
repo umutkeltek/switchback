@@ -153,7 +153,9 @@ pub struct LocalExecutorConfig {
     /// The longest any operator command of this lane (wake, poweroff,
     /// restart) may run. A command still running then is stopped and
     /// treated as failed, so a hung command never holds the lane's wake
-    /// lock. Default 60.
+    /// lock. Default 60. The wake command may run up to `boot_timeout_secs`
+    /// when that is longer, because a wake may block until the machine
+    /// answers.
     #[serde(default = "default_command_timeout_secs")]
     pub command_timeout_secs: u64,
     /// The powered machine this lane runs on. Lanes that name the same

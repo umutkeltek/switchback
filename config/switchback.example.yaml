@@ -492,6 +492,7 @@ routes:
 #     poweroff_command: "ssh gateway poweroff-host executor-1"
 #     idle_timeout_secs: 600
 #     command_timeout_secs: 60       # default 60; a command still running then counts as failed
+#                                    # (the wake command gets boot_timeout_secs when that is longer)
 #
 # One machine, two engines, one GPU. A normally-off machine runs a text
 # engine and ComfyUI; both stay up, but only one may hold the GPU at a time.

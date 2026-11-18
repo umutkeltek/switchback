@@ -403,11 +403,21 @@ impl LocalExecutor {
     }
 
     /// Run one operator command of this lane, bounded by
-    /// `command_timeout_secs` on the clock seam. A command still running
+    /// `command_timeout_secs` (the wake command by `boot_timeout_secs` when
+    /// that is longer) on the clock seam. A command still running
     /// then is dropped (the shell runner kills it) and reported as failed,
     /// so no lock is held waiting on it.
     async fn run_command(&self, kind: &'static str, command: &str) -> Result<(), String> {
-        let timeout_ms = self.cfg().command_timeout_secs.saturating_mul(1000);
+        let cfg = self.cfg();
+        // A wake command may block until the machine answers; it gets the
+        // boot timeout when that is longer, so a wake that worked before
+        // commands were bounded still works.
+        let timeout_secs = if kind == "wake" {
+            cfg.command_timeout_secs.max(cfg.boot_timeout_secs)
+        } else {
+            cfg.command_timeout_secs
+        };
+        let timeout_ms = timeout_secs.saturating_mul(1000);
         tokio::select! {
             biased;
             result = self.runner.run(command) => result,
@@ -3770,6 +3780,7 @@ local_executors:
         let clock = ManualClock::new();
         let mut cfg = (*text_lane(&host, clock.clone(), false).cfg()).clone();
         cfg.command_timeout_secs = 20;
+        cfg.boot_timeout_secs = 20; // a wake command gets the longer of the two
         let lane = LocalExecutor::new(
             cfg,
             clock.clone(),
@@ -3811,6 +3822,64 @@ local_executors:
             .unwrap();
         assert!(second.is_ok(), "{second:?}");
         assert_eq!(host.sim().wake, 1, "the second job's wake ran");
+    }
+
+    /// A runner whose wake command blocks for `ms` on the clock seam (an
+    /// operator script that returns once the machine answers).
+    struct SlowWake {
+        host: FakeHost,
+        clock: Arc<ManualClock>,
+        ms: u64,
+    }
+
+    #[async_trait]
+    impl CommandRunner for SlowWake {
+        async fn run(&self, command: &str) -> Result<(), String> {
+            if command.contains("wake") {
+                self.clock.sleep_ms(self.ms).await;
+            }
+            self.host.run(command).await
+        }
+    }
+
+    // A wake command may run for the boot timeout (180 s here) when that
+    // is longer than `command_timeout_secs` (60 s): a slow wake that worked
+    // before commands were bounded still works.
+    #[tokio::test]
+    async fn a_slow_wake_command_gets_the_boot_timeout() {
+        let host = FakeHost::new(Sim {
+            wake_makes_healthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let cfg = (*text_lane(&host, clock.clone(), false).cfg()).clone();
+        assert_eq!((cfg.command_timeout_secs, cfg.boot_timeout_secs), (60, 180));
+        let lane = LocalExecutor::new(
+            cfg,
+            clock.clone(),
+            Arc::new(SlowWake {
+                host: host.clone(),
+                clock: clock.clone(),
+                ms: 90_000,
+            }),
+            Arc::new(host.clone()),
+            true,
+        );
+        let job = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.ensure_ready().await.map(drop) }
+        });
+        settle().await;
+        clock.advance(60_000);
+        settle().await;
+        assert!(!job.is_finished(), "not cut at command_timeout_secs");
+        clock.advance(30_000);
+        let result = tokio::time::timeout(Duration::from_secs(5), job)
+            .await
+            .expect("the wake returns")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(host.sim().wake, 1);
     }
 
     // After our own power-off the host may still answer while it shuts

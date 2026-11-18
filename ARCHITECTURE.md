@@ -178,8 +178,9 @@ serve, the answer is a retryable 503 (`local_lane_unavailable`, with
 changed or removed by a reload take effect without a restart, and a lane that
 stays keeps its in-flight work and queue.
 
-Operator commands are bounded by the lane's `command_timeout_secs` (on the
-activator's clock seam; the shell runner kills a command dropped at its
+Operator commands are bounded by the lane's `command_timeout_secs` (the wake
+command by `boot_timeout_secs` when that is longer; on the activator's clock
+seam; the shell runner kills a command dropped at its
 timeout), so a hung command fails and frees the wake lock. A failed
 power-off is retried after `wake_retry_interval_secs`, at most
 `retry_budget` times, then the lane is `Degraded` and escalated. After its

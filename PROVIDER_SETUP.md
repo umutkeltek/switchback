@@ -243,8 +243,10 @@ clients cannot wait that long; with `wake_wait_secs: 0` the request falls
 through at once while the wake keeps going for the next one.
 
 Every operator command of a lane (wake, power-off, restart) runs for at
-most `command_timeout_secs` (default 60). A command still running then is
-stopped and counts as failed, so a hung command never blocks the next wake.
+most `command_timeout_secs` (default 60); the wake command, which may block
+until the machine answers, runs for up to `boot_timeout_secs` when that is
+longer. A command still running then is stopped and counts as failed, so a
+hung command never blocks the next wake.
 A failed power-off is retried every `wake_retry_interval_secs`, up to
 `retry_budget` times; after that the lane is `degraded` (level `fail`, with
 `poweroff_failures` on `GET /v1/workloads/capacity` and an error in the log)
