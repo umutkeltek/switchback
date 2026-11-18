@@ -422,6 +422,17 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(len(self.requests("POST", "/v1/hosts/two/holds")), 1)
 
+    def test_hold_on_a_lane_with_a_machine_of_its_own(self):
+        # The full (operator) report leaves `host` out for a lane that has a
+        # machine of its own; the holds API names that machine after the lane.
+        self.fake.holds = []
+        own = lane("lane-solo")
+        del own["host"]
+        self.fake.lanes = [own]
+        run = self.sb("hold", "10m")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(self.requests("POST", "/v1/hosts/lane-solo/holds")), 1)
+
     # ------------------------------------------------------------ config, key, reachability
 
     def test_key_from_file_never_in_argv_or_output(self):

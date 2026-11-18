@@ -688,12 +688,14 @@ def parse_duration(text):
 def host_for(gw, args):
     if args.host:
         return args.host
+    # A lane with a machine of its own has no `host` in the full report; its
+    # machine is then named after the lane (the holds API takes that name).
     lanes = (capacity(gw).get("data") or [])
-    hosts = sorted({lane["host"] for lane in lanes if lane.get("host")})
+    hosts = sorted({machine_of(lane) for lane in lanes})
     if len(hosts) == 1:
         return hosts[0]
     if not hosts:
-        raise Fail(GATEWAY_ERROR, "the capacity report names no machine (no lane has a host)")
+        raise Fail(GATEWAY_ERROR, "the gateway manages no machine (no local lanes)")
     raise Fail(USAGE, f"the gateway manages several machines ({', '.join(hosts)}); choose one with --host")
 
 
