@@ -226,6 +226,9 @@ struct JobSpec {
 /// The inputs bound into a ComfyUI workflow.
 struct ComfyInputs {
     request: ImageGenerationRequest,
+    /// The kind the job runs as: a workflow may run without a prompt, an
+    /// image or a video may not.
+    kind: WorkloadKind,
     image: Option<String>,
     frames: Option<u32>,
     fps: Option<u32>,
@@ -423,14 +426,16 @@ impl WorkloadStore {
     ) -> Result<(), WorkloadError> {
         if !matches!(
             spec.kind,
-            WorkloadKind::ImageGeneration | WorkloadKind::VideoGeneration
+            WorkloadKind::ImageGeneration
+                | WorkloadKind::VideoGeneration
+                | WorkloadKind::WorkflowExecution
         ) {
             return Err(WorkloadError::InvalidRequest(format!(
-                "kind `{}` does not run on /v1/jobs (image_generation, video_generation)",
+                "kind `{}` does not run on /v1/jobs (image_generation, video_generation, workflow_execution)",
                 kind_name(spec.kind)
             )));
         }
-        validate_single_image_request(&spec.request, "job")?;
+        validate_single_image_request(&spec.request, "job", spec.kind)?;
         let extras = [
             ("image", spec.image.is_some()),
             ("frames", spec.frames.is_some()),
@@ -458,6 +463,12 @@ impl WorkloadStore {
                 }
             }
             None => {
+                if spec.kind == WorkloadKind::WorkflowExecution {
+                    return Err(WorkloadError::InvalidRequest(format!(
+                        "`{}` is not a configured workflow (see GET /v1/workflows)",
+                        spec.request.model
+                    )));
+                }
                 ensure_known_image_target(cfg, &spec.request.model)?;
                 if spec.kind != WorkloadKind::ImageGeneration {
                     return Err(WorkloadError::InvalidRequest(format!(
@@ -645,6 +656,7 @@ impl WorkloadStore {
         if let Some((provider, workflow)) = resolve_comfyui_workflow(cfg, &request.model) {
             let inputs = ComfyInputs {
                 request,
+                kind: spec.kind,
                 image: spec.image,
                 frames: spec.frames,
                 fps: spec.fps,
@@ -655,7 +667,13 @@ impl WorkloadStore {
         }
         ensure_known_image_target(cfg, &request.model)?;
         let job = self.create_mock_image_job(request, tenant, project, job_id.to_string())?;
-        record_unpriced_image_usage(&ctx.ledger, &job, "switchback-mock", None);
+        record_unpriced_image_usage(
+            &ctx.ledger,
+            &job,
+            "switchback-mock",
+            None,
+            WorkloadKind::ImageGeneration,
+        );
         Ok(job)
     }
 
@@ -1000,7 +1018,7 @@ impl WorkloadStore {
         project: Option<String>,
         job_id: String,
     ) -> Result<JobRecord, WorkloadError> {
-        validate_single_image_request(&request, "fal")?;
+        validate_single_image_request(&request, "fal", WorkloadKind::ImageGeneration)?;
         let ProviderKind::Fal { base_url, .. } = &provider.kind else {
             return Err(WorkloadError::InvalidRequest(format!(
                 "provider `{}` is not a fal provider",
@@ -1424,7 +1442,7 @@ impl WorkloadStore {
         background: bool,
     ) -> Result<JobRecord, WorkloadError> {
         // Validate cheaply before waking a machine for a doomed request.
-        validate_comfyui_request(&inputs.request)?;
+        validate_comfyui_request(&inputs.request, inputs.kind)?;
         // A ComfyUI behind a token proxy: the provider's credential goes on
         // every call (none configured: none sent, as before).
         // Accounts are keyed by the provider's own `<provider>/<workflow>`
@@ -2045,7 +2063,9 @@ fn record_unpriced_media_usage(
     provider_id: &str,
 ) {
     if job.kind != WorkloadKind::VideoGeneration {
-        record_unpriced_image_usage(ledger, job, provider_id, None);
+        // A workflow job is billed as what it ran: the ledger knows the
+        // kind, and the artifacts are images either way.
+        record_unpriced_image_usage(ledger, job, provider_id, None, job.kind);
         return;
     }
     let videos = job
@@ -2076,6 +2096,7 @@ fn record_unpriced_image_usage(
     job: &JobRecord,
     provider_id: &str,
     account_id: Option<String>,
+    kind: WorkloadKind,
 ) {
     ledger.record(
         sb_ledger::UsageRecord::workload(
@@ -2083,7 +2104,7 @@ fn record_unpriced_image_usage(
             provider_id,
             &job.target,
             account_id,
-            WorkloadKind::ImageGeneration,
+            kind,
             None,
             None,
             None,
@@ -2230,16 +2251,24 @@ struct BoundInput {
 
 /// The inputs of a ComfyUI job as `(binding, value, required)`, in binding
 /// order. `image` (the uploaded file name) is bound apart, last.
+///
+/// The prompt is an input like any other: an image or a video needs one
+/// (an empty one is refused before the job exists), a workflow may run
+/// without one (a segmentation that segments everything). An empty prompt
+/// is not bound at all, so the graph keeps its own default.
 fn comfy_input_values(
     request: &ImageGenerationRequest,
     frames: Option<u32>,
     fps: Option<u32>,
 ) -> Vec<(String, Json, bool)> {
-    let mut inputs = vec![(
-        "prompt".to_string(),
-        Json::String(request.prompt.clone()),
-        true,
-    )];
+    let mut inputs = Vec::new();
+    if !request.prompt.trim().is_empty() {
+        inputs.push((
+            "prompt".to_string(),
+            Json::String(request.prompt.clone()),
+            true,
+        ));
+    }
     if let Some(seed) = request.seed {
         inputs.push(("seed".to_string(), Json::Number(seed.into()), false));
     }
@@ -2441,8 +2470,11 @@ fn set_json_path(target: &mut Json, path: &[String], value: Json) -> Result<(), 
 fn validate_single_image_request(
     request: &ImageGenerationRequest,
     adapter: &str,
+    kind: WorkloadKind,
 ) -> Result<(), WorkloadError> {
-    if request.prompt.trim().is_empty() {
+    // A workflow may run without a prompt (a segmentation that segments
+    // everything); an image or a video needs one.
+    if request.prompt.trim().is_empty() && kind != WorkloadKind::WorkflowExecution {
         return Err(WorkloadError::InvalidRequest(
             "prompt is required".to_string(),
         ));
@@ -3413,8 +3445,12 @@ fn prompt_is_running(queue: &Json, prompt_id: &str) -> bool {
 }
 
 /// Validate a ComfyUI image request (prompt + single-image n) before dispatch.
-fn validate_comfyui_request(request: &ImageGenerationRequest) -> Result<(), WorkloadError> {
-    if request.prompt.trim().is_empty() {
+fn validate_comfyui_request(
+    request: &ImageGenerationRequest,
+    kind: WorkloadKind,
+) -> Result<(), WorkloadError> {
+    // A workflow may run without a prompt; an image or a video needs one.
+    if request.prompt.trim().is_empty() && kind != WorkloadKind::WorkflowExecution {
         return Err(WorkloadError::InvalidRequest(
             "prompt is required".to_string(),
         ));
@@ -3584,6 +3620,7 @@ providers:
         };
         let inputs = ComfyInputs {
             request,
+            kind: WorkloadKind::ImageGeneration,
             image: None,
             frames: None,
             fps: None,
