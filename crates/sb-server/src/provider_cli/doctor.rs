@@ -60,7 +60,7 @@ async fn provider_doctor_embeddings_check(
         "input": "Switchback provider doctor"
     });
     let (_revision, outcome) = engine
-        .execute_embeddings(body, None, None, None, Instant::now())
+        .execute_embeddings(body, None, None, None, None, Instant::now())
         .await;
     match outcome {
         EmbeddingsOutcome::Json { value, summary, .. } => {

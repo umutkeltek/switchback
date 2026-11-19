@@ -596,6 +596,7 @@ async fn embeddings_report_cooldown_locked_accounts_as_provider_unavailable() {
             None,
             None,
             None,
+            None,
             Instant::now(),
         )
         .await;
@@ -1696,6 +1697,7 @@ providers:
     let (_revision, outcome) = engine
         .execute_embeddings(
             serde_json::json!({ "model": "mock/embed", "input": "hello" }),
+            None,
             None,
             None,
             None,

@@ -5,7 +5,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 
-use crate::handlers::common::session_id_from_headers;
+use crate::handlers::common::{session_id_from_headers, wake_preference};
 use crate::http_response::{
     render_exec_error, with_queue_header, with_request_id, with_revision_header, with_route_header,
 };
@@ -34,6 +34,7 @@ pub(crate) async fn embeddings(
             principal.tenant,
             principal.project,
             session_id_from_headers(&headers),
+            wake_preference(&headers),
             started,
         )
         .await;

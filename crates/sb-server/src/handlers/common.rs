@@ -76,17 +76,21 @@ pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
 /// (`prefer_awake`) reads it. Lower-cased and bounded; a value routing does
 /// not understand is ignored there and said on the decision.
 pub(crate) fn attach_wake_preference(req: &mut sb_core::AiRequest, headers: &HeaderMap) {
-    let Some(value) = headers
+    if let Some(value) = wake_preference(headers) {
+        req.metadata
+            .insert(sb_core::WAKE_METADATA_KEY.to_string(), value);
+    }
+}
+
+/// The `x-switchback-wake` request header, lower-cased and bounded, or
+/// `None` when absent or empty. Embeddings pass it to the runtime as is.
+pub(crate) fn wake_preference(headers: &HeaderMap) -> Option<String> {
+    headers
         .get(sb_core::WAKE_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-    let value: String = value.to_ascii_lowercase().chars().take(32).collect();
-    req.metadata
-        .insert(sb_core::WAKE_METADATA_KEY.to_string(), value);
+        .map(|value| value.to_ascii_lowercase().chars().take(32).collect())
 }
 
 pub(crate) fn attach_session_metadata(req: &mut sb_core::AiRequest, headers: &HeaderMap) {

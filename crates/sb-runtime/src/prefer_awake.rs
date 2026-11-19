@@ -5,6 +5,44 @@
 
 use sb_core::{AiRequest, PreferAwakeConfig, WakePolicy, WAKE_METADATA_KEY};
 
+/// Request-metadata key an embeddings request carries its estimated input
+/// size under (see [`embedding_input_tokens`]): its messages are empty, so
+/// the chat estimate would always call it small.
+pub(crate) const EMBEDDING_INPUT_TOKENS_KEY: &str = "switchback_embedding_input_tokens";
+
+/// Estimated tokens of an embeddings request's `input`: characters / 4 over
+/// every input string, plus the length of every token array. A rough proxy,
+/// like the chat estimate, so a large batch may wake a sleeping machine up
+/// front.
+pub(crate) fn embedding_input_tokens(input: &serde_json::Value) -> u64 {
+    fn walk(value: &serde_json::Value, chars: &mut u64, tokens: &mut u64) {
+        match value {
+            serde_json::Value::String(text) => *chars += text.len() as u64,
+            serde_json::Value::Number(_) => *tokens += 1,
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, chars, tokens);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut chars, mut tokens) = (0, 0);
+    walk(input, &mut chars, &mut tokens);
+    chars.div_ceil(4) + tokens
+}
+
+/// The request's estimated prompt size: the chat estimate, or an
+/// embeddings request's input estimate when larger.
+fn estimated_prompt_tokens(req: &AiRequest) -> u64 {
+    let embedding = req
+        .metadata
+        .get(EMBEDDING_INPUT_TOKENS_KEY)
+        .and_then(|tokens| tokens.parse::<u64>().ok())
+        .unwrap_or(0);
+    req.estimated_input_tokens().max(embedding)
+}
+
 /// What wake-aware ordering decided for one request.
 pub(crate) struct WakeDecision {
     pub(crate) policy: WakePolicy,
@@ -49,7 +87,7 @@ pub(crate) fn decide(cfg: &PreferAwakeConfig, req: &AiRequest) -> WakeDecision {
             ));
         }
     }
-    let prompt = req.estimated_input_tokens();
+    let prompt = estimated_prompt_tokens(req);
     let policy = if prompt >= u64::from(cfg.wake_for_prompt_tokens) {
         WakePolicy::Keep {
             why: format!(
@@ -143,6 +181,33 @@ mod tests {
             decide(&cfg(), &req(10, None, Some("auto"))).policy,
             WakePolicy::PreferAwake
         );
+    }
+
+    #[test]
+    fn embeddings_input_size_counts_strings_and_token_arrays() {
+        use serde_json::json;
+        assert_eq!(embedding_input_tokens(&json!("abcd")), 1);
+        assert_eq!(embedding_input_tokens(&json!(["abcd", "abcde"])), 3);
+        assert_eq!(embedding_input_tokens(&json!([1, 2, 3])), 3);
+        assert_eq!(embedding_input_tokens(&json!([[1, 2], [3, 4, 5]])), 5);
+        assert_eq!(embedding_input_tokens(&json!(null)), 0);
+
+        // A large batch is a large prompt: it may wake the GPU up front.
+        let mut embed = AiRequest::new("r", Vec::new());
+        embed.metadata.insert(
+            EMBEDDING_INPUT_TOKENS_KEY.to_string(),
+            embedding_input_tokens(&json!(vec!["x".repeat(40); 10])).to_string(),
+        );
+        assert!(
+            matches!(&decide(&cfg(), &embed).policy, WakePolicy::Keep { why } if why.starts_with("large prompt (~100 tokens")),
+            "{:?}",
+            decide(&cfg(), &embed).policy
+        );
+        embed.metadata.insert(
+            EMBEDDING_INPUT_TOKENS_KEY.to_string(),
+            embedding_input_tokens(&json!("hello")).to_string(),
+        );
+        assert_eq!(decide(&cfg(), &embed).policy, WakePolicy::PreferAwake);
     }
 
     #[test]

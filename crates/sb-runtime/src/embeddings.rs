@@ -22,16 +22,18 @@ impl Engine {
         tenant: Option<String>,
         project: Option<String>,
         session_id: Option<String>,
+        wake: Option<String>,
         started: Instant,
     ) -> (u64, EmbeddingsOutcome) {
         let snap = self.snapshot();
         let revision = snap.revision;
         let outcome = self
-            .execute_embeddings_inner(&snap, body, tenant, project, session_id, started)
+            .execute_embeddings_inner(&snap, body, tenant, project, session_id, wake, started)
             .await;
         (revision, outcome)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_embeddings_inner(
         &self,
         snap: &Snapshot,
@@ -39,6 +41,7 @@ impl Engine {
         tenant: Option<String>,
         project: Option<String>,
         session_id: Option<String>,
+        wake: Option<String>,
         started: Instant,
     ) -> EmbeddingsOutcome {
         let model = match body.get("model").and_then(|m| m.as_str()) {
@@ -70,6 +73,18 @@ impl Engine {
         req.project = project;
         if let Some(session_id) = session_id {
             req.metadata.insert("session_id".to_string(), session_id);
+        }
+        // Wake-aware ordering (`prefer_awake`) reads the client's
+        // `x-switchback-wake` and the input's size, as for chat.
+        if let Some(wake) = wake {
+            req.metadata
+                .insert(sb_core::WAKE_METADATA_KEY.to_string(), wake);
+        }
+        if let Some(input) = body.get("input") {
+            req.metadata.insert(
+                crate::prefer_awake::EMBEDDING_INPUT_TOKENS_KEY.to_string(),
+                crate::prefer_awake::embedding_input_tokens(input).to_string(),
+            );
         }
 
         if let Some(max) = snap.runtime.budget_max_usd {
