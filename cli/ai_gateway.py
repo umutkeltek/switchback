@@ -1981,12 +1981,22 @@ def cmd_unset(gw, args):
 
 
 def cmd_revert(gw, args):
+    # A revert is a write: it names the revision it edits, like set.
+    target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
     try:
-        answer = gw.post(model_path(args.model, "settings/revert"), {"revision": args.revision})
+        answer = gw.call("POST", model_path(target["target"], "settings/revert"),
+                         body={"revision": args.revision},
+                         headers={"If-Match": str(target.get("revision", 0))}, timeout=120)
     except GatewayError as error:
+        if error.status == 409:
+            raise Fail(GATEWAY_ERROR, f"the settings changed meanwhile ({error.message}); "
+                                      "run the command again") from None
         raise gateway_fail(error, "reverting the settings") from None
     print(f"{answer.get('target')}: revision {answer.get('revision')} "
           f"(the settings of revision {args.revision})")
+    apply = answer.get("apply")
+    if isinstance(apply, dict) and apply.get("message"):
+        print(apply["message"])
     return OK
 
 

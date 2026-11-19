@@ -170,8 +170,7 @@ class Fake:
             ("GET", "/v1/models/text/m/settings/history"): lambda r: self.json(
                 {"target": "text/m", "revision": self.settings_revision,
                  "history": self.settings_history}),
-            ("POST", "/v1/models/text/m/settings/revert"): lambda r: self.json(
-                {"target": "text/m", "revision": self.settings_revision + 1}),
+            ("POST", "/v1/models/text/m/settings/revert"): self.revert_route,
             ("POST", "/v1/models/text/m/load"): self.load_route,
             ("POST", "/v1/models/text/m/unload"): lambda r: self.json(
                 {"target": "text/m", "model": "m", "status": "unloaded"}),
@@ -211,6 +210,15 @@ class Fake:
         return {"target": "text/m", "revision": self.settings_revision, "durable": True,
                 "effective": effective, "profiles": self.settings_doc.get("profiles") or {},
                 "document": self.settings_doc}
+
+    def revert_route(self, request):
+        if request["headers"].get("If-Match") is None:
+            return self.json({"error": {"message": "send the revision you edited",
+                                        "type": "revision_required"}}, 428)
+        if request["headers"].get("If-Match") != str(self.settings_revision):
+            return self.json({"error": {"message": "settings changed",
+                                        "type": "revision_conflict"}}, 409)
+        return self.json({"target": "text/m", "revision": self.settings_revision + 1})
 
     def settings_get(self, request):
         return self.json({"model": "text/m", "targets": [self.settings_view()],
@@ -1576,7 +1584,9 @@ class SbAi(unittest.TestCase):
         self.assertIn("patch: defaults.top_k", run.stdout)
         run = self.sb("revert", "text/m", "2")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(self.posted("/v1/models/text/m/settings/revert")["json"], {"revision": 2})
+        revert = self.posted("/v1/models/text/m/settings/revert")
+        self.assertEqual(revert["json"], {"revision": 2})
+        self.assertEqual(revert["headers"]["If-Match"], "3")
 
     def test_chat_sends_profile_and_settings_and_prints_stats(self):
         self.fake.chat_headers = {"x-switchback-route": "strategy=pinned_order selected=text/m",
