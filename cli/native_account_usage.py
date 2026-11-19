@@ -726,7 +726,10 @@ def refresh_plan(groups, schedules, sb):
         windows = [w for row in rows for w in row.get("windows", [])]
         samples = [timestamp(row.get("observed_at")) for row in rows]
         samples = [s for s in samples if s is not None]
-        used = [w["used_percent"] for w in windows if number(w.get("used_percent"))]
+        # The refresh pace follows the account-wide windows; a used-up model limit (Fable) alone must not
+        # make a seat refresh every few minutes for the rest of its week.
+        wide = [w for w in windows if not w.get("model")]
+        used = [w["used_percent"] for w in (wide or windows) if number(w.get("used_percent"))]
         resets = [timestamp(w.get("resets_at")) for w in windows]
         resets = [r for r in resets if r is not None]
         observations.append({"key": key,

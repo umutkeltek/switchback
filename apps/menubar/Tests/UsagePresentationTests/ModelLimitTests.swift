@@ -93,3 +93,12 @@ private func modelSeat(_ slot: String, fiveHour: Double, weekly: Double, fable: 
     #expect(keys.contains("zai"))
     #expect(Presenter.issue("no_usage_collector") == "No usage source")
 }
+
+@Test func thePinReadsTheAccountWideLimitsNotAModelLimit() throws {
+    // 5-hour 70% left, weekly 68% left, Fable used up: the account still has 68% for other models.
+    let data = try snapshot([modelSeat("seat1", fiveHour: 70, weekly: 68, fable: 0)])
+    let menu = Presenter.make(data, now: instant)
+    #expect(menu.groups[0].accounts[0].summary == "68%")
+    #expect(menu.compactTitle == "Cl 68%")
+    #expect(menu.groups[0].accounts[0].lines.contains { $0.contains("Fable") })
+}

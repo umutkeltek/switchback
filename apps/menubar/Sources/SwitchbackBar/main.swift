@@ -434,6 +434,13 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
     FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --open-panel | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style a|cards|rings|gauge|strip] | --render-status snapshot.json --output item.png [--theme light|dark] --style rings|gauge|strip]\n".utf8))
     exit(2)
 } else {
+    // One bar only: a second copy (for example started by `sb bar open` while launchd waits to relaunch
+    // a crashed one) leaves quietly. Exit 0 also tells launchd not to restart it.
+    if let bundle = Bundle.main.bundleIdentifier,
+       NSRunningApplication.runningApplications(withBundleIdentifier: bundle)
+           .contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+        exit(0)
+    }
     let application = NSApplication.shared
     let delegate = BarDelegate()
     application.delegate = delegate

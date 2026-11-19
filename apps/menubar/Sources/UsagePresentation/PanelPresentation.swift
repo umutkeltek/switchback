@@ -131,6 +131,15 @@ extension Presenter {
         guard models.count == 1, let model = models.first, !model.isEmpty else { return "At limit" }
         return model + " at limit"
     }
+    /// A model's own limit (for example Fable) is used up while the account-wide pin still has room.
+    static func modelLimitUsedUp(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> Bool {
+        account.windows.contains { window in
+            guard isGeneration(window), !(window.model ?? "").isEmpty,
+                  valid(window, account: account, snapshotFresh: snapshotFresh, now: now),
+                  let left = window.remainingPercent ?? window.usedPercent.map({ 100 - $0 }) else { return false }
+            return percent(left) == "0%"
+        }
+    }
     static func accountLabel(_ account: UsageAccount) -> String {
         let label = clean(account.label ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !label.isEmpty && label != account.slot { return label }
@@ -202,7 +211,9 @@ extension Presenter {
                 else if account.refreshError != nil { notice = "Refresh unavailable" }
                 else if !validAccount(account, snapshotFresh: fresh, now: now) { notice = "Older reading" }
                 else if account.isEstimated { notice = "Estimated" }
-                else if summary == "0%" { notice = limitNotice(account, snapshotFresh: fresh, now: now) }
+                else if summary == "0%" || modelLimitUsedUp(account, snapshotFresh: fresh, now: now) {
+                    notice = limitNotice(account, snapshotFresh: fresh, now: now)
+                }
                 else if summary == "?" && !account.windows.isEmpty { notice = "Partial reading" }
                 else { notice = nil }
                 let label = accountLabel(account)

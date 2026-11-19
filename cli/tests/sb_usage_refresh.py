@@ -63,6 +63,21 @@ class RefreshTests(unittest.TestCase):
             return usage.report(self.args,self.root,"fixture-sb",self.fs)
 
     @unittest.skipUnless(os.environ.get("SB_TEST_ENGINE"),"requires actual Rust engine")
+    def test_a_used_up_model_limit_does_not_set_the_refresh_pace(self):
+        def plan(model_used):
+            windows=[usage.window("five_hour",30,self.now+3600,self.now,self.now,300),
+                     usage.window("seven_day",32,self.now+86400,self.now,self.now,10080)]
+            if model_used is not None:
+                windows.append({**usage.window("seven_day_fable",model_used,self.now+86400,self.now,self.now,10080),
+                                "model":"Fable","limit_kind":"weekly_scoped"})
+            row={"provider":"claude","slot":"seat-e","source":"native/claude",
+                 "observed_at":usage.iso(self.now),"windows":windows}
+            with patch.object(usage,"query",side_effect=self.query):
+                collector=usage.refresh_plan({"claude/seat-e":[row]},{},"fixture-sb")["collectors"][0]
+            return collector["next_refresh_at_ms"]
+        self.assertEqual(plan(100),plan(None))
+
+    @unittest.skipUnless(os.environ.get("SB_TEST_ENGINE"),"requires actual Rust engine")
     def test_failed_refresh_backs_off_without_relabeling_old_sample(self):
         first=self.run_report()
         self.assertEqual(first["refresh"]["state"],"completed")

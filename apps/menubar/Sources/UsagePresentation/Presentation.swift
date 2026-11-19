@@ -167,10 +167,14 @@ public enum Presenter {
                 }
                 var remaining: [Double] = []
                 var hasUnknown = false
+                // A limit scoped to one model (for example a weekly Fable limit) is not the account's limit:
+                // when the account has account-wide windows, the pin reads those; the model limit stays in the
+                // lines below and in the panel. A provider with only model-scoped windows still pins them.
+                let hasAccountWide = account.windows.contains { isGeneration($0) && ($0.model ?? "").isEmpty }
                 for window in account.windows {
                     let good = valid(window, account: account, snapshotFresh: snapshotFresh, now: now)
                     let estimate = account.isEstimated || window.isEstimated
-                    let generation = isGeneration(window)
+                    let generation = isGeneration(window) && (!hasAccountWide || (window.model ?? "").isEmpty)
                     let qualified = [window.name, window.model, window.scope].compactMap { $0 }.map(clean).joined(separator: " · ")
                     let prefix = estimate ? "Estimate · " : ""
                     let usage: String
