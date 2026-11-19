@@ -353,13 +353,28 @@ async fn revisions_conflicts_patch_history_and_revert() {
         json!(["defaults.temperature", "defaults.top_k"])
     );
 
+    // Revert is a write: it names the revision it edits.
+
     let r = client
         .post(format!("{gw}/v1/models/text/m/settings/revert"))
         .json(&json!({"revision": 1}))
         .send()
         .await
         .unwrap();
+
+    assert_eq!(r.status(), 428);
+
+    let r = client
+        .post(format!("{gw}/v1/models/text/m/settings/revert"))
+        .header("if-match", "*")
+        .json(&json!({"revision": 1}))
+        .send()
+        .await
+        .unwrap();
+
     assert_eq!(r.status(), 200);
+
+    assert_eq!(r.headers()["etag"], "\"3\"");
     let view: Value = r.json().await.unwrap();
     assert_eq!(view["revision"], json!(3));
     assert_eq!(view["document"], json!({"defaults": {"temperature": 0.5}}));

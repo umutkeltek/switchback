@@ -560,7 +560,13 @@ pub struct LocalExecutor {
     /// Places under `max_in_flight` and the FIFO queue for them. Kept
     /// across reloads like the rest of the live state.
     slots: Arc<LaneSlots>,
+    /// Called with the lane's name when the lane comes up (a wake reached
+    /// health). The engine control retries a pending apply there.
+    up_hook: RwLock<Option<LaneUpHook>>,
 }
+
+/// See [`CapacityActivator::attach_lane_up_hook`].
+pub type LaneUpHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// How a lane's health probe treats its provider's credential.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +630,7 @@ impl LocalExecutor {
             probe_auth: RwLock::new(ProbeAuth::default()),
             credentials: RwLock::new(None),
             slots: LaneSlots::new(max_in_flight),
+            up_hook: RwLock::new(None),
         })
     }
 
@@ -719,6 +726,25 @@ impl LocalExecutor {
         self.routed.store(routed, Ordering::SeqCst);
         if !routed {
             self.lock().observed_healthy = None;
+        }
+    }
+
+    fn set_up_hook(&self, hook: Option<LaneUpHook>) {
+        *self
+            .up_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    /// The lane came up: tell the hook (outside the runtime lock).
+    fn came_up(&self) {
+        let hook = self
+            .up_hook
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(&self.name);
         }
     }
 
@@ -1635,6 +1661,8 @@ impl LocalExecutor {
                 rt.wake_cycle_started_ms = None;
                 self.admit_locked(&mut rt);
                 tracing::info!(lane = %self.name, "local executor healthy");
+                drop(rt);
+                self.came_up();
                 return Ok(LaneJobGuard::new(self.clone()));
             }
 
@@ -1723,6 +1751,8 @@ impl LocalExecutor {
             ));
             self.admit_locked(&mut rt);
             tracing::info!(lane = %self.name, "local executor healthy");
+            drop(rt);
+            self.came_up();
             return Ok(LaneJobGuard::new(self.clone()));
         }
         rt.state = LaneState::Offline;
@@ -3722,6 +3752,8 @@ pub struct CapacityActivator {
     /// Host holds (`/v1/hosts/{host}/holds`): an active one keeps its
     /// machine on.
     holds: Arc<Holds>,
+    /// Handed to every lane, including lanes a reload adds.
+    up_hook: RwLock<Option<LaneUpHook>>,
     /// Lane alerts (`server.alert_command`), checked after every
     /// supervisor pass.
     alerts: Arc<Alerter>,
@@ -3784,6 +3816,7 @@ impl CapacityActivator {
             supervisor_started: AtomicBool::new(false),
             credentials: RwLock::new(None),
             holds: Arc::new(Holds::new()),
+            up_hook: RwLock::new(None),
         };
         activator.reconcile(cfg);
         Arc::new(activator)
@@ -3845,6 +3878,7 @@ impl CapacityActivator {
                 };
                 executor
                     .set_probe_auth(probe_auth_for(cfg, executor_cfg), self.credentials_source());
+                executor.set_up_hook(self.up_hook_source());
                 next.insert(executor_cfg.name.clone(), executor);
             }
             for (name, removed) in lanes.iter() {
@@ -3915,6 +3949,24 @@ impl CapacityActivator {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(source.clone());
         }
+    }
+
+    /// Call `hook` with a lane's name whenever that lane comes up.
+    pub fn attach_lane_up_hook(&self, hook: LaneUpHook) {
+        *self
+            .up_hook
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook.clone());
+        for lane in self.all() {
+            lane.set_up_hook(Some(hook.clone()));
+        }
+    }
+
+    fn up_hook_source(&self) -> Option<LaneUpHook> {
+        self.up_hook
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn credentials_source(&self) -> Option<Arc<dyn LaneCredentials>> {
@@ -4486,6 +4538,7 @@ mod tests {
             supervisor_started: AtomicBool::new(false),
             credentials: RwLock::new(None),
             holds: Arc::new(Holds::new()),
+            up_hook: RwLock::new(None),
             alerts: Arc::new(Alerter::new(FakeClock::new(), Arc::new(CommandAlertSink))),
         }
     }

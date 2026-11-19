@@ -74,6 +74,9 @@ impl AppState {
             capacity: capacity.clone(),
             engines: engines.clone(),
         }));
+        // Pending applies are retried when a lane comes up and when the
+        // last request on a held-back model ends.
+        crate::engine_control::install_hooks(&engine, &capacity, &engines);
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),

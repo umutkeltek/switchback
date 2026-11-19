@@ -48,6 +48,7 @@ impl Engine {
     ) -> Result<Self, String> {
         let runtime = Runtime::from_config(&config);
         let plugins = sb_plugin::PluginHost::try_from_config(&config.plugins)?;
+        let history_keep = config.server.model_settings_history_keep;
         let quality_eval = Arc::new(crate::quality_eval::QualityEval::new(
             &config.server.quality_eval,
         ));
@@ -72,7 +73,11 @@ impl Engine {
             exact_cache: Mutex::new(sb_core::ExactRequestCache::new()),
             reload_lock: Mutex::new(()),
             lanes: None,
-            model_settings: Arc::new(crate::model_settings::ModelSettingsRegistry::new()),
+            model_settings: {
+                let registry = crate::model_settings::ModelSettingsRegistry::new();
+                registry.set_history_keep(history_keep);
+                Arc::new(registry)
+            },
             model_variants: OnceLock::new(),
         })
     }

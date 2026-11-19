@@ -761,6 +761,12 @@ pub trait StateStore: Send + Sync {
     ) -> Result<Vec<ModelSettingsChange>> {
         Ok(Vec::new())
     }
+
+    /// Keep only a target's newest `keep` history rows; `Ok` is how many
+    /// were removed.
+    fn model_settings_prune(&self, _target: &str, _keep: usize) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). One connection
@@ -3315,22 +3321,36 @@ impl StateStore for SqliteStore {
              ORDER BY revision DESC LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![target, limit.min(10_000) as i64], |row| {
-                let changed: String = row.get(7)?;
-                Ok(ModelSettingsChange {
-                    target: row.get(0)?,
-                    revision: row.get::<_, i64>(1)? as u64,
-                    doc: row.get(2)?,
-                    actor: row.get(3)?,
-                    role: row.get(4)?,
-                    source: row.get(5)?,
-                    action: row.get(6)?,
-                    changed: serde_json::from_str(&changed).unwrap_or_default(),
-                    at_ms: row.get(8)?,
-                })
-            })?
+            .query_map(
+                params![target, limit.min(i64::MAX as usize) as i64],
+                |row| {
+                    let changed: String = row.get(7)?;
+                    Ok(ModelSettingsChange {
+                        target: row.get(0)?,
+                        revision: row.get::<_, i64>(1)? as u64,
+                        doc: row.get(2)?,
+                        actor: row.get(3)?,
+                        role: row.get(4)?,
+                        source: row.get(5)?,
+                        action: row.get(6)?,
+                        changed: serde_json::from_str(&changed).unwrap_or_default(),
+                        at_ms: row.get(8)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    fn model_settings_prune(&self, target: &str, keep: usize) -> Result<usize> {
+        let conn = self.conn()?;
+        let removed = conn.execute(
+            "DELETE FROM model_settings_history WHERE target = ?1 AND revision NOT IN (
+               SELECT revision FROM model_settings_history WHERE target = ?1
+               ORDER BY revision DESC LIMIT ?2)",
+            params![target, keep.clamp(1, i64::MAX as usize) as i64],
+        )?;
+        Ok(removed)
     }
 }
 
@@ -5460,5 +5480,31 @@ mod model_settings_tests {
         );
         assert_eq!(history[0].changed, vec!["defaults.temperature".to_string()]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_keeps_the_newest_revisions() {
+        let store = SqliteStore::in_memory().unwrap();
+        for revision in 1..=5 {
+            store
+                .model_settings_write(&change("text/m", revision, "{}"))
+                .unwrap();
+        }
+        store
+            .model_settings_write(&change("text/other", 1, "{}"))
+            .unwrap();
+        assert_eq!(store.model_settings_prune("text/m", 2).unwrap(), 3);
+        let history = store.model_settings_history("text/m", 100).unwrap();
+        assert_eq!(
+            history.iter().map(|c| c.revision).collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+        assert_eq!(
+            store
+                .model_settings_history("text/other", 100)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

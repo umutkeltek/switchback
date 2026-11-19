@@ -532,6 +532,14 @@ pub struct RequestLoadPolicy {
     /// of the model (the same KV math as `sb ai fit`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<FitEstimate>,
+    /// GPU bytes the fit check keeps free for other engines on the same
+    /// GPU that the engine does not see (an image engine, ...). Default 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub reserve_bytes: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// What a model needs, for the fit check of a variant when the engine has

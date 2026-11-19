@@ -236,6 +236,56 @@ impl Engine {
         lanes.try_begin_request(provider_id)
     }
 
+    /// Admit the request to the engine model of the target the route would
+    /// choose first, when its lane has an engine control: from here on the
+    /// request counts on that model (queued for its lane or waiting for a
+    /// wake included), so an unload or `apply: now` waits for it, and it
+    /// waits (bounded) while one runs. `Ok(None)`: no such lane among the
+    /// candidates. `Err` is the 503 for a gate that stayed closed.
+    pub(crate) async fn admit_first_choice(
+        &self,
+        snap: &Snapshot,
+        req: &AiRequest,
+        client_profile: Option<&ClientProfileConfig>,
+        resolved: &CandidateResolution,
+    ) -> Result<Option<(String, crate::model_settings::ModelInFlight)>, ExecError> {
+        use crate::model_settings::{gate_error, gate_wait};
+        if !resolved
+            .candidates
+            .iter()
+            .any(|candidate| gate_wait(snap, &candidate.provider_id).is_some())
+        {
+            return Ok(None);
+        }
+        let Some((_, would_be)) = plan_resolved_route(
+            &self.combo_rr,
+            snap,
+            req,
+            client_profile,
+            resolved.clone(),
+            false,
+        )
+        .ok() else {
+            return Ok(None);
+        };
+        let Some(first) = would_be.decision.selected.as_ref().and_then(|selected| {
+            resolved
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == selected.target_id)
+        }) else {
+            return Ok(None);
+        };
+        let Some(wait) = gate_wait(snap, &first.provider_id) else {
+            return Ok(None);
+        };
+        let key = format!("{}/{}", first.provider_id, first.model);
+        match self.model_settings.admit(&key, wait).await {
+            Ok(admission) => Ok(Some((first.id.clone(), admission))),
+            Err(e) => Err(gate_error(&e)),
+        }
+    }
+
     /// Before planning, after any wake: when the target this route would
     /// choose first sits on a lane with `max_in_flight` or in an exclusive
     /// GPU group, take the lane before the first byte.

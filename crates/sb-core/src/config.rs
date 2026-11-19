@@ -2043,6 +2043,10 @@ pub struct ServerConfig {
     /// buffered unbounded. Unset = no cap.
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
+    /// How many revisions of each model's settings the history keeps
+    /// (newest first; revert reaches any of them). Default 500.
+    #[serde(default = "default_model_settings_history_keep")]
+    pub model_settings_history_keep: usize,
     /// Ingress byte ceiling for request extractors. Native clients can send
     /// multi-megabyte history/tool payloads; Axum's default 2 MiB is too low for
     /// Codex/Claude Code relay. `null` disables the cap.
@@ -2668,6 +2672,10 @@ fn default_hedge_max() -> u32 {
     2
 }
 
+fn default_model_settings_history_keep() -> usize {
+    500
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
@@ -2679,6 +2687,7 @@ impl Default for ServerConfig {
             admission_slot_ttl_ms: default_admission_slot_ttl_ms(),
             tenant_concurrency_ttl_ms: default_tenant_concurrency_ttl_ms(),
             max_response_bytes: None,
+            model_settings_history_keep: default_model_settings_history_keep(),
             max_request_bytes: default_max_request_bytes(),
             audio_max_upload_bytes: default_audio_max_upload_bytes(),
             privacy_mode: PrivacyMode::default(),

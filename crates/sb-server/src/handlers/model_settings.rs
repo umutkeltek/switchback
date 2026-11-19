@@ -214,6 +214,8 @@ fn expected_revision(
                 .to_string()
         });
     match (header, body_revision) {
+        // `*`: whatever revision is current.
+        (Some(value), _) if value == "*" => Ok(current),
         (Some(value), _) => value.parse::<u64>().map_err(|_| {
             error(
                 StatusCode::BAD_REQUEST,
@@ -410,7 +412,7 @@ fn get_settings(
     let mut response = Json(body).into_response();
     if targets.len() == 1 {
         if let Ok(value) =
-            axum::http::HeaderValue::from_str(&registry.revision(&targets[0].target).to_string())
+            axum::http::HeaderValue::from_str(&etag(registry.revision(&targets[0].target)))
         {
             response
                 .headers_mut()
@@ -575,44 +577,71 @@ async fn write(
             )
         }
     };
-    if let Err(message) = crate::engine_control::validate_for_target(
-        &crate::engine_control::EngineCtx::from(state),
-        &named.target,
-        &doc,
-    ) {
+    let action = if merge { "patch" } else { "put" };
+    commit_write(
+        state,
+        principal,
+        headers,
+        &named,
+        doc,
+        expected,
+        action,
+        body.apply.unwrap_or_default(),
+        body.wake,
+    )
+    .await
+}
+
+/// A settings `ETag`: the revision, quoted.
+fn etag(revision: u64) -> String {
+    format!("\"{revision}\"")
+}
+
+/// The one write path of PUT, PATCH and revert: the engine checks, the
+/// revisioned write, then the apply of changed load settings. The write
+/// stands whatever the engine does; the `apply` part of the answer says
+/// what that was (a busy model is `reloaded: false, reason: model_busy,
+/// pending: true`, still a 200).
+#[allow(clippy::too_many_arguments)]
+async fn commit_write(
+    state: &AppState,
+    principal: &Principal,
+    headers: &HeaderMap,
+    named: &NamedTarget,
+    doc: ModelSettingsDoc,
+    expected: u64,
+    action: &str,
+    apply: sb_core::ApplyMode,
+    wake: bool,
+) -> Response {
+    let ctx = crate::engine_control::EngineCtx::from(state);
+    if let Err(message) =
+        crate::engine_control::validate_for_target(&ctx, &named.target, &doc).await
+    {
         return error(StatusCode::BAD_REQUEST, "invalid_settings", message);
     }
+    let registry = state.engine.model_settings();
+    let before = registry.get(&named.target).map(|entry| entry.doc.clone());
     let actor = actor_for(principal, headers);
-    let action = if merge { "patch" } else { "put" };
-    let before = current.as_ref().map(|entry| entry.doc.clone());
     let entry = match registry.write(&named.target, doc, expected, &actor, action) {
         Ok(entry) => entry,
         Err(e) => return write_error(e),
     };
-    let apply = crate::engine_control::after_settings_write(
-        &crate::engine_control::EngineCtx::from(state),
+    let applied = crate::engine_control::after_settings_write(
+        &ctx,
         &named.target,
         before.as_deref(),
         &entry,
-        body.apply.unwrap_or_default(),
-        body.wake,
+        apply,
+        wake,
     )
     .await;
-    let mut view = target_view(state, &named, Some(&entry), None, true);
-    let mut status = StatusCode::OK;
-    if let Some(apply) = apply {
-        if apply.conflict {
-            status = StatusCode::CONFLICT;
-            view["error"] = json!({
-                "type": "model_busy",
-                "reason": "model_busy",
-                "message": apply.value["message"],
-            });
-        }
-        view["apply"] = apply.value;
+    let mut view = target_view(state, named, Some(&entry), None, true);
+    if let Some(applied) = applied {
+        view["apply"] = applied;
     }
-    let mut response = (status, Json(view)).into_response();
-    if let Ok(value) = axum::http::HeaderValue::from_str(&entry.revision.to_string()) {
+    let mut response = Json(view).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&etag(entry.revision)) {
         response
             .headers_mut()
             .insert(axum::http::header::ETAG, value);
@@ -623,7 +652,12 @@ async fn write(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevertBody {
+    /// The revision whose document is written again.
     revision: u64,
+    #[serde(default)]
+    apply: Option<sb_core::ApplyMode>,
+    #[serde(default)]
+    wake: bool,
 }
 
 /// `POST /v1/models/{tail}`: `settings/revert`, `load`, `unload`.
@@ -652,7 +686,7 @@ pub(crate) async fn post(
         }
     };
     match parse_model_path(&tail) {
-        Some(ModelPath::Revert(name)) => revert(&state, &principal, &headers, &name, body),
+        Some(ModelPath::Revert(name)) => revert(&state, &principal, &headers, &name, body).await,
         Some(ModelPath::Load(name)) => {
             crate::engine_control::load_endpoint(&state, &principal, &name, body).await
         }
@@ -663,7 +697,11 @@ pub(crate) async fn post(
     }
 }
 
-fn revert(
+/// `POST /v1/models/{model}/settings/revert {"revision": N}`: write
+/// revision N's document again, through the same path as a PUT (engine
+/// checks, apply). The revision being edited comes in `If-Match` (428
+/// without it, 409 when stale), as for any write.
+async fn revert(
     state: &AppState,
     principal: &Principal,
     headers: &HeaderMap,
@@ -680,21 +718,32 @@ fn revert(
             return error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!("{e}; send {{\"revision\": N}}"),
+                format!("{e}; send {{\"revision\": N}} and If-Match: <the revision you edited>"),
             )
         }
     };
     let registry = state.engine.model_settings();
     let current = registry.revision(&named.target);
-    let expected = match expected_revision(headers, None, current, false) {
+    let expected = match expected_revision(headers, None, current, true) {
         Ok(expected) => expected,
         Err(response) => return response,
     };
-    let actor = actor_for(principal, headers);
-    match registry.revert(&named.target, body.revision, expected, &actor) {
-        Ok(entry) => Json(target_view(state, &named, Some(&entry), None, true)).into_response(),
-        Err(e) => write_error(e),
-    }
+    let doc = match registry.revision_doc(&named.target, body.revision) {
+        Ok(doc) => doc,
+        Err(e) => return write_error(e),
+    };
+    commit_write(
+        state,
+        principal,
+        headers,
+        &named,
+        doc,
+        expected,
+        &format!("revert:{}", body.revision),
+        body.apply.unwrap_or_default(),
+        body.wake,
+    )
+    .await
 }
 
 #[cfg(test)]

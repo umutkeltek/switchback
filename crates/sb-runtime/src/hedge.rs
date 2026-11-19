@@ -133,7 +133,7 @@ async fn hedge_attempt(
         .await
         .ok()?;
     let (attempt_req, attempt_target) = settings.prepare(req, target);
-    let _model_busy = settings.enter(target);
+    let _model_busy = settings.admit_racer(snap, target).await.ok()?;
     let prepared =
         PreparedRequest::new(attempt_req, attempt_target, Some(lease)).with_egress(egress_id);
 

@@ -276,7 +276,11 @@ impl Engine {
         };
         let cache_policy = snap.config.server.execution_cache.policy();
         let body_redacted = scope.is_some();
-        let cache_receipt = lookup_exact_cache(self, &req, &cache_policy, body_redacted);
+        let cache_receipt = if request_settings.is_some() {
+            crate::execution_meta::settings_cache_bypass(&cache_policy)
+        } else {
+            lookup_exact_cache(self, &req, &cache_policy, body_redacted)
+        };
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
@@ -310,6 +314,31 @@ impl Engine {
             });
         }
         let unknown = resolved.unknown.clone();
+        // Lanes with an engine control: the request counts on its first
+        // choice's engine model from here (before any wake or lane wait), so
+        // an unload or `apply: now` waits for it; a closed gate holds it
+        // here (bounded).
+        let first_admission = match self
+            .admit_first_choice(snap, &req, client_profile.as_ref(), &resolved)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(e);
+            }
+        };
         // Opt-in (`wake_on_request`): wake the first choice's lane if routing
         // is about to skip it as down, bounded, before the first byte.
         let lane_wake = self
@@ -410,6 +439,18 @@ impl Engine {
         // (or found) by the engine control; other targets cannot honour
         // them, so they leave the plan.
         let mut settings_plan = settings_plan;
+        settings_plan.set_variants(self.model_variants.get().cloned());
+        // Kept only while the plan still has that target (a spill or a lane
+        // wait may have moved the request elsewhere).
+        if let Some((target_id, admission)) = first_admission {
+            if plan
+                .candidates
+                .iter()
+                .any(|candidate| candidate.id == target_id)
+            {
+                settings_plan.add_admission(&target_id, admission);
+            }
+        }
         if let Some(load) = request_settings
             .as_ref()
             .map(|settings| &settings.load)
@@ -429,9 +470,9 @@ impl Engine {
             ) {
                 Ok((target, policy)) => match self.model_variants.get() {
                     Some(variants) => variants
-                        .ensure_variant(&target, load, &policy)
+                        .ensure_variant(&target, load, &policy, role)
                         .await
-                        .map(|name| (target, name)),
+                        .map(|lease| (target, lease)),
                     None => Err(ExecError::new(
                         400,
                         "no_engine_control",
@@ -442,7 +483,8 @@ impl Engine {
                 Err(e) => Err(e),
             };
             match variant {
-                Ok((target, name)) => {
+                Ok((target, lease)) => {
+                    let name = lease.name;
                     for dropped in plan.candidates.iter().skip(1) {
                         plan.decision.reject(
                             dropped.id.clone(),
@@ -453,7 +495,10 @@ impl Engine {
                     plan.decision.fallbacks.clear();
                     plan.decision
                         .add_reason(format!("settings variant {name} of {}", target.id));
-                    settings_plan.set_model(&target, &req, name);
+                    settings_plan.set_model(&target, &req, name, lease.note);
+                    // The variant's admission replaces the base model's: the
+                    // request reaches only the variant.
+                    settings_plan.add_admission(&target.id, lease.admission);
                 }
                 Err(e) => {
                     self.record_denial_trace(DenialTrace {
@@ -743,6 +788,21 @@ impl Engine {
                     }
                 }
             }
+            // The engine model's admission (lanes with an engine control),
+            // before the lane's place: a request never holds a place while
+            // it waits at a closed gate.
+            let model_admission = match settings_plan.admission_for(snap, target).await {
+                Ok(admission) => admission,
+                Err(e) => {
+                    trace.warning(format!("target {} skipped: {}", target.id, e.message));
+                    let retry_after = e.retry_after.unwrap_or(crate::LANE_GROUP_RETRY_AFTER);
+                    unavailable_retry_after = Some(
+                        unavailable_retry_after
+                            .map_or(retry_after, |current| current.min(retry_after)),
+                    );
+                    continue 'targets;
+                }
+            };
             let held = lane_gpu
                 .as_mut()
                 .and_then(|note| note.take_busy(&target.provider_id));
@@ -765,10 +825,20 @@ impl Engine {
                     }
                 },
             };
-            // The model's own in-flight count, held as long as the lane's
-            // busy guard (to the stream's end): unload and `apply: now`
-            // wait for it.
-            if let Some(model_busy) = settings_plan.enter(target) {
+            // Dispatch on the engine model (after the lane's pending apply,
+            // never during a preset re-read); the count is held as long as
+            // the lane's busy guard (to the stream's end): unload, `apply:
+            // now` and a preset re-read wait for it.
+            if let Some(mut model_busy) = model_admission {
+                if let Err(e) = settings_plan.dispatch(snap, target, &mut model_busy).await {
+                    trace.warning(format!("target {} skipped: {}", target.id, e.message));
+                    let retry_after = e.retry_after.unwrap_or(crate::LANE_GROUP_RETRY_AFTER);
+                    unavailable_retry_after = Some(
+                        unavailable_retry_after
+                            .map_or(retry_after, |current| current.min(retry_after)),
+                    );
+                    continue 'targets;
+                }
                 lane_busy = Some(match lane_busy.take() {
                     Some(busy) => Box::new((busy, model_busy)) as crate::LaneBusy,
                     None => Box::new(model_busy),

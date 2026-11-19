@@ -516,6 +516,7 @@ mod tests {
             max_variants: 2,
             variant_idle_ttl_secs: 3600,
             estimate: None,
+            reserve_bytes: 0,
         };
         validate_request_load_policy(&ok).unwrap();
         let mut bad = ok.clone();

@@ -86,6 +86,20 @@ pub(crate) fn preview_cache_receipt(req: &AiRequest, policy: &CachePolicy) -> Ca
     )
 }
 
+/// A request that carries its own model settings (`switchback.settings`,
+/// `switchback.load`, a profile): the exact-request key cannot see them
+/// (they are taken out before the lookup), so the cache is bypassed.
+pub(crate) fn settings_cache_bypass(policy: &CachePolicy) -> CacheLookupReceipt {
+    CacheLookupReceipt {
+        layer: policy.layer,
+        status: CacheStatus::Bypass,
+        key: None,
+        reason: Some("request_model_settings".to_string()),
+        policy_version: policy.version.clone(),
+        ttl_seconds: policy.ttl_seconds,
+    }
+}
+
 fn body_redacted_cache_bypass(policy: &CachePolicy) -> CacheLookupReceipt {
     CacheLookupReceipt {
         layer: policy.layer,

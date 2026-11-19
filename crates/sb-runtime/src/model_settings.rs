@@ -21,16 +21,38 @@ use sb_store::{ModelSettingsChange, ModelSettingsWrite, StateStore};
 
 use crate::{ExecError, Snapshot};
 
+/// A variant found or made for a request.
+#[derive(Debug)]
+pub struct VariantLease {
+    /// The engine model name the attempt sends (`<model>~<hash8>`).
+    pub name: String,
+    /// The request's admission on the variant.
+    pub admission: ModelInFlight,
+    /// Extra words for `x-switchback-settings` (`fit=unchecked`).
+    pub note: Option<String>,
+}
+
 /// Makes (or finds) the engine variant a request's load settings ask for:
 /// `sb-server`'s engine control. `Ok` is the upstream model name the
 /// attempt sends (`<model>~<hash8>`); `Err` is the answer to give.
 pub trait ModelVariants: Send + Sync {
+    /// `Ok` carries the variant's admission: the request is counted on the
+    /// variant from the moment it is found or made, so nothing removes the
+    /// variant while the request still waits for its lane.
     fn ensure_variant<'a>(
         &'a self,
         target: &'a ExecutionTarget,
         load: &'a Map<String, Json>,
         policy: &'a sb_core::RequestLoadPolicy,
-    ) -> crate::BoxFuture<'a, Result<String, ExecError>>;
+        role: &'a str,
+    ) -> crate::BoxFuture<'a, Result<VariantLease, ExecError>>;
+
+    /// Right before an attempt reaches a lane's engine: run the lane's
+    /// pending apply when one is due, so the model loads with its current
+    /// settings. Never fails the request (a failed apply stays pending).
+    fn before_dispatch<'a>(&'a self, _provider_id: &'a str) -> crate::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// One target's current settings.
@@ -81,7 +103,6 @@ impl std::fmt::Display for SettingsWriteError {
 }
 
 /// The settings documents of every target, revisioned.
-#[derive(Default)]
 pub struct ModelSettingsRegistry {
     entries: RwLock<BTreeMap<String, SettingsEntry>>,
     store: RwLock<Option<Arc<dyn StateStore>>>,
@@ -90,34 +111,223 @@ pub struct ModelSettingsRegistry {
     /// Serializes writes so read-revision → check → write is atomic in
     /// this process (the store's transaction covers other processes).
     write_lock: Mutex<()>,
-    /// Requests in flight per engine model (`provider/model`, a variant's
-    /// own name included) and when each model was last used.
+    /// Per engine model (`provider/model`, a variant's own name included):
+    /// requests admitted and dispatched, when it was last used, and its
+    /// admission gate.
     in_flight: Mutex<HashMap<String, ModelUse>>,
+    /// Bumped on every change of `in_flight` (a request ends, a gate opens
+    /// or closes): waiters on a gate or a drain watch it.
+    changed: tokio::sync::watch::Sender<u64>,
+    /// Called (outside every lock) with an engine model's key when its last
+    /// dispatched request ends: the engine control retries an apply it held
+    /// back for that model.
+    idle_hook: RwLock<Option<IdleHook>>,
+    /// How many revisions of each target the history keeps (newest first).
+    history_keep: std::sync::atomic::AtomicUsize,
 }
 
+/// See [`ModelSettingsRegistry::set_idle_hook`].
+pub type IdleHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The default for `server.model_settings_history_keep`.
+pub const DEFAULT_HISTORY_KEEP: usize = 500;
+
+impl Default for ModelSettingsRegistry {
+    fn default() -> Self {
+        ModelSettingsRegistry {
+            entries: RwLock::default(),
+            store: RwLock::default(),
+            memory_history: Mutex::default(),
+            write_lock: Mutex::default(),
+            in_flight: Mutex::default(),
+            changed: tokio::sync::watch::channel(0).0,
+            idle_hook: RwLock::default(),
+            history_keep: std::sync::atomic::AtomicUsize::new(DEFAULT_HISTORY_KEEP),
+        }
+    }
+}
+
+/// One engine model's use and gate.
 #[derive(Debug, Clone, Copy, Default)]
 struct ModelUse {
+    /// Requests whose routing committed to this model: queued, waking and
+    /// dispatched ones.
     count: usize,
+    /// Of those, the ones sent (or about to be sent) to the engine.
+    dispatched: usize,
     last_used_ms: i64,
+    /// Open [`GateKind::Drain`] closers (unload, `apply: now`).
+    drains: u32,
+    /// Open [`GateKind::Hold`] closers (a preset re-read).
+    holds: u32,
 }
 
-/// One request in flight on an engine model; dropping it ends it.
+/// How a closer closes an engine model's admission gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateKind {
+    /// No new request is admitted; admitted ones (queued or waking
+    /// included) go on and the closer waits for them to end. Unload and
+    /// `apply: now`.
+    Drain,
+    /// No new request is admitted and no admitted one is dispatched; the
+    /// closer waits only for dispatched ones. A preset re-read: a queued
+    /// request reaches the engine after it, with the new settings.
+    Hold,
+}
+
+/// A request could not pass a closed gate within its wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateTimeout {
+    pub key: String,
+    pub waited: std::time::Duration,
+}
+
+impl std::fmt::Display for GateTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is being unloaded or reloaded with new settings and did not reopen within {} s",
+            self.key,
+            self.waited.as_secs()
+        )
+    }
+}
+
+/// One request admitted to an engine model (and, once
+/// [`ModelInFlight::dispatch`] passed, dispatched to it); dropping it ends
+/// it.
 pub struct ModelInFlight {
     registry: Arc<ModelSettingsRegistry>,
     key: String,
+    dispatched: bool,
+}
+
+impl std::fmt::Debug for ModelInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelInFlight")
+            .field("key", &self.key)
+            .field("dispatched", &self.dispatched)
+            .finish()
+    }
+}
+
+impl ModelInFlight {
+    /// The engine model this request is counted on.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Mark the request as reaching the engine: waits (bounded) while a
+    /// [`GateKind::Hold`] closer re-reads the model's preset. Idempotent.
+    pub async fn dispatch(&mut self, wait: std::time::Duration) -> Result<(), GateTimeout> {
+        if self.dispatched {
+            return Ok(());
+        }
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let mut changed = self.registry.changed.subscribe();
+            {
+                let mut map = self.registry.lock_use();
+                let entry = map.entry(self.key.clone()).or_default();
+                if entry.holds == 0 {
+                    entry.dispatched += 1;
+                    entry.last_used_ms = sb_store::now_millis();
+                    self.dispatched = true;
+                    return Ok(());
+                }
+            }
+            if tokio::time::timeout_at(deadline, changed.changed())
+                .await
+                .is_err()
+            {
+                return Err(GateTimeout {
+                    key: self.key.clone(),
+                    waited: wait,
+                });
+            }
+        }
+    }
 }
 
 impl Drop for ModelInFlight {
     fn drop(&mut self) {
-        let mut map = self
-            .registry
-            .in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = map.get_mut(&self.key) {
-            entry.count = entry.count.saturating_sub(1);
-            entry.last_used_ms = sb_store::now_millis();
+        let idle = {
+            let mut map = self.registry.lock_use();
+            match map.get_mut(&self.key) {
+                Some(entry) => {
+                    entry.count = entry.count.saturating_sub(1);
+                    if self.dispatched {
+                        entry.dispatched = entry.dispatched.saturating_sub(1);
+                    }
+                    entry.last_used_ms = sb_store::now_millis();
+                    self.dispatched && entry.dispatched == 0
+                }
+                None => false,
+            }
+        };
+        self.registry.bump();
+        if idle {
+            self.registry.run_idle_hook(&self.key);
         }
+    }
+}
+
+/// A closed admission gate of one engine model; dropping it reopens it.
+pub struct ModelGate {
+    registry: Arc<ModelSettingsRegistry>,
+    key: String,
+    kind: GateKind,
+}
+
+impl ModelGate {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// What this closer waits for: admitted requests (drain) or dispatched
+    /// ones (hold).
+    pub fn busy(&self) -> usize {
+        let map = self.registry.lock_use();
+        map.get(&self.key)
+            .map(|entry| match self.kind {
+                GateKind::Drain => entry.count,
+                GateKind::Hold => entry.dispatched,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Wait (bounded) until [`Self::busy`] is 0. `Err` is the count left.
+    pub async fn wait_idle(&self, wait: std::time::Duration) -> Result<(), usize> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let mut changed = self.registry.changed.subscribe();
+            let busy = self.busy();
+            if busy == 0 {
+                return Ok(());
+            }
+            if tokio::time::timeout_at(deadline, changed.changed())
+                .await
+                .is_err()
+            {
+                let busy = self.busy();
+                return if busy == 0 { Ok(()) } else { Err(busy) };
+            }
+        }
+    }
+}
+
+impl Drop for ModelGate {
+    fn drop(&mut self) {
+        {
+            let mut map = self.registry.lock_use();
+            if let Some(entry) = map.get_mut(&self.key) {
+                match self.kind {
+                    GateKind::Drain => entry.drains = entry.drains.saturating_sub(1),
+                    GateKind::Hold => entry.holds = entry.holds.saturating_sub(1),
+                }
+            }
+        }
+        self.registry.bump();
     }
 }
 
@@ -126,32 +336,128 @@ impl ModelSettingsRegistry {
         Self::default()
     }
 
-    /// Count one request in flight on an engine model (`provider/model`).
-    pub fn enter(self: &Arc<Self>, key: &str) -> ModelInFlight {
-        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map.entry(key.to_string()).or_default();
-        entry.count += 1;
-        entry.last_used_ms = sb_store::now_millis();
-        ModelInFlight {
-            registry: self.clone(),
-            key: key.to_string(),
+    fn lock_use(&self) -> std::sync::MutexGuard<'_, HashMap<String, ModelUse>> {
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn bump(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    fn run_idle_hook(&self, key: &str) {
+        let hook = self
+            .idle_hook
+            .read()
+            .ok()
+            .and_then(|hook| hook.as_ref().cloned());
+        if let Some(hook) = hook {
+            hook(key);
         }
     }
 
-    /// Requests in flight on an engine model now.
+    /// Called with an engine model's key whenever its last dispatched
+    /// request ends (outside every lock of the registry).
+    pub fn set_idle_hook(&self, hook: IdleHook) {
+        *self.idle_hook.write().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// How many revisions per target the history keeps (at least 1).
+    pub fn set_history_keep(&self, keep: usize) {
+        self.history_keep
+            .store(keep.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn history_keep(&self) -> usize {
+        self.history_keep.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Admit one request to an engine model now, if its gate is open.
+    pub fn try_admit(self: &Arc<Self>, key: &str) -> Option<ModelInFlight> {
+        {
+            let mut map = self.lock_use();
+            let entry = map.entry(key.to_string()).or_default();
+            if entry.drains > 0 || entry.holds > 0 {
+                return None;
+            }
+            entry.count += 1;
+            entry.last_used_ms = sb_store::now_millis();
+        }
+        self.bump();
+        Some(ModelInFlight {
+            registry: self.clone(),
+            key: key.to_string(),
+            dispatched: false,
+        })
+    }
+
+    /// Admit one request to an engine model, waiting (bounded) while its
+    /// gate is closed.
+    pub async fn admit(
+        self: &Arc<Self>,
+        key: &str,
+        wait: std::time::Duration,
+    ) -> Result<ModelInFlight, GateTimeout> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let mut changed = self.changed.subscribe();
+            if let Some(admitted) = self.try_admit(key) {
+                return Ok(admitted);
+            }
+            if tokio::time::timeout_at(deadline, changed.changed())
+                .await
+                .is_err()
+            {
+                return Err(GateTimeout {
+                    key: key.to_string(),
+                    waited: wait,
+                });
+            }
+        }
+    }
+
+    /// Close an engine model's admission gate. Under the same lock as every
+    /// admission, so a request is either counted before (and the closer
+    /// sees it in [`ModelGate::busy`]) or waits for the gate to reopen.
+    pub fn close(self: &Arc<Self>, key: &str, kind: GateKind) -> ModelGate {
+        {
+            let mut map = self.lock_use();
+            let entry = map.entry(key.to_string()).or_default();
+            match kind {
+                GateKind::Drain => entry.drains += 1,
+                GateKind::Hold => entry.holds += 1,
+            }
+        }
+        self.bump();
+        ModelGate {
+            registry: self.clone(),
+            key: key.to_string(),
+            kind,
+        }
+    }
+
+    /// Requests admitted to an engine model now (queued, waking and
+    /// dispatched).
     pub fn in_flight(&self, key: &str) -> usize {
-        self.in_flight
-            .lock()
-            .map(|map| map.get(key).map(|entry| entry.count).unwrap_or(0))
+        self.lock_use()
+            .get(key)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
+    }
+
+    /// Requests dispatched to an engine model now.
+    pub fn dispatched(&self, key: &str) -> usize {
+        self.lock_use()
+            .get(key)
+            .map(|entry| entry.dispatched)
             .unwrap_or(0)
     }
 
     /// When a request last started or ended on an engine model (ms).
     pub fn last_used_ms(&self, key: &str) -> Option<i64> {
-        self.in_flight
-            .lock()
-            .ok()
-            .and_then(|map| map.get(key).map(|entry| entry.last_used_ms))
+        self.lock_use()
+            .get(key)
+            .map(|entry| entry.last_used_ms)
+            .filter(|ms| *ms > 0)
     }
 
     /// Attach the state store and load every stored document. A stored
@@ -280,12 +586,23 @@ impl ModelSettingsRegistry {
                 Err(e) => return Err(SettingsWriteError::Store(e.0)),
             },
             None => {
-                self.memory_history
+                let mut history = self
+                    .memory_history
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .entry(target.to_string())
-                    .or_default()
-                    .push(change);
+                    .unwrap_or_else(|e| e.into_inner());
+                let changes = history.entry(target.to_string()).or_default();
+                changes.push(change);
+                let keep = self.history_keep();
+                if changes.len() > keep {
+                    let extra = changes.len() - keep;
+                    changes.drain(..extra);
+                }
+            }
+        }
+        if let Some(store) = self.store.read().ok().and_then(|store| store.clone()) {
+            // The write stands; a failed prune only leaves older rows.
+            if let Err(e) = store.model_settings_prune(target, self.history_keep()) {
+                tracing::warn!(target_model = %target, error = %e.0, "model settings: history prune failed");
             }
         }
         let entry = SettingsEntry {
@@ -337,7 +654,27 @@ impl ModelSettingsRegistry {
         }
     }
 
-    /// Write revision `to`'s document again as a new revision.
+    /// Revision `to`'s document, searched in every revision the history
+    /// keeps.
+    pub fn revision_doc(
+        &self,
+        target: &str,
+        to: u64,
+    ) -> Result<ModelSettingsDoc, SettingsWriteError> {
+        let history = self
+            .history(target, self.history_keep())
+            .map_err(SettingsWriteError::Store)?;
+        let change = history
+            .into_iter()
+            .find(|change| change.revision == to)
+            .ok_or(SettingsWriteError::UnknownRevision(to))?;
+        serde_json::from_str(&change.doc)
+            .map_err(|e| SettingsWriteError::Invalid(format!("revision {to}: {e}")))
+    }
+
+    /// Write revision `to`'s document again as a new revision. The HTTP
+    /// revert runs the engine checks and the apply around this, as a PUT
+    /// does.
     pub fn revert(
         &self,
         target: &str,
@@ -345,15 +682,7 @@ impl ModelSettingsRegistry {
         expected: u64,
         actor: &SettingsActor,
     ) -> Result<SettingsEntry, SettingsWriteError> {
-        let history = self
-            .history(target, 10_000)
-            .map_err(SettingsWriteError::Store)?;
-        let change = history
-            .into_iter()
-            .find(|change| change.revision == to)
-            .ok_or(SettingsWriteError::UnknownRevision(to))?;
-        let doc: ModelSettingsDoc = serde_json::from_str(&change.doc)
-            .map_err(|e| SettingsWriteError::Invalid(format!("revision {to}: {e}")))?;
+        let doc = self.revision_doc(target, to)?;
         self.write(target, doc, expected, actor, &format!("revert:{to}"))
     }
 }
@@ -426,6 +755,24 @@ pub fn settings_engine(snap: &Snapshot, provider_id: &str) -> SettingsEngine {
     }
 }
 
+/// How long a request waits at a closed admission gate of a model on
+/// `provider_id`'s lane: its engine's `apply_wait_secs`. `None` = the lane
+/// has no engine control, so nothing closes the gate and nothing is counted.
+pub fn gate_wait(snap: &Snapshot, provider_id: &str) -> Option<std::time::Duration> {
+    snap.config
+        .local_executors
+        .iter()
+        .find(|lane| lane.name == provider_id)
+        .and_then(|lane| lane.engine.as_ref())
+        .map(|engine| std::time::Duration::from_secs(engine.apply_wait_secs.max(1)))
+}
+
+/// A closed gate answered: 503 with a retry delay and a typed reason.
+pub(crate) fn gate_error(e: &GateTimeout) -> ExecError {
+    ExecError::new(503, "model_paused", e.to_string(), None)
+        .with_retry_after(std::time::Duration::from_secs(5))
+}
+
 /// The request each attempt sends, per target, with that target's
 /// settings applied. Targets with no settings (and a request that asked
 /// nothing) are absent: their attempts send the request unchanged.
@@ -433,6 +780,11 @@ pub fn settings_engine(snap: &Snapshot, provider_id: &str) -> SettingsEngine {
 pub(crate) struct SettingsPlan {
     per_target: HashMap<String, PlannedTarget>,
     registry: Option<Arc<ModelSettingsRegistry>>,
+    /// Admissions taken before the attempt (the first choice's, when
+    /// routing committed to it; a variant's, when it was made), per target.
+    admissions: HashMap<String, ModelInFlight>,
+    /// The engine control's seam (pending applies before a dispatch).
+    variants: Option<Arc<dyn ModelVariants>>,
 }
 
 struct PlannedTarget {
@@ -466,20 +818,108 @@ impl SettingsPlan {
         self.per_target.is_empty()
     }
 
-    /// Count an attempt on `target` (its variant name when it has one) as
-    /// in flight on that engine model until the guard drops.
-    pub(crate) fn enter(&self, target: &ExecutionTarget) -> Option<ModelInFlight> {
-        let registry = self.registry.as_ref()?;
+    /// The engine control's seam, for its pending applies before a dispatch.
+    pub(crate) fn set_variants(&mut self, variants: Option<Arc<dyn ModelVariants>>) {
+        self.variants = variants;
+    }
+
+    /// Keep an admission taken before the attempt (replacing an earlier
+    /// one for the same target).
+    pub(crate) fn add_admission(&mut self, target_id: &str, admission: ModelInFlight) {
+        self.admissions.insert(target_id.to_string(), admission);
+    }
+
+    /// The engine model an attempt on `target` reaches (`provider/model`,
+    /// a variant's own name when it has one).
+    fn model_key(&self, target: &ExecutionTarget) -> String {
         let model = self
             .per_target
             .get(&target.id)
             .and_then(|planned| planned.model.as_deref())
             .unwrap_or(&target.model);
-        Some(registry.enter(&format!("{}/{model}", target.provider_id)))
+        format!("{}/{model}", target.provider_id)
+    }
+
+    /// The admission of an attempt on `target`'s engine model: the one
+    /// taken earlier when there is one, else a new one (waiting, bounded,
+    /// at a closed gate). Taken before the attempt's lane place, so a
+    /// request never holds a place while it waits for a gate. `Ok(None)`:
+    /// the lane has no engine control.
+    pub(crate) async fn admission_for(
+        &mut self,
+        snap: &Snapshot,
+        target: &ExecutionTarget,
+    ) -> Result<Option<ModelInFlight>, ExecError> {
+        let key = self.model_key(target);
+        let stored = self
+            .admissions
+            .remove(&target.id)
+            .filter(|admission| admission.key() == key);
+        self.admit_on(snap, target, &key, stored).await
+    }
+
+    async fn admit_on(
+        &self,
+        snap: &Snapshot,
+        target: &ExecutionTarget,
+        key: &str,
+        stored: Option<ModelInFlight>,
+    ) -> Result<Option<ModelInFlight>, ExecError> {
+        let (Some(registry), Some(wait)) =
+            (self.registry.as_ref(), gate_wait(snap, &target.provider_id))
+        else {
+            return Ok(None);
+        };
+        match stored {
+            Some(admission) => Ok(Some(admission)),
+            None => registry
+                .admit(key, wait)
+                .await
+                .map(Some)
+                .map_err(|e| gate_error(&e)),
+        }
+    }
+
+    /// Right before the attempt reaches the engine: the lane's pending
+    /// apply when one is due, then the dispatch (waiting, bounded, while a
+    /// preset re-read holds the model).
+    pub(crate) async fn dispatch(
+        &self,
+        snap: &Snapshot,
+        target: &ExecutionTarget,
+        admission: &mut ModelInFlight,
+    ) -> Result<(), ExecError> {
+        let wait =
+            gate_wait(snap, &target.provider_id).unwrap_or(std::time::Duration::from_secs(1));
+        if let Some(variants) = &self.variants {
+            variants.before_dispatch(&target.provider_id).await;
+        }
+        admission.dispatch(wait).await.map_err(|e| gate_error(&e))
+    }
+
+    /// A hedge racer's admission and dispatch (always a new admission;
+    /// the plan's own stays with the sequential path).
+    pub(crate) async fn admit_racer(
+        &self,
+        snap: &Snapshot,
+        target: &ExecutionTarget,
+    ) -> Result<Option<ModelInFlight>, ExecError> {
+        let key = self.model_key(target);
+        let Some(mut admission) = self.admit_on(snap, target, &key, None).await? else {
+            return Ok(None);
+        };
+        self.dispatch(snap, target, &mut admission).await?;
+        Ok(Some(admission))
     }
 
     /// Send attempts on `target` to the engine model `model` (a variant).
-    pub(crate) fn set_model(&mut self, target: &ExecutionTarget, req: &AiRequest, model: String) {
+    pub(crate) fn set_model(
+        &mut self,
+        target: &ExecutionTarget,
+        req: &AiRequest,
+        model: String,
+        note: Option<String>,
+    ) {
         let planned = self
             .per_target
             .entry(target.id.clone())
@@ -488,10 +928,14 @@ impl SettingsPlan {
                 model: None,
                 summary: String::new(),
             });
+        let variant = match note {
+            Some(note) => format!("variant={model}; {note}"),
+            None => format!("variant={model}"),
+        };
         planned.summary = if planned.summary.is_empty() {
-            format!("variant={model}")
+            variant
         } else {
-            format!("{}; variant={model}", planned.summary)
+            format!("{}; {variant}", planned.summary)
         };
         planned.model = Some(model);
     }
@@ -717,6 +1161,105 @@ mod tests {
         let reverted = registry.revert("text/m", 1, 2, &actor()).unwrap();
         assert_eq!(reverted.revision, 3);
         assert_eq!(reverted.doc.defaults["temperature"], json!(0.6));
+    }
+
+    #[test]
+    fn history_keeps_the_newest_revisions_and_revert_reaches_them() {
+        let registry = ModelSettingsRegistry::new();
+        registry.set_history_keep(3);
+        for revision in 0..5u64 {
+            registry
+                .write(
+                    "text/m",
+                    doc(json!({"defaults": {"top_k": revision + 1}})),
+                    revision,
+                    &actor(),
+                    "put",
+                )
+                .unwrap();
+        }
+        let history = registry.history("text/m", 100).unwrap();
+        assert_eq!(
+            history.iter().map(|c| c.revision).collect::<Vec<_>>(),
+            vec![5, 4, 3]
+        );
+        assert_eq!(
+            registry.revision_doc("text/m", 3).unwrap().defaults["top_k"],
+            json!(3)
+        );
+        assert_eq!(
+            registry.revision_doc("text/m", 2).unwrap_err(),
+            SettingsWriteError::UnknownRevision(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_holds_new_requests_and_a_drain_waits_for_queued_ones() {
+        let registry = Arc::new(ModelSettingsRegistry::new());
+        let wait = std::time::Duration::from_millis(500);
+        // Admitted (queued: not dispatched): a drain waits for it.
+        let queued = registry.admit("text/m", wait).await.unwrap();
+        let gate = registry.close("text/m", GateKind::Drain);
+        assert_eq!(gate.busy(), 1);
+        // A new request waits at the gate, and gives up at its bound.
+        assert!(registry.try_admit("text/m").is_none());
+        let refused = registry
+            .admit("text/m", std::time::Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.key, "text/m");
+        // The queued one still goes on (a drain does not stop dispatch).
+        let mut queued = queued;
+        queued
+            .dispatch(std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+        let waiter = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.admit("text/m", wait).await.is_ok() })
+        };
+        let drained = {
+            let gate_wait = gate.wait_idle(wait);
+            tokio::pin!(gate_wait);
+            tokio::select! {
+                _ = &mut gate_wait => panic!("drained with a request still in flight"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+            drop(queued);
+            gate_wait.await
+        };
+        assert_eq!(drained, Ok(()));
+        assert_eq!(registry.in_flight("text/m"), 0);
+        // Reopened: the waiting request is admitted.
+        drop(gate);
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_hold_waits_only_for_dispatched_requests_and_holds_dispatch() {
+        let registry = Arc::new(ModelSettingsRegistry::new());
+        let wait = std::time::Duration::from_millis(300);
+        let mut queued = registry.admit("text/m", wait).await.unwrap();
+        let gate = registry.close("text/m", GateKind::Hold);
+        // Admitted but not at the engine: the hold does not wait for it...
+        assert_eq!(gate.busy(), 0);
+        // ...and it may not reach the engine while the hold lasts.
+        assert!(queued
+            .dispatch(std::time::Duration::from_millis(50))
+            .await
+            .is_err());
+        drop(gate);
+        queued.dispatch(wait).await.unwrap();
+        assert_eq!(registry.dispatched("text/m"), 1);
+        // The idle hook fires when the last dispatched request ends.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        registry.set_idle_hook(Arc::new(move |key: &str| {
+            sink.lock().unwrap().push(key.to_string());
+        }));
+        drop(queued);
+        assert_eq!(*seen.lock().unwrap(), vec!["text/m".to_string()]);
+        assert_eq!(registry.dispatched("text/m"), 0);
     }
 
     #[test]
