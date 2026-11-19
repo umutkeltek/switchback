@@ -253,7 +253,7 @@ class Fail(Exception):
 class GatewayError(Exception):
     """The gateway answered with an HTTP error."""
 
-    def __init__(self, status, message, has_body, reason=""):
+    def __init__(self, status, message, has_body, reason="", error_type=""):
         super().__init__(message)
         self.status = status
         self.message = message
@@ -261,6 +261,8 @@ class GatewayError(Exception):
         # The gateway's typed reason, when it gave one (a refused power-off
         # says why: `hold_active`, `guard_busy`, ...).
         self.reason = reason
+        # The error's `type` (`model_paused`: retry later).
+        self.error_type = error_type
 
 
 # ---------------------------------------------------------------- config
@@ -358,7 +360,7 @@ class Gateway:
             payload = error.read()
         except OSError:
             payload = b""
-        message, has_body, reason = "", False, ""
+        message, has_body, reason, error_type = "", False, "", ""
         try:
             parsed = json.loads(payload)
             if isinstance(parsed, dict):
@@ -366,11 +368,12 @@ class Gateway:
                 message = inner.get("message", "") if isinstance(inner, dict) else str(inner or "")
                 if isinstance(inner, dict):
                     reason = str(inner.get("reason") or "")
+                    error_type = str(inner.get("type") or "")
                 has_body = True
         except ValueError:
             pass
         return GatewayError(error.code, self.scrub(message or error.reason or "error"), has_body,
-                            reason)
+                            reason, error_type)
 
     def get(self, path, **kw):
         return self.call("GET", path, **kw)
@@ -1851,7 +1854,7 @@ def cmd_doctor(gw, args):
     targets = report.get("targets") or []
     if not targets:
         print("no local targets to report on")
-    rows = [("target", "decode", "prompt", "ttft", "ceiling", "swaps/h", "cache", "accept",
+    rows = [("target", "decode*", "prompt", "ttft", "ceiling", "swaps/h", "cache", "accept",
              "empty", "waits", "wakes")]
     for t in targets:
         cache = (t.get("cache") or {}).get("token_hit_pct")
@@ -1866,6 +1869,8 @@ def cmd_doctor(gw, args):
         widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
         for row in rows:
             print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    if targets:
+        print("* decode: all requests, median (any concurrency, not a single-stream c1 figure)")
     for host in report.get("hosts") or []:
         print(f"host {host.get('host')}: {host.get('bandwidth_gbs')} GB/s ({host.get('source')})")
     findings = report.get("findings") or []

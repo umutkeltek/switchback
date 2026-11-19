@@ -14,15 +14,20 @@ Changes that claim to be lossless must give the same greedy answer; changes
 to the KV cache or context must find needles at about half and all of the
 context; a change to the slot count must survive a concurrent soak at full
 per-slot context. The run stops after three levers in a row inside the
-noise, at the end of its budget, or on Ctrl-C, and always leaves the best
-known settings applied.
+noise, at the end of its budget, when a quiet window begins, when its tuning
+lock is gone (the gateway restarted), or on Ctrl-C, and always leaves the
+best known settings applied.
 
 Safety: the run never starts on a sleeping machine without --wake, on a lane
 with requests in flight, inside a quiet window, or when it would change a
 locked load key. It holds the machine on while it runs, takes the lane's
 tuning lock (other requests go elsewhere meanwhile), never interrupts a
 request (Ctrl-C waits for the requests in flight to end), and lets both go
-at the end.
+at the end. Between runs (never during one) a heartbeat renews the lock and
+reads whether a quiet window began. A write whose apply the gateway held
+back (`apply.pending`: the model was busy) is waited for, never taken as
+applied; a model the gateway pauses (503 `model_paused`) is asked again
+later.
 
 Standard library only. The gateway client (key handling, errors) is
 `ai_gateway.Gateway`.
@@ -48,6 +53,9 @@ REGRESSION = 0.03   # another metric worse by more than 3% rejects a change
 SURPRISE = 0.20     # a win over 20% is repeated once before it is kept
 PLATEAU = 3         # three levers in a row inside the noise: stop
 MIN_SAMPLES = 6     # decode samples per run (the median is used)
+HEARTBEAT_S = 30    # renew the lock and read the quiet window at most this often
+APPLY_WAIT_S = 600  # how long a held-back apply (model busy) may stay pending
+PAUSED_WAIT_S = 300  # how long a request retries a paused model (503 model_paused)
 
 # The lever catalogue, per engine kind, ordered by expected payoff. Each
 # entry: the load settings it changes, the metric it is judged on, the gate
@@ -109,6 +117,16 @@ class TuneError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class Halt(Exception):
+    """Stop at a safe point (no request in flight): a quiet window began
+    (`code` OK) or the tuning lock is gone (`code` FAIL)."""
+
+    def __init__(self, reason, code):
+        super().__init__(reason)
+        self.reason = self.message = reason
+        self.code = code
 
 
 class Interrupted(Exception):
@@ -195,6 +213,10 @@ class Tuner:
         self.greedy_reference = None
         self.last_control = None
         self.current_lever, self.current_metric = "baseline", "decode"
+        self.last_beat = 0.0
+        poll = getattr(args, "poll_secs", None)
+        # Test runs pass a short poll; every wait scales with it.
+        self.scale = 1.0 if poll is None else max(0.001, float(poll) / 2.0)
 
     # ------------------------------------------------------------ talking
 
@@ -294,17 +316,22 @@ class Tuner:
         Returns (list of {key: value} changes, why-none)."""
         lever = entry["lever"]
         if lever == "spec_type":
-            current = load.get("spec_type")
+            current = self.spec_type_now(load, listing_row)
             if current and current != "none":
                 return [{"spec_type": "none"}], None
+            spec = listing_row.get("speculative") or {}
+            # Real routers list `sidecars` only for cached Hugging Face
+            # models, never for preset ones: the preset/overlay keys and a
+            # loaded instance's arguments (`speculative`) come first.
             sidecars = " ".join(str(s) for s in listing_row.get("sidecars") or []).lower()
-            if "mtp" in sidecars or listing_row.get("mtp"):
+            if spec.get("mtp") or "mtp" in sidecars:
                 return [{"spec_type": "draft-mtp"}], None
-            if load.get("spec_draft_model"):
+            if load.get("spec_draft_model") or spec.get("draft_model") or "draft" in sidecars:
                 return [{"spec_type": "draft-simple"}], None
             return [], "no MTP head or draft model file is known for this model"
         if lever == "draft_max":
-            if not load.get("spec_type") or load.get("spec_type") == "none":
+            current = self.spec_type_now(load, listing_row)
+            if not current or current == "none":
                 return [], "speculative decoding is off"
             return [{"draft_max": value} for value in entry["values"]], None
         if lever == "flash_attn":
@@ -351,6 +378,14 @@ class Tuner:
         return [], "advice only"
 
     @staticmethod
+    def spec_type_now(load, listing_row):
+        """The speculative type in force: our settings, else what the preset
+        or the loaded instance says (the gateway's `speculative` view)."""
+        if "spec_type" in load:
+            return load.get("spec_type")
+        return (listing_row.get("speculative") or {}).get("spec_type")
+
+    @staticmethod
     def fits(estimate, ctx, load):
         sizes = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}
         k = sizes.get(load.get("cache_type_k") or "f16", 2.0)
@@ -363,26 +398,86 @@ class Tuner:
     # ------------------------------------------------------------ settings
 
     def put_doc(self, doc, note):
+        """Write `doc` as a new revision and apply it now. The revision we
+        edit rides `If-Match` (a quoted ETag). An apply the gateway held back
+        (`pending`: the model still served requests) is waited for; one
+        that does not happen in time stops the run."""
         path = f"/v1/models/{urllib.parse.quote(self.target, safe='/')}/settings"
         body = dict(doc)
-        body.update({"revision": self.revision, "apply": "now", "note": note})
+        body.update({"apply": "now", "note": note})
         try:
-            answer = self.gw.call("PUT", path, body=body, timeout=900, headers={})
+            answer = self.gw.call("PUT", path, body=body, timeout=900,
+                                  headers={"If-Match": f'"{self.revision}"'})
         except self.fail_types as error:
             if getattr(error, "status", None) != 409 or getattr(error, "reason", "") == "model_busy":
                 raise TuneError(FAIL, f"applying settings: {getattr(error, 'message', error)}") from None
             # Our own earlier write landed after all (an interrupted call):
             # take the current revision and write again.
-            view = self.call("GET", path, doing="reading the settings")
+            view = self.call("GET", path, doing="reading settings")
             self.revision = int((view.get("targets") or [{}])[0].get("revision") or 0)
-            body["revision"] = self.revision
-            answer = self.call("PUT", path, body=body, timeout=900, doing="applying settings")
+            answer = self.call("PUT", path, body=body, timeout=900, doing="applying settings",
+                               headers={"If-Match": f'"{self.revision}"'})
         self.revision = int(answer.get("revision") or self.revision + 1)
         apply = answer.get("apply") or {}
         self.applied_doc = json.loads(json.dumps(doc))
         if apply and apply.get("ok") is False:
             raise TuneError(FAIL, apply.get("message") or apply.get("error") or "the engine did not load it")
+        if apply.get("pending"):
+            self.wait_applied(apply)
         return answer
+
+    def wait_applied(self, apply):
+        """A held-back apply (`pending: true`, e.g. `reason: model_busy`):
+        the engine re-reads the settings once the model is idle. Wait until
+        the lane has nothing pending for this model; never measure before.
+        Still pending at the bound: the run stops (never a rejection)."""
+        self.log(f"  settings revision {self.revision} written; the engine applies it when "
+                 f"{self.model} is idle ({apply.get('reason') or 'pending'}), waiting")
+        deadline = time.monotonic() + APPLY_WAIT_S * self.scale
+        poll = max(0.05, 2.0 * self.scale)
+        while time.monotonic() < deadline:
+            lane = self.engine_lane()
+            if lane is not None and not lane.get("pending_apply") \
+                    and self.model not in (lane.get("deferred") or []):
+                return
+            time.sleep(poll)
+        raise Halt(f"settings revision {self.revision} of {self.target} is still not applied "
+                   f"after {int(APPLY_WAIT_S * self.scale)} s (the model stays busy); stopped", FAIL)
+
+    def engine_lane(self):
+        try:
+            engines = self.call("GET", "/v1/engines", doing="reading engines")
+        except TuneError:
+            return None
+        for lane in engines.get("data") or []:
+            if lane.get("lane") == self.lane:
+                return lane
+        return None
+
+    def heartbeat(self, force=False):
+        """At a safe point (no request in flight): renew the tuning lock and
+        read the quiet window. A window that began, or a lock the gateway no
+        longer has (it restarted, or the lock ran out), stops the run."""
+        if not self.lock_id:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_beat < HEARTBEAT_S * self.scale:
+            return
+        self.last_beat = now
+        ttl = int(max(60, self.budget - self.elapsed() + 900))
+        try:
+            beat = self.gw.call("PATCH", f"/v1/optimize/locks/{self.lock_id}",
+                                body={"ttl_secs": min(ttl, 14400)}, timeout=30, headers={})
+        except self.fail_types as error:
+            if getattr(error, "status", None) == 404:
+                self.lock_id = None
+                raise Halt("the tuning lock is gone (it ran out or the gateway restarted); "
+                           "stopped at a safe point", FAIL) from None
+            self.say(f"renewing the tuning lock: {getattr(error, 'message', error)}")
+            return
+        window = beat.get("quiet_window")
+        if window:
+            raise Halt(f"the quiet window {window} began; stopped at a safe point", OK)
 
     def with_change(self, doc, change):
         new = json.loads(json.dumps(doc))
@@ -435,6 +530,20 @@ class Tuner:
             body["temperature"] = temperature
             body["seed"] = 1
         headers = {"x-switchback-tune-lock": self.lock_id} if self.lock_id else {}
+        deadline = time.monotonic() + PAUSED_WAIT_S * self.scale
+        while True:
+            try:
+                return self.chat_once(body, headers)
+            except self.fail_types as error:
+                paused = getattr(error, "status", None) == 503 and "model_paused" in (
+                    getattr(error, "reason", ""), getattr(error, "error_type", ""))
+                if not paused or time.monotonic() >= deadline or self.stopping:
+                    raise
+                # The gateway closed the model's gate (an apply or an unload
+                # runs): ask again later; never a failed answer.
+                time.sleep(max(0.05, 5.0 * self.scale))
+
+    def chat_once(self, body, headers):
         started = time.monotonic()
         first, usage, text = None, None, []
         for when, chunk in self.gw.stream("/v1/chat/completions", body, timeout=900, headers=headers):
@@ -476,6 +585,7 @@ class Tuner:
         (no cache hits). The first request after a load is discarded."""
         if self.stopping:
             raise Interrupted()
+        self.heartbeat()
         self.run_parallel([lambda: self.chat(CHAT_PROMPT, 64)])  # warm-up, discarded
         out = {}
         answers = []
@@ -794,6 +904,7 @@ class Tuner:
         except TuneError as error:
             raise TuneError(FAIL, error.message.replace("taking the lane's tuning lock: ", "")) from None
         self.lock_id = lock.get("id")
+        self.last_beat = time.monotonic()
 
     def wait_awake(self, timeout=600):
         deadline = time.monotonic() + timeout
@@ -855,6 +966,7 @@ class Tuner:
             if self.stopping:
                 stop = "interrupted"
                 break
+            self.heartbeat()
             if entry.get("kind") == "advice":
                 self.advice(entry)
                 continue
@@ -935,7 +1047,9 @@ class Tuner:
         ceiling = self.ceiling_row
         how = f"median of {self.samples}, warm, fresh prompts, through the gateway (client clock)"
         table = []
-        for key, label in (("decode", "decode tok/s (c1)"), ("prefill", "prefill tok/s"),
+        # Decode is measured one request at a time (concurrency 1): a c1
+        # figure. The aggregate row is the concurrent one.
+        for key, label in (("decode", "decode tok/s (c1, median)"), ("prefill", "prefill tok/s"),
                            ("ttft_ms", "time to first token ms"), ("aggregate", "aggregate tok/s"),
                            ("load_s", "load s")):
             if key not in self.baseline and key not in final:
@@ -996,6 +1110,9 @@ class Tuner:
             self.take_hold_and_lock()
             stop = self.tune()
             final = self.final_metrics()
+        except Halt as halt:
+            stop, final, code = halt.reason, self.baseline, halt.code
+            self.log(f"sb ai tune {self.target}: {halt.reason}")
         except (Interrupted, KeyboardInterrupt):
             stop, final, code = "interrupted (Ctrl-C)", self.baseline, INTERRUPTED
         finally:
@@ -1007,7 +1124,7 @@ class Tuner:
                     if code != INTERRUPTED and self.gains:
                         # The winner as its own revision: `sb ai revert` undoes it.
                         self.put_doc(self.best, f"tune {self.run_id}")
-            except TuneError as error:
+            except (TuneError, Halt) as error:
                 self.say(f"restoring the best settings failed: {error.message}")
                 code = FAIL
             finally:

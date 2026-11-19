@@ -258,6 +258,9 @@ pub(crate) fn build_report(input: &ReportInput) -> Value {
             "configured": info.configured,
             "requests": by_target.get(&info.target).map(Vec::len).unwrap_or(0),
             "decode_tps_p50": decode.map(round1),
+            // Every served request at whatever concurrency it ran, so not
+            // a single-stream (c1) figure.
+            "decode_basis": "all requests, median",
             "decode_samples": decode_samples,
             "prompt_tps_p50": prompt.map(round1),
             "ttft_ms_p50": ttft.map(|v| v.round()),
@@ -310,8 +313,8 @@ pub(crate) fn build_report(input: &ReportInput) -> Value {
                     &info.target,
                     "decode_below_ceiling",
                     format!(
-                        "decode p50 {:.1} tok/s over {decode_samples} requests is {pct:.0}% of its \
-                         ceiling {:.1} tok/s ({})",
+                        "decode {:.1} tok/s (all requests, median of {decode_samples}) is {pct:.0}% \
+                         of its ceiling {:.1} tok/s ({})",
                         decode, ceiling.decode_tps, ceiling.source
                     ),
                     format!(

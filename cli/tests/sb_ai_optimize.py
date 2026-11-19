@@ -103,7 +103,18 @@ class Fake:
         self.ledger = []
         self.build = "b100"
         self.model_file = "file-a"
-        self.sidecars = ["mtp"]
+        # Shaped like the gateway over a real llama.cpp router (b12359): a
+        # preset model has no sidecars; speculation comes from the preset
+        # or the loaded instance's arguments (`speculative`).
+        self.sidecars = []
+        self.speculative = {"spec_type": None, "mtp": False, "draft_model": False, "sources": []}
+        self.quiet_window = None       # the heartbeat's answer, once set
+        self.lose_lock_after = None    # heartbeats before the lock is "lost" (a restart)
+        self.beats = 0
+        self.busy_applies = 0          # apply-now answers held back (model busy), then pending
+        self.pending_polls = 0         # /v1/engines reads the pending apply stays pending
+        self.pending_apply = False
+        self.paused_chats = 0          # chats answered 503 model_paused first
         self.report_targets = [{"target": TARGET, "ceiling": {"decode_tps": 4000.0},
                                 "swaps_last_hour": 0}]
         self.report_findings = []
@@ -141,6 +152,15 @@ class Fake:
         action = "put" + (f": {note}" if note else "")
         self.history.append({"revision": self.revision, "action": action, "doc": json.dumps(body)})
         view = self.settings_view()
+        if apply == "now" and self.busy_applies > 0:
+            # The model still served a request: the write stands, the apply
+            # waits for it to be idle (200, pending).
+            self.busy_applies -= 1
+            self.pending_apply = True
+            self.held_load = body.get("load") or {}
+            view["apply"] = {"ok": True, "reloaded": False, "reason": "model_busy", "pending": True,
+                             "deferred": ["m"], "message": "held back until idle"}
+            return 200, view
         if apply == "now":
             problem = self.engine.apply(body.get("load") or {})
             view["apply"] = ({"ok": False, "error": problem, "message": problem} if problem
@@ -149,6 +169,22 @@ class Fake:
 
     def chat(self, handler, body):
         engine = self.engine
+        with self.lock:
+            paused = self.paused_chats > 0
+            if paused:
+                self.paused_chats -= 1
+        if paused or self.pending_apply:
+            handler.send_response(503)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Retry-After", "5")
+            payload = json.dumps({"error": {"message": "`box/m` is being unloaded or reloaded with "
+                                                       "new settings", "type": "model_paused"}}).encode()
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+            with self.lock:
+                self.engine.requests.append(("paused", False))
+            return
         prompt = body["messages"][0]["content"]
         long_request = len(prompt) > 4000
         completed = False
@@ -235,6 +271,15 @@ class Fake:
             lock_id = f"tune-lock-{len(self.locks) + 1}"
             self.locks[lock_id] = body
             return 201, {"id": lock_id, "target": body["target"], "lane": "box"}
+        if method == "PATCH" and path.startswith("/v1/optimize/locks/"):
+            lock_id = path.rsplit("/", 1)[1]
+            self.beats += 1
+            if self.lose_lock_after is not None and self.beats > self.lose_lock_after:
+                self.locks.pop(lock_id, None)
+            if lock_id not in self.locks:
+                return 404, {"error": {"message": f"no tuning lock {lock_id}", "type": "not_found",
+                                       "reason": "not_found"}}
+            return 200, {"id": lock_id, "quiet_window": self.quiet_window}
         if method == "DELETE" and path.startswith("/v1/optimize/locks/"):
             self.locks.pop(path.rsplit("/", 1)[1], None)
             return 200, {"deleted": True}
@@ -248,9 +293,18 @@ class Fake:
             return 200, {"object": "optimize.report", "targets": self.report_targets,
                          "findings": self.report_findings, "hosts": []}
         if method == "GET" and path == "/v1/engines":
+            if self.pending_apply:
+                if self.pending_polls > 0:
+                    self.pending_polls -= 1
+                else:
+                    # The model went idle: the engine re-read the settings.
+                    self.engine.apply(self.held_load)
+                    self.pending_apply = False
             return 200, {"object": "list", "data": [
-                {"lane": "box", "build": self.build, "models": [
-                    {"id": "m", "file": self.model_file, "sidecars": self.sidecars}]}]}
+                {"lane": "box", "build": self.build, "pending_apply": self.pending_apply,
+                 "deferred": ["m"] if self.pending_apply else [],
+                 "models": [{"id": "m", "file": self.model_file, "sidecars": self.sidecars,
+                             "speculative": self.speculative}]}]}
         return 404, None
 
     def handler(self):
@@ -271,7 +325,9 @@ class Fake:
                     fake.chat(self, body)
                     return
                 if self.command == "PUT" and "revision" not in body and self.headers.get("If-Match"):
-                    body = dict(body, revision=int(self.headers["If-Match"]))
+                    # A quoted ETag (`"7"`) or a bare number, as the gateway takes.
+                    tag = self.headers["If-Match"].strip().removeprefix("W/").strip('"')
+                    body = dict(body, revision=int(tag))
                 status, payload = fake.route(self.command, self.path, body)
                 data = json.dumps(payload).encode() if payload is not None else b""
                 self.send_response(status)
@@ -540,7 +596,97 @@ class TuneTests(Base):
         self.assertNotIn("flash_attn", [row["lever"] for row in plan["levers"]])
         self.assertTrue(any("load.flash_attn is locked" in note for note in plan["notes"]))
 
+    def test_mtp_comes_from_the_preset_or_args_not_sidecars(self):
+        # A real router lists no sidecars for a preset model; the loaded
+        # instance's arguments say MTP is on: the lever tries it off.
+        self.fake.speculative = {"spec_type": "draft-mtp", "mtp": True, "draft_model": False,
+                                 "sources": ["args"]}
+        run = self.sb("tune", TARGET, "--levers", "spec_type,draft_max", "--dry-run", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        plan = {row["lever"]: row for row in json.loads(run.stdout)["levers"]}
+        self.assertEqual(plan["spec_type"]["candidates"], [{"spec_type": "none"}])
+        self.assertIsNone(plan["draft_max"]["skipped"], plan["draft_max"])
+        # Nothing known (no preset key, no args, no sidecars): skipped.
+        self.fake.speculative = {"spec_type": None, "mtp": False, "draft_model": False,
+                                 "sources": []}
+        run = self.sb("tune", TARGET, "--levers", "spec_type,draft_max", "--dry-run", "--json")
+        plan = {row["lever"]: row for row in json.loads(run.stdout)["levers"]}
+        self.assertEqual(plan["spec_type"]["candidates"], [])
+        self.assertIn("no MTP head", plan["spec_type"]["skipped"])
+        self.assertIn("off", plan["draft_max"]["skipped"])
+        # A draft model the settings layer knows: draft-simple.
+        self.fake.speculative = {"spec_type": None, "mtp": False, "draft_model": True,
+                                 "sources": ["settings"]}
+        run = self.sb("tune", TARGET, "--levers", "spec_type", "--dry-run", "--json")
+        plan = {row["lever"]: row for row in json.loads(run.stdout)["levers"]}
+        self.assertEqual(plan["spec_type"]["candidates"], [{"spec_type": "draft-simple"}])
+
+    def test_writes_name_their_revision_with_a_quoted_if_match(self):
+        self.effect("flash_attn", "on", decode=1.6)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        puts = [h for m, p, b, h in self.fake.seen if m == "PUT"]
+        self.assertTrue(puts)
+        for headers in puts:
+            self.assertRegex(headers.get("if-match", ""), r'^"\d+"$')
+
+    def test_a_held_back_apply_is_waited_for_not_taken_as_applied(self):
+        self.effect("flash_attn", "on", decode=1.6)
+        self.fake.busy_applies = 1
+        self.fake.pending_polls = 3
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # No request reached the model while the apply was pending: a chat
+        # during it would have been answered 503 model_paused.
+        self.assertNotIn(("paused", False), self.fake.engine.requests)
+        self.assertEqual(self.fake.pending_polls, 0)
+        self.assertFalse(self.fake.pending_apply)
+        self.assertEqual(self.verdicts()[-1]["verdict"], "accepted")
+        self.assert_released()
+
+    def test_an_apply_that_stays_pending_stops_the_run(self):
+        self.effect("flash_attn", "on", decode=1.6)
+        self.fake.busy_applies = 1
+        self.fake.pending_polls = 10 ** 6
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("still not applied", run.stderr + run.stdout)
+        self.assert_released()
+
+    def test_a_paused_model_is_asked_again_later(self):
+        self.effect("flash_attn", "on", decode=1.6)
+        self.fake.paused_chats = 3
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.fake.paused_chats, 0)
+        self.assertEqual(self.verdicts()[-1]["verdict"], "accepted")
+
+    def test_a_quiet_window_that_begins_stops_the_run_safely(self):
+        self.effect("flash_attn", "on", decode=1.6)
+        self.fake.quiet_window = "00:30-03:00 Asia/Tokyo"
+        run = self.tune("--levers", "flash_attn,ubatch_size")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertIn("quiet window 00:30-03:00 Asia/Tokyo began", result["stopped"])
+        # The settings before it are applied again, and nothing was left.
+        self.assertEqual(self.fake.doc.get("load") or {}, {})
+        self.assertEqual(self.fake.engine.loaded, {})
+        self.assert_released()
+
+    def test_a_lost_lock_stops_the_run_safely(self):
+        self.effect("flash_attn", "on", decode=1.6)
+        self.fake.lose_lock_after = 1
+        run = self.tune("--levers", "flash_attn,ubatch_size")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        result = json.loads(run.stdout)
+        self.assertIn("tuning lock is gone", result["stopped"])
+        self.assertEqual(self.fake.holds, {}, "the hold was not released")
+        best = self.fake.doc.get("load") or {}
+        self.assertEqual(self.fake.engine.loaded, best, "the best settings are not applied")
+
     def test_dry_run_changes_nothing(self):
+        # The sidecar fallback (cached Hugging Face models) still works.
+        self.fake.sidecars = ["model-mtp.gguf"]
         run = self.sb("tune", TARGET, "--dry-run")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("spec_type", run.stdout)
