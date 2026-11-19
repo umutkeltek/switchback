@@ -1054,8 +1054,11 @@ impl crate::Engine {
         if parallel <= 1 {
             return;
         }
+        // Others on the model: every admitted request but this one's own
+        // admission (taken before routing on a lane with an engine control).
         let key = format!("{}/{}", first.provider_id, sticky.engine_model);
-        if self.model_settings.in_flight(&key) > 0 {
+        let own = usize::from(settings_plan.holds_admission(&first.id, &key));
+        if self.model_settings.in_flight(&key).saturating_sub(own) > 0 {
             plan.decision
                 .add_optimize(format!("slot {slot} not pinned (model busy)"));
             return;

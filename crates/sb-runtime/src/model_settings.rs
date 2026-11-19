@@ -943,6 +943,14 @@ impl SettingsPlan {
         Ok(Some(admission))
     }
 
+    /// Whether this plan holds an admission for `target_id` on engine
+    /// model `key` (it counts in [`ModelSettingsRegistry::in_flight`]).
+    pub(crate) fn holds_admission(&self, target_id: &str, key: &str) -> bool {
+        self.admissions
+            .get(target_id)
+            .is_some_and(|admission| admission.key() == key)
+    }
+
     /// Let go of an admission taken earlier for `target` (the attempt
     /// skipped it before dispatch: circuit open, over budget, lane down).
     pub(crate) fn release(&mut self, target_id: &str) {
