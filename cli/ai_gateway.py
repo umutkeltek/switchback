@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sb ai: images, video and machine status through a Switchback gateway.
+"""sb ai: images, video, audio and machine status through a Switchback gateway.
 
 The gateway is the one door: it wakes a managed machine when work arrives and
 powers it off again when the machine has been idle. This client never wakes a
@@ -15,8 +15,11 @@ import math
 import os
 import random
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -27,7 +30,7 @@ OK, GATEWAY_ERROR, USAGE, UNREACHABLE = 0, 1, 2, 3
 MACHINE_OFF = 3  # the same code as an unreachable gateway: the work cannot start
 
 HELP = """\
-sb ai: images, video and machine status through a Switchback gateway
+sb ai: images, video, audio and machine status through a Switchback gateway
 
   sb ai image "prompt" [--model NAME] [--aspect W:H] [--mp N] [--size WxH] [--seed N] [-o FILE]
   sb ai video "prompt" --image FIRST_FRAME [--model NAME] [--seconds N] [--frames N]
@@ -37,7 +40,7 @@ sb ai: images, video and machine status through a Switchback gateway
                                  measure the text models: first token, prompt and decode speed
   sb ai status [--json]          lanes and machine power; never wakes anything
   sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video,
-                                 segment); --all also shows internal provider ids
+                                 segment, audio); --all also shows internal provider ids
   sb ai hold DURATION [REASON] [--wake] [--host NAME]
                                  keep the machine on for direct work (30m, 2h, 1h30m)
   sb ai release [ID | --all] [--host NAME]
@@ -48,6 +51,11 @@ sb ai: images, video and machine status through a Switchback gateway
                                  power the machine off now
   sb ai segment IMAGE ["what to segment"] [--model ID] [-o FILE]
                                  segment an image; the mask is saved next to it
+  sb ai transcribe FILE [--model ID] [--language CODE] [--speakers]
+                   [--format text|srt|vtt|json] [-o OUT]
+                                 speech to text; --speakers says who spoke when
+  sb ai speak "TEXT" [--model ID] [--voice V] -o OUT
+                                 text to speech, saved to OUT
 
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
@@ -81,21 +89,38 @@ Each run starts its prompt with a new line, so the engine cannot reuse the
 prompt it read before; --keep-cache sends the same prompt every run instead
 (to see what the prompt cache saves).
 
+transcribe sends FILE to the gateway's route `transcribe` (or --model) and prints
+the transcript (--format text, the default) or writes it to OUT. --speakers asks
+the route `diarize` (or --model) who spoke when and prints one line per turn,
+like `[00:01:03] SPEAKER_00: text`; with --format json it gives the raw answer.
+A file that is not wav, mp3, m4a, flac, ogg or webm is first turned into 16 kHz
+mono wav when ffmpeg is on the PATH, else sent as it is. speak saves the audio
+to OUT; the extension picks the format (mp3, wav, opus, aac, flac, pcm). Its
+model is --model, else SWITCHBACK_AI_SPEECH_MODEL, else the gateway's one speech
+model. Both wait up to --timeout SECS (default 900).
+
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
-SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL, SWITCHBACK_AI_SEGMENT_MODEL
-(defaults), SWITCHBACK_AI_OUT_DIR.
+SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL, SWITCHBACK_AI_SEGMENT_MODEL,
+SWITCHBACK_AI_SPEECH_MODEL (defaults), SWITCHBACK_AI_OUT_DIR.
 Exit codes: 0 ok, 1 the gateway reported an error, 2 usage error, 3 the gateway does
 not answer, or the machine is off.
 """
 
 CONFIG_KEYS = ("SWITCHBACK_AI_URL", "SWITCHBACK_AI_KEY", "SWITCHBACK_AI_IMAGE_MODEL",
                "SWITCHBACK_AI_VIDEO_MODEL", "SWITCHBACK_AI_SEGMENT_MODEL",
-               "SWITCHBACK_AI_OUT_DIR")
+               "SWITCHBACK_AI_SPEECH_MODEL", "SWITCHBACK_AI_OUT_DIR")
 IMAGE_KIND, VIDEO_KIND = "image_generation", "video_generation"
 SEGMENT_KIND = "workflow_execution"
 # The kinds of work the gateway offers, each with its own models.
-MODEL_GROUPS = ("image", "video", "segment")
+MODEL_GROUPS = ("image", "video", "segment", "audio")
+# /v1/models marks speech-to-text and text-to-speech models with these kinds.
+AUDIO_KINDS = ("audio_transcription", "audio_speech")
+# Audio the gateway's engines read as they are; anything else goes through ffmpeg.
+AUDIO_EXTENSIONS = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
+                    ".flac": "audio/flac", ".ogg": "audio/ogg", ".webm": "audio/webm"}
+SPEECH_FORMATS = {".mp3": "mp3", ".wav": "wav", ".opus": "opus", ".aac": "aac", ".flac": "flac",
+                  ".pcm": "pcm"}
 VIDEO_FPS = 24
 # How long `sb ai on` keeps the machine on when no duration is given.
 DEFAULT_HOLD_DURATION = "1h"
@@ -317,8 +342,9 @@ def gateway_fail(error, doing):
 # ---------------------------------------------------------------- models
 
 def catalog(gw, every_id=False):
-    """{"text": [...], "image": [...], "video": [...], "segment": [...], ...}."""
-    result = {"text": [], "image": [], "video": [], "segment": [], "listed": False, "test": set()}
+    """{"text": [...], "image": [...], "video": [...], "segment": [...], "audio": [...], ...}."""
+    result = {"text": [], "image": [], "video": [], "segment": [], "audio": [], "listed": False,
+              "test": set(), "speech": set()}
     try:
         models = gw.get("/v1/models")
     except GatewayError as error:
@@ -343,6 +369,11 @@ def catalog(gw, every_id=False):
         model_id = row.get("id") if isinstance(row, dict) else None
         if not model_id or model_id in media or model_id in media_providers:
             continue  # a media provider's bare id is listed as a model, but it is not one
+        if row.get("kind") in AUDIO_KINDS:
+            result["audio"].append(model_id)
+            if row["kind"] == "audio_speech":
+                result["speech"].add(model_id)
+            continue
         prefix = model_id.split("/", 1)[0]
         if prefix in MODEL_GROUPS and "/" in model_id:
             result[prefix].append(model_id)
@@ -351,6 +382,7 @@ def catalog(gw, every_id=False):
             result["text"].append(model_id)
     if not every_id:
         result["text"] = plain_text_names(result["text"])
+        result["audio"] = plain_text_names(result["audio"])
     return result
 
 
@@ -549,6 +581,7 @@ def cmd_models(gw, args):
         print(f"{name}:")
         for model_id in ids:
             note = " (test)" if model_id in cat["test"] else ""
+            note += " (speech)" if model_id in cat["speech"] else ""
             print(f"  {model_id}{note}")
         if not ids:
             print("  (none)")
@@ -964,6 +997,160 @@ def cmd_segment(gw, config, args):
                       args.timeout)
     return OK
 
+
+# ---------------------------------------------------------------- audio
+
+def multipart(fields, filename, content_type, data):
+    """A multipart/form-data body: the text fields, then the file."""
+    boundary = f"sb-ai-{uuid.uuid4().hex}"
+    parts = []
+    for name, value in fields:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                     f"{value}\r\n".encode())
+    safe = filename.replace('"', "'").replace("\r", " ").replace("\n", " ")
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{safe}"\r\n'
+                 f"Content-Type: {content_type}\r\n\r\n".encode())
+    parts.append(data)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def audio_file(path, workdir):
+    """(name, content type, bytes) to send: the file itself when engines read
+    it as it is, else a 16 kHz mono wav made by ffmpeg when it is installed."""
+    if not os.path.isfile(path):
+        raise Fail(USAGE, f"cannot read {path}: no such file")
+    name = os.path.basename(path)
+    ext = os.path.splitext(name)[1].lower()
+    ffmpeg = shutil.which("ffmpeg")
+    if ext not in AUDIO_EXTENSIONS and ffmpeg:
+        wav = os.path.join(workdir, os.path.splitext(name)[0] + ".wav")
+        log(f"converting {name} to 16 kHz mono wav")
+        run = subprocess.run([ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-i", path,
+                              "-ac", "1", "-ar", "16000", "-f", "wav", wav],
+                             capture_output=True, text=True)
+        if run.returncode != 0:
+            detail = (run.stderr.strip().splitlines() or ["no detail"])[-1]
+            raise Fail(USAGE, f"ffmpeg cannot read {path}: {detail}")
+        path, name, ext = wav, os.path.basename(wav), ".wav"
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError as error:
+        raise Fail(USAGE, f"cannot read {path}: {error.strerror}")
+    return name, AUDIO_EXTENSIONS.get(ext, "application/octet-stream"), data
+
+
+def clock(seconds):
+    seconds = max(0, int(seconds or 0))
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def speaker_turns(answer):
+    """`[00:01:03] SPEAKER_00: text` lines, one per turn: segments in a row
+    from the same speaker are one turn."""
+    turns = []
+    for segment in answer.get("segments") or []:
+        text = str(segment.get("text") or "").strip()
+        speaker = str(segment.get("speaker") or "SPEAKER")
+        if not text:
+            continue
+        if turns and turns[-1][1] == speaker:
+            turns[-1][2].append(text)
+        else:
+            turns.append([segment.get("start") or 0, speaker, [text]])
+    if not turns and answer.get("text"):
+        return [str(answer["text"]).strip()]
+    return [f"[{clock(start)}] {speaker}: {' '.join(texts)}" for start, speaker, texts in turns]
+
+
+def write_output(path, data):
+    path = os.path.abspath(path)
+    part = path + ".part"
+    try:
+        with open(part, "wb") as handle:
+            handle.write(data)
+        os.replace(part, path)
+    except OSError as error:
+        raise Fail(USAGE, f"cannot write {path}: {error.strerror}") from None
+    print(path, flush=True)
+
+
+def cmd_transcribe(gw, args):
+    fmt = args.format or "text"
+    if args.speakers and args.format in ("srt", "vtt"):
+        raise Fail(USAGE, "--speakers gives turns or json, not srt or vtt")
+    model = args.model or ("diarize" if args.speakers else "transcribe")
+    response_format = "diarized_json" if args.speakers else fmt
+    fields = [("model", model), ("response_format", response_format)]
+    if args.language:
+        fields.append(("language", args.language))
+    with tempfile.TemporaryDirectory(prefix="sb-ai-audio-") as workdir:
+        name, content_type, data = audio_file(args.file, workdir)
+        body, body_type = multipart(fields, name, content_type, data)
+    log(f"transcribing {name} ({len(data) / 2 ** 20:.1f} MiB) with {model}")
+    started = time.time()
+    try:
+        answer = gw.call("POST", "/v1/audio/transcriptions", body=body, content_type=body_type,
+                         timeout=args.timeout, raw=True)
+    except GatewayError as error:
+        if error.status == 413:
+            raise Fail(GATEWAY_ERROR, f"the file is too large for the gateway: {error.message}")
+        raise gateway_fail(error, "the transcription failed")
+    except Fail as failure:
+        if failure.code == UNREACHABLE and gw.answers():
+            raise Fail(GATEWAY_ERROR, f"the upload broke off ({len(data) / 2 ** 20:.1f} MiB); the "
+                                      "gateway may refuse files above its upload limit") from None
+        raise
+    log(f"done in {time.time() - started:.0f}s")
+    if args.speakers and fmt != "json":
+        try:
+            parsed = json.loads(answer)
+        except ValueError:
+            raise Fail(GATEWAY_ERROR, "the gateway sent speaker turns that are not JSON") from None
+        text = "\n".join(speaker_turns(parsed)) + "\n"
+        output = text.encode()
+    elif fmt == "json":
+        output = answer if answer.endswith(b"\n") else answer + b"\n"
+    else:
+        output = answer if answer.endswith(b"\n") or not answer else answer + b"\n"
+    if args.output:
+        write_output(args.output, output)
+    else:
+        sys.stdout.write(output.decode("utf-8", "replace"))
+        sys.stdout.flush()
+    return OK
+
+
+def speech_model(gw, config, args):
+    if args.model or config["SWITCHBACK_AI_SPEECH_MODEL"]:
+        return args.model or config["SWITCHBACK_AI_SPEECH_MODEL"]
+    speech = sorted(catalog(gw)["speech"])
+    if len(speech) == 1:
+        return speech[0]
+    listed = ", ".join(speech) or "none"
+    raise Fail(USAGE, f"choose a speech model with --model (the gateway offers: {listed})")
+
+
+def cmd_speak(gw, config, args):
+    if not args.text.strip():
+        raise Fail(USAGE, "give the text to speak")
+    model = speech_model(gw, config, args)
+    body = {"model": model, "input": args.text}
+    if args.voice:
+        body["voice"] = args.voice
+    fmt = SPEECH_FORMATS.get(os.path.splitext(args.output)[1].lower())
+    if fmt:
+        body["response_format"] = fmt
+    log(f"speaking {len(args.text)} characters with {model}")
+    try:
+        audio = gw.call("POST", "/v1/audio/speech", body=body, timeout=args.timeout, raw=True)
+    except GatewayError as error:
+        raise gateway_fail(error, "the speech failed")
+    if not audio:
+        raise Fail(GATEWAY_ERROR, "the gateway sent no audio")
+    write_output(args.output, audio)
+    return OK
 
 
 # ---------------------------------------------------------------- holds
@@ -1476,6 +1663,20 @@ def parser():
     segment.add_argument("--model", default="")
     segment.add_argument("-o", "--output")
     segment.add_argument("--timeout", type=float, default=900)
+    transcribe = sub.add_parser("transcribe", add_help=False, allow_abbrev=False)
+    transcribe.add_argument("file")
+    transcribe.add_argument("--model", default="")
+    transcribe.add_argument("--language", default="")
+    transcribe.add_argument("--speakers", action="store_true")
+    transcribe.add_argument("--format", choices=("text", "srt", "vtt", "json"))
+    transcribe.add_argument("-o", "--output")
+    transcribe.add_argument("--timeout", type=float, default=900)
+    speak = sub.add_parser("speak", add_help=False, allow_abbrev=False)
+    speak.add_argument("text")
+    speak.add_argument("--model", default="")
+    speak.add_argument("--voice", default="")
+    speak.add_argument("-o", "--output", required=True)
+    speak.add_argument("--timeout", type=float, default=900)
     return top
 
 
@@ -1510,6 +1711,10 @@ def main(argv=None, environ=None):
             return cmd_off(gw, args)
         if args.command == "segment":
             return cmd_segment(gw, config, args)
+        if args.command == "transcribe":
+            return cmd_transcribe(gw, args)
+        if args.command == "speak":
+            return cmd_speak(gw, config, args)
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
         message = gw.scrub(failure.message) if gw else failure.message

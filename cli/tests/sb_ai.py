@@ -21,6 +21,28 @@ SB = CLI / "sb"
 KEY = "sk-test-0f3a9c1d7e5b"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"fake-image-body" * 4
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"fake-video-body" * 4
+WAV = b"RIFF\x24\x00\x00\x00WAVEfmt " + bytes(range(256)) + b"\r\n--not-a-boundary\r\n"
+SPEECH = b"ID3\x04\x00fake-speech-audio" + bytes(range(256))
+DIARIZED = {"task": "transcribe", "duration": 70.0, "text": "hi there all good",
+            "segments": [{"speaker": "SPEAKER_00", "start": 0.4, "end": 1.0, "text": " hi"},
+                         {"speaker": "SPEAKER_00", "start": 1.2, "end": 2.0, "text": "there "},
+                         {"speaker": "SPEAKER_01", "start": 63.2, "end": 65.0, "text": "all good"}]}
+
+
+def form_parts(request):
+    """{name: (filename, content type, bytes)} of a multipart request the fake received."""
+    boundary = request["headers"]["Content-Type"].split("boundary=", 1)[1].encode()
+    parts = {}
+    for chunk in request["body"].split(b"--" + boundary)[1:]:
+        if chunk.startswith(b"--"):
+            break
+        head, _, data = chunk[2:].partition(b"\r\n\r\n")
+        head = head.decode()
+        name = head.split('name="', 1)[1].split('"', 1)[0]
+        filename = head.split('filename="', 1)[1].split('"', 1)[0] if 'filename="' in head else None
+        ctype = head.split("Content-Type: ", 1)[1].split("\r\n", 1)[0] if "Content-Type: " in head else None
+        parts[name] = (filename, ctype, data[:-2])  # the line break before the next boundary
+    return parts
 
 
 def png(width, height):
@@ -137,6 +159,8 @@ class Fake:
             ("POST", "/v1/jobs"): self.jobs_route,
             ("GET", "/v1/jobs/job-v1"): self.job_route,
             ("POST", "/v1/jobs/job-v1/cancel"): lambda r: self.json({"id": "job-v1", "status": "cancelled"}),
+            ("POST", "/v1/audio/transcriptions"): self.transcription_route,
+            ("POST", "/v1/audio/speech"): lambda r: (200, SPEECH, "audio/mpeg"),
         }
         handler = self.handler()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -160,6 +184,17 @@ class Fake:
         return self.json({"object": "image.generation", "model": request["json"]["model"],
                           "job": {"id": "job-1234abcd", "kind": "image_generation", "status": "succeeded"},
                           "data": [{"artifact_id": "art1", "media_type": "image/png", "url": "/v1/artifacts/art1"}]})
+
+    def transcription_route(self, request):
+        """The gateway's `/v1/audio/transcriptions`: the engine's answer per format."""
+        fmt = form_parts(request).get("response_format", (None, None, b"json"))[2].decode()
+        if fmt == "diarized_json":
+            return self.json(DIARIZED)
+        if fmt == "srt":
+            return 200, b"1\n00:00:00,000 --> 00:00:01,000\nhello world\n", "text/plain; charset=utf-8"
+        if fmt == "json":
+            return self.json({"text": "hello world"})
+        return 200, "hello world, grüße".encode(), "text/plain; charset=utf-8"
 
     def job_route(self, request):
         with self.lock:
@@ -476,7 +511,8 @@ class SbAi(unittest.TestCase):
         self.assertEqual(json.loads(run.stdout), {"text": ["chat-a", "chat-b"],
                                                   "image": ["mock-image", "lane-img/flux"],
                                                   "video": ["lane-img/clip", "video/clip2"],
-                                                  "segment": ["segment/sam3"]})
+                                                  "segment": ["segment/sam3"],
+                                                  "audio": []})
         self.assertEqual({r["method"] for r in self.fake.seen}, {"GET"})
 
     def test_models_lists_each_text_model_once(self):
@@ -495,6 +531,155 @@ class SbAi(unittest.TestCase):
         run = self.sb("models")
         self.assertNotIn("lane-txt/chat-a", run.stdout)
         self.assertNotRegex(run.stdout, r"(?m)^  lane-txt$")
+
+    def test_models_lists_audio_models_in_their_own_group(self):
+        self.fake.models.extend([{"id": "transcribe", "kind": "audio_transcription"},
+                                 {"id": "stt/whisper", "kind": "audio_transcription"},
+                                 {"id": "stt", "kind": "audio_transcription"},
+                                 {"id": "speak", "kind": "audio_speech"}])
+        run = self.sb("models", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        groups = json.loads(run.stdout)
+        # Route names, like text: the provider's own ids show with --all.
+        self.assertEqual(groups["audio"], ["transcribe", "speak"])
+        self.assertEqual(groups["text"], ["chat-a", "chat-b"])
+        run = self.sb("models", "--all", "--json")
+        self.assertEqual(json.loads(run.stdout)["audio"], ["transcribe", "stt/whisper", "stt", "speak"])
+        run = self.sb("models")
+        self.assertIn("audio:\n  transcribe\n  speak (speech)\n", run.stdout)
+
+    # ------------------------------------------------------------ audio
+
+    def wav(self, name="talk.wav", data=WAV):
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def test_transcribe_prints_the_text_and_sends_the_file_unchanged(self):
+        run = self.sb("transcribe", str(self.wav()), "--language", "de")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "hello world, grüße\n")
+        request = self.posted("/v1/audio/transcriptions")
+        self.assertEqual(request["headers"].get("Authorization"), f"Bearer {KEY}")
+        self.assertTrue(request["headers"]["Content-Type"].startswith("multipart/form-data; boundary="))
+        parts = form_parts(request)
+        self.assertEqual(parts["model"][2], b"transcribe")  # the operator's route, by default
+        self.assertEqual(parts["response_format"][2], b"text")
+        self.assertEqual(parts["language"][2], b"de")
+        self.assertEqual(parts["file"], ("talk.wav", "audio/wav", WAV))
+        self.assertIn("transcribing talk.wav", run.stderr)
+
+    def test_transcribe_srt_goes_to_the_output_file(self):
+        out = self.root / "talk.srt"
+        run = self.sb("transcribe", str(self.wav()), "--format", "srt", "--model", "stt/whisper",
+                      "-o", str(out))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, f"{out}\n")
+        self.assertEqual(out.read_text(), "1\n00:00:00,000 --> 00:00:01,000\nhello world\n")
+        parts = form_parts(self.posted("/v1/audio/transcriptions"))
+        self.assertEqual(parts["model"][2], b"stt/whisper")
+        self.assertEqual(parts["response_format"][2], b"srt")
+
+    def test_transcribe_speakers_prints_one_line_per_turn(self):
+        run = self.sb("transcribe", str(self.wav()), "--speakers")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "[00:00:00] SPEAKER_00: hi there\n[00:01:03] SPEAKER_01: all good\n")
+        parts = form_parts(self.posted("/v1/audio/transcriptions"))
+        self.assertEqual(parts["model"][2], b"diarize")
+        self.assertEqual(parts["response_format"][2], b"diarized_json")
+        # --format json keeps the raw answer.
+        self.fake.seen.clear()
+        run = self.sb("transcribe", str(self.wav()), "--speakers", "--format", "json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), DIARIZED)
+
+    def test_transcribe_turns_other_files_into_wav_with_ffmpeg(self):
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        ffmpeg = bin_dir / "ffmpeg"
+        ffmpeg.write_text('#!/bin/sh\nfor last; do :; done\nprintf "RIFF-from-ffmpeg:%s" "$*" > "$last"\n')
+        ffmpeg.chmod(0o755)
+        env = dict(self.env, PATH=f"{bin_dir}:{self.env['PATH']}")
+        run = self.sb("transcribe", str(self.wav("meeting.mkv", b"matroska")), env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        filename, ctype, data = form_parts(self.posted("/v1/audio/transcriptions"))["file"]
+        self.assertEqual((filename, ctype), ("meeting.wav", "audio/wav"))
+        self.assertTrue(data.startswith(b"RIFF-from-ffmpeg:"), data)
+        self.assertIn(b"-ac 1 -ar 16000 -f wav", data)
+        # A file engines read as it is never goes through ffmpeg.
+        self.fake.seen.clear()
+        run = self.sb("transcribe", str(self.wav("talk.mp3", b"ID3mp3")), env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(form_parts(self.posted("/v1/audio/transcriptions"))["file"],
+                         ("talk.mp3", "audio/mpeg", b"ID3mp3"))
+        # ffmpeg that cannot read the file: a usage error, nothing sent.
+        self.fake.seen.clear()
+        ffmpeg.write_text("#!/bin/sh\necho 'Invalid data found when processing input' >&2\nexit 1\n")
+        run = self.sb("transcribe", str(self.wav("broken.mkv", b"x")), env=env)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("ffmpeg cannot read", run.stderr)
+        self.assertIn("Invalid data found", run.stderr)
+        self.assertEqual(self.requests("POST"), [])
+
+    def test_transcribe_error_paths(self):
+        run = self.sb("transcribe", str(self.root / "missing.wav"))
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("no such file", run.stderr)
+        run = self.sb("transcribe", str(self.wav()), "--speakers", "--format", "srt")
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(self.requests("POST"), [])
+        self.fake.routes[("POST", "/v1/audio/transcriptions")] = lambda r: Fake.json(
+            {"error": {"message": "the upload is larger than 26214400 bytes", "type": "audio_too_large"}}, 413)
+        run = self.sb("transcribe", str(self.wav()))
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("too large for the gateway: the upload is larger than 26214400 bytes", run.stderr)
+        self.fake.routes[("POST", "/v1/audio/transcriptions")] = lambda r: Fake.json(
+            {"error": {"message": f"no eligible target for key {KEY}", "type": "invalid_request_error"}}, 400)
+        run = self.sb("transcribe", str(self.wav()))
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("the transcription failed: the gateway said 400: no eligible target for key [key]", run.stderr)
+        env = dict(self.env, SWITCHBACK_AI_URL=f"http://127.0.0.1:{closed_port()}")
+        run = self.sb("transcribe", str(self.wav()), env=env)
+        self.assertEqual(run.returncode, 3)
+        self.assertIn("does not answer", run.stderr)
+
+    def test_speak_saves_the_audio_in_the_format_of_the_extension(self):
+        self.fake.models.append({"id": "speak", "kind": "audio_speech"})
+        out = self.root / "hello.mp3"
+        run = self.sb("speak", "Hallo Welt", "--voice", "af_heart", "-o", str(out))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, f"{out}\n")
+        self.assertEqual(out.read_bytes(), SPEECH)
+        self.assertEqual(self.posted("/v1/audio/speech")["json"],
+                         {"model": "speak", "input": "Hallo Welt", "voice": "af_heart",
+                          "response_format": "mp3"})
+        # The configured default wins over the gateway's list.
+        self.fake.seen.clear()
+        env = dict(self.env, SWITCHBACK_AI_SPEECH_MODEL="tts/kokoro")
+        run = self.sb("speak", "hi", "-o", str(self.root / "hi.out"), env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/audio/speech")["json"], {"model": "tts/kokoro", "input": "hi"})
+
+    def test_speak_error_paths(self):
+        run = self.sb("speak", "hi")  # no -o
+        self.assertEqual(run.returncode, 2)
+        run = self.sb("speak", "hi", "-o", str(self.root / "a.wav"))  # the gateway offers no speech model
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("choose a speech model with --model (the gateway offers: none)", run.stderr)
+        self.assertEqual(self.requests("POST"), [])
+        self.fake.routes[("POST", "/v1/audio/speech")] = lambda r: Fake.json(
+            {"error": {"message": "audio output required but target does not support it",
+                       "type": "invalid_request_error"}}, 400)
+        run = self.sb("speak", "hi", "--model", "chat-a", "-o", str(self.root / "a.wav"))
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("the speech failed: the gateway said 400: audio output required", run.stderr)
+        self.assertFalse((self.root / "a.wav").exists())
+
+    def test_audio_help(self):
+        run = self.sb("help")
+        self.assertIn("sb ai transcribe FILE", run.stdout)
+        self.assertIn("sb ai speak \"TEXT\"", run.stdout)
+        self.assertEqual(self.fake.seen, [])
 
     # ------------------------------------------------------------ video
 
