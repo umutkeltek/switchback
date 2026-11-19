@@ -36,8 +36,8 @@ sb ai: images, video and machine status through a Switchback gateway
               [--json] [-o FILE]
                                  measure the text models: first token, prompt and decode speed
   sb ai status [--json]          lanes and machine power; never wakes anything
-  sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video);
-                                 --all also shows internal provider ids
+  sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video,
+                                 segment); --all also shows internal provider ids
   sb ai hold DURATION [REASON] [--wake] [--host NAME]
                                  keep the machine on for direct work (30m, 2h, 1h30m)
   sb ai release [ID | --all] [--host NAME]
