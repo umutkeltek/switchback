@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use sb_core::{AiRequest, ClientProfileConfig, LaneOnFull, LocalExecutorConfig};
+use sb_core::{AiRequest, ClientProfileConfig, LaneOnFull, LocalExecutorConfig, WakePolicy};
 
 use super::profiles::{plan_candidates, plan_resolved_route, CandidateResolution};
 use super::{Engine, ExecError, LaneAcquire, LaneBusy, LaneWake, Snapshot, LANE_QUEUE_RETRY_AFTER};
@@ -243,7 +243,10 @@ impl Engine {
     /// A full lane with `on_full: spill` (the default) sends the request to
     /// the route's next usable target at once (the lane's targets are
     /// skipped with the reason, not counted as failures); when no other
-    /// target can serve, the request waits like `on_full: queue`. Waiting
+    /// target can serve, the request waits like `on_full: queue`. On a
+    /// `prefer_awake` route a small request never spills to a target whose
+    /// machine needs a wake: it waits in the queue, and falls back to (and
+    /// wakes) that target only when the queue times out. Waiting
     /// means the lane's FIFO queue (bounded by `queue_timeout_secs`), then
     /// the GPU group (bounded by `group_wait_secs`). On success the guard
     /// holds the place and the group until the dispatch uses them; on
@@ -296,8 +299,18 @@ impl Engine {
         }
         let spill =
             lane_config(snap, &provider_id).is_some_and(|lane| lane.on_full == LaneOnFull::Spill);
+        // `prefer_awake`, small request: a target whose machine needs a wake
+        // is no place to spill to. The request waits in the full lane's queue
+        // like `on_full: queue`, and reaches the sleeper only when the queue
+        // times out (the dispatch loop wakes it then).
+        let keep_awake = small_request_prefers_awake(resolved, req);
+        let full_now = if limited {
+            lanes.lane_full(&provider_id)
+        } else {
+            None
+        };
         if limited && spill {
-            if let Some(full) = lanes.lane_full(&provider_id) {
+            if let Some(full) = full_now.clone() {
                 let reason = format!(
                     "local lane `{provider_id}` {full}; spilled before dispatch, not counted as a failure"
                 );
@@ -315,7 +328,9 @@ impl Engine {
                 .and_then(|(_, plan)| plan.decision.selected)
                 .is_some_and(|selected| {
                     spilled.candidates.iter().any(|candidate| {
-                        candidate.id == selected.target_id && candidate.provider_id != provider_id
+                        candidate.id == selected.target_id
+                            && candidate.provider_id != provider_id
+                            && !(keep_awake && candidate.wake.is_some())
                     })
                 });
                 if elsewhere {
@@ -336,9 +351,14 @@ impl Engine {
                         busy: None,
                     });
                 }
-                // Nothing else can serve: wait in the lane's queue instead.
+                // Nothing else can serve (or only a sleeper could, on a
+                // `prefer_awake` small request): wait in the lane's queue.
             }
         }
+        // What `prefer_awake` says when this request waited because its
+        // awake first choice was full (not because nothing awake can serve).
+        let queued_awake =
+            (keep_awake && full_now.is_some()).then(|| format!("{provider_id} full, queued"));
         let (detail, retry_after, code) = match lanes.acquire_for_request(&provider_id).await {
             LaneAcquire::Ready { busy, detail } => {
                 let detail = match detail {
@@ -346,13 +366,18 @@ impl Engine {
                     None if grouped => "holds its gpu group".to_string(),
                     None => String::new(),
                 };
+                let prefer_awake =
+                    queued_awake.map(|queued| match &would_be.decision.prefer_awake {
+                        Some(effect) => format!("{queued}; {effect}"),
+                        None => queued,
+                    });
                 return Some(LaneGpuNote {
                     note: LaneWakeNote {
                         wake: LaneWake::Ready { detail },
                         provider_id,
                         code: "local_lane_unavailable",
                         spilled: false,
-                        prefer_awake: None,
+                        prefer_awake,
                     },
                     busy,
                 });
@@ -373,6 +398,35 @@ impl Engine {
                 "local lane `{provider_id}` {detail}; skipped before dispatch, not counted as a failure"
             ),
         );
+        // The queue ran out: the request now falls back, maybe to a sleeper
+        // (woken by the dispatch loop). Say the awake lane was full, not
+        // that nothing awake can serve.
+        let prefer_awake = queued_awake.map(|queued| {
+            let fallback = plan_resolved_route(
+                &self.combo_rr,
+                snap,
+                req,
+                client_profile,
+                resolved.clone(),
+                false,
+            )
+            .ok()
+            .and_then(|(_, plan)| {
+                let selected = plan.decision.selected?;
+                let target = resolved
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.id == selected.target_id)?;
+                Some(match &target.wake {
+                    Some(wake) => format!("wakes {} for {}", wake.describe(), target.id),
+                    None => format!("fell back to {}", target.id),
+                })
+            });
+            match fallback {
+                Some(fallback) => format!("{queued}, {detail}; {fallback}"),
+                None => format!("{queued}, {detail}"),
+            }
+        });
         Some(LaneGpuNote {
             note: LaneWakeNote {
                 wake: LaneWake::NotReady {
@@ -382,7 +436,7 @@ impl Engine {
                 provider_id,
                 code,
                 spilled: false,
-                prefer_awake: None,
+                prefer_awake,
             },
             busy: None,
         })
@@ -535,6 +589,15 @@ impl Engine {
             },
         }
     }
+}
+
+/// A `prefer_awake` route decided this request is small
+/// ([`WakePolicy::PreferAwake`]): a target whose machine needs a wake is a
+/// fallback only, never a place to spill to.
+fn small_request_prefers_awake(resolved: &CandidateResolution, req: &AiRequest) -> bool {
+    resolved
+        .prefer_awake
+        .is_some_and(|cfg| crate::prefer_awake::decide(&cfg, req).policy == WakePolicy::PreferAwake)
 }
 
 /// After a `prefer_awake` wake of `provider_id`'s lane: its targets no

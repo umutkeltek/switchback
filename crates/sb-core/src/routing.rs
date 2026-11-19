@@ -430,10 +430,21 @@ impl RouteDecision {
     }
 
     /// Record what wake-aware ordering did: a `prefer_awake: …` reason line,
-    /// also shown on the summary (`x-switchback-route`).
+    /// also shown on the summary (`x-switchback-route`). One line per
+    /// decision: a later call (the runtime's account of a wake or a queue,
+    /// which knows more than the router's ordering) replaces the earlier
+    /// line in place.
     pub fn set_prefer_awake(&mut self, effect: impl Into<String>) {
         let effect = effect.into();
-        self.add_reason(format!("prefer_awake: {effect}"));
+        let line = format!("prefer_awake: {effect}");
+        let earlier = self
+            .prefer_awake
+            .as_ref()
+            .map(|old| format!("prefer_awake: {old}"));
+        match earlier.and_then(|old| self.reason.iter().position(|r| *r == old)) {
+            Some(index) => self.reason[index] = line,
+            None => self.add_reason(line),
+        }
         self.prefer_awake = Some(effect);
     }
 
