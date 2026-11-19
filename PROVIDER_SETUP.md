@@ -847,7 +847,9 @@ vLLM `enabled: false` or `effort: none` becomes
 `enable_thinking: true` plus the effort; `budget_tokens` goes to vLLM as
 `thinking_token_budget` and is load-time on llama.cpp (`load.reasoning_budget`),
 so per request it is skipped there and the response header says so.
-`repeat_penalty` reaches vLLM as `repetition_penalty`.
+A `repeat_penalty` the settings set reaches vLLM as `repetition_penalty`
+(a request's own `repetition_penalty` counts as its value for that key, and a
+lock replaces it); nothing is renamed that the settings did not set.
 
 **Precedence per key, highest first:** the request's own value (a plain
 OpenAI or llama.cpp field, or `switchback.settings`), unless the key is
@@ -855,6 +857,13 @@ locked > the profile the request asked for > the route's
 `settings_profile` > the target's `defaults` > nothing (the engine's own
 default). A key nobody set is not sent: a target with no settings gets
 exactly the request it got before, byte for byte.
+
+A lock stops values that come with the request. Profiles are part of the
+settings document, which only operator and admin keys write, so a profile
+may set a locked key, and a client that picks that profile gets the
+profile's value: the operator chose both. A request carrying its own
+settings (`switchback` object or `x-switchback-profile`) bypasses the
+exact-request cache receipt.
 
 **Per request:** pick a profile with the header `x-switchback-profile: NAME`
 or the body `"switchback": {"profile": "NAME"}`, and send any key for this
@@ -893,17 +902,23 @@ or paths. Nothing here wakes a machine.
 | `PUT /v1/models/{model}/settings` | replace the document |
 | `PATCH /v1/models/{model}/settings` | JSON merge patch: an object merges, `null` removes a key |
 | `GET /v1/models/{model}/settings/history` | every change, newest first: revision, time, who (the key's tenant and role, never the key), from where (the client's user agent), which keys changed, and the document after it |
-| `POST /v1/models/{model}/settings/revert {"revision": N}` | write revision N's document again as a new revision |
+| `POST /v1/models/{model}/settings/revert {"revision": N}` | write revision N's document again as a new revision (with `If-Match`, like any write) |
 | `POST /v1/models/{model}/load {"wake": false}` | preload the model (below) |
 | `POST /v1/models/{model}/unload` | unload it (below) |
-| `GET /v1/engines` | per engine lane: its models with status, arguments, memory, pending settings, requests in flight, the variants and the last apply |
+| `GET /v1/engines` | per engine lane: its models with status, arguments, memory, pending settings, requests admitted (`in_flight`) and running (`dispatched`), the models whose new settings wait until they are idle (`deferred`), the variants and the last apply |
 
-A write must say which revision it edits (`If-Match: N`, or `"revision": N`
-in the body; 0 for a target never written); without one it is a 428, and a
-stale one is a 409 with `current_revision`. Writes to one target need a name
-that reaches one target. The documents are durable in the state store
-(`server.state_store`) with their history; without a store they live as
-long as the process (`durable: false` in the view).
+A write must say which revision it edits (`If-Match: N`, quoted `"N"` or
+`*` for whatever is current, or `"revision": N` in the body; 0 for a target
+never written); without one it is a 428, and a stale one is a 409 with
+`current_revision`. A revert is a write too: `{"revision": N}` names the
+revision to write again, and `If-Match` the one it edits. It goes through
+the same checks and the same apply as a PUT (and takes `apply` and `wake`
+like one). The `ETag` is the quoted revision (`"3"`). Writes to one target
+need a name that reaches one target. The documents are durable in the state
+store (`server.state_store`) with their history; without a store they live
+as long as the process (`durable: false` in the view). The history keeps the
+newest `server.model_settings_history_keep` revisions of each target
+(default 500); a revert reaches any of them.
 
 **The CLI** (`sb ai`, with the same exit codes as the other commands):
 
@@ -944,14 +959,15 @@ local_executors:
       # base_url: "http://gpu-box.example.invalid:8080"   # default: the provider's, without /v1
       settings_command: "ssh gpu-box python3 /opt/switchback/llamacpp-preset-overlay.py --base /etc/llama/models.base.ini --out /etc/llama/models.ini"
       allow_model_path: false     # true lets load settings and engine_args name files
-      apply_wait_secs: 120        # how long apply-now and unload wait for in-flight requests
+      apply_wait_secs: 120        # how long apply-now and unload wait for a model's requests
       load_timeout_secs: 600      # how long a load may take
 ```
 
-The gateway never writes files on a machine. On every change it runs
+The gateway never writes files on a machine. On a change it runs
 `settings_command` with the managed overlay as JSON on stdin (every managed
 load-time setting of the lane's models and their variants), then asks an
-awake router to re-read its presets (`GET /models?reload=1`):
+awake router to re-read its presets (`GET /models?reload=1`), never while a
+request runs on a model whose section changed (see below):
 
 ```json
 {"version": 1, "lane": "text", "engine": "llama_cpp_router",
@@ -966,7 +982,9 @@ hand-written section, key and comment, marks the keys it manages with
 `; managed by switchback`, copies a variant's section from its base, and
 refuses (exit 2, output left alone) to change a key the base pins with a
 comment line `; switchback-pinned: ctx-size, n-gpu-layers` (in a section, or
-in `[*]` for every model).
+in `[*]` for every model), and to write a section the base file lacks (a
+model name that is neither a base section nor a variant of one would have
+no `model =` line).
 
 **Load keys** (typed, mapped to llama.cpp preset keys): `ctx_size`,
 `n_gpu_layers` (number, `auto` or `all`), `cache_type_k`, `cache_type_v`,
@@ -977,12 +995,20 @@ in `[*]` for every model).
 `yarn_beta_slow`, `yarn_beta_fast`, `spec_type`, `spec_draft_model`,
 `draft_max`, `draft_min` (`spec-draft-n-max`/`-min`), `mmproj` (a path, or
 `off`), `sleep_idle_seconds`, `fit`, `fit_ctx`, `reasoning_budget`, and
-sampling defaults `temp`, `top_k`, `top_p`, `min_p`. `engine_args` takes any
-other `llama-server` argument by its long name without dashes
-(`"n-cpu-moe": 4`), checked against the server's argument list; arguments
-the router controls (`host`, `port`, `api-key`, `alias`, `hf-repo`,
-`models-*`, ...) are refused, and arguments that name files only with
-`allow_model_path`.
+sampling defaults `temp`, `top_k`, `top_p`, `min_p`. `engine_args` takes other
+`llama-server` arguments by their long name without dashes
+(`"n-cpu-moe": 4`) from a per-model allow list: speed, memory and offload,
+sampling defaults, context and RoPE, speculative decoding with local files,
+local model files (`mmproj`, `lora`, ...), chat template and reasoning.
+Anything else is refused by name: tools and agents that run commands
+(`tools`, `agent`, `allow-unauthenticated-tools`, `tools-runtime`), MCP
+servers (`mcp-servers-json`, `mcp-servers-config`), downloads from a URL or
+a model hub (`mmproj-url`, `spec-draft-hf`, `hf-*`, `*-url`, the
+`*-default` presets), remote back ends (`rpc`), and server-wide switches.
+Arguments the router controls (`host`, `port`, `api-key`, `alias`,
+`models-*`, ...) are refused, and arguments that name files need
+`allow_model_path`. Load settings and engine arguments are refused for a
+model the engine does not list.
 
 ```bash
 sb ai set text/qwen3-35b ctx_size=65536 cache_type_k=q8_0 cache_type_v=q8_0 --load
@@ -993,30 +1019,56 @@ sb ai hold 2h "eval run" --wake --load text/qwen3-35b
 ```
 
 **When a load setting takes effect** (`apply` in the write body, `--apply` in
-the CLI):
+the CLI). The write itself always stands and answers 200; its `apply` part
+says what the engine did.
 
-- `next_load` (default): written now; a loaded model keeps running with its
-  old arguments, and the view says `pending` until it loads again.
-- `now`: written, then the model is unloaded and loaded again, but only once
-  no request is in flight on it (waiting up to `apply_wait_secs`, else 409
-  `model_busy`; the write itself stands). A sleeping machine is not woken
-  unless `"wake": true`: the model simply starts with the new settings.
+The rule behind both modes: a request admitted to a model or already
+running on it is never cut off. llama.cpp unloads a running model whose
+preset changed when it re-reads its presets, so the gateway compares the
+overlay with the one the engine last read, and every model whose section
+changes is held (no new request is admitted to it or dispatched to it) for
+the settings command and the re-read. A model with a request running on it
+keeps its old section until it is idle (`deferred` in the answer and in
+`GET /v1/engines`), and the gateway applies it by itself when its last
+request ends. A change to other, idle models goes ahead at once.
+
+- `next_load` (default): the engine re-reads a model's settings when the
+  model is idle. An idle loaded model is unloaded by the re-read and loads
+  with the new settings on its next request; a busy one is applied when its
+  last request ends (`pending` until then).
+- `now`: no new request is admitted to the model; the requests already
+  admitted (including ones queued for the lane or waiting for a wake) end
+  first, up to `apply_wait_secs`. Then the settings are applied and a loaded
+  model is unloaded and loaded again before new requests reach it. If it is
+  still busy after `apply_wait_secs`, nothing is reloaded: the answer has
+  `reloaded: false, reason: model_busy, pending: true`, and the engine
+  re-reads the settings when the model is idle. A sleeping machine is not
+  woken unless `"wake": true`; the model simply starts with the new settings.
 
 A failed `settings_command` (or a router that does not re-read) leaves the
 write in place, shows in the answer and in `GET /v1/engines`
-(`pending_apply`), and is retried before the next load.
+(`pending_apply`), and is retried when the lane comes up, before the next
+load, and before a request reaches the engine (at most every 15 s while the
+machine stays up), so a model woken for a request starts with its current
+settings.
 
-**Load and unload.** `POST /v1/models/{model}/load` preloads a model: on a
+**Load and unload.** `POST /v1/models/{model}/load` preloads the model: on a
 sleeping lane it is a 409 `lane_asleep` unless `"wake": true`; it takes the
 lane's place and GPU group exactly like a request (exclusive groups hand the
-GPU over), counting as lane activity only while it loads, and waits for the
-router to report the model loaded. `POST /v1/models/{model}/unload` is
-refused (409 `model_busy`) while a request is in flight on the model and
-never powers anything off; on a sleeping machine it answers that nothing is
-loaded. `GET /v1/engines` never wakes anything: a sleeping lane shows the
-listing from when it was last seen. A hold can name a model to load once the
-machine is up (`"load": "text/qwen3-35b"` in the hold body; operator and
-admin keys).
+GPU over), counts as lane activity only while it loads, and waits for the
+router to report the model loaded. `POST /v1/models/{model}/unload` stops
+admitting new requests to the model, waits for the ones already admitted
+(including queued and waking ones) up to `apply_wait_secs`, then unloads;
+if they do not end in time it is a 409 `model_busy` and nothing is unloaded.
+It never powers anything off; on a sleeping machine it answers that nothing
+is loaded. While an unload or an `apply: now` holds a model, a new request
+for it waits (up to `apply_wait_secs`) and then gets 503 `model_paused` with
+`Retry-After`. `GET /v1/engines` never wakes anything and never calls an
+engine the lane lifecycle knows to be down or going down: such a lane shows
+its listing from when it was last seen; the other lanes are asked at once,
+each with a short timeout. A hold can name a model to load once the machine
+is up (`"load": "text/qwen3-35b"` in the hold body; operator and admin
+keys).
 
 #### Load settings per request (variants)
 
@@ -1032,29 +1084,48 @@ request_load:
   variant_idle_ttl_secs: 3600
   # estimate: {weights_bytes: N, budget_bytes: N,       # bytes; see the fit check
   #            kv_layers: 48, kv_heads: 8, head_dim: 128}
+  # reserve_bytes: N     # GPU bytes kept free for another engine on the GPU
 ```
 
 Without a policy the request is refused (400 `request_load_disabled`). Client
 keys may set only `allow`ed keys; operator and admin keys any typed load key;
 every key stays within `bounds`; a request never sets a file path. The
-gateway then makes a **variant** of the first target, `<model>~<hash8>`: the
-base model's section plus those keys, in the managed overlay, applied
-through `settings_command` and a preset reload. The request goes to the
+gateway then makes a **variant** of the first target, `<model>~<hash8>`:
+the base model's section plus the keys, in the managed overlay, applied
+through `settings_command` and a preset re-read. The base must be a model
+the engine lists (400 `unknown_engine_model`). The request goes to the
 variant's name, which the router loads (unloading others per its
-`--models-max`, never one serving requests). The same keys reuse the same
-variant. Other targets of the route leave the plan, since they could not
-honour the request. `x-switchback-settings` names the variant.
+`--models-max`). The same keys reuse the same variant. Other targets of the
+route leave the plan, since they could not honour the request.
+`x-switchback-settings` names the variant.
 
-Before a variant exists it must fit: the KV cache the router measured
-(`GET /models` `memory`) is scaled to the variant's context and cache types
-and checked, with the weights and compute, against 95% of the GPU memory the
-measurement saw; without a measurement the policy's `estimate` is used (the
-same KV math as `sb ai fit`: layers × context × heads × (head_dim + value_dim)
-× bytes per element; `sb ai fit --json` gives the numbers). A variant that
-would not fit is a 409 `would_not_fit` with the numbers. At `max_variants`
-the least recently used idle variant gives way (409 `too_many_variants` when
-all serve requests); a variant unused for `variant_idle_ttl_secs` leaves the
-overlay on the next apply. `GET /v1/engines` lists the variants.
+Before a variant exists it must fit. With the engine's own measurement of
+the base model (`GET /models` `memory`): weights and compute as measured,
+the KV cache scaled to the variant's context and cache types, checked
+against 95% of the GPU memory the measurement saw, minus what the other
+models the engine has loaded on those GPUs use (the base stays loaded
+beside the variant) and minus the policy's `reserve_bytes` (memory another
+engine on the same GPU needs, such as an image engine). Without a
+measurement the policy's `estimate` is used (the same KV math as
+`sb ai fit`: layers × context × heads × (head_dim + value_dim) × bytes per
+element; `sb ai fit --json` gives the numbers) against its `budget_bytes`
+minus `reserve_bytes`. A variant that sets no context gets the base's own:
+its `load.ctx_size`, else the running engine's `--ctx-size`, else the
+model's trained context; never a guess. A variant that would not fit is a
+409 `would_not_fit` with the numbers. When nothing can check the fit (no
+measurement and no estimate, or no known context), a client key gets 409
+`fit_unknown` saying what to add; an operator or admin key may go ahead,
+and `x-switchback-settings` then says `fit=unchecked`.
+
+A request holds its variant from the moment the variant is found or made,
+while it still waits for its lane: at `max_variants` the least recently
+used variant with no request gives way, and when every variant has one the
+new request gets 409 `too_many_variants`. A variant unused for
+`variant_idle_ttl_secs` leaves the overlay on the next apply. Variants live
+in the gateway's memory: after a restart the first apply writes the whole
+overlay without them (the reference script then drops their sections), and
+`GET /v1/engines` says so until that apply. `GET /v1/engines` lists the
+variants.
 
 ### Speech to text and text to speech (`/v1/audio/*`)
 
