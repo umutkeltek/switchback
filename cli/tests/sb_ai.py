@@ -385,7 +385,8 @@ class SbAi(unittest.TestCase):
         # A real gateway lists every route twice (`chat-a`, `lane-txt/chat-a`) and
         # its providers as bare ids (`lane-txt`); a target with no plain twin stays.
         self.fake.models.extend([{"id": "lane-txt/chat-a"}, {"id": "lane-txt/chat-b"},
-                                 {"id": "lane-txt"}, {"id": "lane-txt/only-direct"}])
+                                 {"id": "lane-txt"}, {"id": "lane-txt/only-direct"},
+                                 {"id": "lane-img"}])  # the image workflows' provider
         run = self.sb("models", "--json")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout)["text"], ["chat-a", "chat-b", "lane-txt/only-direct"])

@@ -238,10 +238,11 @@ def catalog(gw):
             if str(row.get("provider", "")).endswith("-mock"):
                 result["test"].add(row["id"])
     media = set(result["image"]) | set(result["video"])
+    media_providers = {str(row.get("provider")) for row in workflows.get("data") or [] if row.get("provider")}
     for row in models.get("data") or []:
         model_id = row.get("id") if isinstance(row, dict) else None
-        if not model_id or model_id in media:
-            continue
+        if not model_id or model_id in media or model_id in media_providers:
+            continue  # a media provider's bare id is listed as a model, but it is not one
         prefix = model_id.split("/", 1)[0]
         if prefix in ("image", "video") and "/" in model_id:
             result[prefix].append(model_id)
