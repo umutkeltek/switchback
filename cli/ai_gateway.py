@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 OK, GATEWAY_ERROR, USAGE, UNREACHABLE = 0, 1, 2, 3
 MACHINE_OFF = 3  # the same code as an unreachable gateway: the work cannot start
@@ -31,7 +32,8 @@ sb ai: images, video and machine status through a Switchback gateway
   sb ai image "prompt" [--model NAME] [--aspect W:H] [--mp N] [--size WxH] [--seed N] [-o FILE]
   sb ai video "prompt" --image FIRST_FRAME [--model NAME] [--seconds N] [--frames N]
                        [--aspect W:H] [--mp N] [--size WxH] [--seed N] [-o FILE]
-  sb ai bench [MODEL ...] [--workload chat|read|all] [--runs N] [--wake] [--json] [-o FILE]
+  sb ai bench [MODEL ...] [--workload chat|read|all] [--runs N] [--wake] [--keep-cache]
+              [--json] [-o FILE]
                                  measure the text models: first token, prompt and decode speed
   sb ai status [--json]          lanes and machine power; never wakes anything
   sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video);
@@ -58,6 +60,9 @@ itself: without --wake it says the machine is off and stops (exit 3). With --wak
 it holds the machine for 30 minutes and lets it go again at the end, also when a
 run fails or you press Ctrl-C. --json prints the numbers as JSON, -o FILE writes
 them there too.
+Each run starts its prompt with a new line, so the engine cannot reuse the
+prompt it read before; --keep-cache sends the same prompt every run instead
+(to see what the prompt cache saves).
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
@@ -1045,11 +1050,16 @@ def chunk_has_text(chunk):
     return False
 
 
-def measure(gw, model, workload):
+def measure(gw, model, workload, keep_cache=False):
     """One chat request, timed: the first token, the usage and the server's timings."""
     work = WORKLOADS[workload]
+    prompt = work["prompt"]
+    if not keep_cache:
+        # A new first line every run, so the engine cannot reuse the prompt it
+        # read last time: warm runs measure reading, not the prompt cache.
+        prompt = f"Run {uuid.uuid4().hex[:12]}.\n" + prompt
     body = {"model": model,
-            "messages": [{"role": "user", "content": work["prompt"]}],
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": work["max_tokens"], "temperature": 0, "seed": 1,
             "reasoning_effort": "none", "stream": True,
             "stream_options": {"include_usage": True}}
@@ -1117,7 +1127,7 @@ def summarize(model, workload, samples):
     return rows
 
 
-def bench_rows(gw, models, workloads, runs):
+def bench_rows(gw, models, workloads, runs, keep_cache=False):
     """Measure every model on every workload: cold first, then the warm median."""
     rows = []
     for model in models:
@@ -1125,7 +1135,7 @@ def bench_rows(gw, models, workloads, runs):
             samples = []
             for index in range(runs):
                 log(f"{model} {workload}: run {index + 1}/{runs}")
-                samples.append(measure(gw, model, workload))
+                samples.append(measure(gw, model, workload, keep_cache))
             rows.extend(summarize(model, workload, samples))
     return rows
 
@@ -1201,7 +1211,7 @@ def cmd_bench(gw, args):
                 holds.append((host, str(hold.get("id") or "")))
                 log(f"holding {host} on for {duration_words(BENCH_TTL)}: hold {hold.get('id', '?')}")
             wait_ready(gw, hosts)
-        rows = bench_rows(gw, models, workloads, args.runs)
+        rows = bench_rows(gw, models, workloads, args.runs, args.keep_cache)
     except GatewayError as error:
         raise gateway_fail(error, "the bench request failed") from None
     finally:
@@ -1254,6 +1264,7 @@ def parser():
     bench.add_argument("--workload", choices=("chat", "read", "all"), default="all")
     bench.add_argument("--runs", type=int, default=BENCH_RUNS)
     bench.add_argument("--wake", action="store_true")
+    bench.add_argument("--keep-cache", action="store_true")
     bench.add_argument("--json", action="store_true")
     bench.add_argument("-o", "--output")
     hold = sub.add_parser("hold", add_help=False, allow_abbrev=False)

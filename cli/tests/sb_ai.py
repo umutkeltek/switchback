@@ -697,6 +697,22 @@ class SbAi(unittest.TestCase):
         self.assert_close(row["decode_tok_s"],
                           row["completion_tokens"] / (row["total_s"] - row["ttft_ms"] / 1000))
 
+    def test_bench_sends_a_new_prompt_each_run_unless_keep_cache(self):
+        # The same prompt twice lets the engine skip reading it: warm numbers
+        # would show the cache, not the reading speed.
+        def prompts():
+            return [r["json"]["messages"][0]["content"]
+                    for r in self.requests("POST", "/v1/chat/completions")]
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.01) for _ in range(4)]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "2", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(set(prompts())), 2)
+        self.fake.seen.clear()
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "2", "--keep-cache", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(set(prompts())), 1)
+
     def test_bench_counts_a_reasoning_token_as_the_first_token(self):
         # A thinking model streams reasoning first; the answer comes 0.4 s later.
         self.healthy()
