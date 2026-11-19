@@ -592,4 +592,28 @@ if PATH="${TMPDIR}/bin:${PATH}" \
   fail "remote backup root accepted path traversal"
 fi
 
+# A sealed segment whose records were observed out of order (concurrent requests finish out of order) has
+# first_observed > last_observed in its manifest. It is real captured data and must still be backed up;
+# refusing it held the whole store's backup from 2026-11-18 (three such manifests in 274).
+rm -f "$PLAN_CALL_COUNT"
+if ! out_of_order_plan="$(
+  PATH="${TMPDIR}/bin:${PATH}" \
+  SWITCHBACK_CLI="${TMPDIR}/bin/sb" \
+  SWITCHBACK_BACKUP_REMOTE="backup-host" \
+  SWITCHBACK_BACKUP_REMOTE_ROOT="/mnt/tank/personal/backups/machines/switchback-capture-v2" \
+  TEST_LAST_MS="$((TEST_FIRST_MS - 3190))" \
+  bun "$TOOL" --plan 2>&1
+)"; then
+  fail "segment with out-of-order record timestamps was refused: ${out_of_order_plan}"
+fi
+rm -f "$PLAN_CALL_COUNT"
+if PATH="${TMPDIR}/bin:${PATH}" \
+  SWITCHBACK_CLI="${TMPDIR}/bin/sb" \
+  SWITCHBACK_BACKUP_REMOTE="backup-host" \
+  SWITCHBACK_BACKUP_REMOTE_ROOT="/mnt/tank/personal/backups/machines/switchback-capture-v2" \
+  TEST_LAST_MS="-5" \
+  bun "$TOOL" --plan >/dev/null 2>&1; then
+  fail "segment with a negative record timestamp was accepted"
+fi
+
 print "ok - sealed segment backup transfer and receipt acceptance"

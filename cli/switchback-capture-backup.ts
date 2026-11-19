@@ -523,7 +523,10 @@ function validatePlan(plan: BackupPlan): void {
     if (
       !Number.isSafeInteger(segment.first_observed_at_unix_ms) ||
       !Number.isSafeInteger(segment.last_observed_at_unix_ms) ||
-      segment.first_observed_at_unix_ms > segment.last_observed_at_unix_ms
+      // Records are observed out of order when concurrent requests finish out of order, so a sealed manifest
+      // can have first_observed > last_observed. That is real data; only non-positive values are corrupt.
+      segment.first_observed_at_unix_ms <= 0 ||
+      segment.last_observed_at_unix_ms <= 0
     ) {
       fail(`segment timestamps are invalid: ${segment.segment_file}`);
     }
