@@ -215,16 +215,22 @@ pub(crate) async fn delete(
 /// business, never a client's.
 ///
 /// `off` powers the machine off now, through the same `poweroff_command`
-/// and the same `poweroff_guard_command` the idle timer uses. It is
-/// refused with 409 and a typed `reason` while a hold is active (unless
-/// `"release_holds": true`, which ends the holds first and names them),
-/// while a lane of the machine has work in flight or queued, while the
-/// guard says the machine is busy, while the machine has not been up long
-/// enough, and when the machine has no power-off command at all.
+/// and the same `poweroff_guard_command` the idle timer uses, under the
+/// same locks and re-checks. It is refused with 409 and a typed `reason`
+/// while a hold is active (unless `"release_holds": true`, which ends the
+/// holds that were active when the request came, once every check has
+/// passed, and names them), while a lane of the machine has work in
+/// flight or queued, while the guard says the machine is busy, while the
+/// machine has not been up long enough, while a wake, a power-off or the
+/// idle check runs on it, and when the machine has no power-off command
+/// at all. A machine none of whose lanes answers is already off: 200 with
+/// `"already_off": true`, and no command runs. A failed command is 502.
 ///
 /// `on` wakes the machine through the same wake path a hold with
-/// `wake: true` uses and answers at once (202): the wake runs in the
-/// background. It takes no hold, so the idle timer still applies.
+/// `wake: true` uses and answers at once (202, `"status": "waking"`): the
+/// wake runs in the background. It takes no hold, so the idle timer still
+/// applies. A machine one of whose lanes answers is up: 200 with
+/// `"status": "up"`, and no wake is sent.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PowerRequest {
@@ -256,7 +262,7 @@ pub(crate) async fn power(
 ) -> Response {
     match body.action.as_str() {
         "off" => power_off(&state, &host, body.release_holds).await,
-        "on" => power_on(&state, &host),
+        "on" => power_on(&state, &host).await,
         other => error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -272,6 +278,7 @@ async fn power_off(state: &AppState, host: &str, release_holds: bool) -> Respons
             "host": host,
             "action": "off",
             "powered_off": true,
+            "already_off": outcome.already_off,
             "lanes": outcome.lanes,
             "released_holds": outcome.released_holds,
         }))
@@ -287,8 +294,16 @@ async fn power_off(state: &AppState, host: &str, release_holds: bool) -> Respons
 }
 
 /// The machine is woken now (the wake runs in the background).
-fn power_on(state: &AppState, host: &str) -> Response {
-    match state.capacity.power_on(host) {
+async fn power_on(state: &AppState, host: &str) -> Response {
+    match state.capacity.power_on(host).await {
+        // A lane of the machine answers: it is up, and no wake was sent.
+        Ok(outcome) if outcome.already_up => Json(json!({
+            "host": host,
+            "action": "on",
+            "status": "up",
+            "lanes": outcome.lanes,
+        }))
+        .into_response(),
         Ok(outcome) => (
             StatusCode::ACCEPTED,
             Json(json!({

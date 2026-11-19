@@ -35,6 +35,17 @@ fn marker(name: &str) -> std::path::PathBuf {
 /// The config of one managed machine. `lane_extra` is appended to the lane
 /// (its commands), so each test can give the machine its own behaviour.
 fn config(lane_extra: &str) -> String {
+    config_at("http://127.0.0.1:9/health", lane_extra)
+}
+
+/// One managed machine that is up: its lane's health endpoint answers.
+async fn up_config(lane_extra: &str) -> String {
+    let (lane_url, _lane) = spawn_lane().await;
+    config_at(&format!("{lane_url}/health"), lane_extra)
+}
+
+/// One managed machine whose lane answers health at `health`.
+fn config_at(health: &str, lane_extra: &str) -> String {
     format!(
         r#"
 server:
@@ -55,7 +66,7 @@ local_executors:
   - name: text
     host: gpu-box
     base_url: "http://127.0.0.1:9"
-    health_endpoint: "http://127.0.0.1:9/health"
+    health_endpoint: "{health}"
 {lane_extra}
 "#
     )
@@ -114,7 +125,7 @@ async fn an_operator_powers_a_machine_off_now() {
         "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"",
         marker.display()
     );
-    let base = serve(&config(&lane)).await;
+    let base = serve(&up_config(&lane).await).await;
 
     let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
     assert_eq!(status, 200, "{body}");
@@ -138,10 +149,11 @@ async fn a_repeat_power_off_is_a_no_op() {
         "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"",
         marker.display()
     );
-    let base = serve(&config(&lane)).await;
+    let base = serve(&up_config(&lane).await).await;
 
     let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
     assert_eq!(status, 200, "{body}");
+    assert_eq!(body["already_off"], false, "{body}");
     let first = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(first.lines().count(), 1, "{first:?}");
 
@@ -149,6 +161,7 @@ async fn a_repeat_power_off_is_a_no_op() {
     let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["powered_off"], true);
+    assert_eq!(body["already_off"], true, "{body}");
     let second = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
         second.lines().count(),
@@ -156,6 +169,38 @@ async fn a_repeat_power_off_is_a_no_op() {
         "the command ran again: {second:?}"
     );
     let _ = std::fs::remove_file(&marker);
+}
+
+// A machine that is asleep, but not by a power-off of this gateway (it was
+// off when the gateway started, or something else put it to sleep), is
+// already off: no lane answers, so the answer says so and no command runs
+// (one that reaches a sleeping machine fails, and a false failure would
+// escalate the lane and alert).
+#[tokio::test]
+async fn a_machine_asleep_by_other_means_is_already_off() {
+    let marker = marker("asleep");
+    let lane = format!(
+        "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"",
+        marker.display()
+    );
+    // The health endpoint does not answer: the machine sleeps.
+    let base = serve(&config(&lane)).await;
+    let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["powered_off"], true);
+    assert_eq!(body["already_off"], true, "{body}");
+    assert!(!marker.exists(), "a command ran against a sleeping machine");
+}
+
+// A failed power-off command is a 502 with its own reason; the machine
+// stays as it was.
+#[tokio::test]
+async fn a_failed_power_off_is_a_502() {
+    let lane = "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"exit 3\"";
+    let base = serve(&up_config(lane).await).await;
+    let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(body["error"]["reason"], "poweroff_failed");
 }
 
 // A client key may not touch a machine's power: 403, and the machine keeps
@@ -188,7 +233,7 @@ async fn an_admin_key_powers_a_machine_off_now() {
         "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"",
         marker.display()
     );
-    let base = serve(&config(&lane)).await;
+    let base = serve(&up_config(&lane).await).await;
     let (status, body) = power(&base, ADMIN, "gpu-box", json!({"action": "off"})).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["powered_off"], true);
@@ -204,7 +249,7 @@ async fn a_hold_keeps_the_machine_on() {
         "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"",
         marker.display()
     );
-    let base = serve(&config(&lane)).await;
+    let base = serve(&up_config(&lane).await).await;
     let hold = take_hold(&base, CLIENT, "a benchmark").await;
 
     let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
@@ -229,7 +274,7 @@ async fn release_holds_lets_the_machine_go() {
         "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"",
         marker.display()
     );
-    let base = serve(&config(&lane)).await;
+    let base = serve(&up_config(&lane).await).await;
     let hold = take_hold(&base, CLIENT, "a benchmark").await;
     let hold_id = hold["id"].as_str().unwrap().to_string();
 
@@ -267,7 +312,7 @@ async fn the_guard_keeps_a_busy_machine_on() {
         "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"\n    poweroff_guard_command: \"/usr/bin/false\"",
         marker.display()
     );
-    let base = serve(&config(&lane)).await;
+    let base = serve(&up_config(&lane).await).await;
 
     let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
     assert_eq!(status, 409, "{body}");
@@ -284,7 +329,7 @@ async fn a_machine_that_just_booted_is_left_alone() {
         "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"\n    poweroff_min_uptime_secs: 3600",
         marker.display()
     );
-    let base = serve(&config(&lane)).await;
+    let base = serve(&up_config(&lane).await).await;
 
     let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
     assert_eq!(status, 409, "{body}");
@@ -338,6 +383,23 @@ async fn on_wakes_the_machine() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let _ = std::fs::remove_file(&marker);
+}
+
+// `on` on a machine that is up sends no wake (a power toggle would switch
+// a running machine off) and says the machine is up.
+#[tokio::test]
+async fn on_says_up_on_a_machine_that_is_up() {
+    let marker = marker("on-up");
+    let lane = format!(
+        "    wake_command: \"echo wake >> '{}'\"\n    poweroff_command: \"/usr/bin/true\"",
+        marker.display()
+    );
+    let base = serve(&up_config(&lane).await).await;
+    let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "on"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "up", "{body}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!marker.exists(), "a wake was sent to a running machine");
 }
 
 // An unknown action is a 400, and an unknown machine a 404.

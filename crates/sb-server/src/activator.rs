@@ -509,6 +509,11 @@ impl LaneRuntime {
 /// refresh of the same lane.
 const REFRESH_MIN_INTERVAL_MS: u64 = 1_000;
 
+/// How long an operator's power-off waits for the idle tick of the same
+/// machine (it holds the machine's tick lock while it asks its guard or
+/// powers off) before it answers with the reason.
+const MANUAL_POWEROFF_TICK_WAIT: Duration = Duration::from_secs(2);
+
 /// One on-demand local executor lane.
 pub struct LocalExecutor {
     /// Lane id (the provider id). Fixed for the executor's life; a reload
@@ -825,6 +830,10 @@ impl LocalExecutor {
             ProbeAnswer::Refused(status) => Some(status),
             _ => None,
         };
+        drop(rt);
+        if answer == ProbeAnswer::Down {
+            self.host().forget_up_since_if_all_down();
+        }
         answer
     }
 
@@ -1504,6 +1513,9 @@ impl LocalExecutor {
                 // The wake brought nothing up: it is no evidence that the
                 // machine runs, so the next lane that needs it wakes it.
                 self.host().forget_wake_sent();
+                // Nothing came up: the machine's uptime starts at its next
+                // answer, not at this wake.
+                self.host().forget_up_since();
                 tracing::error!(lane = %self.name, elapsed_ms = elapsed, attempts, "boot timeout");
                 return Err(EnsureError::BootTimeout {
                     wake_path: wake_command,
@@ -2089,6 +2101,13 @@ pub enum PowerOffRefusal {
     WakeInFlight,
     /// Another power-off is running on the machine.
     PoweroffInFlight,
+    /// The idle power-off is evaluating the machine right now (it may be
+    /// asking its guard): ask again in a moment.
+    IdleCheckInFlight,
+    /// A hold was taken while the power-off was being checked: whoever
+    /// took it needs the machine now. `release_holds` only ends the holds
+    /// that were active when the request started.
+    HoldTakenMeanwhile { holds: Vec<String> },
 }
 
 impl PowerOffRefusal {
@@ -2103,6 +2122,8 @@ impl PowerOffRefusal {
             Self::UptimeTooShort { .. } => "uptime_too_short",
             Self::WakeInFlight => "wake_in_flight",
             Self::PoweroffInFlight => "poweroff_in_flight",
+            Self::IdleCheckInFlight => "idle_check_in_flight",
+            Self::HoldTakenMeanwhile { .. } => "hold_active",
         }
     }
 
@@ -2141,6 +2162,17 @@ impl PowerOffRefusal {
                 "a wake is running on this machine; it is coming up now".to_string()
             }
             Self::PoweroffInFlight => "a power-off is already running on this machine".to_string(),
+            Self::IdleCheckInFlight => {
+                "the idle power-off is checking this machine right now (its \
+                 guard may still be asking); try again in a moment"
+                    .to_string()
+            }
+            Self::HoldTakenMeanwhile { holds } => format!(
+                "{} taken on this machine while the power-off was being checked ({}); \
+                 the machine stays on and no hold was released",
+                plural(holds.len(), "hold was", "holds were"),
+                holds.join(", ")
+            ),
         }
     }
 }
@@ -2210,6 +2242,9 @@ pub struct PowerOffOutcome {
     pub released_holds: Vec<String>,
     /// The lanes of the machine that were powered off.
     pub lanes: usize,
+    /// No lane of the machine answered: it was already off, and no
+    /// command ran.
+    pub already_off: bool,
 }
 
 /// What a manual wake did. The wake itself runs in the background: the
@@ -2218,6 +2253,9 @@ pub struct PowerOffOutcome {
 pub struct PowerOnOutcome {
     /// The machine's lanes.
     pub lanes: usize,
+    /// A lane of the machine already answers: it is up, and no wake was
+    /// sent (a power toggle would switch a running machine off).
+    pub already_up: bool,
 }
 
 /// `1 hold` / `3 holds`.
@@ -2700,15 +2738,14 @@ impl Host {
 
     fn note_wake_sent(&self, now: u64) {
         *self.wake_sent_slot() = Some(now);
-        // The machine starts counting its uptime now: it is booting.
-        self.note_up_since(now);
     }
 
     fn forget_wake_sent(&self) {
         *self.wake_sent_slot() = None;
     }
 
-    /// When the machine came up (clock ms), or `None` while it is off.
+    /// When the machine came up (clock ms): the first answer of one of its
+    /// lanes since every lane was last seen down. `None` while it is off.
     fn up_since_slot(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
         self.up_since_ms
             .lock()
@@ -2719,9 +2756,9 @@ impl Host {
         *self.up_since_slot()
     }
 
-    /// The machine came up at `now` (a wake we sent, or the first time we
-    /// saw one of its lanes answer). The first answer wins: a machine that
-    /// was already up when we started keeps the uptime it had.
+    /// One of the machine's lanes answered at `now`. The first answer
+    /// since the machine was last seen down wins: a machine that stays up
+    /// keeps the uptime it had.
     fn note_up_since(&self, now: u64) {
         let mut slot = self.up_since_slot();
         if slot.is_none() {
@@ -2732,6 +2769,36 @@ impl Host {
     /// The machine is off: its uptime starts again at the next wake.
     fn forget_up_since(&self) {
         *self.up_since_slot() = None;
+    }
+
+    /// No lane of the machine answered its last probe (a lane never probed
+    /// counts as down): the machine is off, whoever powered it off, and
+    /// its next answer starts a new uptime. The lanes the supervisor
+    /// watches decide (a routed lane, or every lane of an adopting
+    /// machine): another lane is probed only while a sibling answers, so
+    /// its last answer is stale once the machine is down. A machine with
+    /// no watched lane is judged by all of its lanes. A watched engine
+    /// that is down on a running machine only makes the uptime look
+    /// shorter, never longer. The caller holds no lane lock.
+    fn forget_up_since_if_all_down(&self) {
+        let lanes = self.lanes();
+        let adopts = self.adopts();
+        let watched: Vec<&Arc<LocalExecutor>> = lanes
+            .iter()
+            .filter(|lane| adopts || lane.is_routed())
+            .collect();
+        let judged = if watched.is_empty() {
+            lanes.iter().collect()
+        } else {
+            watched
+        };
+        let all_down = judged.iter().all(|lane| {
+            let rt = lane.lock();
+            !rt.answered_up && rt.refused.is_none()
+        });
+        if all_down {
+            self.forget_up_since();
+        }
     }
 
     /// How long the machine has been up (clock ms), or `None` while it is
@@ -2806,6 +2873,8 @@ impl Host {
         let lanes = self.lanes();
         let runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
         let (_, due) = Self::idle_due(&lanes, &runtimes, held.ended_at_ms)?;
+        drop(runtimes);
+        let due = due.max(self.old_enough_at_ms().unwrap_or(0));
         Some(due.saturating_sub(now))
     }
 
@@ -2843,6 +2912,12 @@ impl Host {
         let Some(period) = period else {
             return;
         };
+        // A machine that has just booted is left alone, as for an
+        // operator's power-off (`poweroff_min_uptime_secs`, 0 = no
+        // minimum). An uptime the gateway does not know never postpones it.
+        if self.too_young_for_idle_poweroff(clock.now_ms()) {
+            return;
+        }
         {
             let mut power = self.power();
             if power.failed_period != Some(period) {
@@ -3030,20 +3105,60 @@ impl Host {
             .unwrap_or(0)
     }
 
-    /// Whether this gateway powered the machine off and it has not come
-    /// back: every lane is down and every lane remembers the power-off.
-    /// A machine that was already off when the gateway started (or that
-    /// came back up) is not this.
-    fn is_off_after_our_poweroff(&self) -> bool {
-        if self.up_since_ms().is_some() {
-            return false; // it came up at some point
+    /// When the machine reaches its minimum uptime (clock ms), or `None`
+    /// with no minimum or no known uptime.
+    fn old_enough_at_ms(&self) -> Option<u64> {
+        let minimum_ms = self.poweroff_min_uptime_secs().saturating_mul(1000);
+        if minimum_ms == 0 {
+            return None;
         }
-        let lanes = self.lanes();
-        !lanes.is_empty()
-            && lanes.iter().all(|lane| {
-                let rt = lane.lock();
-                rt.state == LaneState::Offline && rt.poweroff_returned_ms.is_some()
-            })
+        self.up_since_ms()
+            .map(|since| since.saturating_add(minimum_ms))
+    }
+
+    /// Whether the idle power-off waits for the machine's minimum uptime.
+    fn too_young_for_idle_poweroff(&self, now: u64) -> bool {
+        self.old_enough_at_ms().is_some_and(|at| now < at)
+    }
+
+    /// The machine's lanes with work in flight or queued, read under the
+    /// lane locks the caller holds.
+    fn busy_lanes(
+        lanes: &[Arc<LocalExecutor>],
+        runtimes: &[std::sync::MutexGuard<'_, LaneRuntime>],
+    ) -> Vec<String> {
+        lanes
+            .iter()
+            .zip(runtimes)
+            .filter(|(_, rt)| rt.in_flight > 0 || rt.waiting > 0)
+            .map(|(lane, _)| lane.name.clone())
+            .collect()
+    }
+
+    /// The hold check of a manual power-off. Without `release_holds` any
+    /// active hold refuses it. With it, only the holds `seen` when the
+    /// request started may be released: a hold taken since then refuses it
+    /// (whoever took it needs the machine now).
+    fn hold_refusal(
+        &self,
+        holds: Option<&Holds>,
+        seen: &[String],
+        release_holds: bool,
+        now: u64,
+    ) -> Option<PowerOffRefusal> {
+        let active: Vec<String> = holds?
+            .list(Some(&self.id), now)
+            .into_iter()
+            .map(|hold| hold.id)
+            .collect();
+        if active.is_empty() {
+            return None;
+        }
+        if !release_holds {
+            return Some(PowerOffRefusal::HoldActive { holds: active });
+        }
+        let new: Vec<String> = active.into_iter().filter(|id| !seen.contains(id)).collect();
+        (!new.is_empty()).then_some(PowerOffRefusal::HoldTakenMeanwhile { holds: new })
     }
 
     /// Power the machine off now, on an operator's request. The idle timer
@@ -3053,10 +3168,24 @@ impl Host {
     /// request is refused (409, with a typed reason) while a hold is
     /// active, while a lane has work in flight or queued, while the guard
     /// says the machine is busy, while the machine has not been up long
-    /// enough, and when the machine has no power-off command at all.
+    /// enough, while a wake or another power-off runs, and when the
+    /// machine has no power-off command at all.
     ///
-    /// `release_holds` ends the active holds first and names them in the
-    /// answer.
+    /// As for the idle power-off, the machine's wake lock is held from the
+    /// first check until the command has returned and every lane is marked
+    /// off, so no wake (a request's, a job's, a hold's) can bring a lane up
+    /// on a machine that is going away. Holds and lane work are checked
+    /// again under every lane lock in the same step that marks the lanes
+    /// `powering_off`: a request or a hold that arrived while the guard ran
+    /// refuses the power-off.
+    ///
+    /// `release_holds` ends the holds that were active when the request
+    /// started, and only once every check has passed; a hold taken in the
+    /// meantime refuses the power-off. The released ids are in the answer.
+    ///
+    /// A machine none of whose lanes answers a fresh probe is already off:
+    /// no command runs (one that reaches a sleeping machine fails, and a
+    /// false failure would escalate the lane and alert).
     pub async fn power_off_now(
         &self,
         holds: Option<&Holds>,
@@ -3079,57 +3208,81 @@ impl Host {
         };
 
         // One power-off at a time: the idle timer and an operator's
-        // request never race.
-        let Ok(_tick) = self.tick_lock.try_lock() else {
-            return Err(PowerOffError::Refused(PowerOffRefusal::PoweroffInFlight));
+        // request never race. The idle tick holds this lock only while it
+        // evaluates (its guard) or powers off, so wait for it briefly.
+        let Ok(_tick) =
+            tokio::time::timeout(MANUAL_POWEROFF_TICK_WAIT, self.tick_lock.lock()).await
+        else {
+            let powering_off = lanes
+                .iter()
+                .any(|lane| lane.lock().state == LaneState::PoweringOff);
+            return Err(PowerOffError::Refused(if powering_off {
+                PowerOffRefusal::PoweroffInFlight
+            } else {
+                PowerOffRefusal::IdleCheckInFlight
+            }));
         };
 
         // A machine that is coming up now is not powered off under its
-        // feet: a wake holds the machine's wake lock while it runs.
-        if lanes.iter().any(|lane| lane.cfg().wake_on_request) && self.wake_lock.try_lock().is_err()
-        {
+        // feet. The wake lock is then kept until the power-off is over (as
+        // the idle power-off does): no wake probes or runs its command in
+        // between, so no lane is taken for up on a machine going away.
+        let Ok(_wake) = self.wake_lock.try_lock() else {
             return Err(PowerOffError::Refused(PowerOffRefusal::WakeInFlight));
-        }
+        };
 
-        // A hold keeps the machine on. The operator may end the holds
-        // first; the ones that end are named in the answer.
-        let mut released_holds = Vec::new();
-        if let Some(holds) = holds {
-            let active = holds.list(Some(&self.id), clock.now_ms());
-            if !active.is_empty() {
-                if !release_holds {
-                    return Err(PowerOffError::Refused(PowerOffRefusal::HoldActive {
-                        holds: active.iter().map(|hold| hold.id.clone()).collect(),
-                    }));
-                }
-                for hold in &active {
-                    if holds.delete(&self.id, &hold.id, clock.now_ms()).is_some() {
-                        released_holds.push(hold.id.clone());
-                    }
-                }
-            }
+        // The holds as the request found them: only these may be released.
+        let seen_holds: Vec<String> = holds
+            .map(|holds| {
+                holds
+                    .list(Some(&self.id), clock.now_ms())
+                    .into_iter()
+                    .map(|hold| hold.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(refusal) = self.hold_refusal(holds, &seen_holds, release_holds, clock.now_ms())
+        {
+            return Err(PowerOffError::Refused(refusal));
         }
 
         // Work in flight or queued on any lane of the machine keeps it on.
-        let busy: Vec<String> = lanes
-            .iter()
-            .filter(|lane| {
-                let rt = lane.lock();
-                rt.in_flight > 0 || rt.waiting > 0
-            })
-            .map(|lane| lane.name.clone())
-            .collect();
+        let busy = {
+            let runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
+            Self::busy_lanes(&lanes, &runtimes)
+        };
         if !busy.is_empty() {
             return Err(PowerOffError::Refused(PowerOffRefusal::LaneBusy {
                 lanes: busy,
             }));
         }
 
-        // A machine this gateway powered off and that has not come back is
-        // already off: the request is a no-op, not a failed power-off (a
-        // command that reaches a sleeping machine fails, and a false
-        // failure would escalate the lane and alert).
-        if self.is_off_after_our_poweroff() {
+        // A machine none of whose lanes answers is already off, whoever
+        // powered it off: the request is a no-op.
+        let mut answering = false;
+        for lane in &lanes {
+            if lane.probe_answer().await != ProbeAnswer::Down {
+                answering = true;
+                break;
+            }
+        }
+        if !answering {
+            {
+                let runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
+                let busy = Self::busy_lanes(&lanes, &runtimes);
+                if !busy.is_empty() {
+                    return Err(PowerOffError::Refused(PowerOffRefusal::LaneBusy {
+                        lanes: busy,
+                    }));
+                }
+                if let Some(refusal) =
+                    self.hold_refusal(holds, &seen_holds, release_holds, clock.now_ms())
+                {
+                    return Err(PowerOffError::Refused(refusal));
+                }
+            }
+            self.forget_up_since();
+            let released_holds = self.release_seen_holds(holds, &seen_holds, clock.now_ms());
             tracing::info!(
                 host = %self.id,
                 "power-off asked for on a machine that is already off; nothing to do"
@@ -3137,6 +3290,7 @@ impl Host {
             return Ok(PowerOffOutcome {
                 released_holds,
                 lanes: lanes.len(),
+                already_off: true,
             });
         }
 
@@ -3167,15 +3321,29 @@ impl Host {
             }
         }
 
-        // The same path as an idle power-off: the lanes go to
-        // `powering_off` and the command runs. A failure is recorded the
-        // same way, so the alert hook sees it.
-        {
+        // Re-check under every lane's lock and mark them all powering off
+        // in the same step: a request or a hold may have arrived while the
+        // guard ran.
+        let before: Vec<LaneState> = {
             let mut runtimes: Vec<_> = lanes.iter().map(|lane| lane.lock()).collect();
-            for rt in runtimes.iter_mut() {
-                rt.state = LaneState::PoweringOff;
+            let busy = Self::busy_lanes(&lanes, &runtimes);
+            if !busy.is_empty() {
+                return Err(PowerOffError::Refused(PowerOffRefusal::LaneBusy {
+                    lanes: busy,
+                }));
             }
-        }
+            if let Some(refusal) =
+                self.hold_refusal(holds, &seen_holds, release_holds, clock.now_ms())
+            {
+                return Err(PowerOffError::Refused(refusal));
+            }
+            runtimes
+                .iter_mut()
+                .map(|rt| std::mem::replace(&mut rt.state, LaneState::PoweringOff))
+                .collect()
+        };
+        // Every check passed: the holds the request found end now.
+        let released_holds = self.release_seen_holds(holds, &seen_holds, clock.now_ms());
         tracing::info!(
             host = %self.id,
             lanes = lanes.len(),
@@ -3189,6 +3357,7 @@ impl Host {
                 Ok(PowerOffOutcome {
                     released_holds,
                     lanes: lanes.len(),
+                    already_off: false,
                 })
             }
             Err(error) => {
@@ -3199,20 +3368,22 @@ impl Host {
                 };
                 // A power-off asked for by an operator has no retry driver
                 // (the idle timer only retries its own): the failure is
-                // final for this request, the lane escalates and the alert
-                // hook sees it.
+                // final for this request, and the lane escalates so the
+                // alert hook sees it. The lanes go back to the state they
+                // had, as after a failed idle attempt, so the idle
+                // power-off still runs once the machine is idle.
                 let message = format!(
-                    "poweroff command failed ({error}); the machine stays on until an operator acts"
+                    "poweroff command failed on an operator's request ({error}); the machine stays on"
                 );
                 tracing::error!(
                     host = %self.id,
                     failures,
                     "poweroff command failed on an operator's request; the machine stays on and needs operator attention"
                 );
-                for lane in &lanes {
+                for (lane, before) in lanes.iter().zip(before) {
                     let mut rt = lane.lock();
                     if rt.state == LaneState::PoweringOff {
-                        rt.state = LaneState::Degraded;
+                        rt.state = before;
                     }
                     rt.escalated = true;
                     rt.last_error = Some(message.clone());
@@ -3220,6 +3391,18 @@ impl Host {
                 Err(PowerOffError::Failed(message))
             }
         }
+    }
+
+    /// End the holds a manual power-off found (and that still run), and
+    /// name the ones that ended.
+    fn release_seen_holds(&self, holds: Option<&Holds>, seen: &[String], now: u64) -> Vec<String> {
+        let Some(holds) = holds else {
+            return Vec::new();
+        };
+        seen.iter()
+            .filter(|id| holds.delete(&self.id, id, now).is_some())
+            .cloned()
+            .collect()
     }
 
     /// Wake the machine now, on an operator's request. The wake runs in
@@ -3230,7 +3413,7 @@ impl Host {
     ///
     /// `Err` when the machine has no wake command: it is always on, and
     /// the gateway does not pretend it woke one.
-    pub fn power_on(&self) -> Result<PowerOnOutcome, PowerOnError> {
+    pub async fn power_on(&self) -> Result<PowerOnOutcome, PowerOnError> {
         if self.wake_command().is_none() {
             tracing::warn!(
                 host = %self.id,
@@ -3239,8 +3422,27 @@ impl Host {
             return Err(PowerOnError::Refused(PowerOnRefusal::NoWakeCommand));
         }
         let lanes = self.lanes();
+        // A machine one of whose lanes answers is up: nothing to wake (a
+        // machine that is powering off still answers, and is woken again).
+        let powering_off = lanes
+            .iter()
+            .any(|lane| lane.lock().state == LaneState::PoweringOff);
+        if !powering_off {
+            for lane in &lanes {
+                if lane.probe_answer().await != ProbeAnswer::Down {
+                    tracing::info!(host = %self.id, "wake asked for on a machine that is up; nothing to do");
+                    return Ok(PowerOnOutcome {
+                        lanes: lanes.len(),
+                        already_up: true,
+                    });
+                }
+            }
+        }
         tracing::info!(host = %self.id, lanes = lanes.len(), "wake asked for by an operator");
-        Ok(PowerOnOutcome { lanes: lanes.len() })
+        Ok(PowerOnOutcome {
+            lanes: lanes.len(),
+            already_up: false,
+        })
     }
 
     /// Run the machine's wake in the background (the answer comes at once).
@@ -3724,6 +3926,7 @@ impl CapacityActivator {
             Ok(outcome) => tracing::info!(
                 host = %host,
                 lanes = outcome.lanes,
+                already_off = outcome.already_off,
                 released_holds = outcome.released_holds.len(),
                 "machine powered off on an operator's request"
             ),
@@ -3745,12 +3948,14 @@ impl CapacityActivator {
     /// Wake the machine `host` now, on an operator's request (see
     /// [`Host::power_on`]). The wake runs in the background; the answer
     /// comes at once. No hold is taken: the idle timer still applies.
-    pub fn power_on(&self, host: &str) -> Result<PowerOnOutcome, PowerOnError> {
+    pub async fn power_on(&self, host: &str) -> Result<PowerOnOutcome, PowerOnError> {
         let Some(machine) = self.host_by_id(host) else {
             return Err(PowerOnError::UnknownHost);
         };
-        let outcome = machine.power_on()?;
-        machine.spawn_wake().map_err(PowerOnError::Failed)?;
+        let outcome = machine.power_on().await?;
+        if !outcome.already_up {
+            machine.spawn_wake().map_err(PowerOnError::Failed)?;
+        }
         Ok(outcome)
     }
 
@@ -8639,5 +8844,623 @@ local_executors:
         assert_eq!(activator.lane_full("text"), None, "no limit, never full");
         drop((one, two));
         assert_eq!(slots_of(&activator, "text").in_use, 0);
+    }
+
+    // --- Manual power-off (`POST /v1/hosts/{host}/power`) -------------------
+
+    type PowerHook = Box<dyn FnOnce(&Arc<CapacityActivator>) + Send>;
+
+    /// A runner over a [`FakeHost`] that acts when a command starts: a hook
+    /// (a request, a hold) runs once when a command whose text holds its
+    /// key starts, and a gate holds such a command until the test lets it
+    /// go. So a test puts work inside a power-off's window.
+    struct HookedRunner {
+        host: FakeHost,
+        activator: OnceLock<Weak<CapacityActivator>>,
+        hooks: Mutex<Vec<(&'static str, PowerHook)>>,
+        gates: Mutex<Vec<(&'static str, Arc<tokio::sync::Semaphore>)>>,
+        started: Mutex<Vec<String>>,
+    }
+
+    impl HookedRunner {
+        async fn before(&self, command: &str) {
+            self.started.lock().unwrap().push(command.to_string());
+            let hook = {
+                let mut hooks = self.hooks.lock().unwrap();
+                hooks
+                    .iter()
+                    .position(|(key, _)| command.contains(key))
+                    .map(|at| hooks.remove(at).1)
+            };
+            if let Some(hook) = hook {
+                let activator = self.activator.get().and_then(Weak::upgrade).unwrap();
+                hook(&activator);
+                settle().await;
+            }
+            let gate = self
+                .gates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| command.contains(key))
+                .map(|(_, gate)| gate.clone());
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for HookedRunner {
+        async fn run(&self, command: &str) -> Result<(), String> {
+            self.before(command).await;
+            self.host.run(command).await
+        }
+        async fn exit_code(&self, command: &str) -> Result<i32, String> {
+            self.before(command).await;
+            self.host.exit_code(command).await
+        }
+    }
+
+    struct PowerRig {
+        activator: Arc<CapacityActivator>,
+        runner: Arc<HookedRunner>,
+        host: FakeHost,
+        clock: Arc<dyn Clock>,
+        advance: Box<dyn Fn(u64)>,
+    }
+
+    /// A machine whose wake brings it up and whose power-off takes it
+    /// down. Time moves only when the test moves it ([`ManualClock`]): a
+    /// command held on a gate never times out under the test's feet.
+    fn power_rig(cfg: &Config) -> PowerRig {
+        let clock = ManualClock::new();
+        let moved = clock.clone();
+        power_rig_with(
+            cfg,
+            Sim {
+                wake_makes_healthy: true,
+                poweroff_makes_unhealthy: true,
+                ..Default::default()
+            },
+            clock,
+            Box::new(move |ms| moved.advance(ms)),
+        )
+    }
+
+    fn power_rig_with(
+        cfg: &Config,
+        sim: Sim,
+        clock: Arc<dyn Clock>,
+        advance: Box<dyn Fn(u64)>,
+    ) -> PowerRig {
+        let host = FakeHost::new(sim);
+        let runner = Arc::new(HookedRunner {
+            host: host.clone(),
+            activator: OnceLock::new(),
+            hooks: Mutex::new(Vec::new()),
+            gates: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
+        });
+        let activator = CapacityActivator::with_seams(
+            cfg,
+            clock.clone(),
+            runner.clone(),
+            Arc::new(host.clone()),
+        );
+        runner
+            .activator
+            .set(Arc::downgrade(&activator))
+            .ok()
+            .unwrap();
+        PowerRig {
+            activator,
+            runner,
+            host,
+            clock,
+            advance,
+        }
+    }
+
+    impl PowerRig {
+        /// Run `hook` once when a command holding `key` starts.
+        fn on(
+            &self,
+            key: &'static str,
+            hook: impl FnOnce(&Arc<CapacityActivator>) + Send + 'static,
+        ) {
+            self.runner
+                .hooks
+                .lock()
+                .unwrap()
+                .push((key, Box::new(hook)));
+        }
+
+        /// Hold every command holding `key` until the gate gets a permit.
+        fn gate(&self, key: &'static str) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            self.runner.gates.lock().unwrap().push((key, gate.clone()));
+            gate
+        }
+
+        /// Wake the machine for a media job that ends at once, and let the
+        /// text lane see it: the machine is up and idle.
+        async fn up(&self) {
+            drop(
+                self.activator
+                    .executor("comfy")
+                    .unwrap()
+                    .ensure_ready()
+                    .await
+                    .expect("capacity"),
+            );
+            self.activator.executor("text").unwrap().observe().await;
+        }
+
+        async fn off(&self, release_holds: bool) -> Result<PowerOffOutcome, PowerOffError> {
+            self.activator.power_off("gpu-box", release_holds).await
+        }
+
+        fn take_hold(&self, wake: bool) -> String {
+            self.activator
+                .take_hold("gpu-box", "nightly job", 3_600_000, (None, None), wake)
+                .unwrap()
+                .unwrap()
+                .id
+        }
+
+        fn hold_ids(&self) -> Vec<String> {
+            self.activator
+                .holds()
+                .list(Some("gpu-box"), self.clock.now_ms())
+                .into_iter()
+                .map(|hold| hold.id)
+                .collect()
+        }
+
+        fn states(&self) -> Vec<LaneState> {
+            ["text", "comfy"]
+                .iter()
+                .map(|name| self.activator.executor(name).unwrap().lock().state)
+                .collect()
+        }
+
+        fn poweroffs(&self) -> u32 {
+            self.host.sim().poweroff
+        }
+    }
+
+    fn guarded_shared_host_config(extra: &str) -> Config {
+        let mut cfg = shared_host_config(extra);
+        cfg.local_executors[1].poweroff_guard_command = Some(GUARD.to_string());
+        cfg
+    }
+
+    fn refused(result: &Result<PowerOffOutcome, PowerOffError>) -> Option<&PowerOffRefusal> {
+        match result {
+            Err(PowerOffError::Refused(refusal)) => Some(refusal),
+            _ => None,
+        }
+    }
+
+    // A text request admitted while the guard runs refuses the power-off:
+    // the re-check under every lane lock sees it, and the machine is left
+    // up.
+    #[tokio::test]
+    async fn a_request_admitted_while_the_guard_runs_refuses_a_manual_power_off() {
+        let rig = power_rig(&guarded_shared_host_config(""));
+        rig.up().await;
+        let request = Arc::new(Mutex::new(None));
+        let slot = request.clone();
+        rig.on("check-idle", move |activator| {
+            *slot.lock().unwrap() = sb_runtime::LaneStatus::begin_request(&**activator, "text");
+        });
+        let result = rig.off(false).await;
+        assert!(
+            matches!(refused(&result), Some(PowerOffRefusal::LaneBusy { lanes }) if lanes == &["text"]),
+            "{result:?}"
+        );
+        assert_eq!(rig.poweroffs(), 0, "the machine was left up");
+        assert!(request.lock().unwrap().is_some(), "the request was counted");
+        assert!(
+            !rig.states().contains(&LaneState::PoweringOff),
+            "{:?}",
+            rig.states()
+        );
+    }
+
+    // A hold taken while the guard runs refuses the power-off.
+    #[tokio::test]
+    async fn a_hold_taken_while_the_guard_runs_refuses_a_manual_power_off() {
+        let rig = power_rig(&guarded_shared_host_config(""));
+        rig.up().await;
+        rig.on("check-idle", |activator| {
+            activator
+                .take_hold("gpu-box", "nightly job", 3_600_000, (None, None), false)
+                .unwrap();
+        });
+        let result = rig.off(false).await;
+        assert!(
+            matches!(refused(&result), Some(PowerOffRefusal::HoldActive { .. })),
+            "{result:?}"
+        );
+        assert_eq!(rig.poweroffs(), 0);
+        assert_eq!(rig.hold_ids().len(), 1, "the hold stays");
+    }
+
+    // `release_holds` ends only the holds the request found: one taken
+    // while the guard runs refuses the power-off, and no hold ends.
+    #[tokio::test]
+    async fn release_holds_never_ends_a_hold_taken_meanwhile() {
+        let rig = power_rig(&guarded_shared_host_config(""));
+        rig.up().await;
+        let first = rig.take_hold(false);
+        rig.on("check-idle", |activator| {
+            activator
+                .take_hold("gpu-box", "nightly job", 3_600_000, (None, None), false)
+                .unwrap();
+        });
+        let result = rig.off(true).await;
+        let Some(PowerOffRefusal::HoldTakenMeanwhile { holds }) = refused(&result) else {
+            panic!("{result:?}");
+        };
+        assert!(!holds.contains(&first), "{holds:?}");
+        assert_eq!(rig.poweroffs(), 0);
+        let left = rig.hold_ids();
+        assert_eq!(left.len(), 2, "both holds stay: {left:?}");
+        assert!(left.contains(&first));
+    }
+
+    // A text request whose wake comes while the poweroff command runs
+    // waits for the machine's wake lock: it never marks the lane up on a
+    // machine that is going away, and once the command returns every lane
+    // is off.
+    #[tokio::test]
+    async fn a_request_wake_during_a_manual_power_off_never_marks_the_lane_up() {
+        let rig = power_rig(&shared_host_config(""));
+        rig.up().await;
+        let request = Arc::new(Mutex::new(None));
+        let slot = request.clone();
+        rig.on("poweroff-host", move |activator| {
+            let text = activator.executor("text").unwrap();
+            *slot.lock().unwrap() = Some(text.begin_request());
+            tokio::spawn(async move {
+                text.wake_for_request().await;
+            });
+        });
+        let outcome = rig.off(false).await.expect("powered off");
+        assert!(!outcome.already_off);
+        // Read before anything else runs: the waiting wake has not had its
+        // turn yet.
+        assert_eq!(
+            rig.states(),
+            vec![LaneState::Offline, LaneState::Offline],
+            "every lane is off once the command returned"
+        );
+        assert_eq!(rig.poweroffs(), 1);
+        drop(request);
+    }
+
+    // The same for a hold with `wake: true` taken while the poweroff
+    // command runs.
+    #[tokio::test]
+    async fn a_hold_wake_during_a_manual_power_off_never_marks_the_lane_up() {
+        let rig = power_rig(&shared_host_config(""));
+        rig.up().await;
+        rig.on("poweroff-host", |activator| {
+            activator
+                .take_hold("gpu-box", "nightly job", 3_600_000, (None, None), true)
+                .unwrap();
+        });
+        rig.off(false).await.expect("powered off");
+        assert_eq!(
+            rig.states(),
+            vec![LaneState::Offline, LaneState::Offline],
+            "every lane is off once the command returned"
+        );
+        // The hold's wake then brings the machine back.
+        settle().await;
+        assert_eq!(rig.host.sim().wake, 2, "woken again for the hold");
+    }
+
+    // `release_holds` runs every check first: with a lane busy the request
+    // is refused and the holds still exist.
+    #[tokio::test]
+    async fn release_holds_keeps_the_holds_when_a_lane_is_busy() {
+        let rig = power_rig(&shared_host_config(""));
+        rig.up().await;
+        let hold = rig.take_hold(false);
+        let work = rig.activator.executor("comfy").unwrap().begin_request();
+        let result = rig.off(true).await;
+        assert!(
+            matches!(refused(&result), Some(PowerOffRefusal::LaneBusy { .. })),
+            "{result:?}"
+        );
+        assert_eq!(rig.hold_ids(), vec![hold], "the hold still exists");
+        assert_eq!(rig.poweroffs(), 0);
+        drop(work);
+    }
+
+    // Once every check has passed, the holds end and the answer names them.
+    #[tokio::test]
+    async fn release_holds_names_the_released_holds() {
+        let rig = power_rig(&shared_host_config(""));
+        rig.up().await;
+        let hold = rig.take_hold(false);
+        let outcome = rig.off(true).await.expect("powered off");
+        assert_eq!(outcome.released_holds, vec![hold]);
+        assert!(rig.hold_ids().is_empty());
+        assert_eq!(rig.poweroffs(), 1);
+    }
+
+    // A machine asleep by other means (off when the gateway started, put
+    // to sleep by something else) is already off: no lane answers, so no
+    // command runs. A repeat power-off is the same.
+    #[tokio::test]
+    async fn a_machine_no_lane_of_which_answers_is_already_off() {
+        let rig = power_rig(&shared_host_config(""));
+        let outcome = rig.off(false).await.expect("already off");
+        assert!(outcome.already_off);
+        assert_eq!(
+            rig.poweroffs(),
+            0,
+            "no command ran against a sleeping machine"
+        );
+
+        rig.up().await;
+        assert!(!rig.off(false).await.expect("powered off").already_off);
+        assert!(rig.off(false).await.expect("already off").already_off);
+        assert_eq!(rig.poweroffs(), 1, "the repeat ran no command");
+    }
+
+    // A failed poweroff command is a failure (502): the lanes go back to
+    // the state they had, so the idle power-off still runs later.
+    #[tokio::test]
+    async fn a_failed_manual_power_off_leaves_the_idle_power_off_working() {
+        let rig = power_rig(&shared_host_config(""));
+        rig.up().await;
+        let before = rig.states();
+        rig.host.sim().fail_poweroff = true;
+        let result = rig.off(false).await;
+        assert!(
+            matches!(result, Err(PowerOffError::Failed(_))),
+            "{result:?}"
+        );
+        assert_eq!(rig.states(), before, "the lanes are as they were");
+
+        rig.host.sim().fail_poweroff = false;
+        (rig.advance)(5_000);
+        rig.activator.tick_all().await;
+        assert_eq!(rig.poweroffs(), 2, "the idle power-off ran");
+        assert_eq!(rig.states(), vec![LaneState::Offline, LaneState::Offline]);
+    }
+
+    // The minimum uptime counts the machine's current boot: once every lane
+    // was seen down, the next answer starts it again.
+    #[tokio::test]
+    async fn the_minimum_uptime_counts_the_current_boot() {
+        let rig = power_rig(&shared_host_config("    poweroff_min_uptime_secs: 60\n"));
+        rig.up().await;
+        (rig.advance)(100_000);
+        // Something else puts the machine to sleep, and it comes back.
+        rig.host.sim().healthy = false;
+        rig.activator.observe_all().await;
+        (rig.advance)(100_000);
+        rig.host.sim().healthy = true;
+        rig.activator.observe_all().await;
+        (rig.advance)(30_000);
+        let result = rig.off(false).await;
+        assert_eq!(
+            refused(&result),
+            Some(&PowerOffRefusal::UptimeTooShort {
+                uptime_secs: 30,
+                minimum_secs: 60
+            }),
+            "{result:?}"
+        );
+        assert_eq!(rig.poweroffs(), 0);
+        (rig.advance)(30_000);
+        rig.off(false).await.expect("old enough now");
+        assert_eq!(rig.poweroffs(), 1);
+    }
+
+    // A wake that brought nothing up starts no uptime: the machine's
+    // uptime starts when it answers.
+    #[tokio::test]
+    async fn a_boot_timeout_starts_no_uptime() {
+        // The wake's boot polls sleep: a clock that moves by itself.
+        let clock = FakeClock::new();
+        let moved = clock.clone();
+        let rig = power_rig_with(
+            &shared_host_config("    poweroff_min_uptime_secs: 60\n"),
+            Sim::default(),
+            clock,
+            Box::new(move |ms| moved.advance(ms)),
+        );
+        let comfy = rig.activator.executor("comfy").unwrap();
+        assert!(matches!(
+            comfy.ensure_ready().await,
+            Err(EnsureError::BootTimeout { .. })
+        ));
+        // Started by hand later.
+        rig.host.sim().healthy = true;
+        rig.activator.observe_all().await;
+        (rig.advance)(10_000);
+        let result = rig.off(false).await;
+        assert!(
+            matches!(
+                refused(&result),
+                Some(PowerOffRefusal::UptimeTooShort {
+                    uptime_secs: 10,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    // The idle power-off waits for the minimum uptime too.
+    #[tokio::test]
+    async fn the_idle_power_off_waits_for_the_minimum_uptime() {
+        let rig = power_rig(&shared_host_config("    poweroff_min_uptime_secs: 60\n"));
+        rig.up().await;
+        (rig.advance)(5_000);
+        rig.activator.tick_all().await;
+        assert_eq!(rig.poweroffs(), 0, "idle, but too young");
+        (rig.advance)(55_000);
+        rig.activator.tick_all().await;
+        assert_eq!(rig.poweroffs(), 1);
+    }
+
+    // A wake running on the machine refuses the power-off.
+    #[tokio::test]
+    async fn a_wake_in_flight_refuses_a_manual_power_off() {
+        let rig = power_rig(&shared_host_config(""));
+        let gate = rig.gate("wake-host");
+        let comfy = rig.activator.executor("comfy").unwrap();
+        let wake = tokio::spawn(async move { comfy.ensure_ready().await.map(drop) });
+        settle().await;
+        let result = rig.off(false).await;
+        assert_eq!(
+            refused(&result),
+            Some(&PowerOffRefusal::WakeInFlight),
+            "{result:?}"
+        );
+        assert_eq!(rig.poweroffs(), 0);
+        gate.add_permits(100);
+        wake.await.unwrap().expect("woken");
+    }
+
+    // An idle power-off whose command runs refuses a manual one.
+    #[tokio::test]
+    async fn an_idle_power_off_in_flight_refuses_a_manual_power_off() {
+        let rig = power_rig(&shared_host_config(""));
+        rig.up().await;
+        let gate = rig.gate("poweroff-host");
+        (rig.advance)(5_000);
+        let activator = rig.activator.clone();
+        let tick = tokio::spawn(async move { activator.tick_all().await });
+        settle().await;
+        let result = rig.off(false).await;
+        assert_eq!(
+            refused(&result),
+            Some(&PowerOffRefusal::PoweroffInFlight),
+            "{result:?}"
+        );
+        gate.add_permits(100);
+        tick.await.unwrap();
+        assert_eq!(rig.poweroffs(), 1, "one power-off, the idle one");
+    }
+
+    // While the idle tick only evaluates the machine (its guard asks), a
+    // manual power-off waits for it briefly; if it takes longer, the
+    // answer says what runs.
+    #[tokio::test]
+    async fn a_manual_power_off_waits_briefly_for_the_idle_check() {
+        let rig = power_rig(&guarded_shared_host_config(""));
+        rig.up().await;
+        let gate = rig.gate("check-idle");
+        (rig.advance)(5_000);
+        let activator = rig.activator.clone();
+        let tick = tokio::spawn(async move { activator.tick_all().await });
+        settle().await;
+        let result = rig.off(false).await;
+        assert_eq!(
+            refused(&result),
+            Some(&PowerOffRefusal::IdleCheckInFlight),
+            "{result:?}"
+        );
+        // The guard answers soon: the manual request waits, and finds the
+        // machine the idle tick just powered off.
+        let release = gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release.add_permits(100);
+        });
+        let outcome = rig.off(false).await.expect("waited for the idle check");
+        assert!(outcome.already_off, "{outcome:?}");
+        tick.await.unwrap();
+        assert_eq!(rig.poweroffs(), 1);
+    }
+
+    /// Two machines: an always-on one (no wake or power-off command) with
+    /// one text lane, and `gpu-box` (the shared machine above).
+    fn two_machine_config() -> Config {
+        let mut cfg = shared_host_config("");
+        let always = Config::from_yaml(
+            r#"
+providers:
+  - id: always
+    type: openai_compatible
+    base_url: "http://executor-2.example:8080/v1"
+local_executors:
+  - name: always
+    host: always-on
+    base_url: "http://executor-2.example:8080"
+    health_endpoint: "http://executor-2.example:8080/health"
+    route_health: true
+"#,
+        )
+        .unwrap();
+        cfg.providers.extend(always.providers);
+        cfg.local_executors.extend(always.local_executors);
+        cfg
+    }
+
+    // An always-on machine is never powered off or woken: no command ever
+    // runs against it. A power-off of the other machine checks only that
+    // machine's lanes and holds.
+    #[tokio::test]
+    async fn the_always_on_machine_is_never_touched() {
+        let rig = power_rig(&two_machine_config());
+        rig.up().await;
+        // The always-on machine is busy and held.
+        let busy = rig.activator.executor("always").unwrap().begin_request();
+        rig.activator
+            .take_hold("always-on", "always busy", 3_600_000, (None, None), false)
+            .unwrap()
+            .unwrap();
+
+        let result = rig.activator.power_off("always-on", true).await;
+        assert_eq!(
+            refused(&result),
+            Some(&PowerOffRefusal::NoPoweroffCommand),
+            "{result:?}"
+        );
+        let result = rig.activator.power_on("always-on").await;
+        assert_eq!(
+            result,
+            Err(PowerOnError::Refused(PowerOnRefusal::NoWakeCommand))
+        );
+        assert_eq!(
+            rig.activator
+                .holds()
+                .list(Some("always-on"), rig.clock.now_ms())
+                .len(),
+            1,
+            "its hold stays"
+        );
+
+        // The other machine goes off: the always-on lane's work and hold
+        // are not its business.
+        let outcome = rig.off(false).await.expect("powered off");
+        assert!(!outcome.already_off);
+        assert_eq!(outcome.lanes, 2, "only the box's lanes");
+        let woken = rig.activator.power_on("gpu-box").await.expect("waking");
+        assert!(!woken.already_up);
+        settle().await;
+
+        let started = rig.runner.started.lock().unwrap().clone();
+        assert!(!started.is_empty());
+        assert!(
+            started.iter().all(|command| command.contains("executor-1")),
+            "a command ran against the always-on machine: {started:?}"
+        );
+        assert_eq!(
+            rig.activator.executor("always").unwrap().lock().in_flight,
+            1,
+            "the always-on lane keeps its work"
+        );
+        drop(busy);
     }
 }
