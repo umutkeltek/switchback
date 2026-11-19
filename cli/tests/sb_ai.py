@@ -74,6 +74,27 @@ def lane(name, state="offline", host="box", **extra):
     return row
 
 
+def chat_plan(delay=0.05, prompt_tokens=1000, completion_tokens=256, timings=None):
+    """The chunks of one streamed chat answer: a role, two words of text, then the usage.
+
+    `delay` is the wait before the first token (the time to first token), the
+    later gaps are the answer itself. `timings` is what llama.cpp adds to its
+    last chunk.
+    """
+    steps = [(0.0, {"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}),
+             (delay, {"choices": [{"index": 0, "delta": {"content": "The gateway "},
+                                    "finish_reason": None}]}),
+             (0.05, {"choices": [{"index": 0, "delta": {"content": "keeps the record."},
+                                   "finish_reason": None}]})]
+    final = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                       "total_tokens": prompt_tokens + completion_tokens}}
+    if timings:
+        final["timings"] = timings
+    steps.append((0.05, final))
+    return steps
+
+
 class Fake:
     """A gateway that answers from `self.routes` and records every request."""
 
@@ -92,6 +113,11 @@ class Fake:
         self.workflows_status = 200
         self.job_states = []
         self.holds = None  # None: the gateway has no holds route (bare 404)
+        self.chat_plans = []  # one plan per chat request; the last one is used again
+        self.chat_count = 0
+        self.chat_fail_at = None  # the request number from which the gateway refuses
+        self.chat_status = 500
+        self.wake_makes_healthy = False  # a hold with --wake brings the machine up
         self.routes = {
             ("GET", "/health"): lambda r: (200, b"ok", "text/plain"),
             ("GET", "/v1/workloads/capacity"): lambda r: self.json({"object": "list", "data": self.lanes}),
@@ -147,6 +173,9 @@ class Fake:
                     "state": "waking" if body["wake"] else "active", "owner": "agents",
                     "wake_detail": None}
             self.holds.append(hold)
+            if self.wake_makes_healthy:
+                with self.lock:
+                    self.lanes = [dict(row, state="healthy") for row in self.lanes]
             return self.json(hold, 201)
         if method == "GET":
             return self.json({"object": "list", "host": host, "data": self.holds, "durable": True})
@@ -155,6 +184,42 @@ class Fake:
             return self.json({"error": {"message": "hold not found", "type": "not_found"}}, 404)
         self.holds = [h for h in self.holds if h["id"] != hold_id]
         return self.json({"id": hold_id, "host": host, "deleted": True})
+
+    def chat_plan_for(self):
+        """The plan for the next chat request, or None when the gateway refuses it."""
+        with self.lock:
+            self.chat_count += 1
+            count = self.chat_count
+        if self.chat_fail_at is not None and count >= self.chat_fail_at:
+            return None
+        plans = self.chat_plans or [chat_plan()]
+        return plans[min(count - 1, len(plans) - 1)]
+
+    def stream_answer(self, handler):
+        """Answer a chat request with server-sent events, one flush at a time."""
+        plan = self.chat_plan_for()
+        if plan is None:
+            payload = json.dumps({"error": {"message": "the lane refused the request",
+                                            "type": "workload_error"}}).encode()
+            handler.send_response(self.chat_status)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+            return
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.end_headers()
+        try:
+            for delay, chunk in plan:
+                if delay:
+                    time.sleep(delay)
+                handler.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                handler.wfile.flush()
+            handler.wfile.write(b"data: [DONE]\n\n")
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client hung up (an interrupted run)
 
     def handler(self):
         fake = self
@@ -178,6 +243,9 @@ class Fake:
                     # Every process on the machine: a child that carried the key would show too.
                     ps = subprocess.run(["ps", "-ww", "-A", "-o", "args="], capture_output=True, text=True)
                     fake.argv_seen.append(ps.stdout)
+                if self.command == "POST" and self.path == "/v1/chat/completions":
+                    fake.stream_answer(self)
+                    return
                 route = fake.routes.get((self.command, self.path))
                 if route is None and self.path.startswith("/v1/hosts/"):
                     route = fake.holds_route
@@ -599,6 +667,224 @@ class SbAi(unittest.TestCase):
         run = self.sb("hold", "10m")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(len(self.requests("POST", "/v1/hosts/lane-solo/holds")), 1)
+
+    # ------------------------------------------------------------ bench
+
+    def healthy(self):
+        """The machine is up: its lanes serve."""
+        self.fake.lanes = [lane("lane-img", "healthy"), lane("lane-text", "healthy")]
+
+    def bench(self, *args):
+        return self.sb("bench", *args)
+
+    def assert_close(self, got, want, delta=0.5):
+        self.assertAlmostEqual(got, want, delta=max(delta, abs(want) * 1e-6))
+
+    def test_bench_measures_the_client_math(self):
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.1)]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "1", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        row = json.loads(run.stdout)["results"][0]
+        self.assertEqual(row["source"], "client")
+        self.assertEqual(row["prompt_tokens"], 1000)
+        self.assertEqual(row["completion_tokens"], 256)
+        self.assertGreater(row["ttft_ms"], 50)
+        self.assertGreater(row["total_s"], row["ttft_ms"] / 1000)
+        # the prompt speed is the prompt over the time to the first token
+        self.assert_close(row["prompt_tok_s"], row["prompt_tokens"] / (row["ttft_ms"] / 1000))
+        # and the decode speed is the answer over the time after the first token
+        self.assert_close(row["decode_tok_s"],
+                          row["completion_tokens"] / (row["total_s"] - row["ttft_ms"] / 1000))
+
+    def test_bench_counts_a_reasoning_token_as_the_first_token(self):
+        # A thinking model streams reasoning first; the answer comes 0.4 s later.
+        self.healthy()
+        plan = chat_plan(delay=0.05)
+        plan.insert(1, (0.05, {"choices": [{"index": 0, "delta": {"reasoning_content": "Hm."},
+                                            "finish_reason": None}]}))
+        plan[2] = (0.4, plan[2][1])
+        self.fake.chat_plans = [plan]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "1", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertLess(json.loads(run.stdout)["results"][0]["ttft_ms"], 300)
+
+    def test_bench_uses_the_engine_timings_when_the_stream_has_them(self):
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.05, timings={
+            "prompt_n": 1000, "prompt_ms": 120, "prompt_per_second": 833.3,
+            "predicted_n": 256, "predicted_ms": 480, "predicted_per_second": 533.3})]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "1", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        row = json.loads(run.stdout)["results"][0]
+        self.assertEqual(row["source"], "engine")
+        self.assert_close(row["prompt_tok_s"], 833.3)
+        self.assert_close(row["decode_tok_s"], 533.3)
+
+    def test_bench_stops_when_the_machine_is_off_and_never_wakes_it(self):
+        self.fake.holds = []
+        run = self.bench("chat-a")
+        self.assertEqual(run.returncode, 3, run.stderr)
+        self.assertIn("box is off", run.stderr)
+        self.assertIn("--wake", run.stderr)
+        self.assertEqual(self.requests("POST"), [])
+        self.assertEqual(self.requests("POST", "/v1/chat/completions"), [])
+
+    def test_bench_with_wake_holds_the_machine_and_lets_it_go(self):
+        self.fake.holds = []
+        self.fake.wake_makes_healthy = True
+        self.fake.chat_plans = [chat_plan(delay=0.02)]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "1", "--wake")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
+                         {"ttl_secs": 1800, "reason": "sb ai bench", "wake": True})
+        self.assertEqual(len(self.requests("DELETE", "/v1/hosts/box/holds/hold-1")), 1)
+        self.assertEqual(self.fake.holds, [])
+
+    def test_bench_with_wake_releases_the_hold_when_a_run_fails(self):
+        self.fake.holds = []
+        self.fake.wake_makes_healthy = True
+        self.fake.chat_plans = [chat_plan(delay=0.02)]
+        self.fake.chat_fail_at = 2  # the second request of the run fails
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "3", "--wake")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("the bench request failed", run.stderr)
+        self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
+                         {"ttl_secs": 1800, "reason": "sb ai bench", "wake": True})
+        self.assertEqual(len(self.requests("DELETE", "/v1/hosts/box/holds/hold-1")), 1)
+        self.assertEqual(self.fake.holds, [])
+
+    def test_bench_with_wake_releases_the_hold_when_interrupted(self):
+        self.fake.holds = []
+        self.fake.wake_makes_healthy = True
+        self.fake.chat_plans = [chat_plan(delay=5.0)]  # a slow answer to interrupt
+        process = subprocess.Popen(["zsh", str(SB), "ai", "bench", "chat-a", "--workload", "chat",
+                                    "--runs", "1", "--wake"],
+                                   env=self.env, cwd=self.root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        deadline = time.time() + 20
+        while time.time() < deadline and not self.requests("POST", "/v1/chat/completions"):
+            time.sleep(0.05)
+        self.assertTrue(self.requests("POST", "/v1/chat/completions"), "the bench never sent a request")
+        os.killpg(process.pid, signal.SIGINT)  # what Ctrl-C sends to the foreground group
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 130, stderr)
+        self.assertEqual(len(self.requests("DELETE", "/v1/hosts/box/holds/hold-1")), 1)
+        self.assertEqual(self.fake.holds, [])
+
+    def test_bench_json_shape(self):
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.02)]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "1", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads(run.stdout)
+        self.assertEqual(sorted(report), ["models", "results", "runs", "workloads"])
+        self.assertEqual(report["models"], ["chat-a"])
+        self.assertEqual(report["workloads"], ["chat"])
+        self.assertEqual(report["runs"], 1)
+        self.assertEqual(len(report["results"]), 1)
+        row = report["results"][0]
+        self.assertEqual(sorted(row), ["completion_tokens", "decode_tok_s", "kind", "model",
+                                       "prompt_tok_s", "prompt_tokens", "runs", "source",
+                                       "total_s", "ttft_ms", "workload"])
+        self.assertEqual(row["model"], "chat-a")
+        self.assertEqual(row["workload"], "chat")
+        self.assertEqual(row["kind"], "cold")
+        self.assertEqual(row["runs"], 1)
+        self.assertEqual(row["source"], "client")
+        self.assertIsInstance(row["ttft_ms"], float)
+        self.assertIsInstance(row["total_s"], float)
+        self.assertIsInstance(row["prompt_tokens"], int)
+        self.assertIsInstance(row["completion_tokens"], int)
+
+    def test_bench_splits_cold_and_warm_and_takes_the_median(self):
+        self.healthy()
+        # the later runs answer in 300, 450 and 900 ms: the median is 450, not the mean
+        self.fake.chat_plans = [chat_plan(delay=0.15), chat_plan(delay=0.3),
+                                chat_plan(delay=0.45), chat_plan(delay=0.9)]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "4", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        rows = json.loads(run.stdout)["results"]
+        self.assertEqual([(row["kind"], row["runs"]) for row in rows], [("cold", 1), ("warm", 3)])
+        cold, warm = rows
+        self.assert_close(cold["ttft_ms"], 150, delta=60)
+        self.assert_close(warm["ttft_ms"], 450, delta=50)
+        self.assertGreater(warm["ttft_ms"], cold["ttft_ms"])
+
+    def test_bench_runs_both_workloads_and_several_models(self):
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.02)]
+        run = self.bench("chat-a", "chat-b", "--workload", "all", "--runs", "1", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads(run.stdout)
+        self.assertEqual(report["models"], ["chat-a", "chat-b"])
+        self.assertEqual(report["workloads"], ["chat", "read"])
+        self.assertEqual([(row["model"], row["workload"]) for row in report["results"]],
+                         [("chat-a", "chat"), ("chat-a", "read"),
+                          ("chat-b", "chat"), ("chat-b", "read")])
+        bodies = [r["json"] for r in self.requests("POST", "/v1/chat/completions")]
+        self.assertEqual(len(bodies), 4)
+        self.assertEqual([b["max_tokens"] for b in bodies], [256, 16, 256, 16])
+        for body in bodies:
+            self.assertEqual(body["temperature"], 0)
+            self.assertEqual(body["seed"], 1)
+            self.assertEqual(body["reasoning_effort"], "none")
+            self.assertTrue(body["stream"])
+            self.assertEqual(body["stream_options"], {"include_usage": True})
+        # the reading job is a long document, the chat a shorter note
+        self.assertLess(len(bodies[0]["messages"][0]["content"]), len(bodies[1]["messages"][0]["content"]))
+
+    def test_bench_prints_the_table(self):
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.02)]
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "1")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        lines = run.stdout.splitlines()
+        self.assertEqual(lines[0].split(), ["model", "workload", "kind", "runs", "ttft", "ms",
+                                            "prompt", "tok/s", "decode", "tok/s", "total", "s", "source"])
+        self.assertEqual(lines[1].split()[:4], ["chat-a", "chat", "cold", "1"])
+        self.assertEqual(lines[1].split()[-1], "client")
+        self.assertEqual(len(lines), 2)
+
+    def test_bench_writes_the_json_to_a_file(self):
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.02)]
+        out = self.root / "bench.json"
+        run = self.bench("chat-a", "--workload", "chat", "--runs", "1", "-o", str(out))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads(out.read_text())
+        self.assertEqual(report["models"], ["chat-a"])
+        self.assertEqual(report["results"][0]["kind"], "cold")
+        self.assertIn("ttft ms", run.stdout)  # the table still goes to stdout
+
+    def test_bench_needs_a_model_the_gateway_offers(self):
+        self.healthy()
+        run = self.bench("nope")
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn("unknown text model nope", run.stderr)
+        self.assertEqual(self.requests("POST", "/v1/chat/completions"), [])
+
+    def test_bench_without_a_model_uses_the_only_text_model(self):
+        self.fake.models = [{"id": "chat-a"}]
+        self.healthy()
+        self.fake.chat_plans = [chat_plan(delay=0.02)]
+        run = self.bench("--workload", "chat", "--runs", "1", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["models"], ["chat-a"])
+
+    def test_bench_without_a_model_asks_which_one_when_there_are_several(self):
+        self.healthy()
+        run = self.bench("--workload", "chat", "--runs", "1")
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn("choose a text model to bench", run.stderr)
+        self.assertIn("chat-a, chat-b", run.stderr)
+        self.assertEqual(self.requests("POST", "/v1/chat/completions"), [])
+
+    def test_bench_help(self):
+        run = self.sb("help")
+        self.assertIn("sb ai bench", run.stdout)
+        self.assertIn("--workload", run.stdout)
+        self.assertEqual(self.fake.seen, [])
 
     # ------------------------------------------------------------ config, key, reachability
 

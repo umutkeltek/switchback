@@ -744,6 +744,7 @@ after it has been idle; `sb ai` itself never wakes anything, except
 ```
 sb ai image "a lighthouse at dusk" --model flux --aspect 16:9 -o light.png
 sb ai video "waves roll in" --image light.png --seconds 2 -o waves.mp4
+sb ai bench             # measure the text models: first token, prompt and decode speed
 sb ai status            # one line per lane, and whether the machine is on; never wakes it
 sb ai models            # text, image and video models the gateway offers
 sb ai hold 2h "batch"   # keep the machine on for direct work (--wake turns it on now)
@@ -765,6 +766,17 @@ sb ai release           # let it go again (ID or --all when there are several ho
   (a square one at `--mp` if given).
   `--seconds` becomes frames at 24 fps, `--frames` sends an exact count.
 - Ctrl-C during a video cancels the job on the gateway.
+- `bench` measures text models through the gateway's OpenAI-compatible API and
+  reports the time to the first token, the prompt and the decode speed (tokens
+  per second), the total time and the token counts. The first run of each model
+  and workload stands alone as cold (it may carry the model load); the median
+  of the later runs is the warm number. `--workload` picks `chat` (a 1000 token
+  prompt, 256 tokens back) or `read` (a 9000 token document, 16 tokens back);
+  `--runs` counts the runs (3 by default). It never wakes the machine by
+  itself: without `--wake` it says the machine is off and stops (exit 3). With
+  `--wake` it holds the machine for 30 minutes and lets it go again at the end,
+  also when a run fails or you press Ctrl-C. `--json` prints the numbers as
+  JSON, `-o FILE` writes them there too.
 - `status` shows a held machine's lanes as "held: will not power off", with
   each hold's reason, owner, end time (local clock) and minutes left. It shows
   a power-off countdown only when the gateway gives one; `--json` prints the
@@ -778,7 +790,8 @@ Config: `SWITCHBACK_AI_URL` and `SWITCHBACK_AI_KEY` in the environment, else
 environment wins). There is no default address. The key goes only into the
 `Authorization` header: never on a command line and never in output. Requests
 skip any HTTP proxy set in the environment. Exit codes: 0 ok, 1 the gateway
-reported an error, 2 usage error, 3 gateway unreachable.
+reported an error, 2 usage error, 3 gateway unreachable (or the machine is off,
+when `bench` cannot run).
 
 ## Files
 

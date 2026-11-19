@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 
 OK, GATEWAY_ERROR, USAGE, UNREACHABLE = 0, 1, 2, 3
+MACHINE_OFF = 3  # the same code as an unreachable gateway: the work cannot start
 
 HELP = """\
 sb ai: images, video and machine status through a Switchback gateway
@@ -30,6 +31,8 @@ sb ai: images, video and machine status through a Switchback gateway
   sb ai image "prompt" [--model NAME] [--aspect W:H] [--mp N] [--size WxH] [--seed N] [-o FILE]
   sb ai video "prompt" --image FIRST_FRAME [--model NAME] [--seconds N] [--frames N]
                        [--aspect W:H] [--mp N] [--size WxH] [--seed N] [-o FILE]
+  sb ai bench [MODEL ...] [--workload chat|read|all] [--runs N] [--wake] [--json] [-o FILE]
+                                 measure the text models: first token, prompt and decode speed
   sb ai status [--json]          lanes and machine power; never wakes anything
   sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video);
                                  --all also shows internal provider ids
@@ -44,10 +47,23 @@ They wait up to --timeout SECS (default 900). hold takes --json for the raw answ
 video without --aspect or --size keeps the first frame's shape (0.4 MP, or --mp).
 Ctrl-C during a video cancels the job on the gateway.
 
+bench measures text models through the gateway's OpenAI-compatible API: it sends a
+fixed prompt and reports the time to the first token, the prompt and the decode
+speed (tokens per second), the total time and the token counts. The first run of
+each model and workload stands alone as cold (it may carry the model load); the
+median of the later runs is the warm number. --workload picks chat (a 1000 token
+prompt, 256 tokens back) or read (a 9000 token document, 16 tokens back, like the
+nightly reading job); --workload all runs both. bench never wakes the machine by
+itself: without --wake it says the machine is off and stops (exit 3). With --wake
+it holds the machine for 30 minutes and lets it go again at the end, also when a
+run fails or you press Ctrl-C. --json prints the numbers as JSON, -o FILE writes
+them there too.
+
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
 SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL (defaults), SWITCHBACK_AI_OUT_DIR.
-Exit codes: 0 ok, 1 the gateway reported an error, 2 usage error, 3 gateway unreachable.
+Exit codes: 0 ok, 1 the gateway reported an error, 2 usage error, 3 the gateway does
+not answer, or the machine is off.
 """
 
 CONFIG_KEYS = ("SWITCHBACK_AI_URL", "SWITCHBACK_AI_KEY", "SWITCHBACK_AI_IMAGE_MODEL",
@@ -201,6 +217,54 @@ class Gateway:
             return True
         except (Fail, GatewayError):
             return False
+
+    def stream(self, path, body, timeout=900):
+        """Yields (monotonic_time, chunk) for every chunk of a streaming answer.
+
+        The chunks come as server-sent events; a gateway that ignores
+        stream=true answers with one JSON body, which is yielded as one chunk.
+        """
+        headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
+        if body is not None and not isinstance(body, bytes):
+            body = json.dumps(body).encode()
+        request = urllib.request.Request(self.base + path, data=body, headers=headers, method="POST")
+        plain, streamed = [], False
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                for raw in response:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    if not line.startswith("data:"):
+                        plain.append(line)
+                        continue
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    streamed = True
+                    yield time.monotonic(), chunk
+        except urllib.error.HTTPError as error:
+            raise self._http_error(error) from None
+        except urllib.error.URLError as error:
+            raise Fail(UNREACHABLE, f"the gateway does not answer ({self.scrub(reason_of(error))})") from None
+        except (TimeoutError, socket.timeout):
+            raise Fail(GATEWAY_ERROR, f"no answer from the gateway after {timeout:.0f}s") from None
+        except OSError as error:
+            raise Fail(UNREACHABLE, f"the gateway connection broke ({self.scrub(reason_of(error))})") from None
+        if not streamed and plain:
+            try:
+                chunk = json.loads("\n".join(plain))
+            except ValueError:
+                return
+            yield time.monotonic(), chunk
 
 
 def reason_of(error):
@@ -837,14 +901,27 @@ def holds_error(error, doing):
     return gateway_fail(error, doing)
 
 
+def create_hold(gw, host, ttl_secs, reason, wake=False):
+    """Ask the gateway to hold a machine on; returns the hold it answers with."""
+    body = {"ttl_secs": ttl_secs, "reason": reason, "wake": bool(wake)}
+    try:
+        return gw.post(holds_path(host), body)  # 201 with the hold itself
+    except GatewayError as error:
+        raise holds_error(error, "the hold was refused")
+
+
+def release_hold(gw, host, hold_id):
+    """Let a hold go; the machine may power off again."""
+    try:
+        gw.delete(holds_path(host, hold_id))
+    except GatewayError as error:
+        raise holds_error(error, f"releasing hold {hold_id}")
+
+
 def cmd_hold(gw, args):
     ttl = parse_duration(args.duration)
     host = host_for(gw, args)
-    body = {"ttl_secs": ttl, "reason": args.reason or "sb ai hold", "wake": bool(args.wake)}
-    try:
-        hold = gw.post(holds_path(host), body)  # 201 with the hold itself
-    except GatewayError as error:
-        raise holds_error(error, "the hold was refused")
+    hold = create_hold(gw, host, ttl, args.reason or "sb ai hold", bool(args.wake))
     if args.json:
         print(json.dumps(hold, indent=2))
         return OK
@@ -871,11 +948,276 @@ def cmd_release(gw, args):
         if len(ids) > 1 and not args.all:
             raise Fail(USAGE, f"{host} has {len(ids)} holds ({', '.join(ids)}); give an ID or --all")
     for hold_id in ids:
-        try:
-            gw.delete(holds_path(host, hold_id))
-        except GatewayError as error:
-            raise holds_error(error, f"releasing hold {hold_id}")
+        release_hold(gw, host, hold_id)
         print(f"released hold {hold_id} on {host}")
+    return OK
+
+
+# ---------------------------------------------------------------- bench
+
+BENCH_TTL = 1800          # the hold a bench run keeps (30 minutes)
+BENCH_RUNS = 3
+BENCH_WAKE_TIMEOUT = 300  # seconds to wait for the machine to come up
+BENCH_TIMEOUT = 900       # seconds for one chat request
+
+BENCH_PARAGRAPH = (
+    "The switchback gateway sits between a request and the machine that answers it. "
+    "It picks the lane that should serve the job, it keeps the machine awake while the "
+    "work runs, and it writes down what happened: the tokens that were counted, the "
+    "time to the first token, the lane that was chosen and the price that was paid. "
+    "Because the gateway is the only door, a tool can be replaced without changing the "
+    "way a person works, and a report can be produced without asking the tool to "
+    "remember anything. The same record answers two questions at once: what did the "
+    "machine do, and what should it do next. A reading job sends a long document and "
+    "asks for a short answer; a writing job sends a short instruction and asks for a "
+    "long answer. Both look the same from the outside, and both cost less when the "
+    "gateway can tell them apart. Every number in a report comes from that record, so "
+    "a slow run and a fast run can be compared without guessing why they differ."
+)
+
+WORKLOADS = {
+    # a chat: about 1000 tokens in, 256 tokens back.
+    "chat": {"max_tokens": 256,
+             "prompt": "You are a careful assistant. Read the notes below, then answer the "
+                       "question in one short paragraph, using only the notes.\n\n"
+                       "Notes:\n" + (BENCH_PARAGRAPH + "\n\n") * 4 +
+                       "\nQuestion: what does the gateway record, and why does that matter to "
+                       "the person doing the work?"},
+    # a reading job like the nightly one: about 9000 tokens in, 16 tokens back.
+    "read": {"max_tokens": 16,
+             "prompt": "Read the document below. Reply with one line about what it is about "
+                       "and nothing else.\n\nDocument:\n" + (BENCH_PARAGRAPH + "\n\n") * 38},
+}
+
+BENCH_COLUMNS = (("model", "model"), ("workload", "workload"), ("kind", "kind"),
+                 ("runs", "runs"), ("ttft ms", "ttft_ms"), ("prompt tok/s", "prompt_tok_s"),
+                 ("decode tok/s", "decode_tok_s"), ("total s", "total_s"), ("source", "source"))
+
+
+def bench_models(cat, names):
+    """The models to measure: the ones asked for, else the default text model."""
+    if not names:
+        try:
+            return [resolve_model("", "text", cat, "")]
+        except Fail:
+            listed = ", ".join(cat["text"]) or "none"
+            raise Fail(USAGE, f"choose a text model to bench (the gateway offers: {listed}); "
+                              "give its name") from None
+    return [resolve_model(name, "text", cat, "") for name in names]
+
+
+def model_host(model, lanes):
+    """The machine behind a model: the lane its name points at, else the only one."""
+    hosts = sorted({machine_of(lane) for lane in lanes})
+    if "/" in model:
+        prefix = model.split("/", 1)[0]
+        for lane in lanes:
+            if lane.get("name") == prefix:
+                return machine_of(lane)
+    if len(hosts) == 1:
+        return hosts[0]
+    if not hosts:
+        raise Fail(GATEWAY_ERROR, "the gateway manages no machine (no local lanes)")
+    raise Fail(USAGE, f"the gateway manages several machines ({', '.join(hosts)}); name the "
+                      "model with its lane (like lane/model)")
+
+
+def host_power(lanes, host):
+    """The power of one machine, from the states of its lanes."""
+    return power_of({lane.get("state") for lane in lanes if machine_of(lane) == host})
+
+
+def number_of(value):
+    """A value as a number, or None when it is not one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def chunk_has_text(chunk):
+    """True when a streamed chunk carries generated text."""
+    for choice in chunk.get("choices") or []:
+        delta = choice.get("delta") or {}
+        # A thinking model sends reasoning before the answer: its first token
+        # counts as the first token too.
+        if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
+            return True
+    return False
+
+
+def measure(gw, model, workload):
+    """One chat request, timed: the first token, the usage and the server's timings."""
+    work = WORKLOADS[workload]
+    body = {"model": model,
+            "messages": [{"role": "user", "content": work["prompt"]}],
+            "max_tokens": work["max_tokens"], "temperature": 0, "seed": 1,
+            "reasoning_effort": "none", "stream": True,
+            "stream_options": {"include_usage": True}}
+    started = time.monotonic()
+    first, usage, timings = None, None, None
+    for when, chunk in gw.stream("/v1/chat/completions", body, timeout=BENCH_TIMEOUT):
+        if timings is None and isinstance(chunk.get("timings"), dict):
+            timings = chunk["timings"]
+        if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+            usage = chunk["usage"]
+        if first is None and chunk_has_text(chunk):
+            first = when
+    ended = time.monotonic()
+    if first is None:
+        raise Fail(GATEWAY_ERROR, f"{model} {workload}: the answer carried no token")
+    if not usage:
+        raise Fail(GATEWAY_ERROR, f"{model} {workload}: the answer carried no usage "
+                                  "(the gateway does not report it while streaming)")
+    ttft = (first - started) * 1000
+    total = ended - started
+    decoded = ended - first
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    prompt_speed = prompt_tokens / (ttft / 1000) if ttft > 0 else 0.0
+    decode_speed = completion_tokens / decoded if decoded > 0 else 0.0
+    source = "client"
+    if timings:
+        # llama.cpp times the prompt and the answer itself; its numbers are the
+        # ones the engine measured, ours only guess from the wire.
+        source = "engine"
+        engine_prompt = number_of(timings.get("prompt_per_second"))
+        engine_decode = number_of(timings.get("predicted_per_second"))
+        if engine_prompt is not None:
+            prompt_speed = engine_prompt
+        if engine_decode is not None:
+            decode_speed = engine_decode
+    return {"ttft_ms": ttft, "prompt_tok_s": prompt_speed, "decode_tok_s": decode_speed,
+            "total_s": total, "source": source, "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens}
+
+
+def median(values):
+    """The middle of the numbers; the mean of the two middles when there are two."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def summarize(model, workload, samples):
+    """The cold row (the first run alone) and the warm row (the median of the rest)."""
+    rows = [dict(samples[0], model=model, workload=workload, kind="cold", runs=1)]
+    later = samples[1:]
+    if later:
+        by_time = sorted(later, key=lambda sample: sample["ttft_ms"])
+        rows.append({"model": model, "workload": workload, "kind": "warm", "runs": len(later),
+                     "ttft_ms": median([s["ttft_ms"] for s in later]),
+                     "prompt_tok_s": median([s["prompt_tok_s"] for s in later]),
+                     "decode_tok_s": median([s["decode_tok_s"] for s in later]),
+                     "total_s": median([s["total_s"] for s in later]),
+                     "source": by_time[len(by_time) // 2]["source"],
+                     "prompt_tokens": int(round(median([s["prompt_tokens"] for s in later]))),
+                     "completion_tokens": int(round(median([s["completion_tokens"] for s in later])))})
+    return rows
+
+
+def bench_rows(gw, models, workloads, runs):
+    """Measure every model on every workload: cold first, then the warm median."""
+    rows = []
+    for model in models:
+        for workload in workloads:
+            samples = []
+            for index in range(runs):
+                log(f"{model} {workload}: run {index + 1}/{runs}")
+                samples.append(measure(gw, model, workload))
+            rows.extend(summarize(model, workload, samples))
+    return rows
+
+
+def bench_cell(row, key):
+    """One cell of the table, rounded for reading."""
+    if key == "runs":
+        return str(row["runs"])
+    if key == "ttft_ms":
+        return f"{row['ttft_ms']:.1f}"
+    if key in ("prompt_tok_s", "decode_tok_s"):
+        return f"{row[key]:.1f}"
+    if key == "total_s":
+        return f"{row['total_s']:.2f}"
+    return str(row[key])
+
+
+def bench_table(rows):
+    """The plain table: one line per row, the columns padded to the widest cell."""
+    lines = [[label for label, _ in BENCH_COLUMNS]]
+    lines += [[bench_cell(row, key) for _, key in BENCH_COLUMNS] for row in rows]
+    widths = [max(len(line[index]) for line in lines) for index in range(len(lines[0]))]
+    return "\n".join("  ".join(cell.ljust(widths[index]) for index, cell in enumerate(line)).rstrip()
+                     for line in lines)
+
+
+def wait_ready(gw, hosts, timeout=BENCH_WAKE_TIMEOUT):
+    """Wait until the machines behind the models are up and their lanes healthy."""
+    deadline = time.monotonic() + timeout
+    while True:
+        lanes = (capacity(gw, quiet=True) or {}).get("data") or []
+        powers = {host: host_power(lanes, host) for host in hosts}
+        if all(power == "on" for power in powers.values()):
+            return
+        if time.monotonic() > deadline:
+            raise Fail(GATEWAY_ERROR, f"the machine did not come up within {timeout:.0f}s "
+                                      f"({', '.join(f'{host}: {power}' for host, power in powers.items())})")
+        log("waiting for the machine: " + ", ".join(f"{host}: {power}" for host, power in powers.items()))
+        time.sleep(POLL_SECS)
+
+
+def release_quietly(gw, host, hold_id):
+    """Let a hold go, even at the end of a failed run; a failure here is a warning."""
+    try:
+        release_hold(gw, host, hold_id)
+        log(f"released hold {hold_id} on {host}")
+    except (Fail, GatewayError) as error:
+        log(f"could not release hold {hold_id} on {host}: {getattr(error, 'message', error)}")
+
+
+def cmd_bench(gw, args):
+    if args.runs < 1:
+        raise Fail(USAGE, "--runs must be 1 or more")
+    workloads = list(WORKLOADS) if args.workload == "all" else [args.workload]
+    models = bench_models(catalog(gw), args.model)
+    lanes = (capacity(gw).get("data") or [])
+    hosts = []
+    for model in models:
+        host = model_host(model, lanes)
+        if host not in hosts:
+            hosts.append(host)
+    if not args.wake:
+        for host in hosts:
+            power = host_power(lanes, host)
+            if power in ("off", "powering off"):
+                raise Fail(MACHINE_OFF, f"{host} is {power}; rerun with --wake to let the gateway "
+                                        "wake it, or the bench cannot run")
+    holds = []
+    try:
+        if args.wake:
+            for host in hosts:
+                hold = create_hold(gw, host, BENCH_TTL, "sb ai bench", True)
+                holds.append((host, str(hold.get("id") or "")))
+                log(f"holding {host} on for {duration_words(BENCH_TTL)}: hold {hold.get('id', '?')}")
+            wait_ready(gw, hosts)
+        rows = bench_rows(gw, models, workloads, args.runs)
+    except GatewayError as error:
+        raise gateway_fail(error, "the bench request failed") from None
+    finally:
+        for host, hold_id in holds:
+            release_quietly(gw, host, hold_id)
+    report = {"models": models, "workloads": workloads, "runs": args.runs, "results": rows}
+    if args.output:
+        path = os.path.abspath(args.output)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, indent=2)
+                handle.write("\n")
+        except OSError as error:
+            raise Fail(USAGE, f"cannot write {path}: {error.strerror}") from None
+        log(f"wrote {path}")
+    print(json.dumps(report, indent=2) if args.json else bench_table(rows))
     return OK
 
 
@@ -907,6 +1249,13 @@ def parser():
     for name in ("status", "models"):
         sub.add_parser(name, add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
     sub.choices["models"].add_argument("--all", action="store_true")
+    bench = sub.add_parser("bench", add_help=False, allow_abbrev=False)
+    bench.add_argument("model", nargs="*")
+    bench.add_argument("--workload", choices=("chat", "read", "all"), default="all")
+    bench.add_argument("--runs", type=int, default=BENCH_RUNS)
+    bench.add_argument("--wake", action="store_true")
+    bench.add_argument("--json", action="store_true")
+    bench.add_argument("-o", "--output")
     hold = sub.add_parser("hold", add_help=False, allow_abbrev=False)
     hold.add_argument("duration")
     hold.add_argument("reason", nargs="?", default="")
@@ -939,6 +1288,8 @@ def main(argv=None, environ=None):
             return cmd_status(gw, args)
         if args.command == "models":
             return cmd_models(gw, args)
+        if args.command == "bench":
+            return cmd_bench(gw, args)
         if args.command == "hold":
             return cmd_hold(gw, args)
         if args.command == "release":
