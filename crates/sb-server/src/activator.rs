@@ -2176,15 +2176,6 @@ pub fn power_off_reason(error: &PowerOffError) -> &'static str {
     }
 }
 
-/// The machine-readable reason of a failed wake.
-pub fn power_on_reason(error: &PowerOnError) -> &'static str {
-    match error {
-        PowerOnError::UnknownHost => "unknown_host",
-        PowerOnError::Refused(refusal) => refusal.reason(),
-        PowerOnError::Failed(_) => "wake_failed",
-    }
-}
-
 /// Why a manual wake was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PowerOnRefusal {
@@ -3039,6 +3030,22 @@ impl Host {
             .unwrap_or(0)
     }
 
+    /// Whether this gateway powered the machine off and it has not come
+    /// back: every lane is down and every lane remembers the power-off.
+    /// A machine that was already off when the gateway started (or that
+    /// came back up) is not this.
+    fn is_off_after_our_poweroff(&self) -> bool {
+        if self.up_since_ms().is_some() {
+            return false; // it came up at some point
+        }
+        let lanes = self.lanes();
+        !lanes.is_empty()
+            && lanes.iter().all(|lane| {
+                let rt = lane.lock();
+                rt.state == LaneState::Offline && rt.poweroff_returned_ms.is_some()
+            })
+    }
+
     /// Power the machine off now, on an operator's request. The idle timer
     /// is not involved, but the machine is protected the same way (and
     /// more strictly): the same `poweroff_command` and the same
@@ -3116,6 +3123,21 @@ impl Host {
             return Err(PowerOffError::Refused(PowerOffRefusal::LaneBusy {
                 lanes: busy,
             }));
+        }
+
+        // A machine this gateway powered off and that has not come back is
+        // already off: the request is a no-op, not a failed power-off (a
+        // command that reaches a sleeping machine fails, and a false
+        // failure would escalate the lane and alert).
+        if self.is_off_after_our_poweroff() {
+            tracing::info!(
+                host = %self.id,
+                "power-off asked for on a machine that is already off; nothing to do"
+            );
+            return Ok(PowerOffOutcome {
+                released_holds,
+                lanes: lanes.len(),
+            });
         }
 
         // A machine that has just booted is left alone: it may still be

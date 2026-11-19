@@ -303,11 +303,9 @@ fn power_on(state: &AppState, host: &str) -> Response {
         Err(PowerOnError::Refused(refusal)) => {
             refused(StatusCode::CONFLICT, refusal.reason(), refusal.message())
         }
-        Err(PowerOnError::Failed(message)) => refused(
-            StatusCode::BAD_GATEWAY,
-            crate::activator::power_on_reason(&PowerOnError::Failed(message.clone())),
-            message,
-        ),
+        Err(PowerOnError::Failed(message)) => {
+            refused(StatusCode::BAD_GATEWAY, "wake_failed", message)
+        }
     }
 }
 

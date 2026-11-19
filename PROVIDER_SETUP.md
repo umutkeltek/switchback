@@ -498,6 +498,10 @@ no hold, so the idle timer still applies and the machine powers off again
 once it has been idle long enough. A machine with no `wake_command` answers
 409 (`no_wake_command`): it is always on.
 
+Asking for a machine that this gateway already powered off (and that has
+not come back) is a no-op, not a failed power-off: the command is not run
+again, so a sleeping machine is not asked to power off a second time.
+
 Every refusal and every action is written to the gateway log. A power-off
 that fails escalates the lane and fires the same `poweroff_failed` alert
 the idle power-off fires; a successful one alerts nothing.

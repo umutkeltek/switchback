@@ -128,6 +128,36 @@ async fn an_operator_powers_a_machine_off_now() {
     let _ = std::fs::remove_file(&marker);
 }
 
+// A second power-off on a machine this gateway powered off is a no-op, not
+// a failed power-off: a command that reaches a sleeping machine fails, and
+// a false failure would escalate the lane and alert.
+#[tokio::test]
+async fn a_repeat_power_off_is_a_no_op() {
+    let marker = marker("repeat");
+    let lane = format!(
+        "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"echo off >> '{}'\"",
+        marker.display()
+    );
+    let base = serve(&config(&lane)).await;
+
+    let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
+    assert_eq!(status, 200, "{body}");
+    let first = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(first.lines().count(), 1, "{first:?}");
+
+    // The machine is off: the second request is a no-op, not a failure.
+    let (status, body) = power(&base, OPERATOR, "gpu-box", json!({"action": "off"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["powered_off"], true);
+    let second = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        second.lines().count(),
+        1,
+        "the command ran again: {second:?}"
+    );
+    let _ = std::fs::remove_file(&marker);
+}
+
 // A client key may not touch a machine's power: 403, and the machine keeps
 // running.
 #[tokio::test]
