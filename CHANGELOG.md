@@ -9,6 +9,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Speed tricks, layer 2: the speed report** (`GET /v1/optimize/report`,
+  `sb ai doctor [MODEL] [--json]`): per local target, measured decode,
+  prompt speed and time to first token against its ceiling, swaps, cache
+  hits, speculative acceptance, empty answers after thinking, queue waits,
+  wakes and last use, plus findings with evidence and one action each
+  (decode below 40% of the ceiling, swap thrash, cold cache on repeated
+  prompts, low acceptance, empty answers after thinking, unused for 14 days,
+  a regression after a settings revision). Never wakes a machine or calls an
+  engine; client keys get a tenant-scoped view. Ceilings live in a target's
+  settings (`ceiling`); `sb ai fit REPO --store TARGET [--quant Q]
+  [--bandwidth GBS]` writes bytes per token (and the decode ceiling);
+  `server.optimize.hosts` holds machine bandwidth, else the report
+  calibrates it from the best measured target and says so.
 - **Speed tricks for local engines, layer 1** (`server.optimize`,
   `routes[].optimize`, all off by default; method from
   <https://github.com/sybil-solutions/inference-optimisation-skill>):

@@ -67,6 +67,7 @@ fn client_surface(method: &Method, path: &str) -> bool {
             || model_settings_path(path)
             || path == "/v1/workloads/capacity"
             || path == "/v1/targets/stats"
+            || path == "/v1/optimize/report"
             || path == "/v1/jobs"
             || path.starts_with("/v1/jobs/")
             || path.starts_with("/v1/artifacts/")))

@@ -418,6 +418,12 @@ request one target's attempts send). Attempts report back through an
 `Observer` from the collect path and from the stream finalizer (a content
 watcher tells an empty answer after thinking).
 
+Layer 2 is read-only: `sb-server::optimize::build_report` is a pure
+function over the usage ledger, the settings documents and their latest
+revision time, the runtime's per-target evidence, the lane reports and the
+host numbers (`server.optimize.hosts`); the handler gathers those without
+calling a machine.
+
 ### Durable state (opt-in)
 Point `server.state_store` at a SQLite file and every published config revision +
 a change **audit log** + every request's **usage** are persisted as metadata (no

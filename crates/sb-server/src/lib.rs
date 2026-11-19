@@ -28,6 +28,7 @@ mod local_probe;
 mod mcp_cli;
 mod native_cli;
 mod native_history_cli;
+mod optimize;
 mod otel;
 mod provider_cli;
 mod provider_preset;

@@ -1236,6 +1236,77 @@ keeps its order. What they did rides the response header
   on every target, guard or not: an answer with no text after thinking,
   ended by the token limit.
 
+#### Layer 2: watching (the speed report)
+
+**Ceilings first.** Decode speed is bound by memory bandwidth: a token reads
+the weights it touches (and its KV cache), so the most a target can decode
+is bandwidth ÷ bytes per token. Give each local target its ceiling in its
+settings document, `ceiling: {decode_tps, prefill_tps, bytes_per_token,
+source}`. `sb ai fit` computes bytes per token from a model repository and
+writes it (operator key):
+
+```bash
+sb ai fit unsloth/Qwen3-35B-GGUF --store gpu-box/qwen --quant Q4_K_M --bandwidth 900
+# gpu-box/qwen: ceiling 3.10 GB per token, decode up to 290 tok/s (revision 7)
+```
+
+Without `--quant` it takes the quant a machine of `--machines` would load,
+else the first one. A machine's bandwidth and peak compute may also live in
+the config:
+
+```yaml
+server:
+  optimize:
+    hosts:
+      gpu-box: { bandwidth_gbs: 900, peak_tflops: 160 }
+```
+
+When a host has no `bandwidth_gbs`, the report calibrates an effective
+bandwidth from the best measured target on that host (decode × bytes per
+token) and says `calibrated`: that target then reads 100%, and every other
+target on the host is measured against it.
+
+**The report** (`GET /v1/optimize/report[?model=NAME]`, `sb ai doctor
+[MODEL] [--json]`) lists, per local target (every target of a lane in
+`local_executors`, plus models the engine control has listed): measured
+decode (median over the usage window), prompt speed and time to first token,
+the ceiling and the share of it, model swaps in the last hour and day,
+prefix-cache hits (tokens and requests, and how often a repeated system
+prompt hit the cache), speculative acceptance (`draft_n_accepted ÷
+draft_n`), empty answers after thinking, reasoning-guard uses, lane queue
+waits, wakes and their measured cost, and when it was last used. Then the
+findings, each with its evidence and one suggested action:
+
+| `kind` | when (defaults in `server.optimize.report`) | suggested action |
+|---|---|---|
+| `decode_below_ceiling` | decode below 40% of the ceiling, 6 samples or more | likely layers on the CPU or a slow KV type; run `sb ai tune` |
+| `swap_thrash` | more than 6 swaps to the target in the last hour | point both names at one model, or raise the router's models-max if memory allows (`sb ai fit`) |
+| `cache_cold` | 10 or more requests repeated a system prompt and under 10% hit the cache | turn on stickiness (or, with it on, check `cache_prompt` and the slot count) |
+| `low_acceptance` | speculative acceptance under 50% over 10 requests or more | try a shorter draft (`draft_max`) or no MTP |
+| `empty_after_thinking` | empty answers after thinking and no reasoning guard | turn on the reasoning guard |
+| `unused` | not used for 14 days (or never, in a usage window older than that) | removal candidate; Switchback deletes nothing |
+| `regression` | decode or time to first token worse by more than 10% after the latest settings revision, with 6 samples or more on each side | `sb ai revert TARGET N-1` |
+
+```bash
+sb ai doctor
+# target         decode  prompt  ttft   ceiling  swaps/h  cache  accept  empty  waits  wakes
+# gpu-box/qwen   118     9850    190ms  41%      9        3%     71%     0      2      4
+# host gpu-box: 900 GB/s (configured)
+# findings
+#   gpu-box/qwen: 9 model swaps to gpu-box/qwen in the last hour (limit 6), replacing gemma
+#     -> point both names at one model, or raise the router's models-max if memory allows (check with `sb ai fit`)
+```
+
+The report never wakes a machine and never calls an engine: it reads the
+usage ledger, the settings and their history, the evidence the gateway
+keeps, the lane reports and the engine control's last listing. Operator and
+admin keys see everything; a client key sees the targets its tenant reaches,
+measured from its own requests only, with no gateway-wide counters and no
+findings drawn from them (like `/v1/targets/stats`). The report holds no
+paths and no engine arguments. Decode in the report is a median over all
+requests (single-user requests dominate on a home machine); `sb ai tune`
+measures concurrency separately.
+
 ### Speech to text and text to speech (`/v1/audio/*`)
 
 The gateway carries OpenAI's three audio endpoints, so any OpenAI client

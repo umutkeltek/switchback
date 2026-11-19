@@ -64,6 +64,11 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  text to speech, saved to OUT
   sb ai fit REPO [--ctx N] [--machines FILE] [--vram GB] [--ram GB]
                  [--bandwidth GBS] [--json]
+  sb ai fit REPO --store TARGET [--quant LABEL] [--bandwidth GBS]
+                                  write the target's ceiling (bytes per token, and the
+                                  decode ceiling when the bandwidth is known)
+  sb ai doctor [MODEL] [--json]   the speed report: measured speed against the ceiling,
+                                  swaps, cache hits, acceptance, findings and what to do
                                  where a model fits and which file to take
   sb ai settings MODEL [--profile NAME] [--history] [--json]
                                  a model's settings: each key, its value and where it comes from
@@ -1766,6 +1771,108 @@ def doc_level(key, value=None, doc=None):
     return False
 
 
+def ceiling_from_fit(report, quant=None, bandwidth=None):
+    """The ceiling `sb ai fit --store` writes: bytes per generated token of
+    the chosen quant (weights a token reads at short context), and the
+    decode ceiling (bandwidth / bytes per token) when a bandwidth is known."""
+    options = report.get("options") or []
+    if not options:
+        raise Fail(USAGE, f"{report.get('repo')} has no model file to take a ceiling from")
+    option = None
+    if quant:
+        option = next((o for o in options if (o.get("quant") or "").lower() == quant.lower()), None)
+        if option is None:
+            labels = ", ".join(str(o.get("quant")) for o in options)
+            raise Fail(USAGE, f"no quant {quant} in {report.get('repo')} ({labels})")
+    else:
+        chosen = next((m.get("quant") for m in report.get("machines") or [] if m.get("quant")), None)
+        option = next((o for o in options if chosen and o.get("quant") == chosen), options[0])
+    per_token = option.get("bytes_per_token")
+    if not per_token:
+        raise Fail(USAGE, f"the bytes per token of {option.get('quant')} are unknown "
+                          f"({option.get('bytes_per_token_source')})")
+    ceiling = {"bytes_per_token": int(per_token),
+               "source": f"sb ai fit {report.get('repo')} {option.get('quant') or ''}".strip()}
+    if not bandwidth:
+        bandwidth = next((m.get("bandwidth_gbs") for m in report.get("machines") or []
+                          if m.get("bandwidth_gbs")), None)
+    if bandwidth:
+        ceiling["decode_tps"] = round(float(bandwidth) * 1e9 / per_token, 1)
+        ceiling["source"] += f" at {float(bandwidth):g} GB/s"
+    return ceiling
+
+
+def cmd_fit_store(gw, args):
+    try:
+        report = ai_fit.build_report(args, os.environ)
+    except ai_fit.FitError as error:
+        raise Fail(error.code, error.message) from None
+    ceiling = ceiling_from_fit(report, args.quant, args.bandwidth)
+
+    def change(doc):
+        doc["ceiling"] = ceiling
+
+    answer = write_settings(gw, args.store, change)
+    if args.json:
+        print(json.dumps({"ceiling": ceiling, "settings": answer}, indent=2))
+        return OK
+    line = f"{answer.get('target')}: ceiling {ceiling['bytes_per_token'] / 1e9:.2f} GB per token"
+    if ceiling.get("decode_tps"):
+        line += f", decode up to {ceiling['decode_tps']:.0f} tok/s"
+    print(line + f" (revision {answer.get('revision')})")
+    return OK
+
+
+def pct_words(value):
+    return "-" if value is None else f"{value:.0f}%"
+
+
+def num_words(value, unit=""):
+    return "-" if value is None else f"{value:.0f}{unit}"
+
+
+def cmd_doctor(gw, args):
+    path = "/v1/optimize/report"
+    if args.model:
+        path += "?model=" + urllib.parse.quote(args.model, safe="")
+    try:
+        report = gw.get(path)
+    except GatewayError as error:
+        raise gateway_fail(error, "reading the speed report") from None
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return OK
+    targets = report.get("targets") or []
+    if not targets:
+        print("no local targets to report on")
+    rows = [("target", "decode", "prompt", "ttft", "ceiling", "swaps/h", "cache", "accept",
+             "empty", "waits", "wakes")]
+    for t in targets:
+        cache = (t.get("cache") or {}).get("token_hit_pct")
+        accept = (t.get("speculative") or {}).get("acceptance_pct")
+        wake = t.get("wake") or {}
+        rows.append((t.get("target", "?"), num_words(t.get("decode_tps_p50")),
+                     num_words(t.get("prompt_tps_p50")), num_words(t.get("ttft_ms_p50"), "ms"),
+                     pct_words(t.get("pct_of_ceiling")), str(t.get("swaps_last_hour", "-")),
+                     pct_words(cache), pct_words(accept), str(t.get("empty_after_thinking", "-")),
+                     str(t.get("queue_waits", "-")), str(wake.get("count", "-"))))
+    if targets:
+        widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+        for row in rows:
+            print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    for host in report.get("hosts") or []:
+        print(f"host {host.get('host')}: {host.get('bandwidth_gbs')} GB/s ({host.get('source')})")
+    findings = report.get("findings") or []
+    if findings:
+        print("findings")
+        for f in findings:
+            print(f"  {f.get('target')}: {f.get('evidence')}")
+            print(f"    -> {f.get('action')}")
+    elif targets:
+        print("no findings")
+    return OK
+
+
 def model_path(model, suffix):
     return f"/v1/models/{urllib.parse.quote(model, safe='/')}/{suffix}"
 
@@ -2245,6 +2352,11 @@ def parser():
     speak.add_argument("--timeout", type=float, default=900)
     fit = sub.add_parser("fit", add_help=False, allow_abbrev=False)
     ai_fit.add_arguments(fit)
+    fit.add_argument("--store")
+    fit.add_argument("--quant")
+    doctor = sub.add_parser("doctor", add_help=False, allow_abbrev=False)
+    doctor.add_argument("model", nargs="?", default="")
+    doctor.add_argument("--json", action="store_true")
     settings = sub.add_parser("settings", add_help=False, allow_abbrev=False)
     settings.add_argument("model")
     settings.add_argument("--profile")
@@ -2293,7 +2405,7 @@ def main(argv=None, environ=None):
         print(HELP, end="")
         return OK
     args = parser().parse_args(argv)
-    if args.command == "fit":
+    if args.command == "fit" and not args.store:
         # fit reads the model index, not the gateway: it needs no key.
         return ai_fit.run(args)
     gw = None
@@ -2340,6 +2452,10 @@ def main(argv=None, environ=None):
             return cmd_unload(gw, args)
         if args.command == "engines":
             return cmd_engines(gw, args)
+        if args.command == "fit":
+            return cmd_fit_store(gw, args)
+        if args.command == "doctor":
+            return cmd_doctor(gw, args)
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
         message = gw.scrub(failure.message) if gw else failure.message
