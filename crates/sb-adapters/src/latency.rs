@@ -20,6 +20,9 @@ pub struct LatencyTracker {
     /// interactivity signal. Interactive requests rank on this; long-output ones
     /// care more about total/throughput. (Oracle #3: split TTFT from throughput.)
     ttft_ms: Mutex<HashMap<String, f64>>,
+    /// Decode speed EWMA (output tokens/s) from measured responses — the
+    /// throughput signal a long-output request ranks on.
+    decode_tps: Mutex<HashMap<String, f64>>,
 }
 
 fn fold(map: &Mutex<HashMap<String, f64>>, provider_id: &str, model: &str, sample: f64) {
@@ -59,6 +62,18 @@ impl LatencyTracker {
     pub fn get_ttft(&self, provider_id: &str, model: &str) -> Option<f64> {
         read(&self.ttft_ms, provider_id, model)
     }
+
+    /// Fold a measured decode speed (output tokens per second).
+    pub fn record_decode_tps(&self, provider_id: &str, model: &str, tps: f64) {
+        if tps.is_finite() && tps > 0.0 {
+            fold(&self.decode_tps, provider_id, model, tps);
+        }
+    }
+
+    /// Current decode-speed EWMA (tokens/s) for `provider/model`, or `None`.
+    pub fn get_decode_tps(&self, provider_id: &str, model: &str) -> Option<f64> {
+        read(&self.decode_tps, provider_id, model)
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +108,20 @@ mod tests {
         t.record_ttft("p", "m", 120.0); // time to first token
         assert_eq!(t.get("p", "m"), Some(800.0));
         assert_eq!(t.get_ttft("p", "m"), Some(120.0), "TTFT is a separate EWMA");
+    }
+
+    #[test]
+    fn decode_speed_is_tracked_and_ignores_non_positive_samples() {
+        let t = LatencyTracker::new();
+        assert!(t.get_decode_tps("p", "m").is_none());
+        t.record_decode_tps("p", "m", 0.0);
+        t.record_decode_tps("p", "m", f64::NAN);
+        assert!(t.get_decode_tps("p", "m").is_none());
+        t.record_decode_tps("p", "m", 40.0);
+        assert_eq!(t.get_decode_tps("p", "m"), Some(40.0));
+        assert!(
+            t.get_ttft("p", "m").is_none(),
+            "decode speed is its own EWMA"
+        );
     }
 }

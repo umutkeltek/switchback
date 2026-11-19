@@ -517,6 +517,8 @@ pub(crate) async fn capacity(
                     "in_flight": report.in_flight,
                     "slots": report.slots,
                     "poweroff_in_secs": report.poweroff_in_secs,
+                    "wake_duration_ms": report.wake_duration_ms,
+                    "wake_duration_ewma_ms": report.wake_duration_ewma_ms,
                     "holds": holds,
                 })
             })

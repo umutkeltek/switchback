@@ -395,6 +395,12 @@ impl AdapterRegistry {
         self.latency.record_ttft(provider_id, model, ttft_ms);
     }
 
+    /// Fold a response's measured decode speed (output tokens/s) into the
+    /// per-`provider/model` EWMA that long-output requests rank on.
+    pub fn record_decode_tps(&self, provider_id: &str, model: &str, tps: f64) {
+        self.latency.record_decode_tps(provider_id, model, tps);
+    }
+
     /// The egress id that will actually be used for `egress_id` — `"direct"`
     /// when it's unknown, disabled, or the master switch is off. The server
     /// records this in the trace so it reflects what really happened.
@@ -461,6 +467,9 @@ impl AdapterRegistry {
             outcome: None,
             // Stamped later by the runtime from the quality projection.
             quality: None,
+            decode_tps_ewma: self.latency.get_decode_tps(provider_id, model),
+            // Stamped by the runtime on a `prefer_awake` route only.
+            wake: None,
         })
     }
 

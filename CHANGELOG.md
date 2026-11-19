@@ -9,6 +9,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Wake-aware routing** (`prefer_awake` on a route or `server.prefer_awake`:
+  `enabled`, `wake_for_prompt_tokens`, `wake_for_output_tokens`; off by
+  default): a small request goes to a target whose machine is up, and a
+  target on a sleeping `wake_on_request` lane stays a fallback, woken only if
+  the request reaches it. Bigger requests keep the route's order. Request
+  header `x-switchback-wake: always | never | auto`; `never` with only
+  sleepers left answers 503 `local_lane_asleep`. The decision line
+  (`prefer_awake=[gpu-box asleep (wake ~65s), chose small-host/small]`) rides
+  `x-switchback-route`. Each machine's wake time is measured and shown in
+  `GET /v1/workloads/capacity` (`wake_duration_ms`, `wake_duration_ewma_ms`)
+  and `GET /v1/targets/stats` (`wake`). On a `latency_aware` route a
+  long-output request ranks awake targets on measured decode tokens/s.
 - **A limit and queue per local lane** (`max_in_flight`, `queue_timeout_secs`,
   `on_full: spill | queue` on a `local_executors` entry): work past the limit
   waits in a FIFO queue or, by default, spills to the route's next target; a
@@ -300,6 +312,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **`GET /v1/workflows` lists only the inputs a workflow accepts**: `size`
+  and `seed` show where the workflow binds them (`width` and `height`,
+  `seed`); an image-in workflow such as a segmentation no longer offers
+  inputs that answer 400.
 - **A lane whose engine answers reads `healthy`** in the capacity report,
   also when Switchback did not wake its machine (it read `offline`).
 - **A job task that panics** frees its pending slot and fails its job

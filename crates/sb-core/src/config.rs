@@ -2090,6 +2090,11 @@ pub struct ServerConfig {
     /// of observed upstream latency. `cost_aware` wins when both are on.
     #[serde(default)]
     pub latency_aware: bool,
+    /// Server default for wake-aware ordering ("prefer awake"); a route's
+    /// own `prefer_awake` replaces it. Off by default. See
+    /// [`PreferAwakeConfig`].
+    #[serde(default)]
+    pub prefer_awake: PreferAwakeConfig,
     /// Cost-routing policy gates (all default-allow). Set false to exclude that
     /// lane from routing: `cost_allow_free` (free tiers / price 0),
     /// `cost_allow_promo` (time-boxed promo prices), `cost_allow_aggregator`
@@ -2641,6 +2646,7 @@ impl Default for ServerConfig {
             cost_map: None,
             cost_max_per_mtok: None,
             latency_aware: false,
+            prefer_awake: PreferAwakeConfig::default(),
             cost_allow_free: true,
             cost_allow_promo: true,
             cost_allow_aggregator: true,
@@ -3717,6 +3723,45 @@ pub struct RouteConfig {
     /// the operator knows which engine should serve first. Default `false`.
     #[serde(default)]
     pub pin_order: bool,
+    /// Wake-aware ordering for this route (see [`PreferAwakeConfig`]).
+    /// Absent = the server default (`server.prefer_awake`), which is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_awake: Option<PreferAwakeConfig>,
+}
+
+/// Wake-aware ordering ("prefer awake") for routes over managed local lanes
+/// (`local_executors` with `wake_on_request: true`). When on, a SMALL request
+/// is served by a target whose machine is already up, and a target whose
+/// machine would first need a wake (asleep, waking, powering off) stays a
+/// fallback, in its old order: it is woken only when the request reaches it.
+/// A request is small when its estimated prompt is under
+/// `wake_for_prompt_tokens` and its `max_tokens` is not over
+/// `wake_for_output_tokens`. A bigger request keeps the strategy's order (the
+/// stronger machine is worth waking). The request header
+/// `x-switchback-wake: always` keeps the strategy's order too, and
+/// `x-switchback-wake: never` drops every target that needs a wake. Off by
+/// default: without it routing is exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreferAwakeConfig {
+    pub enabled: bool,
+    /// A request with an estimated prompt of this many tokens or more may
+    /// wake a sleeping machine.
+    pub wake_for_prompt_tokens: u32,
+    /// A request whose `max_tokens` is over this may wake a sleeping
+    /// machine. On a `latency_aware` route such a request also ranks awake
+    /// targets on measured decode tokens/s instead of time to first token.
+    pub wake_for_output_tokens: u32,
+}
+
+impl Default for PreferAwakeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wake_for_prompt_tokens: 6_000,
+            wake_for_output_tokens: 2_000,
+        }
+    }
 }
 
 /// A named, local-friendly route profile: ordered provider/model targets plus a

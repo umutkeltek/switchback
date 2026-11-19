@@ -1015,28 +1015,7 @@ pub fn request_from_anthropic(body: &Value) -> Result<AiRequest, String> {
 /// over system + message text + tool schemas. Not provider-exact, but the shape
 /// Anthropic clients expect (documented as approximate).
 pub fn estimate_input_tokens(req: &AiRequest) -> u64 {
-    let mut chars = req.system.as_deref().map(str::len).unwrap_or(0);
-    let mut image_tokens = 0;
-    for message in &req.messages {
-        for part in &message.content {
-            match part {
-                ContentPart::Text { text } => chars += text.len(),
-                ContentPart::Reasoning { text, .. } => chars += text.len(),
-                ContentPart::Citation { url, .. } => chars += url.len(),
-                ContentPart::ServerToolResult { content, .. } => chars += content.len(),
-                ContentPart::ServerToolUse { name, .. } => chars += name.len(),
-                ContentPart::Image { .. } => image_tokens += 1_600,
-                ContentPart::ToolUse { name, args, .. } => {
-                    chars += name.len() + args.to_string().len()
-                }
-                ContentPart::ToolResult { content, .. } => chars += content.len(),
-            }
-        }
-    }
-    for tool in &req.tools {
-        chars += tool.name.len() + tool.parameters.to_string().len();
-    }
-    (chars as u64).div_ceil(4) + image_tokens
+    req.estimated_input_tokens()
 }
 
 /// Which content block (if any) the encoder currently has open. Anthropic block

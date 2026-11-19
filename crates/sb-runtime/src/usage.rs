@@ -24,6 +24,9 @@ impl Engine {
         streamed: bool,
         speed: sb_ledger::RequestSpeed,
     ) -> Result<(), String> {
+        if let Some(tps) = speed.decode_tps {
+            registry.record_decode_tps(provider_id, model, tps);
+        }
         let cost = registry.cost_micros(provider_id, model, &usage);
         let cache_savings = registry.cache_savings_micros(provider_id, model, &usage);
         let record = sb_ledger::UsageRecord::priced(

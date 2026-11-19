@@ -468,6 +468,23 @@ routes:
   #     - "llamacpp/qwen3"   # provider: openai_compatible, engine: llama_cpp
   #     - "ollama/qwen3"
 
+  # Wake-aware ordering: a small request goes to a target whose machine is
+  # up; a target on a sleeping `wake_on_request` lane stays a fallback and is
+  # woken only if the request reaches it. A bigger request (prompt or
+  # max_tokens over the thresholds) keeps the route's order. Off by default;
+  # `server.prefer_awake` sets it for every route. Request header
+  # `x-switchback-wake: always | never | auto` steers one request.
+  # - name: chat
+  #   match:
+  #     model: "chat"
+  #   prefer_awake:
+  #     enabled: true
+  #     wake_for_prompt_tokens: 6000
+  #     wake_for_output_tokens: 2000
+  #   targets:
+  #     - "gpu-box/big"
+  #     - "small-host/small"
+
 # Managed local lanes. An entry whose `name` equals a provider id makes that
 # provider a managed lane. Routing reads a lane's health only with
 # `route_health: true`. It is off by default: the lane then gets no routing

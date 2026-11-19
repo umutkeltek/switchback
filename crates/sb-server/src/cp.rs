@@ -26,7 +26,7 @@ use crate::controlplane::{
     account_visible_to_principal, audit_context, provider_type_name, provider_visible_to_principal,
     redact_config_for_principal, tenant_scope,
 };
-use crate::handlers::common::attach_session_metadata;
+use crate::handlers::common::{attach_session_metadata, attach_wake_preference};
 use crate::AppState;
 
 const API_VERSION: &str = "cp.switchback.dev/v1";
@@ -399,6 +399,7 @@ async fn route_preview_inner(
     req.tenant = principal.tenant.clone();
     req.project = principal.project.clone();
     attach_session_metadata(&mut req, &headers);
+    attach_wake_preference(&mut req, &headers);
     let preview_tenant = req.tenant.clone();
     let preview_project = req.project.clone();
     let preview_session_id = req.metadata.get("session_id").cloned();

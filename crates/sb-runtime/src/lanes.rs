@@ -154,6 +154,7 @@ pub(crate) struct LaneWakeNote {
     code: &'static str,
     /// The lane was full and the request went to another target at once.
     spilled: bool,
+    prefer_awake: Option<String>,
 }
 
 impl LaneWakeNote {
@@ -163,6 +164,9 @@ impl LaneWakeNote {
     /// evidence is a fresh probe, not a stale one, so fail-open would only
     /// turn into a slow failure.
     pub(crate) fn apply(&self, plan: &mut sb_router::RoutePlan) -> Result<(), ExecError> {
+        if let Some(effect) = &self.prefer_awake {
+            plan.decision.set_prefer_awake(effect.clone());
+        }
         match &self.wake {
             LaneWake::Ready { detail } => {
                 // A place taken at once on a lane with room says nothing.
@@ -327,6 +331,7 @@ impl Engine {
                             // another target serves the request.
                             code: "local_lane_unavailable",
                             spilled: true,
+                            prefer_awake: None,
                         },
                         busy: None,
                     });
@@ -347,6 +352,7 @@ impl Engine {
                         provider_id,
                         code: "local_lane_unavailable",
                         spilled: false,
+                        prefer_awake: None,
                     },
                     busy,
                 });
@@ -376,6 +382,7 @@ impl Engine {
                 provider_id,
                 code,
                 spilled: false,
+                prefer_awake: None,
             },
             busy: None,
         })
@@ -395,6 +402,11 @@ impl Engine {
         resolved: &mut CandidateResolution,
     ) -> Option<LaneWakeNote> {
         let lanes = self.lanes.as_deref()?;
+        if resolved.prefer_awake.is_some() {
+            return self
+                .wake_first_choice_if_asleep(snap, req, client_profile, resolved, lanes)
+                .await;
+        }
         // Opt-out lanes (the default) cost nothing here: no extra planning.
         let any_opted_in = resolved.lane_down.iter().any(|(target_id, _)| {
             resolved
@@ -461,6 +473,99 @@ impl Engine {
             wake,
             code: "local_lane_unavailable",
             spilled: false,
+            prefer_awake: None,
         })
+    }
+
+    /// `prefer_awake` route: when the target the plan would dispatch first
+    /// still needs a wake (nothing that is up can serve, or the request is
+    /// big, or the client said `always`), wake its lane now, bounded, before
+    /// the first byte, like [`Self::wake_lane_before_dispatch`] does for a
+    /// lane known down. A small request whose first choice is up wakes
+    /// nothing here: a target that needs a wake is woken only if the request
+    /// falls back to it ([`Self::wake_for_fallback`]).
+    async fn wake_first_choice_if_asleep(
+        &self,
+        snap: &Snapshot,
+        req: &AiRequest,
+        client_profile: Option<&ClientProfileConfig>,
+        resolved: &mut CandidateResolution,
+        lanes: &dyn crate::LaneStatus,
+    ) -> Option<LaneWakeNote> {
+        if !resolved.candidates.iter().any(|c| c.wake.is_some()) {
+            return None;
+        }
+        let (_, would_be) = plan_resolved_route(
+            &self.combo_rr,
+            snap,
+            req,
+            client_profile,
+            resolved.clone(),
+            false,
+        )
+        .ok()?;
+        let first = would_be.decision.selected.as_ref()?.target_id.clone();
+        let provider_id = resolved
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == first && candidate.wake.is_some())?
+            .provider_id
+            .clone();
+        let prefer_awake = would_be.decision.prefer_awake.clone();
+        let wake = lanes.wake_for_request(&provider_id).await;
+        settle_wake(resolved, &provider_id, &wake);
+        Some(LaneWakeNote {
+            provider_id,
+            wake,
+            code: "local_lane_unavailable",
+            spilled: false,
+            prefer_awake,
+        })
+    }
+
+    /// `prefer_awake` fallback: the request reached a target whose machine
+    /// still needs a wake (every target before it was skipped or failed).
+    /// Wake its lane, bounded by the lane's `wake_wait_secs`.
+    pub(crate) async fn wake_for_fallback(&self, provider_id: &str) -> LaneWake {
+        match self.lanes.as_deref() {
+            Some(lanes) => lanes.wake_for_request(provider_id).await,
+            None => LaneWake::NotReady {
+                detail: "no managed lanes".to_string(),
+                retry_after: Duration::from_secs(1),
+            },
+        }
+    }
+}
+
+/// After a `prefer_awake` wake of `provider_id`'s lane: its targets no
+/// longer need one (woken), or are skipped like a lane known down (the wake
+/// did not bring it up).
+fn settle_wake(resolved: &mut CandidateResolution, provider_id: &str, wake: &LaneWake) {
+    let mut on_lane = Vec::new();
+    for candidate in resolved.candidates.iter_mut() {
+        if candidate.provider_id == provider_id {
+            candidate.wake = None;
+            on_lane.push(candidate.id.clone());
+        }
+    }
+    match wake {
+        LaneWake::Ready { .. } => resolved
+            .lane_down
+            .retain(|(target_id, _)| !on_lane.contains(target_id)),
+        LaneWake::NotReady { detail, .. } => {
+            let reason = format!(
+                "local lane `{provider_id}` down ({detail}); skipped before dispatch, not counted as a failure"
+            );
+            for target_id in on_lane {
+                match resolved
+                    .lane_down
+                    .iter_mut()
+                    .find(|(id, _)| *id == target_id)
+                {
+                    Some((_, existing)) => existing.clone_from(&reason),
+                    None => resolved.lane_down.push((target_id, reason.clone())),
+                }
+            }
+        }
     }
 }

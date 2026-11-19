@@ -22,7 +22,7 @@ use super::profiles::{
     plan_resolved_route, resolve_candidates, tenant_allowed_accounts,
 };
 use super::stream::{attempt_speed, meter_stream, ttft_ms, watch_first_token, StreamFinish};
-use super::{DenialTrace, Engine, ExecError, ExecOutcome, Snapshot};
+use super::{DenialTrace, Engine, ExecError, ExecOutcome, LaneWake, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedSuccess {
@@ -408,7 +408,19 @@ impl Engine {
         // Hedging fast-path (non-streaming only): race the top candidates, take the
         // first success, cancel the losers. On total hedge failure, fall through to
         // the normal sequential fallback loop below.
-        if scope.is_none() && rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
+        // A target that still needs a wake (`prefer_awake`) is never raced: a
+        // hedge would dispatch into a machine that is not up.
+        let hedgeable = !plan
+            .candidates
+            .iter()
+            .take(snap.config.server.hedge.max_parallel.max(1) as usize)
+            .any(|candidate| candidate.wake.is_some());
+        if scope.is_none()
+            && rt.hedge_enabled
+            && !req.stream
+            && plan.candidates.len() >= 2
+            && hedgeable
+        {
             // The place the first choice's lane gave this request goes to
             // that lane's racer; an unused one comes back for the loop.
             let held = lane_gpu.as_mut().map(|note| note.lend_to_hedge());
@@ -507,6 +519,8 @@ impl Engine {
             }
         }
 
+        // Lanes a `prefer_awake` fallback already woke for this request.
+        let mut woken_for_fallback: HashSet<String> = HashSet::new();
         'targets: for target in plan.candidates.iter() {
             let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
                 continue 'targets;
@@ -568,6 +582,35 @@ impl Engine {
             // path, unwinding included. `None` for any other target.
             // A lane in an exclusive GPU group it does not hold right now is
             // skipped here (only the first choice waits for it, above).
+            // `prefer_awake`: the request fell back to a target whose machine
+            // still needs a wake. Wake it now, bounded, before the first
+            // byte; a lane that does not come up is skipped, not counted as a
+            // failure.
+            if target.wake.is_some() && !woken_for_fallback.contains(&target.provider_id) {
+                match self.wake_for_fallback(&target.provider_id).await {
+                    LaneWake::Ready { detail } => {
+                        trace.warning(format!(
+                            "prefer_awake: fell back to {}; local lane `{}` {detail}",
+                            target.id, target.provider_id
+                        ));
+                        woken_for_fallback.insert(target.provider_id.clone());
+                    }
+                    LaneWake::NotReady {
+                        detail,
+                        retry_after,
+                    } => {
+                        trace.warning(format!(
+                            "target {} skipped: local lane `{}` down ({detail}); not counted as a failure",
+                            target.id, target.provider_id
+                        ));
+                        unavailable_retry_after = Some(
+                            unavailable_retry_after
+                                .map_or(retry_after, |current| current.min(retry_after)),
+                        );
+                        continue 'targets;
+                    }
+                }
+            }
             let held = lane_gpu
                 .as_mut()
                 .and_then(|note| note.take_busy(&target.provider_id));
@@ -933,6 +976,9 @@ impl Engine {
                                                         &mdl,
                                                         attempt_ms as f64,
                                                     );
+                                                    if let Some(tps) = speed.decode_tps {
+                                                        registry.record_decode_tps(&pid, &mdl, tps);
+                                                    }
                                                     let cost =
                                                         registry.cost_micros(&pid, &mdl, &usage);
                                                     let cache_savings = registry

@@ -64,6 +64,9 @@ pub(crate) async fn target_stats(
         .unwrap_or(2_000)
         .clamp(1, TARGET_STATS_MAX_LIMIT);
     let mut recent = state.ledger.recent(limit);
+    // Lanes whose machine's wake cost this key may read: every lane for an
+    // admin, else lanes behind the targets its scoped config reaches.
+    let mut wake_lanes: Option<HashSet<String>> = None;
     if !principal.is_admin() {
         let snap = state.snapshot();
         let scoped = crate::controlplane::scoped_config_for_principal(&snap.config, &principal);
@@ -74,6 +77,16 @@ pub(crate) async fn target_stats(
             .chain(scoped.combos.values().flat_map(|combo| combo.models.iter()))
             .map(String::as_str)
             .collect();
+        // A non-admin key without a tenant sees no lane either.
+        wake_lanes = Some(if principal.tenant.is_some() {
+            visible
+                .iter()
+                .filter_map(|target| target.split_once('/'))
+                .map(|(provider, _)| provider.to_string())
+                .collect()
+        } else {
+            HashSet::new()
+        });
         // A non-admin key without a tenant sees nothing.
         let tenant = principal.tenant.as_deref();
         recent.retain(|record| {
@@ -91,7 +104,42 @@ pub(crate) async fn target_stats(
             "durable": state.ledger.durability_health().store_configured,
         },
         "data": data,
+        "wake": wake_costs(&state.capacity.reports(), wake_lanes.as_ref()),
     }))
+}
+
+/// Per machine with a managed lane: what its measured wakes cost (start of
+/// the waking cycle to the first healthy probe), the figure wake-aware
+/// routing (`prefer_awake`) weighs. Only lanes in `lanes` when given.
+fn wake_costs(
+    reports: &[crate::activator::LocalLaneReport],
+    lanes: Option<&HashSet<String>>,
+) -> Vec<serde_json::Value> {
+    let mut hosts: BTreeMap<String, (Vec<String>, &crate::activator::LocalLaneReport)> =
+        BTreeMap::new();
+    for report in reports {
+        if !report.wake_configured || lanes.is_some_and(|lanes| !lanes.contains(&report.name)) {
+            continue;
+        }
+        let host = report.host.clone().unwrap_or_else(|| report.name.clone());
+        hosts
+            .entry(host)
+            .or_insert_with(|| (Vec::new(), report))
+            .0
+            .push(report.name.clone());
+    }
+    hosts
+        .into_iter()
+        .map(|(host, (lanes, report))| {
+            serde_json::json!({
+                "host": host,
+                "lanes": lanes,
+                "last_wake_ms": report.wake_duration_ms,
+                "wake_ewma_ms": report.wake_duration_ewma_ms,
+                "samples": report.wake_samples,
+            })
+        })
+        .collect()
 }
 
 /// Usage/cost summary from the append-only ledger — requests + attributed cost

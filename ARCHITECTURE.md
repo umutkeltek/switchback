@@ -177,6 +177,18 @@ serve, the answer is a retryable 503 (`local_lane_unavailable`, with
 `Retry-After`). The lane view follows every config publish: lanes added,
 changed or removed by a reload take effect without a restart, and a lane that
 stays keeps its in-flight work and queue.
+Wake-aware ordering (`prefer_awake` on a route or `server.prefer_awake`, off
+by default) keeps small requests off a machine that would first need a wake.
+The runtime stamps a target on a `wake_on_request` lane that is asleep,
+waking or powering off with `ExecutionTarget.wake` (machine, state, measured
+wake time) and decides per request, from its estimated size and its
+`x-switchback-wake` header, a `RoutingPolicy.wake`. The router applies it
+after the hard filters and the strategy's ordering, as a stable partition
+inside each demote rank: targets that are up first, sleepers after them in
+their old order (`never` drops sleepers instead). Sleepers are no longer
+skipped as "known down" on such a route; they are fallbacks, and the dispatch
+loop wakes one (bounded by `wake_wait_secs`) only when the request reaches
+it. The decision's `prefer_awake` line rides `x-switchback-route`.
 
 Operator commands are bounded by the lane's `command_timeout_secs` (the wake
 command by `boot_timeout_secs` when that is longer; on the activator's clock

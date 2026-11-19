@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sb_core::{
     AiRequest, DemoteTrigger, ExecutionProfile, ExecutionTarget, HealthState, OutcomeSignal,
     OutcomeTier, RouteDecision, RouteRequire, RouteScore, RoutingPolicy, ScoringPolicy, TargetRef,
-    UnknownContextPolicy, UnknownCostPolicy,
+    UnknownContextPolicy, UnknownCostPolicy, WakePolicy,
 };
 use sb_core::{ContentPart, ImageSource};
 
@@ -548,7 +548,7 @@ fn order_partition(
     streaming_required: bool,
     score_by_target: Option<&BTreeMap<String, f64>>,
     decision: &mut RouteDecision,
-) {
+) -> bool {
     if let Some(score_by_target) = score_by_target {
         part.sort_by(|a, b| {
             score_by_target
@@ -599,6 +599,24 @@ fn order_partition(
             |a, b| cost_cmp(a, b) == Ordering::Equal,
             decision,
         );
+    } else if policy.latency_aware && decode_speed_ranks(part, policy) {
+        // A long-output request (`prefer_awake` route, `max_tokens` over
+        // `wake_for_output_tokens`) where every target is up and measured:
+        // the time spent decoding dominates, so rank on decode tokens/s.
+        let tps_cmp = |a: &ExecutionTarget, b: &ExecutionTarget| {
+            b.decode_tps_ewma
+                .unwrap_or(0.0)
+                .partial_cmp(&a.decode_tps_ewma.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal)
+        };
+        part.sort_by(|a, b| tps_cmp(a, b));
+        apply_outcome_tiebreak(
+            part,
+            policy.scorecard.demotion.min_samples,
+            |a, b| tps_cmp(a, b) == Ordering::Equal,
+            decision,
+        );
+        return true;
     } else if policy.latency_aware {
         // Fastest-first. Interactive (streaming) requests rank on TTFT (first-byte
         // responsiveness), falling back to total latency when a host has never been
@@ -635,6 +653,67 @@ fn order_partition(
             decision,
         );
     }
+    false
+}
+
+/// A long-output request may rank a partition on decode speed only when
+/// every target in it is up (no wake needed) and has a measured speed; a
+/// mixed partition keeps the ordinary latency order, so the comparator stays
+/// one consistent order.
+fn decode_speed_ranks(part: &[ExecutionTarget], policy: &RoutingPolicy) -> bool {
+    policy.rank_on_decode_speed
+        && part.len() >= 2
+        && part
+            .iter()
+            .all(|target| target.wake.is_none() && target.decode_tps_ewma.is_some())
+}
+
+/// Wake-aware ordering (`prefer_awake`), run after the strategy ordered the
+/// survivors. With [`WakePolicy::PreferAwake`] (a small request) targets
+/// that need a wake move behind the targets that are up, inside each rank
+/// `rank` gives (demotion stays the outer key): a stable sort, so both groups
+/// keep the strategy's order. With [`WakePolicy::Keep`] the order stays and
+/// the decision says why a wake may follow. Says nothing when no target
+/// needs a wake.
+fn apply_wake_order(
+    survivors: &mut [ExecutionTarget],
+    policy: &RoutingPolicy,
+    rank: impl Fn(&ExecutionTarget) -> u8,
+    decision: &mut RouteDecision,
+) {
+    let Some(wake_policy) = &policy.wake else {
+        return;
+    };
+    let Some(first_asleep) = survivors.iter().find_map(|target| target.wake.as_ref()) else {
+        return;
+    };
+    let first_asleep = first_asleep.describe();
+    match wake_policy {
+        WakePolicy::PreferAwake => {
+            survivors.sort_by_key(|target| (rank(target), target.wake.is_some()));
+            let Some(first) = survivors.first() else {
+                return;
+            };
+            match &first.wake {
+                None => decision.set_prefer_awake(format!("{first_asleep}, chose {}", first.id)),
+                Some(wake) => decision.set_prefer_awake(format!(
+                    "nothing awake can serve, wakes {} for {}",
+                    wake.describe(),
+                    first.id
+                )),
+            }
+        }
+        WakePolicy::Keep { why } => {
+            if let Some(wake) = survivors.first().and_then(|first| first.wake.as_ref()) {
+                decision.set_prefer_awake(format!(
+                    "{why}, route order kept, wakes {}",
+                    wake.describe()
+                ));
+            }
+        }
+        // Already dropped before ordering.
+        WakePolicy::Never => {}
+    }
 }
 
 /// The strategy's own "selected/cheapest/fastest/widest" summary reason
@@ -647,6 +726,7 @@ fn strategy_summary_reason(
     selected: Option<&ExecutionTarget>,
     streaming_required: bool,
     score_by_target: Option<&BTreeMap<String, f64>>,
+    decode_ranked: bool,
 ) -> Option<String> {
     let selected = selected?;
     if let Some(score_by_target) = score_by_target {
@@ -676,6 +756,15 @@ fn strategy_summary_reason(
             .unwrap_or_else(|| "unpriced".to_string());
         Some(format!(
             "cost_aware: cheapest={} blended={price}",
+            selected.id
+        ))
+    } else if policy.latency_aware && decode_ranked {
+        let tps = selected
+            .decode_tps_ewma
+            .map(|tps| format!("{tps:.0}tok/s"))
+            .unwrap_or_else(|| "unmeasured".to_string());
+        Some(format!(
+            "latency_aware: fastest={} decode={tps} (long output)",
             selected.id
         ))
     } else if policy.latency_aware {
@@ -1013,6 +1102,33 @@ pub fn plan_route(
         ));
     }
 
+    // Wake-aware ordering, `x-switchback-wake: never`: a target whose machine
+    // needs a wake is a hard no for this request, like any other gate.
+    if policy.wake == Some(WakePolicy::Never) {
+        let mut dropped = Vec::new();
+        survivors.retain(|target| match &target.wake {
+            Some(wake) => {
+                dropped.push((target.id.clone(), wake.describe()));
+                false
+            }
+            None => true,
+        });
+        for (target_id, why) in &dropped {
+            decision.reject(
+                target_id.clone(),
+                format!("prefer_awake: x-switchback-wake=never and {why}"),
+            );
+        }
+        if !dropped.is_empty() {
+            let asleep: Vec<&str> = dropped.iter().map(|(_, why)| why.as_str()).collect();
+            decision.set_prefer_awake(format!(
+                "x-switchback-wake=never, dropped {} target(s): {}",
+                dropped.len(),
+                asleep.join("; ")
+            ));
+        }
+    }
+
     // outcome-routing-v1 F10: partition by demote_rank FIRST. A stable sort
     // preserves the declared/candidate order within each rank; strategy
     // ordering + the qualified tie-break then run WITHIN each rank slice
@@ -1054,6 +1170,12 @@ pub fn plan_route(
         .count();
     if policy.pin_order {
         plan_pinned_order(&mut survivors, no_account_demoted, &mut decision);
+        apply_wake_order(
+            &mut survivors,
+            policy,
+            |target| u8::from(target.healthy_accounts == Some(0)),
+            &mut decision,
+        );
         decision.scores = route_scores(
             &survivors,
             policy,
@@ -1079,15 +1201,24 @@ pub fn plan_route(
     let end1 = end0 + survivors[end0..].partition_point(|t| demote_rank(t) == 1);
     let (part0, rest) = survivors.split_at_mut(end0);
     let (part1, part2) = rest.split_at_mut(end1 - end0);
+    let mut decode_ranked = None;
     for part in [part0, part1, part2] {
-        order_partition(
+        let ranked = order_partition(
             part,
             policy,
             streaming_required,
             score_by_target.as_ref(),
             &mut decision,
         );
+        if decode_ranked.is_none() && !part.is_empty() {
+            decode_ranked = Some(ranked);
+        }
     }
+    let decode_ranked = decode_ranked.unwrap_or(false);
+
+    // Wake-aware ordering (`prefer_awake`): a stable partition on top of the
+    // strategy's order, inside each demote rank.
+    apply_wake_order(&mut survivors, policy, demote_rank, &mut decision);
 
     if no_account_demoted > 0 {
         decision.add_reason(format!(
@@ -1107,6 +1238,7 @@ pub fn plan_route(
         survivors.first(),
         streaming_required,
         score_by_target.as_ref(),
+        decode_ranked,
     ) {
         decision.add_reason(reason);
     }
@@ -3245,5 +3377,242 @@ mod tests {
 
         assert_eq!(plan.decision.strategy, "auto/extract");
         assert_eq!(plan.decision.profile.as_deref(), Some("auto/extract"));
+    }
+
+    // --- Wake-aware ordering (`prefer_awake`) -----------------------------
+
+    fn asleep(provider: &str, model: &str, host: &str, wake_ms: Option<u64>) -> ExecutionTarget {
+        let mut target = ExecutionTarget::new(provider, model, ExecutionTargetKind::ModelApi);
+        target.wake = Some(sb_core::WakeNeed {
+            host: host.to_string(),
+            state: "asleep".to_string(),
+            wake_ms,
+        });
+        target
+    }
+
+    fn awake(provider: &str, model: &str) -> ExecutionTarget {
+        ExecutionTarget::new(provider, model, ExecutionTargetKind::ModelApi)
+    }
+
+    fn order(plan: &RoutePlan) -> Vec<&str> {
+        plan.candidates.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    fn plan_with(policy: &RoutingPolicy, targets: &[ExecutionTarget]) -> RoutePlan {
+        let request = AiRequest::new("chat", vec![Message::user("hi")]);
+        plan_route(&request, "chat", &RouteRequire::default(), targets, policy)
+    }
+
+    #[test]
+    fn prefer_awake_puts_awake_targets_first_and_keeps_sleepers_as_fallbacks_in_order() {
+        let targets = [
+            asleep("gpu-box", "big", "gpu-box", Some(65_000)),
+            awake("small-host", "small"),
+            asleep("gpu-box", "big2", "gpu-box", Some(65_000)),
+            awake("small-host", "small2"),
+        ];
+        let policy = RoutingPolicy {
+            wake: Some(WakePolicy::PreferAwake),
+            ..RoutingPolicy::default()
+        };
+        let plan = plan_with(&policy, &targets);
+        assert_eq!(
+            order(&plan),
+            vec![
+                "small-host/small",
+                "small-host/small2",
+                "gpu-box/big",
+                "gpu-box/big2"
+            ],
+            "a stable partition: each group keeps its declared order"
+        );
+        assert_eq!(
+            plan.decision.prefer_awake.as_deref(),
+            Some("gpu-box asleep (wake ~65s), chose small-host/small")
+        );
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r == "prefer_awake: gpu-box asleep (wake ~65s), chose small-host/small"));
+        assert!(
+            plan.decision
+                .summary()
+                .ends_with(" prefer_awake=[gpu-box asleep (wake ~65s), chose small-host/small]"),
+            "{}",
+            plan.decision.summary()
+        );
+        assert!(plan.decision.rejected.is_empty(), "nothing dropped");
+    }
+
+    #[test]
+    fn without_a_wake_policy_stamped_sleepers_keep_the_strategy_order() {
+        // `prefer_awake` off: the router ignores the stamp completely.
+        let targets = [
+            asleep("gpu-box", "big", "gpu-box", None),
+            awake("small-host", "small"),
+        ];
+        let plan = plan_with(&RoutingPolicy::default(), &targets);
+        assert_eq!(order(&plan), vec!["gpu-box/big", "small-host/small"]);
+        assert!(plan.decision.prefer_awake.is_none());
+        assert!(!plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r.starts_with("prefer_awake")));
+        assert!(!plan.decision.summary().contains("prefer_awake"));
+    }
+
+    #[test]
+    fn prefer_awake_stays_inside_the_demote_rank() {
+        // An awake target with no usable account stays behind a sleeper that
+        // can serve: demotion is the outer key.
+        let mut locked = awake("small-host", "small");
+        locked.healthy_accounts = Some(0);
+        let targets = [locked, asleep("gpu-box", "big", "gpu-box", None)];
+        let policy = RoutingPolicy {
+            wake: Some(WakePolicy::PreferAwake),
+            ..RoutingPolicy::default()
+        };
+        let plan = plan_with(&policy, &targets);
+        assert_eq!(order(&plan), vec!["gpu-box/big", "small-host/small"]);
+        assert_eq!(
+            plan.decision.prefer_awake.as_deref(),
+            Some("nothing awake can serve, wakes gpu-box asleep (wake time unmeasured) for gpu-box/big")
+        );
+    }
+
+    #[test]
+    fn prefer_awake_applies_on_a_pinned_route_too() {
+        let targets = [
+            asleep("gpu-box", "big", "gpu-box", Some(1_400)),
+            awake("small-host", "small"),
+        ];
+        let policy = RoutingPolicy {
+            wake: Some(WakePolicy::PreferAwake),
+            pin_order: true,
+            ..RoutingPolicy::default()
+        };
+        let plan = plan_with(&policy, &targets);
+        assert_eq!(order(&plan), vec!["small-host/small", "gpu-box/big"]);
+        assert_eq!(
+            plan.decision.prefer_awake.as_deref(),
+            Some("gpu-box asleep (wake ~1s), chose small-host/small")
+        );
+    }
+
+    #[test]
+    fn a_big_request_keeps_the_order_and_says_a_wake_follows() {
+        let targets = [
+            asleep("gpu-box", "big", "gpu-box", Some(65_000)),
+            awake("small-host", "small"),
+        ];
+        let policy = RoutingPolicy {
+            wake: Some(WakePolicy::Keep {
+                why: "large prompt (~7000 tokens, wake_for_prompt_tokens 6000)".to_string(),
+            }),
+            ..RoutingPolicy::default()
+        };
+        let plan = plan_with(&policy, &targets);
+        assert_eq!(order(&plan), vec!["gpu-box/big", "small-host/small"]);
+        assert_eq!(
+            plan.decision.prefer_awake.as_deref(),
+            Some("large prompt (~7000 tokens, wake_for_prompt_tokens 6000), route order kept, wakes gpu-box asleep (wake ~65s)")
+        );
+    }
+
+    #[test]
+    fn never_drops_targets_that_need_a_wake() {
+        let targets = [
+            asleep("gpu-box", "big", "gpu-box", Some(65_000)),
+            awake("small-host", "small"),
+        ];
+        let policy = RoutingPolicy {
+            wake: Some(WakePolicy::Never),
+            ..RoutingPolicy::default()
+        };
+        let plan = plan_with(&policy, &targets);
+        assert_eq!(order(&plan), vec!["small-host/small"]);
+        assert_eq!(plan.decision.rejected.len(), 1);
+        assert_eq!(
+            plan.decision.rejected[0].reason,
+            "prefer_awake: x-switchback-wake=never and gpu-box asleep (wake ~65s)"
+        );
+        // Only sleepers: nothing is selected (the runtime answers 503).
+        let plan = plan_with(&policy, &targets[..1]);
+        assert!(plan.decision.selected.is_none());
+        assert!(plan.candidates.is_empty());
+    }
+
+    fn measured(provider: &str, ttft: f64, tps: Option<f64>) -> ExecutionTarget {
+        let mut target = awake(provider, "m");
+        target.ttft_ewma_ms = Some(ttft);
+        target.latency_ewma_ms = Some(ttft);
+        target.decode_tps_ewma = tps;
+        target
+    }
+
+    #[test]
+    fn a_long_output_request_ranks_awake_targets_on_decode_speed() {
+        // `quick` answers first, `strong` decodes three times faster.
+        let targets = [
+            measured("quick", 150.0, Some(20.0)),
+            measured("strong", 600.0, Some(60.0)),
+        ];
+        let policy = RoutingPolicy {
+            latency_aware: true,
+            wake: Some(WakePolicy::PreferAwake),
+            rank_on_decode_speed: true,
+            ..RoutingPolicy::default()
+        };
+        let plan = plan_with(&policy, &targets);
+        assert_eq!(order(&plan), vec!["strong/m", "quick/m"]);
+        assert!(plan
+            .decision
+            .reason
+            .iter()
+            .any(|r| r == "latency_aware: fastest=strong/m decode=60tok/s (long output)"));
+
+        // Without the long-output flag: first-token latency as before.
+        let policy = RoutingPolicy {
+            rank_on_decode_speed: false,
+            ..policy
+        };
+        assert_eq!(
+            order(&plan_with(&policy, &targets)),
+            vec!["quick/m", "strong/m"]
+        );
+    }
+
+    #[test]
+    fn decode_speed_ranks_only_when_every_target_is_measured_and_awake() {
+        let policy = RoutingPolicy {
+            latency_aware: true,
+            wake: Some(WakePolicy::PreferAwake),
+            rank_on_decode_speed: true,
+            ..RoutingPolicy::default()
+        };
+        let unmeasured = [
+            measured("quick", 150.0, Some(20.0)),
+            measured("strong", 600.0, None),
+        ];
+        assert_eq!(
+            order(&plan_with(&policy, &unmeasured)),
+            vec!["quick/m", "strong/m"],
+            "one target without a sample: latency order"
+        );
+        let mut sleeping = measured("strong", 600.0, Some(60.0));
+        sleeping.wake = Some(sb_core::WakeNeed {
+            host: "gpu-box".to_string(),
+            state: "asleep".to_string(),
+            wake_ms: None,
+        });
+        let mixed = [measured("quick", 150.0, Some(20.0)), sleeping];
+        assert_eq!(
+            order(&plan_with(&policy, &mixed)),
+            vec!["quick/m", "strong/m"],
+            "a sleeper is not raced on decode speed"
+        );
     }
 }

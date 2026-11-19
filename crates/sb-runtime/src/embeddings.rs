@@ -258,6 +258,8 @@ impl Engine {
         let mut last_err: Option<AdapterError> = None;
         let mut unavailable_retry_after: Option<Duration> = None;
 
+        let mut woken_for_fallback: HashSet<String> = HashSet::new();
+
         'targets: for target in plan.candidates.iter() {
             let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
                 continue 'targets;
@@ -299,6 +301,22 @@ impl Engine {
                 }
             }
 
+            // `prefer_awake`: wake a fallback target's machine first,
+            // bounded; skipped (not a failure) when it does not come up.
+            if target.wake.is_some() && !woken_for_fallback.contains(&target.provider_id) {
+                match self.wake_for_fallback(&target.provider_id).await {
+                    crate::LaneWake::Ready { .. } => {
+                        woken_for_fallback.insert(target.provider_id.clone());
+                    }
+                    crate::LaneWake::NotReady { detail, .. } => {
+                        tracing::info!(
+                            request_id = %req.id, target = %target.id,
+                            "target skipped: local lane down ({detail})"
+                        );
+                        continue 'targets;
+                    }
+                }
+            }
             // Opt-in lanes (`wake_on_request`) count this request as
             // in-flight work until this target's attempts end.
             let held = lane_gpu

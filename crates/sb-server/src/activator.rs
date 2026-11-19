@@ -306,6 +306,18 @@ pub struct LocalLaneReport {
     pub last_wake_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_wake_result: Option<String>,
+    /// How long the machine's most recent measured wake took, ms (start
+    /// of the waking cycle to the first healthy probe). Absent until one
+    /// was measured. Per machine: lanes sharing a `host` show the same.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_duration_ms: Option<u64>,
+    /// EWMA of the machine's measured wake durations, ms: what wake-aware
+    /// routing (`prefer_awake`) expects the next wake to cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_duration_ewma_ms: Option<u64>,
+    /// Wakes measured since start-up. Absent at zero.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub wake_samples: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub wake_configured: bool,
@@ -1025,6 +1037,37 @@ impl LocalExecutor {
 
     /// `Some(why)` while new work on this lane would have to wait for a
     /// place (`max_in_flight` reached, or others already wait). Never waits.
+    /// Whether this lane's machine must first be woken to serve a request
+    /// (`prefer_awake` routing): asleep (off, or its engine last seen
+    /// down), already waking, or powering off. `None` when it is up, and
+    /// always for a lane that does not wake on request or is not routed.
+    /// Answers from state already held; never waits.
+    pub fn wake_need(&self) -> Option<sb_core::WakeNeed> {
+        let cfg = self.cfg();
+        if !cfg.wake_on_request || !self.is_routed() {
+            return None;
+        }
+        let state = {
+            let rt = self.lock();
+            match rt.state {
+                LaneState::PoweringOff => "powering off",
+                LaneState::Waking => "waking",
+                _ if rt.observed_healthy == Some(false) => "asleep",
+                state if Self::is_ready(state) => return None,
+                // Off to the lifecycle but answering (started outside
+                // Switchback): up.
+                _ if rt.observed_healthy == Some(true) || rt.answered_up => return None,
+                _ => "asleep",
+            }
+        };
+        let host = self.host();
+        Some(sb_core::WakeNeed {
+            host: host.id.clone(),
+            state: state.to_string(),
+            wake_ms: host.wake_stats().expected_ms(),
+        })
+    }
+
     pub fn full_detail(&self) -> Option<String> {
         self.slots.full().map(full_text)
     }
@@ -1584,6 +1627,9 @@ impl LocalExecutor {
                 return Err(self.refused(status));
             }
             if answer == ProbeAnswer::Up {
+                // Start of the waking cycle to its first healthy probe.
+                self.host()
+                    .record_wake(self.clock.now_ms().saturating_sub(start));
                 let mut rt = self.lock();
                 rt.last_wake_result = Some(format!("ok after {} attempt(s)", rt.wake_attempts));
                 rt.wake_cycle_started_ms = None;
@@ -1909,6 +1955,7 @@ impl LocalExecutor {
             .unwrap_or_default();
         let wake_configured = host.wake_command().is_some();
         let poweroff_configured = host.poweroff_command().is_some();
+        let wake_stats = host.wake_stats();
         let poweroff_failures = host.power().failures;
         let guard = host.guard_view(self.clock.now_ms());
         let restart_configured = self.cfg().restart_command.is_some();
@@ -1957,6 +2004,9 @@ impl LocalExecutor {
             wake_attempts: rt.wake_attempts,
             last_wake_ms: rt.last_wake_ms,
             last_wake_result: rt.last_wake_result.clone(),
+            wake_duration_ms: wake_stats.last_ms,
+            wake_duration_ewma_ms: wake_stats.expected_ms(),
+            wake_samples: wake_stats.samples,
             last_error: rt.last_error.clone(),
             wake_configured,
             poweroff_configured,
@@ -2078,6 +2128,40 @@ pub(crate) struct Host {
     groups: Mutex<BTreeMap<String, GroupState>>,
     /// Bumped whenever a group changes, so waiters wake without polling.
     group_changes: tokio::sync::watch::Sender<u64>,
+    /// How long the machine's wakes took (start of the waking cycle to the
+    /// first healthy probe), for wake-aware routing and the capacity view.
+    wake_stats: Mutex<WakeStats>,
+}
+
+/// Measured wakes of one machine.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct WakeStats {
+    /// The most recent wake's duration (ms).
+    pub(crate) last_ms: Option<u64>,
+    /// EWMA of wake durations (ms), weight [`WAKE_EWMA_ALPHA`] on the newest.
+    pub(crate) ewma_ms: Option<f64>,
+    /// Wakes measured since start-up.
+    pub(crate) samples: u64,
+}
+
+/// Weight of the newest wake in [`WakeStats::ewma_ms`].
+const WAKE_EWMA_ALPHA: f64 = 0.3;
+
+impl WakeStats {
+    fn record(&mut self, duration_ms: u64) {
+        let sample = duration_ms as f64;
+        self.ewma_ms = Some(match self.ewma_ms {
+            Some(ewma) => WAKE_EWMA_ALPHA * sample + (1.0 - WAKE_EWMA_ALPHA) * ewma,
+            None => sample,
+        });
+        self.last_ms = Some(duration_ms);
+        self.samples += 1;
+    }
+
+    /// The expected wake time (ms), rounded.
+    pub(crate) fn expected_ms(&self) -> Option<u64> {
+        self.ewma_ms.map(|ms| ms.round() as u64)
+    }
 }
 
 /// Why a manual power-off was refused. Each variant is one typed reason the
@@ -2432,6 +2516,7 @@ impl Host {
             up_since_ms: Mutex::new(None),
             groups: Mutex::new(BTreeMap::new()),
             group_changes: tokio::sync::watch::channel(0).0,
+            wake_stats: Mutex::new(WakeStats::default()),
         })
     }
 
@@ -2734,6 +2819,21 @@ impl Host {
 
     fn wake_sent_ms(&self) -> Option<u64> {
         *self.wake_sent_slot()
+    }
+
+    /// Record one measured wake of the machine.
+    fn record_wake(&self, duration_ms: u64) {
+        self.wake_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(duration_ms);
+    }
+
+    pub(crate) fn wake_stats(&self) -> WakeStats {
+        *self
+            .wake_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn note_wake_sent(&self, now: u64) {
@@ -3488,6 +3588,10 @@ fn ensure_error_text(error: &EnsureError) -> String {
 
 /// Serde helper: leave a zero count out of the report, so a lane that
 /// never failed reports exactly what it did before the count existed.
+fn is_zero_u64(count: &u64) -> bool {
+    *count == 0
+}
+
 fn is_zero(count: &u32) -> bool {
     *count == 0
 }
@@ -4183,6 +4287,10 @@ impl sb_runtime::LaneStatus for CapacityActivator {
 
     fn lane_full(&self, provider_id: &str) -> Option<String> {
         self.executor(provider_id)?.full_detail()
+    }
+
+    fn wake_need(&self, provider_id: &str) -> Option<sb_core::WakeNeed> {
+        self.executor(provider_id)?.wake_need()
     }
 
     fn config_published(&self, config: &Config) {

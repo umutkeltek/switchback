@@ -245,6 +245,45 @@ pub struct ExecutionTarget {
     /// Never serialized: this is live routing evidence, not config or wire data.
     #[serde(skip)]
     pub quality: Option<QualitySignal>,
+    /// Recent decode speed EWMA (output tokens per second), stamped at
+    /// routing time from measured responses. `None` = never measured. A
+    /// long-output request on a `latency_aware` route with `prefer_awake`
+    /// ranks awake targets on it when every one of them has a sample.
+    #[serde(default)]
+    pub decode_tps_ewma: Option<f64>,
+    /// Set when the target's machine must first be woken (managed local lane,
+    /// asleep / waking / powering off). Stamped by `sb-runtime` only on a
+    /// route with `prefer_awake` on; `None` everywhere else, so the router
+    /// behaves exactly as before. Live state, never serialized.
+    #[serde(skip)]
+    pub wake: Option<WakeNeed>,
+}
+
+/// Why a target's machine is not up, and what waking it is expected to cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeNeed {
+    /// The machine (the lane's `host`, or the lane's name when it has a
+    /// machine of its own).
+    pub host: String,
+    /// `asleep`, `waking` or `powering off`.
+    pub state: String,
+    /// Expected wake time (EWMA of measured wakes, ms); `None` = unmeasured.
+    pub wake_ms: Option<u64>,
+}
+
+impl WakeNeed {
+    /// `gpu-box asleep (wake ~65s)`.
+    pub fn describe(&self) -> String {
+        match self.wake_ms {
+            Some(ms) => format!(
+                "{} {} (wake ~{}s)",
+                self.host,
+                self.state,
+                ms.saturating_add(500) / 1_000
+            ),
+            None => format!("{} {} (wake time unmeasured)", self.host, self.state),
+        }
+    }
 }
 
 impl ExecutionTarget {
@@ -271,6 +310,8 @@ impl ExecutionTarget {
             unverified: false,
             outcome: None,
             quality: None,
+            decode_tps_ewma: None,
+            wake: None,
         }
     }
 }

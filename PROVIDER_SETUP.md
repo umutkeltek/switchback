@@ -258,6 +258,46 @@ model in seconds. Give the route a fast remote target after the lane if
 clients cannot wait that long; with `wake_wait_secs: 0` the request falls
 through at once while the wake keeps going for the next one.
 
+When a route lists targets on a machine that sleeps (a GPU machine woken on
+request) and on one that is always on, set `prefer_awake` on the route (or
+`server.prefer_awake` for every route) so a small request does not wake the
+sleeping machine:
+
+```yaml
+routes:
+  - name: chat
+    match: { model: "chat" }
+    prefer_awake:
+      enabled: true                 # default false
+      wake_for_prompt_tokens: 6000  # a prompt this big may wake a machine
+      wake_for_output_tokens: 2000  # max_tokens above this may wake one
+    targets:
+      - "gpu-box/big"      # wake_on_request lane
+      - "small-host/small" # always on
+```
+
+A target needs a wake while its lane (with `wake_on_request: true`) is asleep,
+is waking, or is powering off. A small request (estimated prompt under
+`wake_for_prompt_tokens`, `max_tokens` not over `wake_for_output_tokens`) is
+served by the targets that are up first; targets that need a wake stay
+fallbacks in their old order and are woken only when the request reaches one
+(every target before it failed, was skipped, or its lane was closed). A bigger
+request keeps the route's order, so the strong machine is woken. A client can
+steer one request with the header `x-switchback-wake`: `always` keeps the
+route's order, `never` drops every target that needs a wake (a 503
+`local_lane_asleep` when nothing else can serve), `auto` is the default. The
+header is read on `/v1/chat/completions`, `/v1/responses`, `/v1/messages` and
+route preview. The decision says what happened, in `reason` and on the
+`x-switchback-route` header, for example
+`prefer_awake=[gpu-box asleep (wake ~65s), chose small-host/small]`. The wake
+time is measured per machine (start of the wake to its first healthy probe)
+and shown as `wake_duration_ms` / `wake_duration_ewma_ms` in
+`GET /v1/workloads/capacity` and under `wake` in `GET /v1/targets/stats`. On
+a `latency_aware` route, a request with `max_tokens` over
+`wake_for_output_tokens` ranks targets that are up on measured decode tokens
+per second instead of time to first token, when each of them has a sample.
+
+
 Every operator command of a lane (wake, power-off, restart) runs for at
 most `command_timeout_secs` (default 60); the wake command, which may block
 until the machine answers, runs for up to `boot_timeout_secs` when that is

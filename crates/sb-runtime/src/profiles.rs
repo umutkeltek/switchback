@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use sb_core::{
-    AiRequest, ClientProfileConfig, ComboStrategy, ExecutionProfile, ExecutionTarget, RouteRequire,
-    ScoringPolicy, TenantConfig,
+    AiRequest, ClientProfileConfig, ComboStrategy, ExecutionProfile, ExecutionTarget,
+    PreferAwakeConfig, RouteRequire, ScoringPolicy, TenantConfig,
 };
 
 use crate::{ExecError, Snapshot};
@@ -28,6 +28,8 @@ pub(crate) fn routing_policy(
         scorecard: snap.config.server.scorecard.clone(),
         quality_eval: snap.config.server.quality_eval.clone(),
         pin_order: false,
+        wake: None,
+        rank_on_decode_speed: false,
     };
 
     match profile {
@@ -83,7 +85,24 @@ pub(crate) struct CandidateResolution {
     /// to be down. [`plan_resolved_route`] skips them (recorded on the
     /// decision's `rejected`) unless no other candidate can serve.
     pub(crate) lane_down: Vec<(String, String)>,
+    /// Wake-aware ordering in force for this route (`prefer_awake` with
+    /// `enabled: true`), else `None`. When set, candidates on a lane that
+    /// wakes on request carry [`ExecutionTarget::wake`].
+    pub(crate) prefer_awake: Option<PreferAwakeConfig>,
 }
+
+/// What a model resolved to before candidates are stamped: route name,
+/// requirements, candidates, unknown target ids, combo, `pin_order`, and the
+/// route's own `prefer_awake`.
+type ResolvedRoute = (
+    String,
+    RouteRequire,
+    Vec<sb_core::ExecutionTarget>,
+    Vec<String>,
+    Option<ResolvedCombo>,
+    bool,
+    Option<PreferAwakeConfig>,
+);
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedCombo {
@@ -259,14 +278,7 @@ pub(crate) fn resolve_candidates(
     lanes: Option<&dyn crate::LaneStatus>,
 ) -> Result<CandidateResolution, ExecError> {
     let profile = ExecutionProfile::from_model(model);
-    let (route_name, require, mut candidates, unknown, combo, pin_order): (
-        String,
-        RouteRequire,
-        Vec<sb_core::ExecutionTarget>,
-        Vec<String>,
-        Option<ResolvedCombo>,
-        bool,
-    ) = if let Some(profile) = profile {
+    let (route_name, require, mut candidates, unknown, combo, pin_order, route_prefer_awake): ResolvedRoute = if let Some(profile) = profile {
         let route = snap
             .config
             .exact_route_for(model)
@@ -302,6 +314,7 @@ pub(crate) fn resolve_candidates(
             unknown,
             None,
             route.pin_order,
+            route.prefer_awake,
         )
     } else if let Some(route) = snap.config.exact_route_for(model) {
         let mut candidates = Vec::new();
@@ -319,6 +332,7 @@ pub(crate) fn resolve_candidates(
             unknown,
             None,
             route.pin_order,
+            route.prefer_awake,
         )
     } else if let Some(combo_cfg) = snap.config.combo_for(model) {
         let mut candidates = Vec::new();
@@ -339,6 +353,7 @@ pub(crate) fn resolve_candidates(
                 strategy: combo_cfg.strategy,
             }),
             false,
+            None,
         )
     } else if let Some(target) = snap.registry.target_for(model) {
         (
@@ -348,6 +363,7 @@ pub(crate) fn resolve_candidates(
             Vec::new(),
             None,
             false,
+            None,
         )
     } else if let Some(route) = snap.config.wildcard_route() {
         let mut candidates = Vec::new();
@@ -365,6 +381,7 @@ pub(crate) fn resolve_candidates(
             unknown,
             None,
             route.pin_order,
+            route.prefer_awake,
         )
     } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
         match snap.registry.target_for_provider_model(provider, model) {
@@ -379,6 +396,7 @@ pub(crate) fn resolve_candidates(
                     Vec::new(),
                     None,
                     false,
+                    None,
                 )
             }
             None => {
@@ -423,6 +441,18 @@ pub(crate) fn resolve_candidates(
             );
         }
     }
+    // Wake-aware ordering (`prefer_awake`): the route's own setting, else
+    // the server default. Only then is a target's wake need stamped, so a
+    // route without it plans exactly as before.
+    let effective = route_prefer_awake.unwrap_or(snap.config.server.prefer_awake);
+    let prefer_awake = effective.enabled.then_some(effective);
+    if let (Some(_), Some(lanes)) = (prefer_awake, lanes) {
+        for candidate in candidates.iter_mut() {
+            if crate::lanes::wakes_on_request(snap, &candidate.provider_id) {
+                candidate.wake = lanes.wake_need(&candidate.provider_id);
+            }
+        }
+    }
     let lane_down = known_down_lanes(snap, &candidates, lanes);
     Ok(CandidateResolution {
         route_name,
@@ -433,6 +463,7 @@ pub(crate) fn resolve_candidates(
         combo,
         pin_order,
         lane_down,
+        prefer_awake,
     })
 }
 
@@ -476,7 +507,56 @@ fn known_down_lanes(
 /// when skipping them leaves nothing that can serve the request — after
 /// tenant, client-profile and router hard filters — they are kept, because a
 /// stale probe must never turn into a hard outage; the attempt then decides.
+///
+/// With `prefer_awake` on, a target whose lane is down but wakes on request
+/// (it carries [`ExecutionTarget::wake`]) is not skipped: the router orders it
+/// behind the targets that are up, and it is woken only if the request
+/// reaches it. When `x-switchback-wake: never` left nothing that can serve,
+/// the answer is a typed 503 (`local_lane_asleep`) instead of a 400.
 pub(crate) fn plan_resolved_route(
+    combo_rr: &Mutex<HashMap<String, usize>>,
+    snap: &Snapshot,
+    req: &AiRequest,
+    client_profile: Option<&ClientProfileConfig>,
+    resolved: CandidateResolution,
+    advance_combo_cursor: bool,
+) -> Result<(String, sb_router::RoutePlan), ExecError> {
+    let (route_name, plan) = plan_lanes_skipped(
+        combo_rr,
+        snap,
+        req,
+        client_profile,
+        resolved,
+        advance_combo_cursor,
+    )?;
+    if plan.decision.selected.is_none() {
+        let asleep: Vec<&str> = plan
+            .decision
+            .rejected
+            .iter()
+            .filter(|rejected| {
+                rejected
+                    .reason
+                    .starts_with("prefer_awake: x-switchback-wake=never")
+            })
+            .map(|rejected| rejected.target_id.as_str())
+            .collect();
+        if !asleep.is_empty() {
+            return Err(ExecError::new(
+                503,
+                "local_lane_asleep",
+                format!(
+                    "x-switchback-wake=never and every target that can serve needs a wake ({}); send x-switchback-wake: always or auto to wake one",
+                    asleep.join(",")
+                ),
+                Some(plan.decision.summary()),
+            ));
+        }
+    }
+    Ok((route_name, plan))
+}
+
+fn plan_lanes_skipped(
     combo_rr: &Mutex<HashMap<String, usize>>,
     snap: &Snapshot,
     req: &AiRequest,
@@ -488,6 +568,13 @@ pub(crate) fn plan_resolved_route(
     // A caller-side filter (e.g. a quality-eval scope) may already have
     // removed some of them; those carry their own rejection.
     lane_down.retain(|(target_id, _)| resolved.candidates.iter().any(|c| &c.id == target_id));
+    // `prefer_awake`: a down lane that wakes on request stays a candidate.
+    lane_down.retain(|(target_id, _)| {
+        !resolved
+            .candidates
+            .iter()
+            .any(|c| &c.id == target_id && c.wake.is_some())
+    });
     if lane_down.is_empty() {
         return plan_candidates(
             combo_rr,
@@ -603,6 +690,12 @@ pub(crate) fn plan_candidates(
     }
     let mut policy = routing_policy(snap, resolved.profile);
     policy.pin_order = resolved.pin_order;
+    let wake_note = resolved.prefer_awake.map(|cfg| {
+        let decided = crate::prefer_awake::decide(&cfg, req);
+        policy.wake = Some(decided.policy);
+        policy.rank_on_decode_speed = decided.long_output;
+        decided.note
+    });
     let mut plan = sb_router::plan_route(
         req,
         &resolved.route_name,
@@ -628,6 +721,9 @@ pub(crate) fn plan_candidates(
             .add_reason(format!("client_profile={}", profile.id));
         plan.decision
             .add_reason(format!("client_profile_mode={}", profile.mode.as_str()));
+    }
+    if let Some(Some(note)) = wake_note {
+        plan.decision.add_reason(note);
     }
     for (target_id, reason) in tenant_rejections {
         plan.decision.reject(target_id, reason);

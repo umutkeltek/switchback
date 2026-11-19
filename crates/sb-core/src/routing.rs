@@ -96,6 +96,37 @@ pub struct RoutingPolicy {
     /// The route pins its declared order (`RouteConfig.pin_order`): no
     /// scorecard demotion, no outcome tie-break, no strategy reordering.
     pub pin_order: bool,
+    /// Wake-aware ordering for THIS request (`prefer_awake` on the route or
+    /// server), decided by the runtime from the request's size and its
+    /// `x-switchback-wake` header. `None` = off: ordering exactly as before.
+    /// Acts only on targets stamped with [`crate::ExecutionTarget::wake`].
+    pub wake: Option<WakePolicy>,
+    /// A long-output request on a `latency_aware` route: rank on measured
+    /// decode tokens/s instead of time to first token, when every awake
+    /// candidate has a sample. Set by the runtime only with `prefer_awake`.
+    pub rank_on_decode_speed: bool,
+}
+
+/// Request header that steers wake-aware ordering for one request:
+/// `always` (wake if the route's order says so), `never` (never wake; 503
+/// when nothing awake can serve) or `auto` (the default).
+pub const WAKE_HEADER: &str = "x-switchback-wake";
+
+/// Request-metadata key the gateway stores the [`WAKE_HEADER`] value under.
+pub const WAKE_METADATA_KEY: &str = "switchback_wake";
+
+/// What wake-aware ordering does with targets whose machine needs a wake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakePolicy {
+    /// A small request: targets that are up come first; targets that need a
+    /// wake stay as fallbacks in their old order.
+    PreferAwake,
+    /// Keep the strategy's order (the request is large, or the client sent
+    /// `x-switchback-wake: always`). `why` is said on the decision.
+    Keep { why: String },
+    /// The client sent `x-switchback-wake: never`: drop targets that need a
+    /// wake.
+    Never,
 }
 
 impl Default for RoutingPolicy {
@@ -116,6 +147,8 @@ impl Default for RoutingPolicy {
             scorecard: crate::ScorecardConfig::default(),
             quality_eval: crate::QualityEvalConfig::default(),
             pin_order: false,
+            wake: None,
+            rank_on_decode_speed: false,
         }
     }
 }
@@ -371,6 +404,11 @@ pub struct RouteDecision {
     /// Surfaced so clients/operators don't treat it as a known model (Oracle #5).
     #[serde(default)]
     pub unverified: bool,
+    /// What wake-aware ordering did (`prefer_awake`), when it touched the
+    /// decision, e.g. `gpu-box asleep (wake ~65s), chose small-host/m`. Also
+    /// one of `reason`; kept apart so it rides `x-switchback-route`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_awake: Option<String>,
 }
 
 impl RouteDecision {
@@ -387,7 +425,16 @@ impl RouteDecision {
             scores: Vec::new(),
             capability_fallback: Vec::new(),
             unverified: false,
+            prefer_awake: None,
         }
+    }
+
+    /// Record what wake-aware ordering did: a `prefer_awake: …` reason line,
+    /// also shown on the summary (`x-switchback-route`).
+    pub fn set_prefer_awake(&mut self, effect: impl Into<String>) {
+        let effect = effect.into();
+        self.add_reason(format!("prefer_awake: {effect}"));
+        self.prefer_awake = Some(effect);
     }
 
     /// Record that a capability was relaxed to keep the request serviceable.
@@ -446,8 +493,15 @@ impl RouteDecision {
                     .join(",")
             )
         };
+        // What wake-aware ordering did rides the header too: a client
+        // served by the slower machine sees why without opening the trace.
+        let awake = self
+            .prefer_awake
+            .as_deref()
+            .map(|effect| format!(" prefer_awake=[{effect}]"))
+            .unwrap_or_default();
         format!(
-            "strategy={} selected={} fallbacks=[{}] rejected={}{degraded}",
+            "strategy={} selected={} fallbacks=[{}] rejected={}{degraded}{awake}",
             self.strategy,
             sel,
             fb.join(","),

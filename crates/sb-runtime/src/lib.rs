@@ -31,6 +31,7 @@ mod hedge;
 mod helpers;
 mod lanes;
 mod outcome;
+mod prefer_awake;
 mod profiles;
 pub(crate) mod quality_eval;
 pub mod scorecard;
@@ -143,6 +144,15 @@ pub trait LaneStatus: Send + Sync {
     /// stale by the time the request dispatches (the dispatch then takes
     /// its place, or waits for one, through [`Self::acquire_for_request`]).
     fn lane_full(&self, _provider_id: &str) -> Option<String> {
+        None
+    }
+
+    /// `Some` when the provider's lane would first need a wake to serve
+    /// (its machine is asleep, already waking, or powering off), with the
+    /// machine and its expected wake time; `None` when it is up, or is not a
+    /// lane that wakes on request. Read only on a route with `prefer_awake`
+    /// on. Never waits on I/O.
+    fn wake_need(&self, _provider_id: &str) -> Option<sb_core::WakeNeed> {
         None
     }
 

@@ -475,6 +475,35 @@ pub struct AiRequest {
 }
 
 impl AiRequest {
+    /// Rough prompt-size estimate: a chars/4 heuristic over system +
+    /// message text + tool schemas, plus a flat 1600 per image. Not
+    /// provider-exact; used for `/v1/messages/count_tokens` and for
+    /// wake-aware routing's "is this request small" check.
+    pub fn estimated_input_tokens(&self) -> u64 {
+        let mut chars = self.system.as_deref().map(str::len).unwrap_or(0);
+        let mut image_tokens = 0;
+        for message in &self.messages {
+            for part in &message.content {
+                match part {
+                    ContentPart::Text { text } => chars += text.len(),
+                    ContentPart::Reasoning { text, .. } => chars += text.len(),
+                    ContentPart::Citation { url, .. } => chars += url.len(),
+                    ContentPart::ServerToolResult { content, .. } => chars += content.len(),
+                    ContentPart::ServerToolUse { name, .. } => chars += name.len(),
+                    ContentPart::Image { .. } => image_tokens += 1_600,
+                    ContentPart::ToolUse { name, args, .. } => {
+                        chars += name.len() + args.to_string().len()
+                    }
+                    ContentPart::ToolResult { content, .. } => chars += content.len(),
+                }
+            }
+        }
+        for tool in &self.tools {
+            chars += tool.name.len() + tool.parameters.to_string().len();
+        }
+        (chars as u64).div_ceil(4) + image_tokens
+    }
+
     pub fn new(model: impl Into<String>, messages: Vec<Message>) -> Self {
         AiRequest {
             id: crate::new_id("req"),
