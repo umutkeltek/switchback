@@ -249,7 +249,8 @@ pub struct ExecutionTarget {
     /// routing time from measured responses. `None` = never measured. A
     /// long-output request on a `latency_aware` route with `prefer_awake`
     /// ranks awake targets on it when every one of them has a sample.
-    #[serde(default)]
+    /// Never serialized: live routing evidence, like `quality`.
+    #[serde(skip)]
     pub decode_tps_ewma: Option<f64>,
     /// Set when the target's machine must first be woken (managed local lane,
     /// asleep / waking / powering off). Stamped by `sb-runtime` only on a
@@ -272,9 +273,16 @@ pub struct WakeNeed {
 }
 
 impl WakeNeed {
-    /// `gpu-box asleep (wake ~65s)`.
+    /// `gpu-box asleep (wake ~65s)`; a wake under 10 s keeps one decimal
+    /// (`wake ~0.3s`), so a quick wake never reads as free.
     pub fn describe(&self) -> String {
         match self.wake_ms {
+            Some(ms) if ms < 10_000 => format!(
+                "{} {} (wake ~{:.1}s)",
+                self.host,
+                self.state,
+                ms as f64 / 1_000.0
+            ),
             Some(ms) => format!(
                 "{} {} (wake ~{}s)",
                 self.host,

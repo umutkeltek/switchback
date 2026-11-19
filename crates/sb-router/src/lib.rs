@@ -3498,7 +3498,7 @@ mod tests {
         assert_eq!(order(&plan), vec!["small-host/small", "gpu-box/big"]);
         assert_eq!(
             plan.decision.prefer_awake.as_deref(),
-            Some("gpu-box asleep (wake ~1s), chose small-host/small")
+            Some("gpu-box asleep (wake ~1.4s), chose small-host/small")
         );
     }
 
@@ -3602,6 +3602,10 @@ mod tests {
             vec!["quick/m", "strong/m"],
             "one target without a sample: latency order"
         );
+        // A sleeper in the partition: latency order, not decode speed. Under
+        // `Keep` (a long-output request: route order kept) the wake order
+        // moves nothing, so only the decode-speed guard keeps the faster
+        // decoder that is asleep from ranking first.
         let mut sleeping = measured("strong", 600.0, Some(60.0));
         sleeping.wake = Some(sb_core::WakeNeed {
             host: "gpu-box".to_string(),
@@ -3609,10 +3613,26 @@ mod tests {
             wake_ms: None,
         });
         let mixed = [measured("quick", 150.0, Some(20.0)), sleeping];
+        let keep = RoutingPolicy {
+            wake: Some(WakePolicy::Keep {
+                why: "long output (max_tokens 4000, wake_for_output_tokens 2000)".to_string(),
+            }),
+            ..policy
+        };
+        let plan = plan_with(&keep, &mixed);
         assert_eq!(
-            order(&plan_with(&policy, &mixed)),
+            order(&plan),
             vec!["quick/m", "strong/m"],
-            "a sleeper is not raced on decode speed"
+            "a sleeper is not ranked on decode speed"
+        );
+        assert!(
+            !plan
+                .decision
+                .reason
+                .iter()
+                .any(|r| r.contains("(long output)")),
+            "{:?}",
+            plan.decision.reason
         );
     }
 }

@@ -1035,8 +1035,6 @@ impl LocalExecutor {
         self.slots.try_take().map_err(full_text)
     }
 
-    /// `Some(why)` while new work on this lane would have to wait for a
-    /// place (`max_in_flight` reached, or others already wait). Never waits.
     /// Whether this lane's machine must first be woken to serve a request
     /// (`prefer_awake` routing): asleep (off, or its engine last seen
     /// down), already waking, or powering off. `None` when it is up, and
@@ -1068,6 +1066,8 @@ impl LocalExecutor {
         })
     }
 
+    /// `Some(why)` while new work on this lane would have to wait for a
+    /// place (`max_in_flight` reached, or others already wait). Never waits.
     pub fn full_detail(&self) -> Option<String> {
         self.slots.full().map(full_text)
     }
