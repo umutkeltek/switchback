@@ -409,6 +409,12 @@ pub struct RouteDecision {
     /// one of `reason`; kept apart so it rides `x-switchback-route`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_awake: Option<String>,
+    /// What model settings did to the served attempt (profile, keys a lock
+    /// overrode), e.g. `profile=nothink; locked=temperature; applied=3`.
+    /// Key names only, never values. Rides `x-switchback-route` and
+    /// `x-switchback-settings`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<String>,
 }
 
 impl RouteDecision {
@@ -426,6 +432,7 @@ impl RouteDecision {
             capability_fallback: Vec::new(),
             unverified: false,
             prefer_awake: None,
+            settings: None,
         }
     }
 
@@ -511,8 +518,13 @@ impl RouteDecision {
             .as_deref()
             .map(|effect| format!(" prefer_awake=[{effect}]"))
             .unwrap_or_default();
+        let settings = self
+            .settings
+            .as_deref()
+            .map(|effect| format!(" settings=[{effect}]"))
+            .unwrap_or_default();
         format!(
-            "strategy={} selected={} fallbacks=[{}] rejected={}{degraded}{awake}",
+            "strategy={} selected={} fallbacks=[{}] rejected={}{degraded}{awake}{settings}",
             self.strategy,
             sel,
             fb.join(","),

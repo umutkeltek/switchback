@@ -15,7 +15,6 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "eval")]
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 #[cfg(feature = "eval")]
@@ -61,6 +60,44 @@ pub struct RevisionRecord {
     pub config_hash: String,
     pub source: String,
     pub created_at_ms: i64,
+}
+
+/// One target model's settings document as stored (`provider/model`).
+/// `doc` is the document's JSON text; `revision` counts writes to this
+/// target from 1.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelSettingsRecord {
+    pub target: String,
+    pub revision: u64,
+    pub doc: String,
+    pub updated_at_ms: i64,
+}
+
+/// One change to a target's settings: who (key tenant and role, never the
+/// key), what (the keys that changed, and the document after), when and
+/// from where.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelSettingsChange {
+    pub target: String,
+    pub revision: u64,
+    pub doc: String,
+    pub actor: String,
+    pub role: String,
+    pub source: String,
+    /// `put`, `patch`, `revert`, ...
+    pub action: String,
+    pub changed: Vec<String>,
+    pub at_ms: i64,
+}
+
+/// The outcome of a compare-and-set settings write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSettingsWrite {
+    Written,
+    /// The stored revision is not the one the writer edited.
+    Conflict {
+        current: u64,
+    },
 }
 
 /// One audit-log entry: a control-plane change, the actor/source/object context
@@ -699,6 +736,31 @@ pub trait StateStore: Send + Sync {
             "quality judgment persistence is not supported".to_string(),
         ))
     }
+
+    // ---- model settings ------------------------------------------------
+
+    /// Write a target's settings document if its stored revision is still
+    /// `change.revision - 1` (0 = none stored), and record the change in
+    /// its history, in one transaction.
+    fn model_settings_write(&self, _change: &ModelSettingsChange) -> Result<ModelSettingsWrite> {
+        Err(StoreError(
+            "model settings persistence is not supported".to_string(),
+        ))
+    }
+
+    /// Every stored settings document.
+    fn model_settings_list(&self) -> Result<Vec<ModelSettingsRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// A target's changes, newest first.
+    fn model_settings_history(
+        &self,
+        _target: &str,
+        _limit: usize,
+    ) -> Result<Vec<ModelSettingsChange>> {
+        Ok(Vec::new())
+    }
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). One connection
@@ -1291,6 +1353,31 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
                     tx.execute(&format!("ALTER TABLE usage ADD COLUMN {column} {ty}"), [])?;
                 }
             }
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 21, "model_settings", |tx| {
+            // Per-target model settings (revisioned) and their change
+            // history. New tables only: an older binary never reads them.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS model_settings (
+                    target TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    doc TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS model_settings_history (
+                    target TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    doc TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    changed TEXT NOT NULL,
+                    at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (target, revision)
+                );",
+            )?;
             Ok(())
         })?;
         Ok(())
@@ -3146,6 +3233,104 @@ impl StateStore for SqliteStore {
     fn quality_judgment_budget(&self, since_ms: i64) -> Result<QualityJudgmentBudget> {
         let conn = self.conn()?;
         quality_judgment_budget_from(&conn, since_ms)
+    }
+
+    fn model_settings_write(&self, change: &ModelSettingsChange) -> Result<ModelSettingsWrite> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: u64 = tx
+            .query_row(
+                "SELECT revision FROM model_settings WHERE target = ?1",
+                [&change.target],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|revision| revision as u64)
+            .unwrap_or(0);
+        if change.revision != current + 1 {
+            return Ok(ModelSettingsWrite::Conflict { current });
+        }
+        tx.execute(
+            "INSERT INTO model_settings (target, revision, doc, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(target) DO UPDATE SET
+               revision = excluded.revision, doc = excluded.doc,
+               updated_at_ms = excluded.updated_at_ms",
+            params![
+                change.target,
+                change.revision as i64,
+                change.doc,
+                change.at_ms
+            ],
+        )?;
+        let changed = serde_json::to_string(&change.changed)
+            .map_err(|e| StoreError(format!("model settings change list: {e}")))?;
+        tx.execute(
+            "INSERT INTO model_settings_history
+               (target, revision, doc, actor, role, source, action, changed, at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                change.target,
+                change.revision as i64,
+                change.doc,
+                change.actor,
+                change.role,
+                change.source,
+                change.action,
+                changed,
+                change.at_ms
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ModelSettingsWrite::Written)
+    }
+
+    fn model_settings_list(&self) -> Result<Vec<ModelSettingsRecord>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT target, revision, doc, updated_at_ms FROM model_settings ORDER BY target",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ModelSettingsRecord {
+                    target: row.get(0)?,
+                    revision: row.get::<_, i64>(1)? as u64,
+                    doc: row.get(2)?,
+                    updated_at_ms: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn model_settings_history(
+        &self,
+        target: &str,
+        limit: usize,
+    ) -> Result<Vec<ModelSettingsChange>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT target, revision, doc, actor, role, source, action, changed, at_ms
+             FROM model_settings_history WHERE target = ?1
+             ORDER BY revision DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![target, limit.min(10_000) as i64], |row| {
+                let changed: String = row.get(7)?;
+                Ok(ModelSettingsChange {
+                    target: row.get(0)?,
+                    revision: row.get::<_, i64>(1)? as u64,
+                    doc: row.get(2)?,
+                    actor: row.get(3)?,
+                    role: row.get(4)?,
+                    source: row.get(5)?,
+                    action: row.get(6)?,
+                    changed: serde_json::from_str(&changed).unwrap_or_default(),
+                    at_ms: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
 
@@ -5214,5 +5399,66 @@ mod tests {
             !store.admission_slot_renew("slot-2", 60_000).unwrap(),
             "expired slots should not be revived by renewal"
         );
+    }
+}
+
+#[cfg(test)]
+mod model_settings_tests {
+    use super::*;
+
+    fn change(target: &str, revision: u64, doc: &str) -> ModelSettingsChange {
+        ModelSettingsChange {
+            target: target.to_string(),
+            revision,
+            doc: doc.to_string(),
+            actor: "tenant=ops".to_string(),
+            role: "admin".to_string(),
+            source: "api".to_string(),
+            action: "put".to_string(),
+            changed: vec!["defaults.temperature".to_string()],
+            at_ms: now_millis(),
+        }
+    }
+
+    #[test]
+    fn compare_and_set_and_history_survive_reopen() {
+        let dir = std::env::temp_dir().join(format!("sb-ms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SqliteStore::open(path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                store
+                    .model_settings_write(&change("text/m", 1, "{}"))
+                    .unwrap(),
+                ModelSettingsWrite::Written
+            );
+            // A second writer that also edited revision 0 loses.
+            assert_eq!(
+                store
+                    .model_settings_write(&change("text/m", 1, "{\"a\":1}"))
+                    .unwrap(),
+                ModelSettingsWrite::Conflict { current: 1 }
+            );
+            assert_eq!(
+                store
+                    .model_settings_write(&change("text/m", 2, "{\"b\":2}"))
+                    .unwrap(),
+                ModelSettingsWrite::Written
+            );
+        }
+        let store = SqliteStore::open(path.to_str().unwrap()).unwrap();
+        let rows = store.model_settings_list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revision, 2);
+        assert_eq!(rows[0].doc, "{\"b\":2}");
+        let history = store.model_settings_history("text/m", 10).unwrap();
+        assert_eq!(
+            history.iter().map(|c| c.revision).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(history[0].changed, vec!["defaults.temperature".to_string()]);
+        let _ = std::fs::remove_file(&path);
     }
 }

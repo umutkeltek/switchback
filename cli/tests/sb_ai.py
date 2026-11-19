@@ -147,6 +147,10 @@ class Fake:
         self.chat_fail_at = None  # the request number from which the gateway refuses
         self.chat_status = 500
         self.wake_makes_healthy = False  # a hold with --wake brings the machine up
+        self.chat_headers = {}  # extra headers on a chat answer (route, settings)
+        # Model settings of text/m: the document, its revision and history.
+        self.settings_doc, self.settings_revision, self.settings_history = {}, 0, []
+        self.settings_conflict = False  # the next write loses to another writer
         self.routes = {
             ("GET", "/health"): lambda r: (200, b"ok", "text/plain"),
             ("GET", "/v1/workloads/capacity"): lambda r: self.json({"object": "list", "data": self.lanes}),
@@ -161,6 +165,13 @@ class Fake:
             ("POST", "/v1/jobs/job-v1/cancel"): lambda r: self.json({"id": "job-v1", "status": "cancelled"}),
             ("POST", "/v1/audio/transcriptions"): self.transcription_route,
             ("POST", "/v1/audio/speech"): lambda r: (200, SPEECH, "audio/mpeg"),
+            ("GET", "/v1/models/text/m/settings"): self.settings_get,
+            ("PUT", "/v1/models/text/m/settings"): self.settings_put,
+            ("GET", "/v1/models/text/m/settings/history"): lambda r: self.json(
+                {"target": "text/m", "revision": self.settings_revision,
+                 "history": self.settings_history}),
+            ("POST", "/v1/models/text/m/settings/revert"): lambda r: self.json(
+                {"target": "text/m", "revision": self.settings_revision + 1}),
         }
         handler = self.handler()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -174,6 +185,33 @@ class Fake:
     @staticmethod
     def json(value, status=200):
         return status, json.dumps(value).encode(), "application/json"
+
+    def settings_view(self):
+        effective = {"temperature": {"value": None, "source": "engine", "locked": False}}
+        for key, value in (self.settings_doc.get("defaults") or {}).items():
+            effective[key] = {"value": value, "source": "defaults",
+                              "locked": key in self.settings_doc.get("locked", [])}
+        return {"target": "text/m", "revision": self.settings_revision, "durable": True,
+                "effective": effective, "profiles": self.settings_doc.get("profiles") or {},
+                "document": self.settings_doc}
+
+    def settings_get(self, request):
+        return self.json({"model": "text/m", "targets": [self.settings_view()],
+                          "revision": self.settings_revision})
+
+    def settings_put(self, request):
+        if self.settings_conflict or request["headers"].get("If-Match") != str(self.settings_revision):
+            return self.json({"error": {"message": "settings changed: you edited revision 0, "
+                                        "the current one is 1", "type": "revision_conflict"}}, 409)
+        body = dict(request["json"])
+        apply = body.pop("apply", None)
+        body.pop("wake", None)
+        self.settings_doc = body
+        self.settings_revision += 1
+        view = self.settings_view()
+        if apply:
+            view["apply"] = {"mode": apply, "message": f"load settings written ({apply})"}
+        return self.json(view)
 
     def workflows_route(self, request):
         if self.workflows_status != 200:
@@ -271,6 +309,8 @@ class Fake:
             return
         handler.send_response(200)
         handler.send_header("Content-Type", "text/event-stream")
+        for name, value in self.chat_headers.items():
+            handler.send_header(name, value)
         handler.end_headers()
         try:
             for delay, chunk in plan:
@@ -324,7 +364,7 @@ class Fake:
                 self.end_headers()
                 self.wfile.write(payload)
 
-            do_GET = do_POST = do_DELETE = serve
+            do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = serve
 
         return Handler
 
@@ -1452,6 +1492,98 @@ class SbAi(unittest.TestCase):
             run = self.sb(*args)
             self.assertEqual(run.returncode, 2, args)
         self.assertEqual(self.requests("POST"), [])
+
+    # ------------------------------------------------------------ model settings
+
+    def test_set_writes_typed_values_into_a_profile_with_its_revision(self):
+        run = self.sb("set", "text/m", "temperature=0.6", "reasoning.enabled=false",
+                      'stop=["\\n\\n"]', "system_prompt=Be brief.", "--profile", "nothink", "--lock")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("text/m: revision 1", run.stdout)
+        put = self.posted_with("PUT", "/v1/models/text/m/settings")
+        self.assertEqual(put["headers"]["If-Match"], "0")
+        self.assertEqual(put["json"]["profiles"]["nothink"],
+                         {"temperature": 0.6, "reasoning": {"enabled": False},
+                          "stop": ["\n\n"], "system_prompt": "Be brief."})
+        self.assertEqual(sorted(put["json"]["locked"]),
+                         ["reasoning.enabled", "stop", "system_prompt", "temperature"])
+
+        run = self.sb("unset", "text/m", "temperature", "--profile", "nothink")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        puts = self.requests("PUT", "/v1/models/text/m/settings")
+        self.assertEqual(puts[-1]["headers"]["If-Match"], "1")
+        self.assertNotIn("temperature", puts[-1]["json"]["profiles"]["nothink"])
+        self.assertNotIn("temperature", puts[-1]["json"]["locked"])
+
+    def test_set_load_keys_need_load_and_carry_apply(self):
+        run = self.sb("set", "text/m", "ctx_size=65536")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("--load", run.stderr)
+        self.assertEqual(self.requests("PUT"), [])
+        run = self.sb("set", "text/m", "ctx_size=65536", "cache_type_k=q8_0", "--load",
+                      "--apply", "now", "--wake")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        put = self.posted_with("PUT", "/v1/models/text/m/settings")
+        self.assertEqual(put["json"]["load"], {"ctx_size": 65536, "cache_type_k": "q8_0"})
+        self.assertEqual(put["json"]["apply"], "now")
+        self.assertTrue(put["json"]["wake"])
+        self.assertIn("load settings written", run.stdout)
+
+    def test_set_loses_a_race_with_exit_1(self):
+        self.fake.settings_conflict = True
+        run = self.sb("set", "text/m", "top_k=20")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("changed meanwhile", run.stderr)
+
+    def test_unknown_request_key_is_a_usage_error(self):
+        run = self.sb("set", "text/m", "tempreature=1")
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(self.requests("PUT"), [])
+
+    def test_settings_table_history_and_revert(self):
+        self.fake.settings_doc = {"defaults": {"top_k": 20}, "locked": ["top_k"],
+                                  "profiles": {"nothink": {"reasoning": {"enabled": False}}}}
+        self.fake.settings_revision = 3
+        self.fake.settings_history = [{"revision": 3, "at_ms": 0, "actor": "tenant=ops",
+                                       "role": "admin", "action": "patch",
+                                       "changed": ["defaults.top_k"]}]
+        run = self.sb("settings", "text/m")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("text/m  revision 3 (durable)", run.stdout)
+        self.assertRegex(run.stdout, r"top_k\s+20\s+defaults\s+locked")
+        self.assertRegex(run.stdout, r"temperature\s+-\s+engine")
+        self.assertIn("profile nothink:", run.stdout)
+        run = self.sb("settings", "text/m", "--json")
+        self.assertEqual(json.loads(run.stdout)["revision"], 3)
+        run = self.sb("settings", "text/m", "--history")
+        self.assertIn("patch: defaults.top_k", run.stdout)
+        run = self.sb("revert", "text/m", "2")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/models/text/m/settings/revert")["json"], {"revision": 2})
+
+    def test_chat_sends_profile_and_settings_and_prints_stats(self):
+        self.fake.chat_headers = {"x-switchback-route": "strategy=pinned_order selected=text/m",
+                                  "x-switchback-settings": "profile=nothink; applied=2"}
+        run = self.sb("chat", "fast", "hi there", "--profile", "nothink", "--set", "top_k=5",
+                      "--set", "reasoning.enabled=false")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "The gateway keeps the record.\n")
+        body = self.posted("/v1/chat/completions")["json"]
+        self.assertEqual(body["switchback"], {"profile": "nothink",
+                                              "settings": {"top_k": 5, "reasoning": {"enabled": False}}})
+        self.assertTrue(body["stream"])
+        self.assertIn("tokens: 1000 in, 256 out", run.stderr)
+        self.assertIn("route: strategy=pinned_order selected=text/m", run.stderr)
+        self.assertIn("settings: profile=nothink; applied=2", run.stderr)
+        run = self.sb("chat", "fast", "hi", "--json")
+        result = json.loads(run.stdout)
+        self.assertEqual(result["completion_tokens"], 256)
+        self.assertNotIn("switchback", self.requests("POST", "/v1/chat/completions")[-1]["json"])
+
+    def posted_with(self, method, path):
+        found = self.requests(method, path)
+        self.assertEqual(len(found), 1, f"expected one {method} {path}")
+        return found[0]
 
 
 if __name__ == "__main__":

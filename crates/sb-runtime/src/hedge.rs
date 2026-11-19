@@ -108,6 +108,7 @@ async fn hedge_attempt(
     snap: &Snapshot,
     req: &AiRequest,
     target: &sb_core::ExecutionTarget,
+    settings: &crate::model_settings::SettingsPlan,
     scorecard: &Scorecard,
     scorecard_cfg: &ScorecardConfig,
 ) -> Option<HedgeWin> {
@@ -131,8 +132,9 @@ async fn hedge_attempt(
         .fresh_lease(&target.provider_id, &account_id, lease)
         .await
         .ok()?;
+    let (attempt_req, attempt_target) = settings.prepare(req, target);
     let prepared =
-        PreparedRequest::new(req.clone(), target.clone(), Some(lease)).with_egress(egress_id);
+        PreparedRequest::new(attempt_req, attempt_target, Some(lease)).with_egress(egress_id);
 
     // outcome-routing-v1 F6: every STARTED racer (i.e. one that reaches
     // actual dispatch) gets its own dispatch-time token/guard. Account
@@ -234,6 +236,7 @@ pub(crate) async fn run_hedge(
     snap: &Snapshot,
     req: &AiRequest,
     candidates: &[sb_core::ExecutionTarget],
+    settings: &crate::model_settings::SettingsPlan,
     scorecard: &Scorecard,
     scorecard_cfg: &ScorecardConfig,
     lane_busy: &(dyn Fn(&str) -> Result<Option<LaneBusy>, String> + Sync),
@@ -263,7 +266,7 @@ pub(crate) async fn run_hedge(
             let Ok(_lane_busy) = lane_busy(&target.provider_id) else {
                 return None;
             };
-            hedge_attempt(snap, req, target, scorecard, scorecard_cfg).await
+            hedge_attempt(snap, req, target, settings, scorecard, scorecard_cfg).await
         });
     }
     while let Some(result) = futs.next().await {

@@ -96,6 +96,28 @@ impl Engine {
         // The caller pinned ONE compiled snapshot for this request's whole
         // lifetime — a config publish mid-request never tears it across revisions.
         let rt = &snap.runtime;
+        // Model settings (`switchback` body object, `x-switchback-profile`):
+        // taken out of the request first so none of it can reach an
+        // upstream, whatever happens next.
+        let request_settings = match sb_core::take_request_settings(&mut req) {
+            Ok(settings) => settings,
+            Err(e) => {
+                let message = e.to_string();
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: 400,
+                    error_type: "invalid_settings",
+                    message: &message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(ExecError::new(400, "invalid_settings", message, None));
+            }
+        };
 
         // Global spend cap: once attributed spend reaches `budget.max_usd`, reject
         // new requests (402) rather than keep billing. Per-provider caps are checked
@@ -356,6 +378,49 @@ impl Engine {
                 "capability_fallback: served image request as text on a text-only route"
             );
         }
+        // Per-target model settings: the request each attempt sends, with
+        // that target's defaults/profile/locks applied. Nothing configured
+        // and nothing asked = an empty plan and the request goes unchanged.
+        let settings_plan = match crate::model_settings::plan_settings(
+            &self.model_settings,
+            snap,
+            &route_name,
+            &req,
+            request_settings.as_ref(),
+            &plan.candidates,
+        ) {
+            Ok(settings_plan) => settings_plan,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(e);
+            }
+        };
+        if !settings_plan.is_empty() {
+            if let Some(summary) = plan
+                .candidates
+                .first()
+                .and_then(|first| settings_plan.summary_for(&first.id))
+            {
+                plan.decision.settings = Some(summary.to_string());
+            }
+            for candidate in &plan.candidates {
+                if let Some(summary) = settings_plan.summary_for(&candidate.id) {
+                    plan.decision
+                        .add_reason(format!("settings target={} {summary}", candidate.id));
+                }
+            }
+        }
         attach_execution_receipt(&mut plan, &req, cache_receipt.clone(), body_redacted);
         // Plugin post-route hook (Oracle #6): observe the explainable decision.
         snap.plugins.post_route(&req, &plan.decision);
@@ -428,6 +493,7 @@ impl Engine {
                 snap,
                 &req,
                 &plan.candidates,
+                &settings_plan,
                 &self.scorecard,
                 &snap.config.server.scorecard,
                 &|provider_id: &str| match held.as_ref().and_then(|held| held.take_for(provider_id))
@@ -773,8 +839,9 @@ impl Engine {
                         // Same-target retry on transient errors (timeout/network/5xx)
                         // before we fall over to another account. The lease + egress
                         // are reused; each retry waits an exponential backoff.
+                        let (attempt_req, attempt_target) = settings_plan.prepare(&req, target);
                         let prepared =
-                            PreparedRequest::new(req.clone(), target.clone(), Some(lease.clone()))
+                            PreparedRequest::new(attempt_req, attempt_target, Some(lease.clone()))
                                 .with_egress(egress_id.clone());
                         let mut exec = adapter
                             .execute(prepared)
@@ -822,9 +889,10 @@ impl Engine {
                                 delay_ms = delay.as_millis() as u64, "retrying transient failure"
                             );
                             tokio::time::sleep(delay).await;
+                            let (attempt_req, attempt_target) = settings_plan.prepare(&req, target);
                             let prepared = PreparedRequest::new(
-                                req.clone(),
-                                target.clone(),
+                                attempt_req,
+                                attempt_target,
                                 Some(lease.clone()),
                             )
                             .with_egress(egress_id.clone());

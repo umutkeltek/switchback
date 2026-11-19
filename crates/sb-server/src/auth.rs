@@ -17,6 +17,29 @@ fn holds_path(path: &str, with_id: bool) -> bool {
     }
 }
 
+/// `/v1/models/{model}/settings` (a model name may hold `/`).
+fn model_settings_path(path: &str) -> bool {
+    path.strip_prefix("/v1/models/")
+        .and_then(|rest| rest.strip_suffix("/settings"))
+        .is_some_and(|name| !name.is_empty())
+}
+
+/// Model settings writes and engine control: `PUT`/`PATCH`
+/// `/v1/models/{model}/settings`, `POST .../settings/revert`, `.../load`,
+/// `.../unload`. Operator and admin keys only.
+fn model_control_write(method: &Method, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/v1/models/") else {
+        return false;
+    };
+    let named = |suffix: &str| {
+        rest.strip_suffix(suffix)
+            .is_some_and(|name| !name.is_empty())
+    };
+    (matches!(*method, Method::PUT | Method::PATCH) && named("/settings"))
+        || (method == Method::POST
+            && (named("/settings/revert") || named("/load") || named("/unload")))
+}
+
 /// `/v1/hosts/{host}/power` — a machine's power is the operator's
 /// business: operator and admin keys only, never a client key.
 fn power_path(path: &str) -> bool {
@@ -41,6 +64,7 @@ fn client_surface(method: &Method, path: &str) -> bool {
     }
     (method == Method::GET
         && (path == "/v1/models"
+            || model_settings_path(path)
             || path == "/v1/workloads/capacity"
             || path == "/v1/targets/stats"
             || path == "/v1/jobs"
@@ -69,6 +93,9 @@ fn operator_surface(method: &Method, path: &str) -> bool {
         return true;
     }
     if method == Method::GET && (path.starts_with("/v1/") || path.starts_with("/cp/v1")) {
+        return true;
+    }
+    if model_control_write(method, path) {
         return true;
     }
     method == Method::POST

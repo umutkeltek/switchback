@@ -12,7 +12,22 @@ pub(crate) fn with_route_header(mut response: Response, summary: &str) -> Respon
     if let Ok(value) = HeaderValue::from_str(summary) {
         response.headers_mut().insert("x-switchback-route", value);
     }
+    if let Some(settings) = settings_from_summary(summary) {
+        if let Ok(value) = HeaderValue::from_str(settings) {
+            response
+                .headers_mut()
+                .insert(sb_core::SETTINGS_RESPONSE_HEADER, value);
+        }
+    }
     response
+}
+
+/// The model-settings part of a route summary (` settings=[...]`), which
+/// also rides its own `x-switchback-settings` header.
+pub(crate) fn settings_from_summary(summary: &str) -> Option<&str> {
+    let start = summary.find(" settings=[")? + " settings=[".len();
+    let rest = &summary[start..];
+    rest.find(']').map(|end| &rest[..end])
 }
 
 /// Stamp the native client compatibility profile that served this request.

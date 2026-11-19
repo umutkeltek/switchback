@@ -3731,6 +3731,12 @@ pub struct RouteConfig {
     /// default, which is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_awake: Option<PreferAwakeOverride>,
+    /// Model-settings profile this route applies (see
+    /// [`crate::ModelSettingsDoc`]): layered over each target's `defaults`,
+    /// below a profile the request names. A target without this profile
+    /// gets its defaults only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_profile: Option<String>,
 }
 
 /// A route's `prefer_awake`: each field set replaces the server default's

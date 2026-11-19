@@ -30,6 +30,7 @@ mod finish_attempt;
 mod hedge;
 mod helpers;
 mod lanes;
+pub mod model_settings;
 mod outcome;
 mod prefer_awake;
 mod profiles;
@@ -271,6 +272,10 @@ pub struct Engine {
     /// rejected before dispatch, so a lane stopped on purpose never collects
     /// failures. `None` = no managed lanes (routing unchanged).
     lanes: Option<Arc<dyn LaneStatus>>,
+    /// Per-model settings (request-time defaults, profiles, locks, load
+    /// settings). State, not config: survives a publish, durable in the
+    /// state store when one is attached.
+    model_settings: Arc<model_settings::ModelSettingsRegistry>,
 }
 
 /// Outcome of an optimistic-concurrency publish ([`Engine::publish_with_audit`]).

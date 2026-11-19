@@ -72,7 +72,13 @@ impl Engine {
             exact_cache: Mutex::new(sb_core::ExactRequestCache::new()),
             reload_lock: Mutex::new(()),
             lanes: None,
+            model_settings: Arc::new(crate::model_settings::ModelSettingsRegistry::new()),
         })
+    }
+
+    /// The per-model settings registry (shared; survives reloads).
+    pub fn model_settings(&self) -> Arc<crate::model_settings::ModelSettingsRegistry> {
+        self.model_settings.clone()
     }
 
     /// Attach the managed local lane view (see [`crate::LaneStatus`]).
@@ -108,6 +114,7 @@ impl Engine {
         required: bool,
     ) -> Result<Self, String> {
         self.quality_eval.attach_store(store.clone());
+        self.model_settings.attach_store(store.clone());
         self.store = Some(store);
         self.store_required = required;
         self.hydrate_scorecard_from_store();

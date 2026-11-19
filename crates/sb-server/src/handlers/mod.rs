@@ -5,5 +5,6 @@ pub(crate) mod common;
 pub(crate) mod embeddings;
 pub(crate) mod hosts;
 pub(crate) mod meta;
+pub(crate) mod model_settings;
 pub(crate) mod openai;
 pub(crate) mod workloads;

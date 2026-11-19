@@ -82,6 +82,24 @@ pub(crate) fn attach_wake_preference(req: &mut sb_core::AiRequest, headers: &Hea
     }
 }
 
+/// Carry the `x-switchback-profile` request header (a model-settings
+/// profile name) into the request's metadata; the runtime takes it out
+/// with the body's `switchback` object before dispatch, so it never
+/// reaches an upstream. Bounded; the runtime checks the name.
+pub(crate) fn attach_settings_profile(req: &mut sb_core::AiRequest, headers: &HeaderMap) {
+    if let Some(value) = headers
+        .get(sb_core::SETTINGS_PROFILE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        req.metadata.insert(
+            sb_core::SETTINGS_PROFILE_METADATA_KEY.to_string(),
+            value.chars().take(128).collect(),
+        );
+    }
+}
+
 /// The `x-switchback-wake` request header, lower-cased and bounded, or
 /// `None` when absent or empty. Embeddings pass it to the runtime as is.
 pub(crate) fn wake_preference(headers: &HeaderMap) -> Option<String> {

@@ -10,6 +10,7 @@ mod config_cli;
 mod controlplane;
 mod cp;
 mod doctor_cli;
+mod engine_control;
 mod eval_cli;
 mod fal_probe;
 mod forward_proxy;

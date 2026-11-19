@@ -65,6 +65,15 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai fit REPO [--ctx N] [--machines FILE] [--vram GB] [--ram GB]
                  [--bandwidth GBS] [--json]
                                  where a model fits and which file to take
+  sb ai settings MODEL [--profile NAME] [--history] [--json]
+                                 a model's settings: each key, its value and where it comes from
+  sb ai set MODEL key=value ... [--profile NAME] [--lock]
+                                 change request settings (temperature=0.6 reasoning.enabled=false)
+  sb ai unset MODEL key ... [--profile NAME]
+                                 remove settings (and their locks)
+  sb ai revert MODEL REVISION    put back the settings of an earlier revision
+  sb ai chat MODEL "prompt" [--profile NAME] [--set key=value ...] [--json]
+                                 one quick request to try settings: answer, tokens, speed, route
 
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
@@ -138,6 +147,28 @@ needed_bytes, on_gpu_bytes, offloaded_bytes, offloaded_fraction,
 bytes_per_token, speed_estimate_tok_s, disk_bytes, faster_alternative,
 warnings}], notes. A diffusion repository answers with the model it takes
 and the parts around it instead: model {name, bytes}, on_gpu [], offload [].
+
+settings, set, unset, revert and chat work on a model's settings in the gateway.
+MODEL is a public name (a route) or provider/model; set, unset and revert need
+one target, so a route over several targets asks for provider/model. Request
+settings: temperature, top_p, top_k, min_p, typical_p, repeat_penalty,
+repeat_last_n, presence_penalty, frequency_penalty, seed, max_tokens, stop,
+system_prompt, system_prompt_mode (prepend, replace_if_absent), response_format,
+reasoning.enabled, reasoning.effort (none, low, medium, high),
+reasoning.budget_tokens, and extra.KEY for any engine-specific per-request key
+(sent as it is). Values are JSON when they parse as JSON: top_k=20,
+reasoning.enabled=false, stop='["\\n\\n"]'; anything else is a string.
+--profile NAME sets the keys in a named profile instead of the defaults;
+--lock also locks them, so a request cannot change them. A request picks a
+profile with the header x-switchback-profile: NAME or the body
+"switchback": {"profile": NAME, "settings": {...}}. settings shows every key:
+its value and its source (defaults, profile:NAME, route_profile:NAME, or
+engine when nothing sets it); --profile shows what a request naming that
+profile gets; --history lists the changes (who, when, which keys). A change
+made meanwhile by someone else stops set with exit 1; run it again.
+chat streams one answer to stdout and prints the tokens, the first token time,
+the speed and the route on stderr; --set key=value sends a setting for this
+request only.
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
@@ -258,8 +289,10 @@ class Gateway:
         text = str(text)
         return text.replace(self.key, "[key]") if self.key else text
 
-    def call(self, method, path, body=None, content_type=None, timeout=30, raw=False):
-        headers = {"Accept": "application/json"}
+    def call(self, method, path, body=None, content_type=None, timeout=30, raw=False,
+             headers=None):
+        extra, headers = headers or {}, {"Accept": "application/json"}
+        headers.update(extra)
         if self.key:
             headers["Authorization"] = f"Bearer {self.key}"
         if body is not None and not isinstance(body, bytes):
@@ -321,13 +354,16 @@ class Gateway:
         except (Fail, GatewayError):
             return False
 
-    def stream(self, path, body, timeout=900):
+    def stream(self, path, body, timeout=900, headers=None, answer_headers=None):
         """Yields (monotonic_time, chunk) for every chunk of a streaming answer.
 
         The chunks come as server-sent events; a gateway that ignores
         stream=true answers with one JSON body, which is yielded as one chunk.
+        `answer_headers`, a dict, receives the answer's headers (lower-case).
         """
+        extra = headers or {}
         headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+        headers.update(extra)
         if self.key:
             headers["Authorization"] = f"Bearer {self.key}"
         if body is not None and not isinstance(body, bytes):
@@ -336,6 +372,8 @@ class Gateway:
         plain, streamed = [], False
         try:
             with self.opener.open(request, timeout=timeout) as response:
+                if answer_headers is not None:
+                    answer_headers.update({k.lower(): v for k, v in response.headers.items()})
                 for raw in response:
                     line = raw.decode("utf-8", "replace").strip()
                     if not line:
@@ -1669,6 +1707,321 @@ def cmd_bench(gw, args):
 
 # ---------------------------------------------------------------- main
 
+# ---------------------------------------------------------------- model settings
+
+# Load-time keys (the gateway's `load` section); the rest are request-time.
+LOAD_KEYS = ("ctx_size", "n_gpu_layers", "cache_type_k", "cache_type_v", "flash_attn",
+             "batch_size", "ubatch_size", "parallel", "threads", "threads_batch", "mlock",
+             "mmap", "load_mode", "rope_scaling", "rope_freq_base", "rope_freq_scale",
+             "yarn_orig_ctx", "yarn_ext_factor", "yarn_attn_factor", "yarn_beta_slow",
+             "yarn_beta_fast", "spec_type", "spec_draft_model", "draft_max", "draft_min",
+             "mmproj", "sleep_idle_seconds", "fit", "fit_ctx", "reasoning_budget", "temp",
+             "top_k", "top_p", "min_p")
+REQUEST_KEYS = ("temperature", "top_p", "top_k", "min_p", "typical_p", "repeat_penalty",
+                "repeat_last_n", "presence_penalty", "frequency_penalty", "seed", "max_tokens",
+                "stop", "system_prompt", "system_prompt_mode", "response_format", "reasoning",
+                "extra")
+
+
+def model_path(model, suffix):
+    return f"/v1/models/{urllib.parse.quote(model, safe='/')}/{suffix}"
+
+
+def parse_assignment(text):
+    """key=value; the value is JSON when it parses as JSON, else a string."""
+    key, sep, raw = text.partition("=")
+    key = key.strip()
+    if not sep or not key:
+        raise Fail(USAGE, f"`{text}` is not key=value")
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = raw
+    return key, value
+
+
+def set_key(layer, path, value):
+    """Set (or with None remove) one key path: `reasoning.enabled`, `extra.x.y`, `top_k`."""
+    top, dot, field = path.partition(".")
+    if not dot:
+        if value is None:
+            layer.pop(top, None)
+        else:
+            layer[top] = value
+        return
+    inner = layer.setdefault(top, {})
+    if not isinstance(inner, dict):
+        raise Fail(USAGE, f"`{top}` is not an object, so `{path}` cannot be set")
+    if value is None:
+        inner.pop(field, None)
+        if not inner:
+            layer.pop(top, None)
+    else:
+        inner[field] = value
+
+
+def settings_view(gw, model, doing):
+    try:
+        return gw.get(model_path(model, "settings"))
+    except GatewayError as error:
+        raise gateway_fail(error, doing) from None
+
+
+def one_target(view, model):
+    targets = view.get("targets") or []
+    if len(targets) != 1:
+        names = ", ".join(t.get("target", "?") for t in targets)
+        raise Fail(USAGE, f"{model} reaches {len(targets)} targets ({names}); name one")
+    return targets[0]
+
+
+def value_words(value):
+    if value is None:
+        return "-"
+    if isinstance(value, str):
+        return value if len(value) <= 60 else value[:57] + "..."
+    text = json.dumps(value)
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def print_settings(view):
+    for target in view.get("targets") or []:
+        durable = "durable" if target.get("durable") else "memory only"
+        line = f"{target.get('target')}  revision {target.get('revision', 0)} ({durable})"
+        if target.get("route_profile"):
+            line += f"  route profile {target['route_profile']}"
+        print(line)
+        effective = target.get("effective") or {}
+        rows = [(key, value_words(row.get("value")), row.get("source", ""),
+                 "locked" if row.get("locked") else "")
+                for key, row in sorted(effective.items())]
+        width = max([len(r[0]) for r in rows] + [3])
+        vwidth = max([len(r[1]) for r in rows] + [5])
+        for key, value, source, locked in rows:
+            print(f"  {key.ljust(width)}  {value.ljust(vwidth)}  {source}{'  ' + locked if locked else ''}")
+        profiles = target.get("profiles") or {}
+        for name, layer in sorted(profiles.items()):
+            keys = ", ".join(f"{k}={value_words(v)}" for k, v in sorted(layer.items()))
+            print(f"  profile {name}: {keys or '(empty)'}")
+        load = target.get("load")
+        if isinstance(load, dict):
+            print_load(load)
+
+
+def print_load(load):
+    engine = load.get("engine") or {}
+    status = engine.get("status") or "unknown"
+    print(f"  engine {engine.get('lane', '?')}: model {status}")
+    for key, row in sorted((load.get("settings") or {}).items()):
+        note = "  pending until reload" if row.get("pending") else ""
+        print(f"  load {key} = {value_words(row.get('value'))}{note}")
+    memory = load.get("memory")
+    if isinstance(memory, dict):
+        for name in ("min", "max", "effective"):
+            part = memory.get(name)
+            if isinstance(part, dict):
+                print(f"  memory {name}: {part.get('bytes', 0) / 2**30:.1f} GiB at ctx {part.get('n_ctx', '?')}")
+
+
+def cmd_settings(gw, args):
+    if args.history:
+        try:
+            answer = gw.get(model_path(args.model, "settings/history"))
+        except GatewayError as error:
+            raise gateway_fail(error, "reading the settings history") from None
+        if args.json:
+            print(json.dumps(answer, indent=2))
+            return OK
+        print(f"{answer.get('target')}  revision {answer.get('revision', 0)}")
+        for row in answer.get("history") or []:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime((row.get("at_ms") or 0) / 1000))
+            changed = ", ".join(row.get("changed") or []) or "(no change)"
+            print(f"  {row.get('revision'):>4}  {when}  {row.get('role', '')} {row.get('actor', '')}"
+                  f"  {row.get('action', '')}: {changed}")
+        return OK
+    path = model_path(args.model, "settings")
+    if args.profile:
+        path += "?profile=" + urllib.parse.quote(args.profile)
+    try:
+        view = gw.get(path)
+    except GatewayError as error:
+        raise gateway_fail(error, "reading the settings") from None
+    if args.json:
+        print(json.dumps(view, indent=2))
+    else:
+        print_settings(view)
+    return OK
+
+
+def write_settings(gw, model, change, extra=None):
+    """Read the document, change it, and write it back with its revision."""
+    target = one_target(settings_view(gw, model, "reading the settings"), model)
+    if "document" not in target:
+        raise Fail(GATEWAY_ERROR, "this key may not change settings (an operator or admin key can)")
+    doc = target.get("document") or {}
+    change(doc)
+    body = dict(doc)
+    body.update(extra or {})
+    try:
+        return gw.call("PUT", model_path(target["target"], "settings"), body=body,
+                       headers={"If-Match": str(target.get("revision", 0))}, timeout=120)
+    except GatewayError as error:
+        if error.status == 409:
+            raise Fail(GATEWAY_ERROR, f"the settings changed meanwhile ({error.message}); "
+                                      "run the command again") from None
+        raise gateway_fail(error, "writing the settings") from None
+
+
+def layer_of(doc, args):
+    if args.profile:
+        return doc.setdefault("profiles", {}).setdefault(args.profile, {})
+    return doc.setdefault("defaults", {})
+
+
+def clean_empty(doc):
+    for name in ("defaults", "load", "engine_args"):
+        if name in doc and not doc[name]:
+            doc.pop(name)
+    profiles = doc.get("profiles")
+    if isinstance(profiles, dict) and not profiles:
+        doc.pop("profiles")
+    if "locked" in doc and not doc["locked"]:
+        doc.pop("locked")
+
+
+def cmd_set(gw, args):
+    pairs = [parse_assignment(text) for text in args.pairs]
+    load = getattr(args, "load", False)
+    for key, _ in pairs:
+        top = key.partition(".")[0]
+        if load and top not in LOAD_KEYS and top != "engine_args":
+            raise Fail(USAGE, f"{key} is not a load setting ({', '.join(LOAD_KEYS)}, engine_args.KEY)")
+        if not load and top not in REQUEST_KEYS:
+            hint = " (a load setting: add --load)" if top in LOAD_KEYS else ""
+            raise Fail(USAGE, f"{key} is not a request setting{hint}")
+
+    def change(doc):
+        for key, value in pairs:
+            if load:
+                if key.startswith("engine_args."):
+                    set_key(doc.setdefault("engine_args", {}), key.partition(".")[2], value)
+                else:
+                    set_key(doc.setdefault("load", {}), key, value)
+                continue
+            set_key(layer_of(doc, args), key, value)
+            if args.lock and key not in doc.setdefault("locked", []):
+                doc["locked"].append(key)
+        clean_empty(doc)
+
+    extra = {}
+    if load:
+        extra["apply"] = "now" if args.apply == "now" else "next_load"
+        if args.wake:
+            extra["wake"] = True
+    answer = write_settings(gw, args.model, change, extra)
+    if args.json:
+        print(json.dumps(answer, indent=2))
+        return OK
+    print(f"{answer.get('target')}: revision {answer.get('revision')}")
+    apply = answer.get("apply")
+    if isinstance(apply, dict) and apply.get("message"):
+        print(apply["message"])
+    return OK
+
+
+def cmd_unset(gw, args):
+    def change(doc):
+        for key in args.keys:
+            top = key.partition(".")[0]
+            if getattr(args, "load", False) or (top in LOAD_KEYS and top not in REQUEST_KEYS):
+                set_key(doc.setdefault("load", {}), key, None)
+            elif key.startswith("engine_args."):
+                set_key(doc.setdefault("engine_args", {}), key.partition(".")[2], None)
+            else:
+                set_key(layer_of(doc, args), key, None)
+                if key in doc.get("locked", []):
+                    doc["locked"].remove(key)
+        if args.profile and not doc.get("profiles", {}).get(args.profile):
+            doc.get("profiles", {}).pop(args.profile, None)
+        clean_empty(doc)
+
+    answer = write_settings(gw, args.model, change)
+    print(f"{answer.get('target')}: revision {answer.get('revision')}")
+    return OK
+
+
+def cmd_revert(gw, args):
+    try:
+        answer = gw.post(model_path(args.model, "settings/revert"), {"revision": args.revision})
+    except GatewayError as error:
+        raise gateway_fail(error, "reverting the settings") from None
+    print(f"{answer.get('target')}: revision {answer.get('revision')} "
+          f"(the settings of revision {args.revision})")
+    return OK
+
+
+def cmd_chat(gw, args):
+    settings = {}
+    for text in args.set or []:
+        key, value = parse_assignment(text)
+        set_key(settings, key, value)
+    body = {"model": args.model, "messages": [{"role": "user", "content": args.prompt}],
+            "stream": True, "stream_options": {"include_usage": True}}
+    if settings or args.profile:
+        body["switchback"] = {}
+        if settings:
+            body["switchback"]["settings"] = settings
+        if args.profile:
+            body["switchback"]["profile"] = args.profile
+    answer_headers, text, reasoning = {}, [], []
+    started = time.monotonic()
+    first, usage, timings = None, None, None
+    try:
+        for when, chunk in gw.stream("/v1/chat/completions", body, timeout=args.timeout,
+                                     answer_headers=answer_headers):
+            if isinstance(chunk.get("timings"), dict):
+                timings = chunk["timings"]
+            if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or choice.get("message") or {}
+                if delta.get("content"):
+                    text.append(delta["content"])
+                if delta.get("reasoning_content") or delta.get("reasoning"):
+                    reasoning.append(delta.get("reasoning_content") or delta.get("reasoning"))
+            if first is None and chunk_has_text(chunk):
+                first = when
+    except GatewayError as error:
+        raise gateway_fail(error, f"asking {args.model}") from None
+    ended = time.monotonic()
+    usage = usage or {}
+    completion = int(usage.get("completion_tokens") or 0)
+    decoded = ended - first if first else 0
+    speed = completion / decoded if decoded > 0 else 0.0
+    if timings and number_of(timings.get("predicted_per_second")) is not None:
+        speed = number_of(timings.get("predicted_per_second"))
+    result = {"model": args.model, "answer": "".join(text),
+              "reasoning": "".join(reasoning) or None,
+              "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+              "completion_tokens": completion,
+              "ttft_ms": round((first - started) * 1000) if first else None,
+              "decode_tok_s": round(speed, 1), "total_s": round(ended - started, 2),
+              "route": answer_headers.get("x-switchback-route"),
+              "settings": answer_headers.get("x-switchback-settings")}
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return OK
+    print(result["answer"])
+    ttft = f"{result['ttft_ms']} ms" if result["ttft_ms"] is not None else "-"
+    log(f"tokens: {result['prompt_tokens']} in, {completion} out; first token {ttft}; "
+        f"{result['decode_tok_s']} tok/s; {result['total_s']} s")
+    if result["route"]:
+        log(f"route: {result['route']}")
+    if result["settings"]:
+        log(f"settings: {result['settings']}")
+    return OK
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         print(f"sb ai: {message}\n(see sb ai help)", file=sys.stderr)
@@ -1743,6 +2096,35 @@ def parser():
     speak.add_argument("--timeout", type=float, default=900)
     fit = sub.add_parser("fit", add_help=False, allow_abbrev=False)
     ai_fit.add_arguments(fit)
+    settings = sub.add_parser("settings", add_help=False, allow_abbrev=False)
+    settings.add_argument("model")
+    settings.add_argument("--profile")
+    settings.add_argument("--history", action="store_true")
+    settings.add_argument("--json", action="store_true")
+    set_cmd = sub.add_parser("set", add_help=False, allow_abbrev=False)
+    set_cmd.add_argument("model")
+    set_cmd.add_argument("pairs", nargs="+")
+    set_cmd.add_argument("--profile")
+    set_cmd.add_argument("--lock", action="store_true")
+    set_cmd.add_argument("--load", action="store_true")
+    set_cmd.add_argument("--apply", choices=("next-load", "now"), default="next-load")
+    set_cmd.add_argument("--wake", action="store_true")
+    set_cmd.add_argument("--json", action="store_true")
+    unset = sub.add_parser("unset", add_help=False, allow_abbrev=False)
+    unset.add_argument("model")
+    unset.add_argument("keys", nargs="+")
+    unset.add_argument("--profile")
+    unset.add_argument("--load", action="store_true")
+    revert = sub.add_parser("revert", add_help=False, allow_abbrev=False)
+    revert.add_argument("model")
+    revert.add_argument("revision", type=int)
+    chat = sub.add_parser("chat", add_help=False, allow_abbrev=False)
+    chat.add_argument("model")
+    chat.add_argument("prompt")
+    chat.add_argument("--profile")
+    chat.add_argument("--set", action="append")
+    chat.add_argument("--json", action="store_true")
+    chat.add_argument("--timeout", type=float, default=900)
     return top
 
 
@@ -1784,6 +2166,16 @@ def main(argv=None, environ=None):
             return cmd_transcribe(gw, args)
         if args.command == "speak":
             return cmd_speak(gw, config, args)
+        if args.command == "settings":
+            return cmd_settings(gw, args)
+        if args.command == "set":
+            return cmd_set(gw, args)
+        if args.command == "unset":
+            return cmd_unset(gw, args)
+        if args.command == "revert":
+            return cmd_revert(gw, args)
+        if args.command == "chat":
+            return cmd_chat(gw, args)
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
         message = gw.scrub(failure.message) if gw else failure.message

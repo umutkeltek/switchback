@@ -267,6 +267,40 @@ pub fn apply_engine_reasoning(engine: sb_core::OpenAiEngine, body: &mut Value) {
     }
 }
 
+/// Model settings asked for thinking on without an effort: llama.cpp and
+/// vLLM switch it through the chat template. A request's own
+/// `enable_thinking` is never overwritten.
+pub fn apply_engine_thinking_on(engine: sb_core::OpenAiEngine, body: &mut Value) {
+    use sb_core::OpenAiEngine;
+    if !matches!(engine, OpenAiEngine::LlamaCpp | OpenAiEngine::Vllm) {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    let kwargs = obj
+        .entry("chat_template_kwargs")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(kwargs) = kwargs.as_object_mut() {
+        kwargs.entry("enable_thinking").or_insert(Value::Bool(true));
+    }
+}
+
+/// Sampling keys an engine spells differently from the model-settings
+/// names (which follow llama.cpp): vLLM reads `repetition_penalty`. A
+/// request that already sent vLLM's own name keeps it.
+pub fn apply_engine_sampling(engine: sb_core::OpenAiEngine, body: &mut Value) {
+    if engine != sb_core::OpenAiEngine::Vllm {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if let Some(value) = obj.remove("repeat_penalty") {
+        obj.entry("repetition_penalty").or_insert(value);
+    }
+}
+
 impl WireCodec for EngineChatCodec {
     fn id(&self) -> &'static str {
         OpenAiCodec.id()
@@ -277,6 +311,13 @@ impl WireCodec for EngineChatCodec {
     fn request_body(&self, req: &AiRequest, model: &str, stream: bool) -> Result<Value, String> {
         let mut body = OpenAiCodec.request_body(req, model, stream)?;
         apply_engine_reasoning(self.engine, &mut body);
+        if req
+            .metadata
+            .contains_key(sb_core::REASONING_ENABLE_METADATA_KEY)
+        {
+            apply_engine_thinking_on(self.engine, &mut body);
+        }
+        apply_engine_sampling(self.engine, &mut body);
         Ok(body)
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
