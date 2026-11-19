@@ -94,8 +94,9 @@ the transcript (--format text, the default) or writes it to OUT. --speakers asks
 the route `diarize` (or --model) who spoke when and prints one line per turn,
 like `[00:01:03] SPEAKER_00: text`; with --format json it gives the raw answer.
 A file that is not wav, mp3, m4a, flac, ogg or webm is first turned into 16 kHz
-mono wav when ffmpeg is on the PATH, else sent as it is. speak saves the audio
-to OUT; the extension picks the format (mp3, wav, opus, aac, flac, pcm). Its
+mono Ogg/Opus at 32 kbps (FLAC when ffmpeg has no libopus) when ffmpeg is on the
+PATH, else sent as it is. speak saves the audio to OUT; the extension picks the
+format (.mp3, .wav, .opus or .ogg, .aac, .flac, .pcm). Its
 model is --model, else SWITCHBACK_AI_SPEECH_MODEL, else the gateway's one speech
 model. Both wait up to --timeout SECS (default 900).
 
@@ -119,8 +120,10 @@ AUDIO_KINDS = ("audio_transcription", "audio_speech")
 # Audio the gateway's engines read as they are; anything else goes through ffmpeg.
 AUDIO_EXTENSIONS = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4",
                     ".flac": "audio/flac", ".ogg": "audio/ogg", ".webm": "audio/webm"}
-SPEECH_FORMATS = {".mp3": "mp3", ".wav": "wav", ".opus": "opus", ".aac": "aac", ".flac": "flac",
-                  ".pcm": "pcm"}
+# `speak -o FILE`: the extension picks one of OpenAI's speech formats. Opus
+# comes in an Ogg container, so .ogg is opus too.
+SPEECH_FORMATS = {".mp3": "mp3", ".wav": "wav", ".opus": "opus", ".ogg": "opus", ".aac": "aac",
+                  ".flac": "flac", ".pcm": "pcm"}
 VIDEO_FPS = 24
 # How long `sb ai on` keeps the machine on when no duration is given.
 DEFAULT_HOLD_DURATION = "1h"
@@ -383,6 +386,9 @@ def catalog(gw, every_id=False):
     if not every_id:
         result["text"] = plain_text_names(result["text"])
         result["audio"] = plain_text_names(result["audio"])
+        # /v1/models marks a speech route's targets and provider as speech
+        # too; only the names people use are speech models to choose from.
+        result["speech"] = {m for m in result["audio"] if m in result["speech"]}
     return result
 
 
@@ -1015,24 +1021,37 @@ def multipart(fields, filename, content_type, data):
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
+def ffmpeg_has_libopus(ffmpeg):
+    run = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True)
+    return run.returncode == 0 and "libopus" in run.stdout
+
+
 def audio_file(path, workdir):
     """(name, content type, bytes) to send: the file itself when engines read
-    it as it is, else a 16 kHz mono wav made by ffmpeg when it is installed."""
+    it as it is, else mono 16 kHz Ogg/Opus at 32 kbps made by ffmpeg when it is
+    installed (about 14 MiB an hour, well under the usual 25 MiB upload limit),
+    or FLAC when this ffmpeg has no libopus."""
     if not os.path.isfile(path):
         raise Fail(USAGE, f"cannot read {path}: no such file")
     name = os.path.basename(path)
     ext = os.path.splitext(name)[1].lower()
     ffmpeg = shutil.which("ffmpeg")
     if ext not in AUDIO_EXTENSIONS and ffmpeg:
-        wav = os.path.join(workdir, os.path.splitext(name)[0] + ".wav")
-        log(f"converting {name} to 16 kHz mono wav")
-        run = subprocess.run([ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-i", path,
-                              "-ac", "1", "-ar", "16000", "-f", "wav", wav],
+        if ffmpeg_has_libopus(ffmpeg):
+            ext, label, codec = ".ogg", "Ogg/Opus", ["-c:a", "libopus", "-b:a", "32k", "-f", "ogg"]
+        else:
+            ext, label, codec = ".flac", "FLAC", ["-c:a", "flac", "-f", "flac"]
+        converted = os.path.join(workdir, os.path.splitext(name)[0] + ext)
+        log(f"converting {name} to 16 kHz mono {label}")
+        # `file:` keeps a name like `concat:a|b` or `http://x` a plain file.
+        source = "file:" + os.path.abspath(path)
+        run = subprocess.run([ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-i", source,
+                              "-vn", "-ac", "1", "-ar", "16000", *codec, converted],
                              capture_output=True, text=True)
         if run.returncode != 0:
             detail = (run.stderr.strip().splitlines() or ["no detail"])[-1]
             raise Fail(USAGE, f"ffmpeg cannot read {path}: {detail}")
-        path, name, ext = wav, os.path.basename(wav), ".wav"
+        path, name = converted, os.path.basename(converted)
     try:
         with open(path, "rb") as handle:
             data = handle.read()
@@ -1135,13 +1154,14 @@ def speech_model(gw, config, args):
 def cmd_speak(gw, config, args):
     if not args.text.strip():
         raise Fail(USAGE, "give the text to speak")
+    fmt = SPEECH_FORMATS.get(os.path.splitext(args.output)[1].lower())
+    if not fmt:
+        allowed = ", ".join(SPEECH_FORMATS)
+        raise Fail(USAGE, f"-o must end in one of {allowed}: the extension picks the audio format")
     model = speech_model(gw, config, args)
-    body = {"model": model, "input": args.text}
+    body = {"model": model, "input": args.text, "response_format": fmt}
     if args.voice:
         body["voice"] = args.voice
-    fmt = SPEECH_FORMATS.get(os.path.splitext(args.output)[1].lower())
-    if fmt:
-        body["response_format"] = fmt
     log(f"speaking {len(args.text)} characters with {model}")
     try:
         audio = gw.call("POST", "/v1/audio/speech", body=body, timeout=args.timeout, raw=True)

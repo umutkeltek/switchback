@@ -593,19 +593,30 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout), DIARIZED)
 
-    def test_transcribe_turns_other_files_into_wav_with_ffmpeg(self):
+    def fake_ffmpeg(self, encoders=" A..... libopus              libopus Opus\n"):
+        """An ffmpeg on the PATH that lists `encoders` and writes its own
+        arguments into the output file (the last argument)."""
         bin_dir = self.root / "bin"
-        bin_dir.mkdir()
+        bin_dir.mkdir(exist_ok=True)
         ffmpeg = bin_dir / "ffmpeg"
-        ffmpeg.write_text('#!/bin/sh\nfor last; do :; done\nprintf "RIFF-from-ffmpeg:%s" "$*" > "$last"\n')
+        ffmpeg.write_text('#!/bin/sh\ncase "$*" in *-encoders*) printf %s "$ENCODERS"; exit 0;; esac\n'
+                          'for last; do :; done\nprintf "FROM-ffmpeg:%s" "$*" > "$last"\n')
         ffmpeg.chmod(0o755)
-        env = dict(self.env, PATH=f"{bin_dir}:{self.env['PATH']}")
-        run = self.sb("transcribe", str(self.wav("meeting.mkv", b"matroska")), env=env)
+        return ffmpeg, dict(self.env, PATH=f"{bin_dir}:{self.env['PATH']}", ENCODERS=encoders)
+
+    def test_transcribe_turns_other_files_into_small_opus_with_ffmpeg(self):
+        ffmpeg, env = self.fake_ffmpeg()
+        source = self.wav("meeting.mkv", b"matroska")
+        run = self.sb("transcribe", str(source), env=env)
         self.assertEqual(run.returncode, 0, run.stderr)
         filename, ctype, data = form_parts(self.posted("/v1/audio/transcriptions"))["file"]
-        self.assertEqual((filename, ctype), ("meeting.wav", "audio/wav"))
-        self.assertTrue(data.startswith(b"RIFF-from-ffmpeg:"), data)
-        self.assertIn(b"-ac 1 -ar 16000 -f wav", data)
+        self.assertEqual((filename, ctype), ("meeting.ogg", "audio/ogg"))
+        self.assertTrue(data.startswith(b"FROM-ffmpeg:"), data)
+        # Mono 16 kHz Opus at 32 kbps: an hour is about 14 MiB, not 110 MiB of wav.
+        self.assertIn(b"-ac 1 -ar 16000 -c:a libopus -b:a 32k -f ogg", data)
+        # The input is always a plain file, never a protocol like concat:.
+        self.assertIn(f"-i file:{source}".encode(), data)
+        self.assertIn("to 16 kHz mono Ogg/Opus", run.stderr)
         # A file engines read as it is never goes through ffmpeg.
         self.fake.seen.clear()
         run = self.sb("transcribe", str(self.wav("talk.mp3", b"ID3mp3")), env=env)
@@ -614,12 +625,23 @@ class SbAi(unittest.TestCase):
                          ("talk.mp3", "audio/mpeg", b"ID3mp3"))
         # ffmpeg that cannot read the file: a usage error, nothing sent.
         self.fake.seen.clear()
-        ffmpeg.write_text("#!/bin/sh\necho 'Invalid data found when processing input' >&2\nexit 1\n")
+        ffmpeg.write_text('#!/bin/sh\ncase "$*" in *-encoders*) exit 0;; esac\n'
+                          "echo 'Invalid data found when processing input' >&2\nexit 1\n")
         run = self.sb("transcribe", str(self.wav("broken.mkv", b"x")), env=env)
         self.assertEqual(run.returncode, 2)
         self.assertIn("ffmpeg cannot read", run.stderr)
         self.assertIn("Invalid data found", run.stderr)
         self.assertEqual(self.requests("POST"), [])
+
+    def test_transcribe_falls_back_to_flac_without_libopus(self):
+        _, env = self.fake_ffmpeg(encoders=" A..... flac                 FLAC\n")
+        source = self.wav("concat:meeting.mkv", b"matroska")
+        run = self.sb("transcribe", str(source), env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        filename, ctype, data = form_parts(self.posted("/v1/audio/transcriptions"))["file"]
+        self.assertEqual((filename, ctype), ("concat:meeting.flac", "audio/flac"))
+        self.assertIn(b"-ac 1 -ar 16000 -c:a flac -f flac", data)
+        self.assertIn(f"-i file:{source}".encode(), data)
 
     def test_transcribe_error_paths(self):
         run = self.sb("transcribe", str(self.root / "missing.wav"))
@@ -644,7 +666,14 @@ class SbAi(unittest.TestCase):
         self.assertIn("does not answer", run.stderr)
 
     def test_speak_saves_the_audio_in_the_format_of_the_extension(self):
-        self.fake.models.append({"id": "speak", "kind": "audio_speech"})
+        # What a real gateway lists for one speech route: the route, its
+        # target and its provider, all marked as speech.
+        self.fake.models.extend([{"id": "speak", "kind": "audio_speech"},
+                                 {"id": "tts/kokoro", "kind": "audio_speech"},
+                                 {"id": "tts", "kind": "audio_speech"},
+                                 {"id": "transcribe", "kind": "audio_transcription"},
+                                 {"id": "stt/whisper", "kind": "audio_transcription"},
+                                 {"id": "stt", "kind": "audio_transcription"}])
         out = self.root / "hello.mp3"
         run = self.sb("speak", "Hallo Welt", "--voice", "af_heart", "-o", str(out))
         self.assertEqual(run.returncode, 0, run.stderr)
@@ -656,13 +685,19 @@ class SbAi(unittest.TestCase):
         # The configured default wins over the gateway's list.
         self.fake.seen.clear()
         env = dict(self.env, SWITCHBACK_AI_SPEECH_MODEL="tts/kokoro")
-        run = self.sb("speak", "hi", "-o", str(self.root / "hi.out"), env=env)
+        run = self.sb("speak", "hi", "-o", str(self.root / "hi.ogg"), env=env)
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(self.posted("/v1/audio/speech")["json"], {"model": "tts/kokoro", "input": "hi"})
+        self.assertEqual(self.posted("/v1/audio/speech")["json"],
+                         {"model": "tts/kokoro", "input": "hi", "response_format": "opus"})
 
     def test_speak_error_paths(self):
         run = self.sb("speak", "hi")  # no -o
         self.assertEqual(run.returncode, 2)
+        for name in ("a.m4a", "a.out", "noextension"):  # no speech format matches
+            run = self.sb("speak", "hi", "--model", "speak", "-o", str(self.root / name))
+            self.assertEqual(run.returncode, 2, name)
+            self.assertIn("-o must end in one of .mp3, .wav, .opus, .ogg, .aac, .flac, .pcm", run.stderr)
+        self.assertEqual(self.requests("POST"), [])
         run = self.sb("speak", "hi", "-o", str(self.root / "a.wav"))  # the gateway offers no speech model
         self.assertEqual(run.returncode, 2)
         self.assertIn("choose a speech model with --model (the gateway offers: none)", run.stderr)
