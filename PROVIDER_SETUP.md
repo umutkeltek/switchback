@@ -471,10 +471,10 @@ not: it gets 403.
 ```sh
 curl -s -X POST "$SB/v1/hosts/gpu-box/power" -H "authorization: Bearer $KEY" \
   -H 'content-type: application/json' -d '{"action": "off"}'
-# 200 {"host":"gpu-box","action":"off","powered_off":true,"lanes":2,"released_holds":[]}
+# 200 {"host":"gpu-box","action":"off","powered_off":true,"already_off":false,"lanes":2,"released_holds":[]}
 curl -s -X POST "$SB/v1/hosts/gpu-box/power" -H "authorization: Bearer $KEY" \
   -H 'content-type: application/json' -d '{"action": "on"}'
-# 202 {"host":"gpu-box","action":"on","status":"waking","lanes":2}
+# 202 {"host":"gpu-box","action":"on","status":"waking","lanes":2}   (200 "status":"up" when it already runs)
 ```
 
 `off` runs the machine's `poweroff_command`, exactly as the idle timer does,
@@ -483,14 +483,15 @@ a typed `reason` while the machine must stay on:
 
 | `reason` | why |
 |---|---|
-| `hold_active` | a hold is active; the message names the holds. `{"action": "off", "release_holds": true}` ends them first and names them in the answer (`released_holds`). |
+| `hold_active` | a hold is active; the message names the holds. `{"action": "off", "release_holds": true}` ends the holds that were active when the request came, once every other check has passed, and names them in the answer (`released_holds`). A hold taken while the request is being checked refuses it, and then no hold ends. |
 | `lane_busy` | a lane of the machine has work in flight or queued. |
 | `guard_busy` | the machine's power-off guard says somebody else is using it. |
 | `guard_unavailable` | the guard gave no answer; the machine stays on. |
 | `uptime_too_short` | the machine has not been up long enough (see `poweroff_min_uptime_secs` below). |
 | `no_poweroff_command` | the machine has no power-off command: it is always on and the gateway never powers it off. |
 | `wake_in_flight` | a wake is running on the machine; it is coming up now. |
-| `poweroff_in_flight` | another power-off is already running. |
+| `poweroff_in_flight` | another power-off (an operator's or the idle timer's) is already running. |
+| `idle_check_in_flight` | the idle timer is checking the machine right now (its guard is still asking); the request waits up to 2 s for it first. Ask again in a moment. |
 
 `on` wakes the machine through the same wake path a hold with `wake: true`
 uses and answers at once (202): the wake runs in the background. It takes
@@ -498,20 +499,33 @@ no hold, so the idle timer still applies and the machine powers off again
 once it has been idle long enough. A machine with no `wake_command` answers
 409 (`no_wake_command`): it is always on.
 
-Asking for a machine that this gateway already powered off (and that has
-not come back) is a no-op, not a failed power-off: the command is not run
-again, so a sleeping machine is not asked to power off a second time.
+The power-off holds the machine's wake lock from its first check until
+the command has returned and every lane is marked off, as the idle
+power-off does: no wake (a request's, a job's, a hold's) can bring a lane
+up on a machine that is going away; it waits and wakes the machine again
+afterwards. Holds and lane work are checked a last time under every
+lane's lock, in the same step that marks the lanes `powering_off`, so a
+request or a hold that arrives while the guard runs refuses the
+power-off. A command that fails (502, `poweroff_failed`) leaves the lanes
+as they were, so the idle power-off still runs later.
+
+A machine none of whose lanes answers a fresh health probe is already
+off, whoever put it to sleep: the answer is 200 with `"already_off":
+true` and no command runs (one that reaches a sleeping machine fails,
+and a false failure would escalate the lane and alert).
 
 Every refusal and every action is written to the gateway log. A power-off
 that fails escalates the lane and fires the same `poweroff_failed` alert
 the idle power-off fires; a successful one alerts nothing.
 
 `poweroff_min_uptime_secs` on a lane (default 0, no minimum) is the
-shortest time a machine may have been up before a power-off runs. The idle
-timer waits for the idle timeout anyway; this is the rule that keeps an
-operator's request from cutting off a machine that booted a second ago.
-The uptime is counted from the moment the gateway last woke the machine,
-or from the moment it first saw it up.
+shortest time the machine may have been up before it is powered off. An
+operator's `off` is refused while the machine is younger
+(`uptime_too_short`); the idle power-off waits until it is old enough. The
+uptime runs from the first answer of one of the machine's lanes since
+every lane was last seen down, so a machine that slept and came back, or a
+wake that timed out, starts a new count. On a shared machine the
+strictest lane counts.
 
 **The capacity report.** Each lane in `GET /v1/workloads/capacity` carries
 `poweroff_in_secs`: seconds until its machine's idle power-off, `null` while
@@ -844,8 +858,11 @@ providers:
 The `path` of a binding is the place in the graph the value goes; the
 parent nodes must exist in the graph already. `output_node_ids` names the
 nodes whose output is the artifact; without it every output of the graph is
-taken. `GET /v1/workflows` lists the workflow with the inputs it binds
-(`image` as an artifact, `prompt` as text) and one `artifact` output.
+taken. `GET /v1/workflows` lists the workflow inputs it binds: `image` as a
+required artifact, and `prompt` as optional text where the workflow binds
+one. A workflow job is checked before any machine wakes: a workflow that
+binds `image` needs one (400 without it), and a `prompt` the workflow does
+not bind is refused (400) instead of failing later at binding.
 
 **Public model ids.** A workflow's id for callers is `<provider id>/<workflow
 id>` by default, so the provider's name shows in every caller's model name.
