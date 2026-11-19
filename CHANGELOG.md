@@ -9,6 +9,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **A limit and queue per local lane** (`max_in_flight`, `queue_timeout_secs`,
+  `on_full: spill | queue` on a `local_executors` entry): work past the limit
+  waits in a FIFO queue or, by default, spills to the route's next target; a
+  wait past the timeout is a retryable 503 `local_lane_queue_timeout`. Counts
+  show as `slots` in `GET /v1/workloads/capacity`. Works with GPU groups,
+  holds, wake on request and idle power-off; a queued request keeps the
+  machine on.
+- **Measured speed per request and per target**: usage records carry
+  `ttft_ms`, `prompt_tps` and `decode_tps`, each with its source (`engine`
+  from a llama.cpp server's `timings`, else `gateway` clocks); store
+  migration 20 adds them (rollback-safe). `GET /v1/targets/stats` shows
+  per-target p50 decode and prompt speed, p50 time to first token, count and
+  last seen. Routing does not use them yet.
+
 - **Public model ids for workflows** (`model_id`, `aliases` on a ComfyUI
   workflow): callers see and send a name by job (`image/flux`, `video/i2v`)
   instead of `<provider>/<workflow>`, in requests, `GET /v1/workflows`, job

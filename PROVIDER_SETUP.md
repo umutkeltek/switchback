@@ -471,10 +471,95 @@ the machine has work or a waiting request, is held, is off, or has no
 lane also lists `holds`, its machine's active holds (`id`, `reason`,
 `expires_at`, `expires_at_ms`, `owner` (tenant name, never a key), `state`).
 A client key (it got 403 before) reads a view of its own: per lane `name`,
-`host`, `state`, `level`, `queue_depth`, `in_flight`, `poweroff_in_secs`, and
-its own holds only, with `"view": "client"`; no details, errors, commands,
+`host`, `state`, `level`, `queue_depth`, `in_flight`, `slots`,
+`poweroff_in_secs`, and its own holds only, with `"view": "client"`; no details, errors, commands,
 artifact store or alert state, and nothing of another tenant. Operator and
 admin keys get the full report, which also shows `alerts`.
+
+**Limit each lane: `max_in_flight` and its queue.** One slow local engine
+must not be flooded. Give its lane a limit:
+
+```yaml
+local_executors:
+  - name: llamacpp
+    host: gpu-box
+    # ... wake, power and health settings as above ...
+    max_in_flight: 2          # at most 2 requests and media jobs at once (unset = no limit)
+    queue_timeout_secs: 60    # the longest one waits for a place (default 60; 0 = never wait)
+    on_full: spill            # spill (default) | queue
+```
+
+Every text or embeddings request dispatched to the lane's provider takes a
+place, and so does every media job; the place is given back when the
+response is complete, the stream ends, the client goes away, the attempt
+fails, or the task panics or is cancelled. Work past the limit waits in the
+lane's queue, oldest first: a newcomer never jumps it. A request waiting there
+counts in the lane's `queue_depth`, so the machine's idle power-off waits for
+it; one whose client disconnects leaves the queue at once.
+
+What a request does when its route's first choice is on a full lane:
+
+- `on_full: spill` (default): it goes at once to the route's next target that
+  can serve it. The lane's targets are skipped with the reason (`local lane
+  `llamacpp` is full (2 of 2 in flight, 0 queued), spilled to the route's next
+  target`), never counted as failures. Only when no other target can serve
+  does the request wait in the queue.
+- `on_full: queue`: it waits in the queue first, and falls through to the next
+  target only once `queue_timeout_secs` passed.
+
+A request still waiting after `queue_timeout_secs` falls through to the next
+target, or, when nothing else can serve, gets a retryable 503 with
+`Retry-After` and the error code `local_lane_queue_timeout`. A full lane
+reached as a later fallback (or by a hedge racer) is skipped at once, never
+waited for. A media job always queues, and one that waits past the timeout
+fails with the same code (503 on the blocking image route). The wait for a
+place comes before the wake and before the GPU group: a queued request holds
+no GPU, so a waiting media job can still take the group when the running work
+ends. So a request waits at most `wake_wait_secs` + `queue_timeout_secs` +
+`group_wait_secs`. A reload that changes the limit keeps the work that holds a
+place and the order of the queue; a lower limit only makes new work wait.
+
+Each lane in `GET /v1/workloads/capacity` shows its places:
+
+```json
+"slots": {"max_in_flight": 2, "in_use": 2, "queued": 1,
+          "on_full": "spill", "queue_timeout_secs": 60}
+```
+
+**Measured speed of each target.** Every text usage record carries how fast
+it was served, each number with its source:
+
+- `ttft_ms`: time from dispatching the attempt to its first token (wake, queue
+  and GPU waits come before the dispatch and are not in it); always `gateway`.
+- `prompt_tps`: prompt tokens per second.
+- `decode_tps`: generated tokens per second.
+- `ttft_source`, `prompt_tps_source`, `decode_tps_source`: `engine` when the
+  engine reported its own timing (a llama.cpp server's `timings`: `prompt_n`,
+  `prompt_ms`, `predicted_n`, `predicted_ms`, on the response or on the last
+  stream chunk), `gateway` when computed from the gateway's clocks:
+  `decode = output_tokens / (end - first token)` and `prompt = input_tokens /
+  ttft` (a lower bound: it includes the network and any upstream queue).
+
+A number nothing measured is left out rather than made up: no token, no
+tokens counted, or a response that arrived in one piece (no decode window).
+Engine timings never reach the client. They are stored with the usage
+(SQLite migration 20; older rows have none) and summarized, read-only, at
+`GET /v1/targets/stats` (any key, client keys included):
+
+```sh
+curl -s "$SB/v1/targets/stats?limit=2000" -H "authorization: Bearer $KEY"
+# {"object":"list",
+#  "window":{"limit":2000,"records":1840,"durable":true},
+#  "data":[{"target":"llamacpp/qwen","provider_id":"llamacpp","model":"qwen",
+#           "count":1200,"last_seen_unix":...,
+#           "p50_decode_tps":41.7,"p50_prompt_tps":1630.2,"p50_ttft_ms":180,
+#           "decode_sources":{"engine":1190,"gateway":10},
+#           "prompt_sources":{"engine":1190,"gateway":10},"ttft_samples":1200}]}
+```
+
+The window is the most recent `limit` usage records (default 2000, at most
+10000). A target's medians mix sources when it reported both; the
+`*_sources` counts say how. Routing does not read these numbers yet.
 
 **Alerts.** Set `server.alert_command` to hear about a problem without
 watching the report:

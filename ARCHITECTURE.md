@@ -233,6 +233,42 @@ the engine's live resolver through `LaneCredentials`, and only to a
 wake. `scheme_auth` attaches that credential with the adapters'
 `SchemeSigner`, for ComfyUI calls, the probe and the provider doctor.
 
+A lane may set `max_in_flight` (with `queue_timeout_secs` and `on_full`).
+Its places live in `sb-server::lane_slots::LaneSlots`, owned by the lane's
+executor (kept across reloads): a counter and a FIFO queue of tickets on the
+activator's clock seam. A ticket leaves the queue on drop (client gone, wait
+over) and a `SlotPermit` gives its place back on drop, so error, panic
+unwinding and task abort all free it. Every dispatch to such a lane holds a
+permit inside its `LaneBusy` guard: the route's first choice takes it in the
+pre-dispatch step (`Engine::take_lane_before_dispatch`, the same step and
+bound order as the GPU group: place first, then group, so a queued request
+never holds the GPU), any other dispatch only without waiting
+(`LaneStatus::try_begin_request` refuses on a full lane and the target is
+skipped). With `on_full: spill` the step first asks `LaneStatus::lane_full`;
+when the lane is full and the plan without the lane's targets selects another
+provider, those targets are skipped with the reason and nothing waits; else the
+request queues. A wait that runs out is `LaneAcquire::QueueTimeout`: the
+targets are skipped, and the plan's 503 when nothing else serves is typed
+`local_lane_queue_timeout` with `Retry-After`. Media jobs take a place first
+in `run_job_noted` (before wake and group) and fail with
+`JobError::QueueTimeout`. Waiting is counted in the lane's `waiting`, which
+the host's idle check already reads, so a queue keeps the machine on. The
+capacity report shows the lane's `slots`.
+
+Each text attempt also measures its speed (`sb-ledger::RequestSpeed`): the
+OpenAI codec turns a llama.cpp `timings` object into `Usage.engine_timings`
+(non-streamed body) or an `AiStreamEvent::EngineTimings` (last stream chunk,
+a separate event so no egress encoder emits it; the stream meter and the
+collector fold it into the usage). `stream::attempt_speed` takes the attempt
+start, the first-token time and token-event count from `watch_first_token`,
+and the end; engine numbers win, gateway numbers fill the rest, each tagged
+with its source. The record carries it into the ledger, the JSONL line and
+the store (migration 20: six nullable `usage` columns; the previous binary
+names its columns in every statement, so it keeps working on a migrated
+file). `GET /v1/targets/stats` folds the most recent usage records into
+per-target medians (`sb_ledger::target_speed_stats`). Routing does not read
+them in this slice.
+
 Media work runs as jobs (`sb-server::workloads`). Every job, from
 `POST /v1/jobs` (background, answered 202 at once) or
 `/v1/images/generations` (which waits for it), is one task created by
