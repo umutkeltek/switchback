@@ -273,7 +273,21 @@ pub(crate) async fn power(
 
 /// The machine is powered off now.
 async fn power_off(state: &AppState, host: &str, release_holds: bool) -> Response {
-    match state.capacity.power_off(host, release_holds).await {
+    // The power-off runs in its own task: a caller that goes away
+    // mid-command (Ctrl-C, a client timeout) drops this handler, and a
+    // power-off cancelled there would leave every lane "powering off" and
+    // stop the idle power-off. The task always finishes the lanes or puts
+    // them back.
+    let capacity = state.capacity.clone();
+    let machine = host.to_string();
+    let task = tokio::spawn(async move { capacity.power_off(&machine, release_holds).await });
+    let result = match task.await {
+        Ok(result) => result,
+        Err(join) => Err(PowerOffError::Failed(format!(
+            "the power-off task ended early: {join}"
+        ))),
+    };
+    match result {
         Ok(outcome) => Json(json!({
             "host": host,
             "action": "off",

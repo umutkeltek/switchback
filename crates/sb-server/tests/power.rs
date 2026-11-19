@@ -139,6 +139,61 @@ async fn an_operator_powers_a_machine_off_now() {
     let _ = std::fs::remove_file(&marker);
 }
 
+// A caller that goes away while the power-off command runs (Ctrl-C, a
+// client timeout) must not leave the machine "powering off": the power-off
+// still finishes, and the lane ends off, so the idle power-off keeps working.
+#[tokio::test]
+async fn a_caller_that_goes_away_mid_power_off_does_not_strand_the_lanes() {
+    let gate = marker("gate");
+    let ran = marker("ran");
+    let lane = format!(
+        "    wake_command: \"/usr/bin/true\"\n    poweroff_command: \"while [ ! -f '{}' ]; do sleep 0.05; done; echo off >> '{}'\"",
+        gate.display(),
+        ran.display()
+    );
+    let base = serve(&up_config(&lane).await).await;
+    // The caller gives up while the command still waits on the gate.
+    let gave_up = reqwest::Client::new()
+        .post(format!("{base}/v1/hosts/gpu-box/power"))
+        .bearer_auth(OPERATOR)
+        .timeout(std::time::Duration::from_millis(800))
+        .json(&json!({"action": "off"}))
+        .send()
+        .await;
+    assert!(gave_up.is_err(), "the caller timed out: {gave_up:?}");
+    std::fs::write(&gate, b"go").unwrap();
+    let mut state = Value::Null;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let capacity: Value = reqwest::Client::new()
+            .get(format!("{base}/v1/workloads/capacity"))
+            .bearer_auth(OPERATOR)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lane = capacity["data"]
+            .as_array()
+            .and_then(|lanes| lanes.iter().find(|lane| lane["name"] == "text"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        state = lane["state"].clone();
+        if state != "powering_off" && std::fs::read_to_string(&ran).is_ok() {
+            break;
+        }
+    }
+    let done = std::fs::read_to_string(&ran).unwrap_or_default();
+    assert!(
+        done.contains("off"),
+        "the power-off command finished: {done:?}"
+    );
+    assert_ne!(state, "powering_off", "the lane must not stay powering off");
+    let _ = std::fs::remove_file(&gate);
+    let _ = std::fs::remove_file(&ran);
+}
+
 // A second power-off on a machine this gateway powered off is a no-op, not
 // a failed power-off: a command that reaches a sleeping machine fails, and
 // a false failure would escalate the lane and alert.
