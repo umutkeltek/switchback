@@ -35,13 +35,13 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-/// Usage/cost summary from the append-only ledger — requests + attributed cost
-/// (micro-USD and USD) by model and provider. The "see every cost" surface that
-/// complements the explainable "see every decision" route headers.
+/// Most usage records the per-target speed summary reads at once.
+const TARGET_STATS_MAX_LIMIT: usize = 5_000;
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct TargetStatsQuery {
     /// How many recent usage records to summarize (default 2000, at most
-    /// 10000).
+    /// 5000).
     limit: Option<usize>,
 }
 
@@ -50,13 +50,38 @@ pub(crate) struct TargetStatsQuery {
 /// prompt tokens per second, p50 time to first token, how many records
 /// carried them and from which source, and when the target was last seen.
 /// The records come from the durable store when one is attached, else from
-/// memory. Metadata only; client keys may read it, like the capacity report.
+/// memory. Metadata only; client keys may read it, like the capacity report,
+/// but a non-admin key sees only its own tenant's records on targets its
+/// scoped config can reach (like `/v1/usage` and `/v1/models`): nothing of
+/// another tenant. Admin keys see every target.
 pub(crate) async fn target_stats(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<TargetStatsQuery>,
 ) -> Json<serde_json::Value> {
-    let limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
-    let recent = state.ledger.recent(limit);
+    let limit = query
+        .limit
+        .unwrap_or(2_000)
+        .clamp(1, TARGET_STATS_MAX_LIMIT);
+    let mut recent = state.ledger.recent(limit);
+    if !principal.is_admin() {
+        let snap = state.snapshot();
+        let scoped = crate::controlplane::scoped_config_for_principal(&snap.config, &principal);
+        let visible: HashSet<&str> = scoped
+            .routes
+            .iter()
+            .flat_map(|route| route.targets.iter())
+            .chain(scoped.combos.values().flat_map(|combo| combo.models.iter()))
+            .map(String::as_str)
+            .collect();
+        // A non-admin key without a tenant sees nothing.
+        let tenant = principal.tenant.as_deref();
+        recent.retain(|record| {
+            tenant.is_some()
+                && record.tenant.as_deref() == tenant
+                && visible.contains(format!("{}/{}", record.provider_id, record.model).as_str())
+        });
+    }
     let data = sb_ledger::target_speed_stats(&recent);
     Json(serde_json::json!({
         "object": "list",
@@ -69,6 +94,9 @@ pub(crate) async fn target_stats(
     }))
 }
 
+/// Usage/cost summary from the append-only ledger — requests + attributed cost
+/// (micro-USD and USD) by model and provider. The "see every cost" surface that
+/// complements the explainable "see every decision" route headers.
 pub(crate) async fn usage(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,

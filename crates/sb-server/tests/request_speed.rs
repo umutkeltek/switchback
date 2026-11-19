@@ -271,3 +271,105 @@ routes:
         .unwrap();
     assert_eq!(anonymous.status(), 401);
 }
+
+/// One usage record with a speed, as tenant `tenant` on `provider/echo`.
+fn record_as(ledger: &sb_ledger::UsageLedger, tenant: &str, provider: &str, ttft_ms: u64) {
+    ledger.record(
+        sb_ledger::UsageRecord::new(
+            format!("{tenant}-{provider}-{ttft_ms}"),
+            provider,
+            "echo",
+            None,
+            sb_core::Usage::default(),
+            ttft_ms,
+            false,
+            &sb_core::Catalog::default(),
+        )
+        .with_tenant(Some(tenant.to_string()))
+        .with_speed(sb_ledger::RequestSpeed {
+            ttft_ms: Some(ttft_ms),
+            ttft_source: Some(sb_ledger::SpeedSource::Gateway),
+            ..Default::default()
+        }),
+    );
+}
+
+/// The `target -> count` rows `key` sees on the summary.
+async fn stats_seen_by(gateway: &str, key: &str) -> Vec<(String, u64)> {
+    let stats: Value = reqwest::Client::new()
+        .get(format!("{gateway}/v1/targets/stats"))
+        .bearer_auth(key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    stats["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["target"].as_str().unwrap().to_string(),
+                row["count"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+// A client key sees only what its own tenant made, and only on targets its
+// scoped config can reach: nothing of another tenant. Admin keys see all.
+#[tokio::test]
+async fn a_client_key_sees_only_its_own_tenants_targets() {
+    let (gateway, ledger) = spawn_gateway(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+tenants:
+  - id: team-a
+    allowed_providers: ["mock"]
+  - id: team-b
+api_keys:
+  - key: "client-a"
+    tenant: team-a
+    role: client
+  - key: "client-b"
+    tenant: team-b
+    role: client
+  - key: "admin-key"
+    tenant: team-a
+    role: admin
+providers:
+  - id: mock
+    type: mock
+  - id: secret
+    type: mock
+routes:
+  - name: default
+    match: { model: "*" }
+    targets: ["mock/echo", "secret/echo"]
+"#,
+    )
+    .await;
+    record_as(&ledger, "team-a", "mock", 10);
+    record_as(&ledger, "team-b", "mock", 20);
+    // Used only by tenant B.
+    record_as(&ledger, "team-b", "secret", 30);
+    // Tenant A on a target outside its scope (say, before a config change).
+    record_as(&ledger, "team-a", "secret", 40);
+
+    assert_eq!(
+        stats_seen_by(&gateway, "client-a").await,
+        vec![("mock/echo".to_string(), 1)],
+        "tenant A sees neither B's records nor a target it cannot reach"
+    );
+    assert_eq!(
+        stats_seen_by(&gateway, "client-b").await,
+        vec![("mock/echo".to_string(), 1), ("secret/echo".to_string(), 1)]
+    );
+    assert_eq!(
+        stats_seen_by(&gateway, "admin-key").await,
+        vec![("mock/echo".to_string(), 2), ("secret/echo".to_string(), 2)]
+    );
+}
