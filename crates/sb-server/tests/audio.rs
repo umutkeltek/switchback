@@ -25,11 +25,14 @@ fn audio_bytes() -> Vec<u8> {
     bytes
 }
 
+/// (path, content type, authorization, raw body) of one engine call.
+type Seen = (String, String, String, Vec<u8>);
+
 #[derive(Clone, Default)]
 struct Engine {
     calls: Arc<AtomicUsize>,
     /// (path, content type, authorization, raw body) of every call.
-    seen: Arc<Mutex<Vec<(String, String, String, Vec<u8>)>>>,
+    seen: Arc<Mutex<Vec<Seen>>>,
     /// Answer every call with this status instead (a failing engine).
     fail_with: Option<u16>,
     /// Hold every answer until this is notified (a busy engine).
@@ -48,7 +51,7 @@ impl Engine {
         self.calls.load(Ordering::SeqCst)
     }
 
-    fn last(&self) -> (String, String, String, Vec<u8>) {
+    fn last(&self) -> Seen {
         self.seen
             .lock()
             .unwrap()
@@ -104,6 +107,14 @@ async fn engine_call(
         let mut audio = b"ID3-SPEECH:".to_vec();
         audio.extend(body["input"].as_str().unwrap_or("").as_bytes());
         return ([("content-type", "audio/mpeg")], audio).into_response();
+    }
+    if form_field(&body, "stream").as_deref() == Some("true") {
+        return (
+            [("content-type", "text/event-stream")],
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hel\"}\n\n\
+data: {\"type\":\"transcript.text.done\",\"text\":\"hello\"}\n\n",
+        )
+            .into_response();
     }
     match form_field(&body, "response_format").as_deref() {
         Some("srt") => (
@@ -619,6 +630,29 @@ async fn usage_records_kind_target_latency_and_audio_seconds() {
     assert!(record["latency_ms"].is_u64());
     let trace = trace(&gw.base, &id).await;
     assert_eq!(trace["final_status"], 200, "{trace}");
+}
+
+#[tokio::test]
+async fn a_streamed_transcript_passes_through_as_events() {
+    let e = engines().await;
+    let gw = spawn_gateway(
+        &config(&e.urls, &["stt1/whisper-large"], &["tts/voice"], ""),
+        sb_ledger::UsageLedger::in_memory(),
+    )
+    .await;
+    let response = transcribe(&gw.base, &[("model", "transcribe"), ("stream", "true")]).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let text = response.text().await.unwrap();
+    assert!(text.contains("transcript.text.delta"), "{text}");
+    assert!(text.contains("transcript.text.done"), "{text}");
+    assert_eq!(
+        form_field(&e.stt1.last().3, "stream").as_deref(),
+        Some("true")
+    );
+    let record = serde_json::to_value(&gw.ledger.snapshot()[0]).unwrap();
+    assert_eq!(record["workload_kind"], "audio_transcription");
+    assert_eq!(record["streamed"], true);
 }
 
 #[tokio::test]
