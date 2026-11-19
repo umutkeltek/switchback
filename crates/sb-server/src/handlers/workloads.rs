@@ -70,11 +70,32 @@ fn owner_of(principal: &tenancy::Principal) -> Owner {
 }
 
 fn workload_error(error: WorkloadError) -> Response {
+    if let WorkloadError::LaneQueueTimeout {
+        message,
+        retry_after_secs,
+    } = &error
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after_secs.to_string(),
+            )],
+            Json(json!({"error": {
+                "message": message,
+                "type": "workload_error",
+                "code": "local_lane_queue_timeout",
+            }})),
+        )
+            .into_response();
+    }
     let (status, kind) = match error {
         WorkloadError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "workload_error"),
         WorkloadError::TooManyJobs(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
         WorkloadError::Upstream(_) => (StatusCode::BAD_GATEWAY, "workload_error"),
-        WorkloadError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "workload_error"),
+        WorkloadError::Internal(_) | WorkloadError::LaneQueueTimeout { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "workload_error")
+        }
     };
     (
         status,
@@ -470,8 +491,8 @@ pub(crate) async fn workflows(State(state): State<AppState>) -> Response {
 /// snapshot). Metadata only — no prompts or media bodies.
 ///
 /// A client key gets a read-only view: per lane its name, machine, state,
-/// level, queue depth, in-flight count, power-off countdown and its own
-/// holds. No details, errors, commands, artifact store or alert state, and
+/// level, queue depth, in-flight count, its `max_in_flight` places
+/// (`slots`), power-off countdown and its own holds. No details, errors, commands, artifact store or alert state, and
 /// nothing of another tenant.
 pub(crate) async fn capacity(
     State(state): State<AppState>,
@@ -494,6 +515,7 @@ pub(crate) async fn capacity(
                     "level": report.level,
                     "queue_depth": report.queue_depth,
                     "in_flight": report.in_flight,
+                    "slots": report.slots,
                     "poweroff_in_secs": report.poweroff_in_secs,
                     "holds": holds,
                 })

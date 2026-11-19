@@ -21,6 +21,7 @@ mod http_response;
 mod idempotency;
 mod lane_cli;
 mod lane_profile_cli;
+mod lane_slots;
 mod lease;
 mod local_probe;
 mod mcp_cli;

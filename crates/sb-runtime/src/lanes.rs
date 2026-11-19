@@ -8,10 +8,10 @@
 
 use std::time::Duration;
 
-use sb_core::{AiRequest, ClientProfileConfig};
+use sb_core::{AiRequest, ClientProfileConfig, LaneOnFull, LocalExecutorConfig};
 
 use super::profiles::{plan_candidates, plan_resolved_route, CandidateResolution};
-use super::{Engine, ExecError, LaneAcquire, LaneBusy, LaneWake, Snapshot};
+use super::{Engine, ExecError, LaneAcquire, LaneBusy, LaneWake, Snapshot, LANE_QUEUE_RETRY_AFTER};
 
 /// The provider's lane is listed in the pinned config with `wake_on_request`
 /// (which config validation only accepts together with `route_health`).
@@ -41,8 +41,37 @@ pub(crate) fn on_shared_host(snap: &Snapshot, provider_id: &str) -> bool {
         .any(|lane| lane.name == provider_id && lane.host.is_some())
 }
 
-/// What taking the first choice's GPU group did, plus the busy guard that
-/// holds the group from here until the dispatch loop reaches that lane.
+/// The provider's lane entry in the pinned config, if it is a managed lane.
+fn lane_config<'a>(snap: &'a Snapshot, provider_id: &str) -> Option<&'a LocalExecutorConfig> {
+    snap.config
+        .local_executors
+        .iter()
+        .find(|lane| lane.name == provider_id)
+}
+
+/// The provider's lane is listed in the pinned config with a `max_in_flight`:
+/// every request to it takes a place under the limit.
+pub(crate) fn has_slot_limit(snap: &Snapshot, provider_id: &str) -> bool {
+    lane_config(snap, provider_id).is_some_and(|lane| lane.max_in_flight.is_some())
+}
+
+/// The targets of `provider_id` in `resolved`, skipped with `reason`.
+fn skip_lane(resolved: &mut CandidateResolution, provider_id: &str, reason: &str) {
+    for candidate in &resolved.candidates {
+        if candidate.provider_id == provider_id
+            && !resolved.lane_down.iter().any(|(id, _)| *id == candidate.id)
+        {
+            resolved
+                .lane_down
+                .push((candidate.id.clone(), reason.to_string()));
+        }
+    }
+}
+
+/// What taking the first choice's lane did (a place under `max_in_flight`,
+/// the GPU group, or a spill to another target), plus the busy guard that
+/// holds the place and the group from here until the dispatch loop reaches
+/// that lane.
 pub(crate) struct LaneGpuNote {
     note: LaneWakeNote,
     busy: Option<LaneBusy>,
@@ -75,6 +104,11 @@ impl LaneGpuNote {
 pub(crate) struct LaneWakeNote {
     provider_id: String,
     wake: LaneWake,
+    /// The typed error of the 503 when the lane did not get ready and the
+    /// plan still selected it.
+    code: &'static str,
+    /// The lane was full and the request went to another target at once.
+    spilled: bool,
 }
 
 impl LaneWakeNote {
@@ -86,18 +120,25 @@ impl LaneWakeNote {
     pub(crate) fn apply(&self, plan: &mut sb_router::RoutePlan) -> Result<(), ExecError> {
         match &self.wake {
             LaneWake::Ready { detail } => {
-                plan.decision
-                    .add_reason(format!("local lane `{}` {detail}", self.provider_id));
+                // A place taken at once on a lane with room says nothing.
+                if !detail.is_empty() {
+                    plan.decision
+                        .add_reason(format!("local lane `{}` {detail}", self.provider_id));
+                }
                 Ok(())
             }
             LaneWake::NotReady {
                 detail,
                 retry_after,
             } => {
-                plan.decision.add_reason(format!(
-                    "local lane `{}` {detail}, fell through",
-                    self.provider_id
-                ));
+                plan.decision.add_reason(if self.spilled {
+                    format!(
+                        "local lane `{}` {detail}, spilled to the route's next target",
+                        self.provider_id
+                    )
+                } else {
+                    format!("local lane `{}` {detail}, fell through", self.provider_id)
+                });
                 let selected_on_lane = plan.decision.selected.as_ref().is_some_and(|selected| {
                     plan.candidates.iter().any(|candidate| {
                         candidate.id == selected.target_id
@@ -109,7 +150,7 @@ impl LaneWakeNote {
                 }
                 Err(ExecError::new(
                     503,
-                    "local_lane_unavailable",
+                    self.code,
                     format!(
                         "local lane `{}` is not ready ({detail}) and no other target can serve; retry later",
                         self.provider_id
@@ -139,6 +180,7 @@ impl Engine {
         if !wakes_on_request(snap, provider_id)
             && !in_gpu_group(snap, provider_id)
             && !on_shared_host(snap, provider_id)
+            && !has_slot_limit(snap, provider_id)
         {
             return Ok(None);
         }
@@ -146,12 +188,20 @@ impl Engine {
     }
 
     /// Before planning, after any wake: when the target this route would
-    /// choose first sits on a lane in an exclusive GPU group, wait (bounded
-    /// by the lane's `group_wait_secs`) until the lane holds the group. On
-    /// success the guard holds the group until the dispatch uses it; on
+    /// choose first sits on a lane with `max_in_flight` or in an exclusive
+    /// GPU group, take the lane before the first byte.
+    ///
+    /// A full lane with `on_full: spill` (the default) sends the request to
+    /// the route's next usable target at once (the lane's targets are
+    /// skipped with the reason, not counted as failures); when no other
+    /// target can serve, the request waits like `on_full: queue`. Waiting
+    /// means the lane's FIFO queue (bounded by `queue_timeout_secs`), then
+    /// the GPU group (bounded by `group_wait_secs`). On success the guard
+    /// holds the place and the group until the dispatch uses them; on
     /// expiry or a failed release the lane's targets are skipped with the
-    /// reason. At most one group wait per request.
-    pub(crate) async fn take_gpu_before_dispatch(
+    /// reason, and a 503 answers when nothing else can serve. At most one
+    /// lane wait per request.
+    pub(crate) async fn take_lane_before_dispatch(
         &self,
         snap: &Snapshot,
         req: &AiRequest,
@@ -159,12 +209,11 @@ impl Engine {
         resolved: &mut CandidateResolution,
     ) -> Option<LaneGpuNote> {
         let lanes = self.lanes.as_deref()?;
-        // Lanes outside a GPU group (the default) cost nothing here.
-        if !resolved
-            .candidates
-            .iter()
-            .any(|candidate| in_gpu_group(snap, &candidate.provider_id))
-        {
+        // Lanes without a limit or a GPU group (the default) cost nothing.
+        if !resolved.candidates.iter().any(|candidate| {
+            in_gpu_group(snap, &candidate.provider_id)
+                || has_slot_limit(snap, &candidate.provider_id)
+        }) {
             return None;
         }
         let (_, would_be) = plan_resolved_route(
@@ -191,45 +240,98 @@ impl Engine {
             .find(|candidate| candidate.id == first)?
             .provider_id
             .clone();
-        if !in_gpu_group(snap, &provider_id) {
+        let grouped = in_gpu_group(snap, &provider_id);
+        let limited = has_slot_limit(snap, &provider_id);
+        if !grouped && !limited {
             return None;
         }
-        match lanes.acquire_for_request(&provider_id).await {
-            LaneAcquire::Ready { busy, detail } => Some(LaneGpuNote {
-                note: LaneWakeNote {
-                    wake: LaneWake::Ready {
-                        detail: detail.unwrap_or_else(|| "holds its gpu group".to_string()),
+        let spill =
+            lane_config(snap, &provider_id).is_some_and(|lane| lane.on_full == LaneOnFull::Spill);
+        if limited && spill {
+            if let Some(full) = lanes.lane_full(&provider_id) {
+                let reason = format!(
+                    "local lane `{provider_id}` {full}; spilled before dispatch, not counted as a failure"
+                );
+                let mut spilled = resolved.clone();
+                skip_lane(&mut spilled, &provider_id, &reason);
+                let elsewhere = plan_resolved_route(
+                    &self.combo_rr,
+                    snap,
+                    req,
+                    client_profile,
+                    spilled.clone(),
+                    false,
+                )
+                .ok()
+                .and_then(|(_, plan)| plan.decision.selected)
+                .is_some_and(|selected| {
+                    spilled.candidates.iter().any(|candidate| {
+                        candidate.id == selected.target_id && candidate.provider_id != provider_id
+                    })
+                });
+                if elsewhere {
+                    *resolved = spilled;
+                    return Some(LaneGpuNote {
+                        note: LaneWakeNote {
+                            wake: LaneWake::NotReady {
+                                detail: full,
+                                retry_after: LANE_QUEUE_RETRY_AFTER,
+                            },
+                            provider_id,
+                            code: "local_lane_full",
+                            spilled: true,
+                        },
+                        busy: None,
+                    });
+                }
+                // Nothing else can serve: wait in the lane's queue instead.
+            }
+        }
+        let (detail, retry_after, code) = match lanes.acquire_for_request(&provider_id).await {
+            LaneAcquire::Ready { busy, detail } => {
+                let detail = match detail {
+                    Some(detail) => detail,
+                    None if grouped => "holds its gpu group".to_string(),
+                    None => String::new(),
+                };
+                return Some(LaneGpuNote {
+                    note: LaneWakeNote {
+                        wake: LaneWake::Ready { detail },
+                        provider_id,
+                        code: "local_lane_unavailable",
+                        spilled: false,
                     },
-                    provider_id,
-                },
-                busy,
-            }),
+                    busy,
+                });
+            }
             LaneAcquire::NotReady {
                 detail,
                 retry_after,
-            } => {
-                for candidate in &resolved.candidates {
-                    if candidate.provider_id == provider_id {
-                        resolved.lane_down.push((
-                            candidate.id.clone(),
-                            format!(
-                                "local lane `{provider_id}` {detail}; skipped before dispatch, not counted as a failure"
-                            ),
-                        ));
-                    }
-                }
-                Some(LaneGpuNote {
-                    note: LaneWakeNote {
-                        wake: LaneWake::NotReady {
-                            detail,
-                            retry_after,
-                        },
-                        provider_id,
-                    },
-                    busy: None,
-                })
-            }
-        }
+            } => (detail, retry_after, "local_lane_unavailable"),
+            LaneAcquire::QueueTimeout {
+                detail,
+                retry_after,
+            } => (detail, retry_after, "local_lane_queue_timeout"),
+        };
+        skip_lane(
+            resolved,
+            &provider_id,
+            &format!(
+                "local lane `{provider_id}` {detail}; skipped before dispatch, not counted as a failure"
+            ),
+        );
+        Some(LaneGpuNote {
+            note: LaneWakeNote {
+                wake: LaneWake::NotReady {
+                    detail,
+                    retry_after,
+                },
+                provider_id,
+                code,
+                spilled: false,
+            },
+            busy: None,
+        })
     }
 
     /// Before planning: when the target this route would choose first sits
@@ -307,6 +409,11 @@ impl Engine {
                 }
             }
         }
-        Some(LaneWakeNote { provider_id, wake })
+        Some(LaneWakeNote {
+            provider_id,
+            wake,
+            code: "local_lane_unavailable",
+            spilled: false,
+        })
     }
 }

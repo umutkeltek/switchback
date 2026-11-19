@@ -27,8 +27,9 @@ use sb_core::{Config, LocalExecutorConfig, ProviderKind};
 
 use crate::alerts::{AlertSink, Alerter, CommandAlertSink};
 use crate::holds::{Hold, HoldError, HoldState, HoldView, Holds};
+use crate::lane_slots::{LaneSlots, LaneSlotsReport, SlotPermit};
 use crate::scheme_auth::SchemeCredential;
-use sb_runtime::{LaneAcquire, LaneBusy, LaneWake, LANE_GROUP_RETRY_AFTER};
+use sb_runtime::{LaneAcquire, LaneBusy, LaneWake, LANE_GROUP_RETRY_AFTER, LANE_QUEUE_RETRY_AFTER};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -347,6 +348,9 @@ pub struct LocalLaneReport {
     /// where `host` is the lane's `host`, or its name when it has a machine
     /// of its own).
     pub holds: Vec<HoldView>,
+    /// The lane's `max_in_flight` and its queue: how many requests and
+    /// media jobs hold a place now and how many wait for one.
+    pub slots: LaneSlotsReport,
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +396,12 @@ pub enum JobError<E> {
     GpuUnavailable(String),
     /// The engine's health endpoint refused the credential.
     Refused(String),
+    /// The lane stayed full (`max_in_flight`) for the whole of its
+    /// `queue_timeout_secs`; `retry_after` is a hint for the caller.
+    QueueTimeout {
+        detail: String,
+        retry_after: Duration,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +540,9 @@ pub struct LocalExecutor {
     /// Where the probe leases that credential (the engine's resolver once
     /// the server attached it).
     credentials: RwLock<Option<Arc<dyn LaneCredentials>>>,
+    /// Places under `max_in_flight` and the FIFO queue for them. Kept
+    /// across reloads like the rest of the live state.
+    slots: Arc<LaneSlots>,
 }
 
 /// How a lane's health probe treats its provider's credential.
@@ -580,6 +593,7 @@ impl LocalExecutor {
         probe: Arc<dyn HealthProbe>,
         routed: bool,
     ) -> Arc<Self> {
+        let max_in_flight = cfg.max_in_flight;
         Arc::new_cyclic(|me| Self {
             host: RwLock::new(Host::new(&cfg.name, false, vec![me.clone()])),
             name: cfg.name.clone(),
@@ -592,6 +606,7 @@ impl LocalExecutor {
             changes: tokio::sync::watch::channel(0).0,
             probe_auth: RwLock::new(ProbeAuth::default()),
             credentials: RwLock::new(None),
+            slots: LaneSlots::new(max_in_flight),
         })
     }
 
@@ -679,6 +694,7 @@ impl LocalExecutor {
     /// loop reads the new timings on its next pass). Turning routing off
     /// clears the routing observation, so the report stays honest.
     fn update_config(&self, cfg: LocalExecutorConfig, routed: bool) {
+        self.slots.set_limit(cfg.max_in_flight);
         *self
             .cfg
             .write()
@@ -942,18 +958,39 @@ impl LocalExecutor {
         LaneJobGuard::new(self.clone())
     }
 
-    /// A text or embeddings request on a lane in an exclusive GPU group,
-    /// before its first byte: wait up to `group_wait_secs` for the group
-    /// (counted as queued, so the machine stays busy), then hold the group
-    /// and the lane until the returned guard is dropped.
+    /// A text or embeddings request for the target its route chose first,
+    /// before its first byte. On a lane with `max_in_flight`: wait in the
+    /// lane's FIFO queue (up to `queue_timeout_secs`) for a place. On a
+    /// lane in an exclusive GPU group: then wait up to `group_wait_secs`
+    /// for the group. Both waits count as queued, so the machine stays
+    /// busy. The returned guard holds the place, the group and the lane
+    /// until it is dropped.
     pub async fn acquire_for_request(self: &Arc<Self>) -> LaneAcquire {
-        let wait_ms = self.cfg().group_wait_secs.saturating_mul(1000);
+        let cfg = self.cfg();
+        // A place under `max_in_flight` first (FIFO), so a request waiting
+        // for one never holds the GPU group that running work may need.
+        let (slot, slot_note) = match self.take_slot().await {
+            Ok(taken) => taken,
+            Err((detail, retry_after)) => {
+                return LaneAcquire::QueueTimeout {
+                    detail,
+                    retry_after,
+                }
+            }
+        };
+        if cfg.exclusive_group.is_none() {
+            return LaneAcquire::Ready {
+                busy: Some(Box::new((self.begin_request(), slot))),
+                detail: slot_note,
+            };
+        }
+        let wait_ms = cfg.group_wait_secs.saturating_mul(1000);
         let queued = QueuedSlot::new(self.clone());
         let taken = self.take_group(wait_ms).await;
         let outcome = match taken {
             Ok((permit, detail)) => LaneAcquire::Ready {
-                busy: Some(Box::new((self.begin_request(), permit))),
-                detail: Some(detail),
+                busy: Some(Box::new((self.begin_request(), permit, slot))),
+                detail: Some(join_notes(slot_note, detail)),
             },
             Err((detail, retry_after)) => LaneAcquire::NotReady {
                 detail,
@@ -962,6 +999,63 @@ impl LocalExecutor {
         };
         drop(queued);
         outcome
+    }
+
+    /// Take a place under `max_in_flight` without waiting: only while the
+    /// lane has room and nobody waits. `Err` says the lane is full. Without
+    /// a limit a place is always free (it is only counted).
+    fn try_take_slot(&self) -> Result<SlotPermit, String> {
+        self.slots.try_take().map_err(full_text)
+    }
+
+    /// `Some(why)` while new work on this lane would have to wait for a
+    /// place (`max_in_flight` reached, or others already wait). Never waits.
+    pub fn full_detail(&self) -> Option<String> {
+        self.slots.full().map(full_text)
+    }
+
+    /// Take a place under `max_in_flight`, waiting in the lane's FIFO queue
+    /// up to `queue_timeout_secs` on the clock seam. The wait counts as
+    /// queued (`queue_depth`), so the machine stays busy and is never
+    /// powered off under it. Dropping the future (a client that went away,
+    /// a cancelled job) leaves the queue. `Ok((place, note))`, where `note`
+    /// says how long it waited when it did; `Err((why, retry_after))` once
+    /// the wait ran out.
+    async fn take_slot(
+        self: &Arc<Self>,
+    ) -> Result<(SlotPermit, Option<String>), (String, Duration)> {
+        if let Ok(permit) = self.slots.try_take() {
+            return Ok((permit, None));
+        }
+        let wait_ms = self.cfg().queue_timeout_secs.saturating_mul(1000);
+        let _queued = QueuedSlot::new(self.clone());
+        match self.slots.take(wait_ms, &*self.clock).await {
+            Ok((permit, 0)) => Ok((permit, None)),
+            Ok((permit, waited)) => Ok((
+                permit,
+                Some(format!(
+                    "waited {} in the lane's queue for a place",
+                    fmt_ms(waited)
+                )),
+            )),
+            Err(timeout) => {
+                tracing::warn!(
+                    lane = %self.name,
+                    waited_ms = timeout.waited_ms,
+                    in_use = timeout.counts.in_use,
+                    "lane stayed full for the whole queue timeout"
+                );
+                Err((
+                    format!(
+                        "waited {} in its queue and is still full ({} of {} in flight)",
+                        fmt_ms(timeout.waited_ms),
+                        timeout.counts.in_use,
+                        timeout.counts.limit.unwrap_or(0),
+                    ),
+                    LANE_QUEUE_RETRY_AFTER,
+                ))
+            }
+        }
     }
 
     /// Take the lane's GPU group without waiting: only while the lane holds
@@ -1625,6 +1719,17 @@ impl LocalExecutor {
         Fut: std::future::Future<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
+        // A place under `max_in_flight` before anything else: a job waiting
+        // in the queue never starts a wake or asks for the GPU group.
+        let (_slot, slot_note) = match self.take_slot().await {
+            Ok(taken) => taken,
+            Err((detail, retry_after)) => {
+                return Err(JobError::QueueTimeout {
+                    detail,
+                    retry_after,
+                })
+            }
+        };
         let _guard = match self.ensure_ready().await {
             Ok(guard) => guard,
             Err(EnsureError::WakeUnconfigured) => return Err(JobError::Queued),
@@ -1640,12 +1745,12 @@ impl LocalExecutor {
             Err(EnsureError::WakeFailed(error)) => return Err(JobError::WakeFailed(error)),
             Err(EnsureError::Refused(detail)) => return Err(JobError::Refused(detail)),
         };
-        let mut note = None;
+        let mut note = slot_note;
         let _permit = if self.cfg().exclusive_group.is_some() {
             let wait_ms = self.cfg().group_wait_secs.saturating_mul(1000);
             match self.take_group(wait_ms).await {
                 Ok((permit, detail)) => {
-                    note = Some(detail);
+                    note = Some(join_notes(note.take(), detail));
                     Some(permit)
                 }
                 Err((detail, _)) => return Err(JobError::GpuUnavailable(detail)),
@@ -1795,6 +1900,15 @@ impl LocalExecutor {
                 .get(group)
                 .is_some_and(|state| state.holder.as_deref() == Some(self.name.as_str()))
         });
+        let counts = self.slots.counts();
+        let cfg = self.cfg();
+        let slots = LaneSlotsReport {
+            max_in_flight: counts.limit,
+            in_use: counts.in_use,
+            queued: counts.queued,
+            on_full: cfg.on_full.as_str(),
+            queue_timeout_secs: cfg.queue_timeout_secs,
+        };
         let rt = self.lock();
         let mut level = lane_level(&rt, wake_configured, poweroff_failures);
         if guard.broken && level == LaneLevel::Ok {
@@ -1839,7 +1953,26 @@ impl LocalExecutor {
             observed_healthy: rt.observed_healthy,
             poweroff_in_secs,
             holds: hold_views,
+            slots,
         }
+    }
+}
+
+/// Why new work on a lane must wait for a place (see [`LaneSlots::full`]).
+fn full_text(counts: crate::lane_slots::SlotCounts) -> String {
+    format!(
+        "is full ({} of {} in flight, {} queued)",
+        counts.in_use,
+        counts.limit.unwrap_or(0),
+        counts.queued
+    )
+}
+
+/// What a wait for a place did, then what the GPU group wait did.
+fn join_notes(first: Option<String>, then: String) -> String {
+    match first {
+        Some(first) => format!("{first}; {then}"),
+        None => then,
     }
 }
 
@@ -3270,14 +3403,21 @@ impl sb_runtime::LaneStatus for CapacityActivator {
             return Ok(None);
         };
         let cfg = executor.cfg();
+        // A lane with `max_in_flight` counts every request against it and
+        // refuses one past the limit: the target is skipped, never waited
+        // for here (only the route's first choice waits, before planning).
+        let slot = match cfg.max_in_flight {
+            Some(_) => Some(executor.try_take_slot()?),
+            None => None,
+        };
         if cfg.exclusive_group.is_some() {
             let permit = executor.try_take_group()?;
-            return Ok(Some(Box::new((executor.begin_request(), permit))));
+            return Ok(Some(Box::new((executor.begin_request(), permit, slot))));
         }
-        if !cfg.wake_on_request && cfg.host.is_none() {
+        if !cfg.wake_on_request && cfg.host.is_none() && slot.is_none() {
             return Ok(None);
         }
-        Ok(Some(Box::new(executor.begin_request())))
+        Ok(Some(Box::new((executor.begin_request(), slot))))
     }
 
     /// Bounded by the lane's `group_wait_secs` on the [`Clock`] seam.
@@ -3288,7 +3428,10 @@ impl sb_runtime::LaneStatus for CapacityActivator {
         let executor = self.executor(provider_id);
         Box::pin(async move {
             match executor {
-                Some(executor) if executor.cfg().exclusive_group.is_some() => {
+                Some(executor)
+                    if executor.cfg().exclusive_group.is_some()
+                        || executor.cfg().max_in_flight.is_some() =>
+                {
                     executor.acquire_for_request().await
                 }
                 _ => match self.try_begin_request(provider_id) {
@@ -3300,6 +3443,10 @@ impl sb_runtime::LaneStatus for CapacityActivator {
                 },
             }
         })
+    }
+
+    fn lane_full(&self, provider_id: &str) -> Option<String> {
+        self.executor(provider_id)?.full_detail()
     }
 
     fn config_published(&self, config: &Config) {
@@ -3552,6 +3699,9 @@ mod tests {
             group_wait_secs: 120,
             poweroff_guard_command: legs.guard.map(str::to_string),
             adopt_external_wake: false,
+            max_in_flight: None,
+            queue_timeout_secs: 60,
+            on_full: sb_core::LaneOnFull::Spill,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -3698,6 +3848,9 @@ mod tests {
             group_wait_secs: 120,
             poweroff_guard_command: None,
             adopt_external_wake: false,
+            max_in_flight: None,
+            queue_timeout_secs: 60,
+            on_full: sb_core::LaneOnFull::Spill,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -4207,6 +4360,9 @@ local_executors:
             group_wait_secs: 120,
             poweroff_guard_command: None,
             adopt_external_wake: false,
+            max_in_flight: None,
+            queue_timeout_secs: 60,
+            on_full: sb_core::LaneOnFull::Spill,
         };
         LocalExecutor::new(
             cfg,
@@ -5528,7 +5684,9 @@ local_executors:
                 detail: Some(detail),
             } => (busy, detail),
             LaneAcquire::Ready { .. } => panic!("ready without a guard or a detail"),
-            LaneAcquire::NotReady { detail, .. } => panic!("not ready: {detail}"),
+            LaneAcquire::NotReady { detail, .. } | LaneAcquire::QueueTimeout { detail, .. } => {
+                panic!("not ready: {detail}")
+            }
         }
     }
 
@@ -5702,7 +5860,9 @@ local_executors:
                 );
                 assert_eq!(retry_after, LANE_GROUP_RETRY_AFTER);
             }
-            LaneAcquire::Ready { .. } => panic!("the bound passed"),
+            LaneAcquire::Ready { .. } | LaneAcquire::QueueTimeout { .. } => {
+                panic!("the bound passed")
+            }
         }
         assert_eq!(activator.executor("text").unwrap().report().queue_depth, 0);
         assert!(
@@ -5744,7 +5904,9 @@ local_executors:
                     "release command of lane `comfy` failed: exit 1; gpu group `gpu0` not handed over",
                     "attempt {attempt}"
                 ),
-                LaneAcquire::Ready { .. } => panic!("handed over after a failed release"),
+                LaneAcquire::Ready { .. } | LaneAcquire::QueueTimeout { .. } => {
+                    panic!("handed over after a failed release")
+                }
             }
         }
         let comfy = activator.executor("comfy").unwrap().report();
@@ -5766,7 +5928,7 @@ local_executors:
             LaneAcquire::NotReady { detail, .. } => {
                 assert!(detail.contains("needs operator attention"), "{detail}")
             }
-            LaneAcquire::Ready { .. } => panic!("handed over"),
+            LaneAcquire::Ready { .. } | LaneAcquire::QueueTimeout { .. } => panic!("handed over"),
         }
         assert_eq!(releases(&host).len(), runs, "not run again past the budget");
     }
@@ -5954,7 +6116,9 @@ local_executors:
         for _ in 0..5 {
             match acquire(&activator, "text").await.unwrap() {
                 LaneAcquire::NotReady { detail, .. } => details.push(detail),
-                LaneAcquire::Ready { .. } => panic!("handed over after a failed release"),
+                LaneAcquire::Ready { .. } | LaneAcquire::QueueTimeout { .. } => {
+                    panic!("handed over after a failed release")
+                }
             }
             clock.advance(2_000);
         }
@@ -7556,5 +7720,390 @@ local_executors:
         assert_eq!(payload["host"], "gpu-box");
         assert_eq!(payload["level"], "fail");
         assert!(summary.starts_with("switchback escalated: text on gpu-box is fail"));
+    }
+
+    // --- `max_in_flight`: a FIFO queue per lane --------------------------
+
+    /// One text lane on a machine that is up, with `max_in_flight` and a
+    /// queue timeout of 30 s; `extra` is appended to the lane.
+    fn limited_lane(
+        max_in_flight: u32,
+        extra: &str,
+    ) -> (FakeHost, Arc<ManualClock>, Arc<CapacityActivator>) {
+        let cfg = Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: text
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+local_executors:
+  - name: text
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    route_health: true
+    wake_on_request: true
+    wake_command: "ssh gateway wake-host executor-1"
+    poweroff_command: "ssh gateway poweroff-host executor-1"
+    idle_timeout_secs: 5
+    boot_timeout_secs: 180
+    wake_retry_interval_secs: 60
+    max_in_flight: {max_in_flight}
+    queue_timeout_secs: 30
+{extra}"#
+        ))
+        .unwrap();
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = shared_activator(&cfg, &host, clock.clone());
+        (host, clock, activator)
+    }
+
+    fn slots_of(activator: &CapacityActivator, lane: &str) -> LaneSlotsReport {
+        activator.executor(lane).unwrap().report().slots
+    }
+
+    // Requests past the limit wait in arrival order; a freed place goes to
+    // the oldest waiter; one that waits past `queue_timeout_secs` gets a
+    // typed timeout with a retry hint and leaves the queue.
+    #[tokio::test]
+    async fn a_full_lane_serves_its_queue_in_order_and_times_out_the_rest() {
+        let (_host, clock, activator) = limited_lane(1, "");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first = match acquire(&activator, "text").await.unwrap() {
+            LaneAcquire::Ready {
+                busy: Some(busy),
+                detail,
+            } => {
+                assert_eq!(detail, None, "a place at once says nothing");
+                busy
+            }
+            _ => panic!("the first request gets the place"),
+        };
+        let waiter = |name: &'static str| {
+            let activator = activator.clone();
+            let order = order.clone();
+            tokio::spawn(async move {
+                let acquired =
+                    sb_runtime::LaneStatus::acquire_for_request(&*activator, "text").await;
+                if matches!(acquired, LaneAcquire::Ready { .. }) {
+                    order.lock().unwrap().push(name);
+                }
+                acquired
+            })
+        };
+        let second = waiter("second");
+        settle().await;
+        clock.advance(2_000);
+        let third = waiter("third");
+        settle().await;
+        let report = activator.executor("text").unwrap().report();
+        assert_eq!((report.slots.in_use, report.slots.queued), (1, 2));
+        assert_eq!(report.queue_depth, 2, "queued work shows as queue depth");
+        assert_eq!(report.slots.max_in_flight, Some(1));
+        assert_eq!(report.slots.on_full, "spill");
+        assert_eq!(
+            sb_runtime::LaneStatus::lane_full(&*activator, "text").as_deref(),
+            Some("is full (1 of 1 in flight, 2 queued)")
+        );
+
+        drop(first);
+        let second = match second.await.unwrap() {
+            LaneAcquire::Ready {
+                busy: Some(busy),
+                detail,
+            } => {
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("waited 2 s in the lane's queue for a place")
+                );
+                busy
+            }
+            _ => panic!("the oldest waiter gets the freed place"),
+        };
+        settle().await;
+        assert!(!third.is_finished(), "the third still waits");
+        assert_eq!(*order.lock().unwrap(), ["second"]);
+
+        clock.advance(30_000); // the third (queued at 2 s) has now waited its 30 s
+        match third.await.unwrap() {
+            LaneAcquire::QueueTimeout {
+                detail,
+                retry_after,
+            } => {
+                assert_eq!(
+                    detail,
+                    "waited 30 s in its queue and is still full (1 of 1 in flight)"
+                );
+                assert_eq!(retry_after, LANE_QUEUE_RETRY_AFTER);
+            }
+            _ => panic!("the third times out"),
+        }
+        let report = activator.executor("text").unwrap().report();
+        assert_eq!((report.slots.in_use, report.slots.queued), (1, 0));
+        assert_eq!(report.queue_depth, 0);
+        drop(second);
+        assert_eq!(slots_of(&activator, "text").in_use, 0);
+    }
+
+    // A dispatch that must not wait (a fallback, a hedge racer) is refused
+    // on a full lane, and counts against the limit when it gets in.
+    #[tokio::test]
+    async fn a_full_lane_refuses_a_dispatch_that_must_not_wait() {
+        use sb_runtime::LaneStatus;
+        let (_host, _clock, activator) = limited_lane(2, "");
+        let one = activator
+            .try_begin_request("text")
+            .unwrap()
+            .expect("counted");
+        let two = activator
+            .try_begin_request("text")
+            .unwrap()
+            .expect("counted");
+        assert_eq!(activator.executor("text").unwrap().report().in_flight, 2);
+        let refused = activator.try_begin_request("text").err().expect("full");
+        assert_eq!(refused, "is full (2 of 2 in flight, 0 queued)");
+        drop(one);
+        assert_eq!(activator.lane_full("text"), None, "room again");
+        drop(two);
+        assert_eq!(slots_of(&activator, "text").in_use, 0);
+    }
+
+    // Every way work ends gives its place back: a client that goes away
+    // while queued, a request that ends, a media job that fails, and a
+    // media job whose task panics.
+    #[tokio::test]
+    async fn every_ending_gives_the_place_back() {
+        let (_host, _clock, activator) = limited_lane(1, "");
+        let held = ready_busy(acquire(&activator, "text").await.unwrap());
+        // A client that disconnects while queued: its future is dropped.
+        let gone = acquire(&activator, "text");
+        settle().await;
+        assert_eq!(slots_of(&activator, "text").queued, 1);
+        gone.abort();
+        settle().await;
+        assert_eq!(slots_of(&activator, "text").queued, 0, "left the queue");
+        assert_eq!(activator.executor("text").unwrap().report().queue_depth, 0);
+        drop(held);
+        assert_eq!(slots_of(&activator, "text").in_use, 0);
+
+        // A media job whose dispatch fails while the engine is healthy.
+        let lane = activator.executor("text").unwrap();
+        let failed = lane
+            .run_job(|_attempt| async { Err::<(), _>("engine said no".to_string()) })
+            .await;
+        assert!(matches!(failed, Err(JobError::Dispatch(_))));
+        assert_eq!(slots_of(&activator, "text").in_use, 0, "error frees it");
+        assert_eq!(lane.report().in_flight, 0);
+
+        // A media job whose task panics mid-dispatch.
+        let task = tokio::spawn({
+            let lane = lane.clone();
+            async move {
+                lane.run_job(|_attempt| async {
+                    if true {
+                        panic!("a bug in the job");
+                    }
+                    Ok::<(), String>(())
+                })
+                .await
+            }
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(slots_of(&activator, "text").in_use, 0, "panic frees it");
+        assert_eq!(lane.report().in_flight, 0);
+        assert!(
+            sb_runtime::LaneStatus::try_begin_request(&*activator, "text")
+                .unwrap()
+                .is_some(),
+            "the lane takes work again"
+        );
+    }
+
+    fn ready_busy(acquired: LaneAcquire) -> LaneBusy {
+        match acquired {
+            LaneAcquire::Ready {
+                busy: Some(busy), ..
+            } => busy,
+            _ => panic!("expected a place"),
+        }
+    }
+
+    // A media job waits in the same queue as text requests, and one that
+    // waits past the timeout fails with the typed error.
+    #[tokio::test]
+    async fn a_media_job_waits_in_the_lane_queue_and_can_time_out() {
+        let (_host, clock, activator) = limited_lane(1, "");
+        let held = ready_busy(acquire(&activator, "text").await.unwrap());
+        let lane = activator.executor("text").unwrap();
+        let job = tokio::spawn({
+            let lane = lane.clone();
+            async move {
+                lane.run_job(|_attempt| async { Ok::<_, String>("done") })
+                    .await
+            }
+        });
+        settle().await;
+        assert!(!job.is_finished(), "waits for the place");
+        assert_eq!(slots_of(&activator, "text").queued, 1);
+        clock.advance(30_000);
+        match job.await.unwrap() {
+            Err(JobError::QueueTimeout {
+                detail,
+                retry_after,
+            }) => {
+                assert!(detail.starts_with("waited 30 s in its queue"), "{detail}");
+                assert_eq!(retry_after, LANE_QUEUE_RETRY_AFTER);
+            }
+            other => panic!("expected a queue timeout, got {:?}", other.map(|_| ())),
+        }
+        drop(held);
+        let done = lane
+            .run_job(|_attempt| async { Ok::<_, String>("done") })
+            .await
+            .map_err(|error| format!("{error:?}"))
+            .expect("runs once there is room");
+        assert_eq!(done, "done");
+    }
+
+    // A request waiting in the queue keeps the machine busy: the idle
+    // power-off waits for it and runs once it is gone.
+    #[tokio::test]
+    async fn a_queued_request_keeps_the_machine_from_powering_off() {
+        let (host, clock, activator) = limited_lane(1, "");
+        let lane = activator.executor("text").unwrap();
+        assert!(matches!(
+            lane.wake_for_request().await,
+            LaneWake::Ready { .. }
+        ));
+        // The lane's only place is taken by work that is not on the engine
+        // (nothing in flight), so only the queued request can keep the
+        // machine up.
+        let place = lane.slots.try_take().expect("room");
+        assert_eq!(lane.report().in_flight, 0);
+        assert_eq!(lane.report().state, LaneState::IdleCountdown);
+        let queued = acquire(&activator, "text");
+        settle().await;
+        assert_eq!(lane.report().queue_depth, 1);
+
+        clock.advance(20_000); // far past the 5 s idle timeout, within the 30 s queue
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 0, "never under a queued request");
+        assert!(!queued.is_finished());
+
+        queued.abort(); // the client goes away
+        settle().await;
+        assert_eq!(lane.report().queue_depth, 0);
+        drop(place);
+        lane.tick().await;
+        assert_eq!(host.sim().poweroff, 1, "powers off once the queue is empty");
+    }
+
+    // A text lane with a limit in an exclusive GPU group: a request queued
+    // for a place holds no GPU permit, so a media job's switch goes ahead
+    // when the running request ends; the queued request then takes its
+    // place, waits behind the switch and gets the GPU back after the job.
+    #[tokio::test]
+    async fn a_queue_and_an_exclusive_gpu_group_take_turns() {
+        let mut cfg = gpu_group_config();
+        cfg.local_executors[0].max_in_flight = Some(1);
+        assert_eq!(cfg.local_executors[0].name, "text");
+        let host = FakeHost::new(Sim {
+            healthy: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = shared_activator(&cfg, &host, clock.clone());
+
+        let (first, _) = ready(acquire(&activator, "text").await.unwrap());
+        assert_eq!(releases(&host), [RELEASE_COMFY]);
+        let queued = acquire(&activator, "text");
+        settle().await;
+        assert_eq!(slots_of(&activator, "text").queued, 1);
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let started = Arc::new(AtomicU64::new(0));
+        let job = media_job(&activator, gate.clone(), started.clone());
+        settle().await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "the running request holds the GPU"
+        );
+
+        drop(first); // the running request ends
+        settle().await;
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the job took the GPU");
+        assert_eq!(releases(&host), [RELEASE_COMFY, RELEASE_TEXT]);
+        assert!(
+            !queued.is_finished(),
+            "the queued request waits behind the switch"
+        );
+        let text = activator.executor("text").unwrap().report();
+        assert_eq!(
+            (text.slots.in_use, text.slots.queued, text.holds_gpu),
+            (1, 0, Some(false)),
+            "it has its place, not the GPU"
+        );
+
+        gate.add_permits(1); // the image is done
+        job.await.unwrap().expect("the job runs");
+        let (busy, detail) = ready(queued.await.unwrap());
+        assert!(detail.ends_with("took it from lane `comfy`"), "{detail}");
+        assert_eq!(
+            releases(&host),
+            [RELEASE_COMFY, RELEASE_TEXT, RELEASE_COMFY]
+        );
+        drop(busy);
+        assert_eq!(slots_of(&activator, "text").in_use, 0);
+    }
+
+    // A reload changes the limit in place: running work keeps its place.
+    #[tokio::test]
+    async fn a_reload_changes_the_limit_and_keeps_running_work() {
+        use sb_runtime::LaneStatus;
+        let (_host, _clock, activator) = limited_lane(1, "");
+        let one = activator
+            .try_begin_request("text")
+            .unwrap()
+            .expect("counted");
+        assert!(activator.try_begin_request("text").is_err());
+        let mut cfg = Config::from_yaml(
+            r#"
+providers:
+  - id: text
+    type: openai_compatible
+    base_url: "http://executor-1.example:8080/v1"
+local_executors:
+  - name: text
+    base_url: "http://executor-1.example:8080"
+    health_endpoint: "http://executor-1.example:8080/health"
+    max_in_flight: 2
+    on_full: queue
+"#,
+        )
+        .unwrap();
+        activator.reconcile(&cfg);
+        let two = activator
+            .try_begin_request("text")
+            .unwrap()
+            .expect("room under 2");
+        let report = activator.executor("text").unwrap().report();
+        assert_eq!(
+            (
+                report.slots.max_in_flight,
+                report.slots.in_use,
+                report.slots.on_full
+            ),
+            (Some(2), 2, "queue")
+        );
+        cfg.local_executors[0].max_in_flight = None;
+        activator.reconcile(&cfg);
+        assert_eq!(activator.lane_full("text"), None, "no limit, never full");
+        drop((one, two));
+        assert_eq!(slots_of(&activator, "text").in_use, 0);
     }
 }

@@ -57,7 +57,10 @@ pub(crate) async fn collect_response(
             }
             AiStreamEvent::ToolCallEnd { .. } => {}
             AiStreamEvent::UsageDelta { usage: delta } => {
-                usage = delta;
+                usage.replace_with(delta);
+            }
+            AiStreamEvent::EngineTimings { timings } => {
+                usage.engine_timings = Some(timings);
             }
             AiStreamEvent::MessageEnd {
                 finish_reason: finish,

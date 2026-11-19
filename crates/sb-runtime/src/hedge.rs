@@ -25,6 +25,8 @@ pub(crate) struct HedgeWin {
     pub(crate) canceled: Vec<HedgeCancel>,
     /// When the winner's first token arrived (`None` = no token).
     pub(crate) first_token_at: Option<Instant>,
+    /// How fast the winning attempt was served, for its usage record.
+    pub(crate) speed: sb_ledger::RequestSpeed,
 }
 
 #[derive(Clone)]
@@ -204,6 +206,8 @@ async fn hedge_attempt(
         .registry
         .cost_micros(&target.provider_id, &target.model, &response.usage);
     let latency_ms = started.elapsed().as_millis() as u64;
+    let speed =
+        super::stream::attempt_speed(&response.usage, &first_token, started, Instant::now());
     guard.finish(FinishOutcome::Ok {
         finish_reason: response.finish_reason,
         cost_micros: Some(cost),
@@ -218,6 +222,7 @@ async fn hedge_attempt(
         latency_ms,
         canceled: Vec::new(),
         first_token_at: first_token.get().copied(),
+        speed,
     })
 }
 

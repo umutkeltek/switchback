@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -91,7 +92,10 @@ where
                         first(started.elapsed().as_millis() as f64);
                     }
                     if let Ok(AiStreamEvent::UsageDelta { usage: latest }) = &item {
-                        guard.usage = latest.clone();
+                        guard.usage.replace_with(latest.clone());
+                    }
+                    if let Ok(AiStreamEvent::EngineTimings { timings }) = &item {
+                        guard.usage.engine_timings = Some(timings.clone());
                     }
                     if let Ok(AiStreamEvent::MessageEnd { finish_reason }) = &item {
                         guard.finish_reason = Some(*finish_reason);
@@ -120,8 +124,29 @@ where
     .boxed()
 }
 
-/// When the first token of a response arrived, filled by [`watch_first_token`].
-pub(crate) type FirstToken = Arc<OnceLock<Instant>>;
+/// When the first token of a response arrived, and how many token events
+/// passed, filled by [`watch_first_token`].
+#[derive(Clone, Default)]
+pub(crate) struct FirstToken(Arc<TokenClock>);
+
+#[derive(Default)]
+struct TokenClock {
+    first: OnceLock<Instant>,
+    events: AtomicU64,
+}
+
+impl FirstToken {
+    /// When the first token arrived (`None` = no token yet).
+    pub(crate) fn get(&self) -> Option<&Instant> {
+        self.0.first.get()
+    }
+
+    /// Token events seen so far. A response that came in one piece (a
+    /// non-streamed upstream body) has one; a streamed one has many.
+    pub(crate) fn events(&self) -> u64 {
+        self.0.events.load(Ordering::Relaxed)
+    }
+}
 
 /// Note the moment the first token passes through the stream: the first text,
 /// reasoning or tool-call event, or an output image. Framing events
@@ -129,12 +154,15 @@ pub(crate) type FirstToken = Arc<OnceLock<Instant>>;
 /// produced none leaves the cell empty. Shared by the streaming and the
 /// collected path, so both measure on the one event pipeline.
 pub(crate) fn watch_first_token(stream: EventStream) -> (EventStream, FirstToken) {
-    let first: FirstToken = Arc::new(OnceLock::new());
+    let first = FirstToken::default();
     let seen = first.clone();
     let stream = stream
         .inspect(move |item| {
-            if seen.get().is_none() && matches!(item, Ok(event) if is_token(event)) {
-                let _ = seen.set(Instant::now());
+            if matches!(item, Ok(event) if is_token(event)) {
+                if seen.0.first.get().is_none() {
+                    let _ = seen.0.first.set(Instant::now());
+                }
+                seen.0.events.fetch_add(1, Ordering::Relaxed);
             }
         })
         .boxed();
@@ -151,6 +179,27 @@ fn is_token(event: &AiStreamEvent) -> bool {
         | AiStreamEvent::OutputImage { .. } => true,
         _ => false,
     }
+}
+
+/// How fast one attempt was served, for its usage record: time from the
+/// attempt's dispatch to its first token and from the first token to
+/// `ended`, on the gateway's clock, plus any engine timings in `usage`
+/// (which win). The gateway's decode window counts only for a response
+/// that streamed in (two or more token events): one that came in one piece
+/// has no decode window to measure, so its decode speed is left out rather
+/// than made up.
+pub(crate) fn attempt_speed(
+    usage: &Usage,
+    first: &FirstToken,
+    attempt_started: Instant,
+    ended: Instant,
+) -> sb_ledger::RequestSpeed {
+    let first_at = first.get().copied();
+    let ttft = first_at.map(|at| at.saturating_duration_since(attempt_started).as_millis() as u64);
+    let decode = first_at
+        .filter(|_| first.events() >= 2)
+        .map(|at| ended.saturating_duration_since(at).as_millis() as u64);
+    sb_ledger::RequestSpeed::measure(usage, ttft, decode)
 }
 
 /// Time to first token for a trace, measured from the request's start (the

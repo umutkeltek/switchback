@@ -20,7 +20,9 @@ fn holds_path(path: &str, with_id: bool) -> bool {
 /// Client-facing endpoints that tenant/client keys may use. Job, artifact
 /// and hold reads are on it: the handlers then show a client only what its
 /// own tenant and project made (another's answers 404). The capacity report
-/// is on it too: a client key gets its read-only view.
+/// is on it too: a client key gets its read-only view. So is the per-target
+/// speed summary (`/v1/targets/stats`), which is read-only aggregate
+/// metadata.
 fn client_surface(method: &Method, path: &str) -> bool {
     if (matches!(*method, Method::GET | Method::POST) && holds_path(path, false))
         || (matches!(*method, Method::PATCH | Method::DELETE) && holds_path(path, true))
@@ -30,6 +32,7 @@ fn client_surface(method: &Method, path: &str) -> bool {
     (method == Method::GET
         && (path == "/v1/models"
             || path == "/v1/workloads/capacity"
+            || path == "/v1/targets/stats"
             || path == "/v1/jobs"
             || path.starts_with("/v1/jobs/")
             || path.starts_with("/v1/artifacts/")))

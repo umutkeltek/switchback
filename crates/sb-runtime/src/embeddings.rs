@@ -211,7 +211,7 @@ impl Engine {
             .wake_lane_before_dispatch(snap, &req, None, &mut resolved)
             .await;
         let mut lane_gpu = self
-            .take_gpu_before_dispatch(snap, &req, None, &mut resolved)
+            .take_lane_before_dispatch(snap, &req, None, &mut resolved)
             .await;
         let planned = plan_resolved_route(&self.combo_rr, snap, &req, None, resolved, true)
             .and_then(|(route_name, mut plan)| {
@@ -436,6 +436,8 @@ impl Engine {
                                     usage.clone(),
                                     started,
                                     false,
+                                    // Embeddings stream no tokens: no speed.
+                                    sb_ledger::RequestSpeed::default(),
                                 ) {
                                     let message = format!("usage persistence failed: {e}");
                                     self.record_trace(trace.finish(

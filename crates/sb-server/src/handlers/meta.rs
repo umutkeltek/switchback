@@ -38,6 +38,37 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
 /// Usage/cost summary from the append-only ledger — requests + attributed cost
 /// (micro-USD and USD) by model and provider. The "see every cost" surface that
 /// complements the explainable "see every decision" route headers.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TargetStatsQuery {
+    /// How many recent usage records to summarize (default 2000, at most
+    /// 10000).
+    limit: Option<usize>,
+}
+
+/// `GET /v1/targets/stats`: a read-only rolling speed summary per target
+/// (provider + model) over the most recent usage records: p50 decode and
+/// prompt tokens per second, p50 time to first token, how many records
+/// carried them and from which source, and when the target was last seen.
+/// The records come from the durable store when one is attached, else from
+/// memory. Metadata only; client keys may read it, like the capacity report.
+pub(crate) async fn target_stats(
+    State(state): State<AppState>,
+    Query(query): Query<TargetStatsQuery>,
+) -> Json<serde_json::Value> {
+    let limit = query.limit.unwrap_or(2_000).clamp(1, 10_000);
+    let recent = state.ledger.recent(limit);
+    let data = sb_ledger::target_speed_stats(&recent);
+    Json(serde_json::json!({
+        "object": "list",
+        "window": {
+            "limit": limit,
+            "records": recent.len(),
+            "durable": state.ledger.durability_health().store_configured,
+        },
+        "data": data,
+    }))
+}
+
 pub(crate) async fn usage(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,

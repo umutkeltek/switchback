@@ -1139,7 +1139,9 @@ impl AnthropicStreamEncoder {
             // dropped from this surface rather than emitted malformed.
             AiStreamEvent::OutputImage { .. }
             | AiStreamEvent::Citation { .. }
-            | AiStreamEvent::ServerToolCall { .. } => {}
+            | AiStreamEvent::ServerToolCall { .. }
+            // Gateway metadata: never sent to a client.
+            | AiStreamEvent::EngineTimings { .. } => {}
             AiStreamEvent::TextDelta { text } => {
                 if text.is_empty() {
                     return out;

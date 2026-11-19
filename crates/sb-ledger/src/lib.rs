@@ -95,6 +95,107 @@ pub fn compute_unit_cost_micros(price: Option<UnitPrice>, units: Option<f64>) ->
     Some(micros.ceil() as u64)
 }
 
+/// Where one speed number of a request came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedSource {
+    /// The engine's own timing of the request (the `timings` a llama.cpp
+    /// server reports): pure engine work, no network or queue time.
+    Engine,
+    /// The gateway's clocks: includes the network and any upstream queue.
+    Gateway,
+}
+
+impl SpeedSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Engine => "engine",
+            Self::Gateway => "gateway",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "engine" => Some(Self::Engine),
+            "gateway" => Some(Self::Gateway),
+            _ => None,
+        }
+    }
+}
+
+/// How fast one request was served, each number with its source. Every
+/// field is optional: a number is absent when nothing measured it (no
+/// token came, no engine timing and no gateway clock covered it).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RequestSpeed {
+    /// Time from dispatching the attempt to its first token, on the
+    /// gateway's clock (wake, queue and GPU-group waits are before the
+    /// dispatch and not in it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_source: Option<SpeedSource>,
+    /// Prompt tokens processed per second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tps_source: Option<SpeedSource>,
+    /// Tokens generated per second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_tps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_tps_source: Option<SpeedSource>,
+}
+
+impl RequestSpeed {
+    /// Measure one request. Engine timings in `usage` win; otherwise the
+    /// gateway's clocks: `ttft_ms` is dispatch to first token and
+    /// `decode_ms` is first token to the end, so decode speed is
+    /// `output_tokens / decode_ms` and prompt speed `input_tokens /
+    /// ttft_ms` (an upper bound on the time, so a lower bound on the speed:
+    /// it includes the network and any upstream queue).
+    pub fn measure(usage: &Usage, ttft_ms: Option<u64>, decode_ms: Option<u64>) -> Self {
+        let engine = usage.engine_timings.as_ref();
+        let (prompt_tps, prompt_tps_source) =
+            match engine.and_then(|timings| timings.prompt_tokens_per_sec()) {
+                Some(rate) => (Some(round2(rate)), Some(SpeedSource::Engine)),
+                None => match gateway_rate(usage.input_tokens, ttft_ms) {
+                    Some(rate) => (Some(rate), Some(SpeedSource::Gateway)),
+                    None => (None, None),
+                },
+            };
+        let (decode_tps, decode_tps_source) =
+            match engine.and_then(|timings| timings.decode_tokens_per_sec()) {
+                Some(rate) => (Some(round2(rate)), Some(SpeedSource::Engine)),
+                None => match gateway_rate(usage.output_tokens, decode_ms) {
+                    Some(rate) => (Some(rate), Some(SpeedSource::Gateway)),
+                    None => (None, None),
+                },
+            };
+        Self {
+            ttft_ms,
+            ttft_source: ttft_ms.map(|_| SpeedSource::Gateway),
+            prompt_tps,
+            prompt_tps_source,
+            decode_tps,
+            decode_tps_source,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ttft_ms.is_none() && self.prompt_tps.is_none() && self.decode_tps.is_none()
+    }
+}
+
+fn gateway_rate(tokens: u64, ms: Option<u64>) -> Option<f64> {
+    let ms = ms.filter(|ms| *ms > 0)?;
+    (tokens > 0).then(|| round2(tokens as f64 / (ms as f64 / 1000.0)))
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 /// One executed request's usage + attributed cost. Append-only; never mutated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
@@ -138,6 +239,11 @@ pub struct UsageRecord {
     /// Lets the operator see when an old name is no longer used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
+    /// How fast the request was served (time to first token, prompt and
+    /// decode tokens per second), each number with its source. Empty for
+    /// media jobs and for records written before it existed.
+    #[serde(flatten, default)]
+    pub speed: RequestSpeed,
 }
 
 impl UsageRecord {
@@ -175,6 +281,7 @@ impl UsageRecord {
             tenant: None,
             project: None,
             requested_model: None,
+            speed: RequestSpeed::default(),
         }
     }
 
@@ -213,6 +320,7 @@ impl UsageRecord {
             tenant: None,
             project: None,
             requested_model: None,
+            speed: RequestSpeed::default(),
         }
     }
 
@@ -249,6 +357,7 @@ impl UsageRecord {
             tenant: None,
             project: None,
             requested_model: None,
+            speed: RequestSpeed::default(),
         }
     }
 
@@ -277,6 +386,126 @@ impl UsageRecord {
         self.cache_savings_micros = cache_savings_micros;
         self
     }
+
+    /// Attach how fast the request was served (builder).
+    pub fn with_speed(mut self, speed: RequestSpeed) -> Self {
+        self.speed = speed;
+        self
+    }
+}
+
+/// Rolling speed summary of one target (provider + model) over recent usage
+/// records: the median of each speed number, how many records carried it,
+/// and which source each came from. See [`target_speed_stats`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TargetSpeedStats {
+    /// `provider_id/model`.
+    pub target: String,
+    pub provider_id: String,
+    pub model: String,
+    /// Records in the window with at least one speed number.
+    pub count: u64,
+    /// Newest of those records (Unix seconds).
+    pub last_seen_unix: u64,
+    pub p50_decode_tps: Option<f64>,
+    pub p50_prompt_tps: Option<f64>,
+    pub p50_ttft_ms: Option<u64>,
+    /// How many records carried each number, and from which source
+    /// (`engine` or `gateway`).
+    pub decode_sources: BTreeMap<&'static str, u64>,
+    pub prompt_sources: BTreeMap<&'static str, u64>,
+    pub ttft_samples: u64,
+}
+
+/// Summarize `records` (any order) per target: p50 decode and prompt tokens
+/// per second, p50 time to first token, count and last seen. Records with no
+/// speed number (media jobs, embeddings, rows from before the numbers
+/// existed) are left out. Targets come back sorted by `target`. Read-only and
+/// metadata-only; the medians mix sources when a target reported both (the
+/// `*_sources` counts say so).
+pub fn target_speed_stats<'a>(
+    records: impl IntoIterator<Item = &'a UsageRecord>,
+) -> Vec<TargetSpeedStats> {
+    #[derive(Default)]
+    struct Acc {
+        count: u64,
+        last_seen_unix: u64,
+        decode: Vec<f64>,
+        prompt: Vec<f64>,
+        ttft: Vec<u64>,
+        decode_sources: BTreeMap<&'static str, u64>,
+        prompt_sources: BTreeMap<&'static str, u64>,
+    }
+    let mut by_target: BTreeMap<(String, String), Acc> = BTreeMap::new();
+    for record in records {
+        let speed = &record.speed;
+        if speed.is_empty() {
+            continue;
+        }
+        let acc = by_target
+            .entry((record.provider_id.clone(), record.model.clone()))
+            .or_default();
+        acc.count += 1;
+        acc.last_seen_unix = acc.last_seen_unix.max(record.timestamp_unix);
+        if let Some(tps) = speed.decode_tps.filter(|tps| tps.is_finite()) {
+            acc.decode.push(tps);
+            if let Some(source) = speed.decode_tps_source {
+                *acc.decode_sources.entry(source.as_str()).or_default() += 1;
+            }
+        }
+        if let Some(tps) = speed.prompt_tps.filter(|tps| tps.is_finite()) {
+            acc.prompt.push(tps);
+            if let Some(source) = speed.prompt_tps_source {
+                *acc.prompt_sources.entry(source.as_str()).or_default() += 1;
+            }
+        }
+        if let Some(ms) = speed.ttft_ms {
+            acc.ttft.push(ms);
+        }
+    }
+    by_target
+        .into_iter()
+        .map(|((provider_id, model), mut acc)| TargetSpeedStats {
+            target: format!("{provider_id}/{model}"),
+            p50_decode_tps: median_f64(&mut acc.decode),
+            p50_prompt_tps: median_f64(&mut acc.prompt),
+            p50_ttft_ms: median_u64(&mut acc.ttft),
+            ttft_samples: acc.ttft.len() as u64,
+            provider_id,
+            model,
+            count: acc.count,
+            last_seen_unix: acc.last_seen_unix,
+            decode_sources: acc.decode_sources,
+            prompt_sources: acc.prompt_sources,
+        })
+        .collect()
+}
+
+fn median_f64(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    let median = if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    };
+    Some(round2(median))
+}
+
+fn median_u64(values: &mut [u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]).div_ceil(2)
+    } else {
+        values[mid]
+    })
 }
 
 /// Operator-facing health of usage durability. This is intentionally compact:
@@ -881,6 +1110,21 @@ fn record_to_event(r: &UsageRecord) -> sb_store::UsageEvent {
         energy_total_cost_usd: energy.and_then(|energy| energy.total_cost_usd),
         created_at_ms: (r.timestamp_unix as i64).saturating_mul(1000),
         requested_model: r.requested_model.clone(),
+        ttft_ms: r.speed.ttft_ms,
+        ttft_source: r
+            .speed
+            .ttft_source
+            .map(|source| source.as_str().to_string()),
+        prompt_tps: r.speed.prompt_tps,
+        prompt_tps_source: r
+            .speed
+            .prompt_tps_source
+            .map(|source| source.as_str().to_string()),
+        decode_tps: r.speed.decode_tps,
+        decode_tps_source: r
+            .speed
+            .decode_tps_source
+            .map(|source| source.as_str().to_string()),
     }
 }
 
@@ -931,6 +1175,20 @@ fn event_to_record(event: sb_store::UsageEvent) -> UsageRecord {
         tenant: event.tenant,
         project: event.project,
         requested_model: event.requested_model,
+        speed: RequestSpeed {
+            ttft_ms: event.ttft_ms,
+            ttft_source: event.ttft_source.as_deref().and_then(SpeedSource::parse),
+            prompt_tps: event.prompt_tps,
+            prompt_tps_source: event
+                .prompt_tps_source
+                .as_deref()
+                .and_then(SpeedSource::parse),
+            decode_tps: event.decode_tps,
+            decode_tps_source: event
+                .decode_tps_source
+                .as_deref()
+                .and_then(SpeedSource::parse),
+        },
     }
 }
 
@@ -1867,5 +2125,151 @@ mod tests {
         fn delete_draft(&self, _id: &str) -> sb_store::Result<()> {
             Ok(())
         }
+    }
+
+    // --- per-request speed ----------------------------------------------
+
+    fn usage(input: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Usage::default()
+        }
+    }
+
+    // Engine timings win over the gateway's clocks, and say so.
+    #[test]
+    fn engine_timings_win_and_are_marked_engine() {
+        let mut usage = usage(120, 40);
+        usage.engine_timings = Some(sb_core::EngineTimings {
+            prompt_tokens: Some(120),
+            prompt_ms: Some(60.0),
+            decode_tokens: Some(40),
+            decode_ms: Some(800.0),
+        });
+        let speed = RequestSpeed::measure(&usage, Some(300), Some(2_000));
+        assert_eq!(speed.prompt_tps, Some(2000.0));
+        assert_eq!(speed.prompt_tps_source, Some(SpeedSource::Engine));
+        assert_eq!(speed.decode_tps, Some(50.0));
+        assert_eq!(speed.decode_tps_source, Some(SpeedSource::Engine));
+        assert_eq!(speed.ttft_ms, Some(300));
+        assert_eq!(speed.ttft_source, Some(SpeedSource::Gateway));
+    }
+
+    // Without engine timings the gateway computes them:
+    // decode = output_tokens / (end - first token), prompt = input / ttft.
+    #[test]
+    fn without_timings_the_gateway_clock_computes_them() {
+        let speed = RequestSpeed::measure(&usage(500, 90), Some(250), Some(1_500));
+        assert_eq!(speed.decode_tps, Some(60.0));
+        assert_eq!(speed.decode_tps_source, Some(SpeedSource::Gateway));
+        assert_eq!(speed.prompt_tps, Some(2000.0));
+        assert_eq!(speed.prompt_tps_source, Some(SpeedSource::Gateway));
+        // A partial engine report fills only what it covers.
+        let mut partial = usage(500, 90);
+        partial.engine_timings = Some(sb_core::EngineTimings {
+            decode_tokens: Some(90),
+            decode_ms: Some(900.0),
+            ..Default::default()
+        });
+        let speed = RequestSpeed::measure(&partial, Some(250), Some(1_500));
+        assert_eq!(
+            (speed.decode_tps, speed.decode_tps_source),
+            (Some(100.0), Some(SpeedSource::Engine))
+        );
+        assert_eq!(speed.prompt_tps_source, Some(SpeedSource::Gateway));
+    }
+
+    // Nothing measured, nothing made up.
+    #[test]
+    fn no_clock_and_no_tokens_means_no_numbers() {
+        let speed = RequestSpeed::measure(&usage(10, 0), None, None);
+        assert!(speed.is_empty());
+        let speed = RequestSpeed::measure(&usage(10, 5), Some(0), Some(0));
+        assert_eq!((speed.prompt_tps, speed.decode_tps), (None, None));
+    }
+
+    fn record_at(provider: &str, ts: u64, decode: f64, prompt: f64, ttft: u64) -> UsageRecord {
+        let mut record = UsageRecord::priced(
+            format!("r{ts}"),
+            provider,
+            "m",
+            None,
+            usage(1, 1),
+            1,
+            true,
+            0,
+        );
+        record.timestamp_unix = ts;
+        record.with_speed(RequestSpeed {
+            ttft_ms: Some(ttft),
+            ttft_source: Some(SpeedSource::Gateway),
+            prompt_tps: Some(prompt),
+            prompt_tps_source: Some(SpeedSource::Engine),
+            decode_tps: Some(decode),
+            decode_tps_source: Some(if ts.is_multiple_of(2) {
+                SpeedSource::Engine
+            } else {
+                SpeedSource::Gateway
+            }),
+        })
+    }
+
+    #[test]
+    fn target_stats_take_medians_per_target_and_skip_records_without_speed() {
+        let mut records = vec![
+            record_at("gpu-box", 10, 30.0, 900.0, 400),
+            record_at("gpu-box", 13, 50.0, 1100.0, 200),
+            record_at("gpu-box", 11, 40.0, 1000.0, 300),
+            record_at("cloud", 12, 80.0, 5000.0, 700),
+            record_at("cloud", 14, 100.0, 7000.0, 900),
+        ];
+        // A media job: no speed, left out.
+        records.push(UsageRecord::workload(
+            "img",
+            "gpu-box",
+            "m",
+            None,
+            WorkloadKind::ImageGeneration,
+            None,
+            None,
+            None,
+            9,
+        ));
+        let stats = target_speed_stats(&records);
+        assert_eq!(stats.len(), 2);
+        let cloud = &stats[0];
+        assert_eq!(cloud.target, "cloud/m");
+        assert_eq!(
+            cloud.p50_decode_tps,
+            Some(90.0),
+            "even count: mean of the middle two"
+        );
+        assert_eq!(cloud.p50_ttft_ms, Some(800));
+        let gpu = &stats[1];
+        assert_eq!(gpu.target, "gpu-box/m");
+        assert_eq!(gpu.count, 3, "the media job is not counted");
+        assert_eq!(gpu.last_seen_unix, 13);
+        assert_eq!(gpu.p50_decode_tps, Some(40.0));
+        assert_eq!(gpu.p50_prompt_tps, Some(1000.0));
+        assert_eq!(gpu.p50_ttft_ms, Some(300));
+        assert_eq!(gpu.decode_sources.get("engine"), Some(&1));
+        assert_eq!(gpu.decode_sources.get("gateway"), Some(&2));
+    }
+
+    // The speed survives the store round trip and old JSONL lines (with no
+    // speed fields) still read.
+    #[test]
+    fn speed_round_trips_through_the_event_and_old_lines_still_read() {
+        let record = record_at("gpu-box", 10, 30.0, 900.0, 400);
+        let back = event_to_record(record_to_event(&record));
+        assert_eq!(back.speed, record.speed);
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["decode_tps"], 30.0);
+        assert_eq!(json["decode_tps_source"], "engine");
+        let old = r#"{"request_id":"r","provider_id":"p","model":"m","timestamp_unix":1,
+            "usage":{"input_tokens":1,"output_tokens":1},"cost_micros":0,"latency_ms":5}"#;
+        let old: UsageRecord = serde_json::from_str(old).unwrap();
+        assert!(old.speed.is_empty());
     }
 }

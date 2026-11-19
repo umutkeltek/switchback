@@ -211,7 +211,8 @@ pub(crate) async fn provider_test_config(
                     | AiStreamEvent::ToolCallEnd { .. }
                     | AiStreamEvent::OutputImage { .. }
                     | AiStreamEvent::Citation { .. }
-                    | AiStreamEvent::ServerToolCall { .. } => {}
+                    | AiStreamEvent::ServerToolCall { .. }
+                    | AiStreamEvent::EngineTimings { .. } => {}
                 }
             }
             Ok(ProviderTestSummary {

@@ -217,6 +217,55 @@ pub struct LocalExecutorConfig {
     /// (the default): such a machine stays on, as before.
     #[serde(default)]
     pub adopt_external_wake: bool,
+    /// The most requests and media jobs this lane serves at once. Work past
+    /// the limit does not reach the engine: it either goes to another target
+    /// of its route or waits in this lane's queue, oldest first (see
+    /// `on_full`). Every text or embeddings request dispatched to the lane's
+    /// provider counts, and so does every media job. Unset (the default): no
+    /// limit, as before. Must be at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<u32>,
+    /// The longest one request or media job waits in this lane's queue for a
+    /// free place under `max_in_flight`. A request still waiting then gets a
+    /// retryable 503 (`local_lane_queue_timeout`, with `Retry-After`) unless
+    /// another target of its route can serve it; a media job fails with the
+    /// same error. `0` never waits. Default 60.
+    #[serde(default = "default_queue_timeout_secs")]
+    pub queue_timeout_secs: u64,
+    /// What a request does when this lane is full (`max_in_flight` reached)
+    /// and the lane holds the target its route would choose first.
+    /// `spill` (the default): it goes to the route's next usable target at
+    /// once, and waits in the queue only when no other target can serve it.
+    /// `queue`: it waits in the queue (up to `queue_timeout_secs`) and falls
+    /// through to the next target only after that. A fallback target on a
+    /// full lane is always skipped, never waited for. Media jobs always queue.
+    #[serde(default)]
+    pub on_full: LaneOnFull,
+}
+
+/// What a request does when its first choice's lane is full; see
+/// [`LocalExecutorConfig::on_full`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneOnFull {
+    /// Go to the route's next usable target; queue only when there is none.
+    #[default]
+    Spill,
+    /// Wait in the lane's queue first; fall through after `queue_timeout_secs`.
+    Queue,
+}
+
+impl LaneOnFull {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spill => "spill",
+            Self::Queue => "queue",
+        }
+    }
+}
+
+fn default_queue_timeout_secs() -> u64 {
+    60
 }
 
 fn default_group_wait_secs() -> u64 {
@@ -1210,6 +1259,11 @@ impl Config {
                 if host.trim().is_empty() {
                     problems.push(format!("local_executors[{i}].host is empty"));
                 }
+            }
+            if executor.max_in_flight == Some(0) {
+                problems.push(format!(
+                    "local_executors[{i}].max_in_flight must be at least 1 (remove it for no limit)"
+                ));
             }
             if let Some(group) = &executor.exclusive_group {
                 if group.trim().is_empty() {

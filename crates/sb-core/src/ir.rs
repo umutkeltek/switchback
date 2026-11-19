@@ -630,9 +630,59 @@ pub struct Usage {
     pub reasoning_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub energy: Option<EnergyUsage>,
+    /// The engine's own timing of this request, when it reports one (for
+    /// example a llama.cpp server's `timings`). Metadata only: it feeds the
+    /// per-request speed numbers and is never sent back to a client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_timings: Option<EngineTimings>,
+}
+
+/// Provider-agnostic engine timing of one request: how many prompt tokens
+/// the engine processed and how long that took, and how many tokens it
+/// generated and how long that took. Each field is optional; a speed is
+/// derived only from a matching count and time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EngineTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_ms: Option<f64>,
+}
+
+impl EngineTimings {
+    /// Prompt tokens per second, when both the count and a positive time
+    /// are known.
+    pub fn prompt_tokens_per_sec(&self) -> Option<f64> {
+        rate(self.prompt_tokens?, self.prompt_ms?)
+    }
+
+    /// Generated tokens per second, when both the count and a positive time
+    /// are known.
+    pub fn decode_tokens_per_sec(&self) -> Option<f64> {
+        rate(self.decode_tokens?, self.decode_ms?)
+    }
+}
+
+fn rate(tokens: u64, ms: f64) -> Option<f64> {
+    (tokens > 0 && ms.is_finite() && ms > 0.0).then(|| tokens as f64 / (ms / 1000.0))
 }
 
 impl Usage {
+    /// Take a newer usage report in place of this one (each report
+    /// supersedes the last), keeping engine timings seen earlier when the
+    /// newer report carries none.
+    pub fn replace_with(&mut self, latest: Usage) {
+        let timings = self.engine_timings.take();
+        *self = latest;
+        if self.engine_timings.is_none() {
+            self.engine_timings = timings;
+        }
+    }
+
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
     }
@@ -699,6 +749,13 @@ pub enum AiStreamEvent {
     },
     UsageDelta {
         usage: Usage,
+    },
+    /// The engine's own timing of this request (for example the `timings`
+    /// a llama.cpp server adds to its last chunk). Metadata for the gateway's
+    /// speed numbers: the meter folds it into the request's [`Usage`], and no
+    /// egress encoder ever sends it to a client.
+    EngineTimings {
+        timings: EngineTimings,
     },
     MessageEnd {
         finish_reason: FinishReason,

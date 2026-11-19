@@ -2918,3 +2918,286 @@ fn a_gpu_group_needs_a_host_and_a_release_command() {
         "{error}"
     );
 }
+
+// --- max_in_flight: spill to the next target, or wait in the lane's queue ---
+
+/// What [`SlotLanes::acquire_for_request`] answers.
+#[derive(Clone, Copy)]
+enum SlotWait {
+    /// A place at once (no wait, no detail).
+    Room,
+    /// A place after waiting in the queue.
+    Waited,
+    /// The queue wait ran out.
+    TimedOut,
+}
+
+/// A lane view where `lane` has a `max_in_flight`: `full` is what
+/// `lane_full` says, `wait` what a waiting first choice gets, and a
+/// dispatch that must not wait is refused while the lane is full.
+struct SlotLanes {
+    full: Option<&'static str>,
+    wait: SlotWait,
+    acquired: AtomicUsize,
+    tried: AtomicUsize,
+    active: Arc<AtomicUsize>,
+}
+
+const LANE_FULL: &str = "is full (2 of 2 in flight, 0 queued)";
+const LANE_WAITED: &str = "waited 3 s in the lane's queue for a place";
+const LANE_TIMED_OUT: &str = "waited 60 s in its queue and is still full (2 of 2 in flight)";
+
+impl SlotLanes {
+    fn new(full: bool, wait: SlotWait) -> Arc<Self> {
+        Arc::new(Self {
+            full: full.then_some(LANE_FULL),
+            wait,
+            acquired: AtomicUsize::new(0),
+            tried: AtomicUsize::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn busy(&self) -> crate::LaneBusy {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        Box::new(Busy(self.active.clone()))
+    }
+}
+
+impl crate::LaneStatus for SlotLanes {
+    fn known_down(&self, _provider_id: &str) -> Option<String> {
+        None
+    }
+
+    fn lane_full(&self, provider_id: &str) -> Option<String> {
+        assert_eq!(provider_id, "lane");
+        self.full.map(str::to_string)
+    }
+
+    fn try_begin_request(&self, provider_id: &str) -> Result<Option<crate::LaneBusy>, String> {
+        assert_eq!(provider_id, "lane");
+        self.tried.fetch_add(1, Ordering::SeqCst);
+        match self.full {
+            Some(full) => Err(full.to_string()),
+            None => Ok(Some(self.busy())),
+        }
+    }
+
+    fn acquire_for_request<'a>(
+        &'a self,
+        provider_id: &'a str,
+    ) -> crate::BoxFuture<'a, crate::LaneAcquire> {
+        assert_eq!(provider_id, "lane");
+        self.acquired.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(match self.wait {
+            SlotWait::Room => crate::LaneAcquire::Ready {
+                busy: Some(self.busy()),
+                detail: None,
+            },
+            SlotWait::Waited => crate::LaneAcquire::Ready {
+                busy: Some(self.busy()),
+                detail: Some(LANE_WAITED.to_string()),
+            },
+            SlotWait::TimedOut => crate::LaneAcquire::QueueTimeout {
+                detail: LANE_TIMED_OUT.to_string(),
+                retry_after: crate::LANE_QUEUE_RETRY_AFTER,
+            },
+        }))
+    }
+}
+
+/// [`wake_lane_config`] with `max_in_flight: 2` on the lane and `on_full`.
+fn slot_lane_config(on_full: sb_core::LaneOnFull) -> Config {
+    let mut cfg = wake_lane_config(false);
+    let lane = &mut cfg.local_executors[0];
+    lane.max_in_flight = Some(2);
+    lane.on_full = on_full;
+    cfg
+}
+
+fn selected(engine: &Engine) -> (String, Vec<String>, Vec<(String, String)>) {
+    let trace = engine.traces().recent(1).pop().unwrap();
+    (
+        trace.decision.selected.as_ref().unwrap().target_id.clone(),
+        trace.decision.reason.clone(),
+        trace
+            .decision
+            .rejected
+            .iter()
+            .map(|r| (r.target_id.clone(), r.reason.clone()))
+            .collect(),
+    )
+}
+
+// A full lane with `on_full: spill` (the default) sends the route's first
+// choice to the next target at once: no wait, no dispatch to the lane, and
+// the decision says why.
+#[tokio::test]
+async fn a_full_lane_spills_the_first_choice_to_the_next_target() {
+    let lanes = SlotLanes::new(true, SlotWait::Room);
+    let engine = engine_from_config(slot_lane_config(sb_core::LaneOnFull::Spill))
+        .with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    let (target, reasons, rejected) = selected(&engine);
+    assert_eq!(target, "spare/echo");
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r
+                == &format!("local lane `lane` {LANE_FULL}, spilled to the route's next target")),
+        "{reasons:?}"
+    );
+    let (_, why) = rejected
+        .iter()
+        .find(|(id, _)| id == "lane/echo")
+        .expect("the lane's target is skipped with a reason");
+    assert!(why.contains(LANE_FULL) && why.contains("spilled"), "{why}");
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 0, "never waited");
+    assert_eq!(lanes.tried.load(Ordering::SeqCst), 0, "never dispatched");
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 0);
+}
+
+// The same full lane when it is the only target that can serve: the request
+// waits in the lane's queue instead, is served there, and holds its place
+// until the response is complete.
+#[tokio::test]
+async fn a_full_lane_with_no_other_target_waits_in_its_queue() {
+    let lanes = SlotLanes::new(true, SlotWait::Waited);
+    let engine = engine_from_config(slot_lane_config(sb_core::LaneOnFull::Spill))
+        .with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("lane/echo", true), Instant::now())
+        .await;
+    let ExecOutcome::Stream { mut stream, .. } = outcome else {
+        panic!("expected a stream from the lane");
+    };
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 1, "holds its place");
+    while stream.next().await.is_some() {}
+    drop(stream);
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        0,
+        "the place is given back"
+    );
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        lanes.tried.load(Ordering::SeqCst),
+        0,
+        "the waited place is used"
+    );
+    let (target, reasons, _) = selected(&engine);
+    assert_eq!(target, "lane/echo");
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r == &format!("local lane `lane` {LANE_WAITED}")),
+        "{reasons:?}"
+    );
+}
+
+// A queue wait that runs out with no other target is a typed, retryable 503.
+#[tokio::test]
+async fn a_queue_timeout_with_no_other_target_is_a_typed_retryable_503() {
+    let lanes = SlotLanes::new(true, SlotWait::TimedOut);
+    let engine = engine_from_config(slot_lane_config(sb_core::LaneOnFull::Spill))
+        .with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("lane/echo", false), Instant::now())
+        .await;
+    let ExecOutcome::Error(error) = outcome else {
+        panic!("expected a retryable error");
+    };
+    assert_eq!(error.status, 503);
+    assert_eq!(error.error_type, "local_lane_queue_timeout");
+    assert_eq!(error.retry_after, Some(crate::LANE_QUEUE_RETRY_AFTER));
+    assert!(error.message.contains(LANE_TIMED_OUT), "{}", error.message);
+    assert_eq!(lanes.active.load(Ordering::SeqCst), 0);
+}
+
+// `on_full: queue` waits even when another target could serve, and falls
+// through to it only when the wait runs out.
+#[tokio::test]
+async fn on_full_queue_waits_first_then_falls_through() {
+    let lanes = SlotLanes::new(true, SlotWait::Waited);
+    let engine = engine_from_config(slot_lane_config(sb_core::LaneOnFull::Queue))
+        .with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    assert_eq!(selected(&engine).0, "lane/echo", "waited for the lane");
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 1);
+
+    let lanes = SlotLanes::new(true, SlotWait::TimedOut);
+    let engine = engine_from_config(slot_lane_config(sb_core::LaneOnFull::Queue))
+        .with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    let (target, reasons, _) = selected(&engine);
+    assert_eq!(target, "spare/echo", "fell through after the wait");
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r == &format!("local lane `lane` {LANE_TIMED_OUT}, fell through")),
+        "{reasons:?}"
+    );
+}
+
+// A lane with room gives a place at once and says nothing on the decision.
+#[tokio::test]
+async fn a_lane_with_room_takes_the_request_without_a_note() {
+    let lanes = SlotLanes::new(false, SlotWait::Room);
+    let engine = engine_from_config(slot_lane_config(sb_core::LaneOnFull::Spill))
+        .with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    let (target, reasons, _) = selected(&engine);
+    assert_eq!(target, "lane/echo");
+    assert!(
+        !reasons.iter().any(|r| r.starts_with("local lane")),
+        "{reasons:?}"
+    );
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        0,
+        "released when collected"
+    );
+}
+
+// A full lane reached as a fallback is skipped at once, never waited for.
+#[tokio::test]
+async fn a_full_lane_reached_as_a_fallback_is_skipped_without_waiting() {
+    let mut cfg = slot_lane_config(sb_core::LaneOnFull::Queue);
+    cfg.routes[0].targets = vec!["spare/always-error".to_string(), "lane/echo".to_string()];
+    let lanes = SlotLanes::new(true, SlotWait::Waited);
+    let engine = engine_from_config(cfg).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Error(_)));
+    assert_eq!(lanes.acquired.load(Ordering::SeqCst), 0, "no wait");
+    assert_eq!(
+        lanes.tried.load(Ordering::SeqCst),
+        1,
+        "refused without waiting"
+    );
+}
+
+#[test]
+fn max_in_flight_must_be_at_least_one() {
+    let mut cfg = slot_lane_config(sb_core::LaneOnFull::Spill);
+    assert!(Engine::validate_config(&cfg).is_ok());
+    cfg.local_executors[0].max_in_flight = Some(0);
+    let error = Engine::validate_config(&cfg).unwrap_err();
+    assert!(
+        error.contains("local_executors[0].max_in_flight must be at least 1"),
+        "{error}"
+    );
+}

@@ -948,6 +948,7 @@ fn parse_usage(value: Option<&Value>, energy_value: Option<&Value>) -> Usage {
             .and_then(Value::as_u64)
             .unwrap_or_default(),
         energy: parse_energy_usage(energy_value),
+        engine_timings: None,
     }
 }
 
@@ -1057,6 +1058,8 @@ impl OpenAiResponsesStreamEncoder {
             AiStreamEvent::MessageStart { .. } => {
                 out.push(self.created());
             }
+            // Gateway metadata: never sent to a client.
+            AiStreamEvent::EngineTimings { .. } => {}
             AiStreamEvent::ServerToolCall { id, name, status } => {
                 // Re-emit the provider-side tool lifecycle (web_search_call,
                 // code_interpreter_call, …) so the client sees the same status.

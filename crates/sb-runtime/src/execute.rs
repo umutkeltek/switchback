@@ -21,7 +21,7 @@ use super::profiles::{
     apply_request_client_profile, client_profile_allowed_accounts, combine_allowed_accounts,
     plan_resolved_route, resolve_candidates, tenant_allowed_accounts,
 };
-use super::stream::{meter_stream, ttft_ms, watch_first_token, StreamFinish};
+use super::stream::{attempt_speed, meter_stream, ttft_ms, watch_first_token, StreamFinish};
 use super::{DenialTrace, Engine, ExecError, ExecOutcome, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,10 +293,11 @@ impl Engine {
         let lane_wake = self
             .wake_lane_before_dispatch(snap, &req, client_profile.as_ref(), &mut resolved)
             .await;
-        // Opt-in (`exclusive_group`): the first choice's lane takes its GPU
-        // group, bounded, before the first byte.
+        // Opt-in (`max_in_flight`, `exclusive_group`): the first choice's
+        // lane gives it a place (or it spills to the next target) and takes
+        // its GPU group, bounded, before the first byte.
         let mut lane_gpu = self
-            .take_gpu_before_dispatch(snap, &req, client_profile.as_ref(), &mut resolved)
+            .take_lane_before_dispatch(snap, &req, client_profile.as_ref(), &mut resolved)
             .await;
 
         let planned = plan_resolved_route(
@@ -434,6 +435,7 @@ impl Engine {
                     win.response.usage.clone(),
                     started,
                     false,
+                    win.speed.clone(),
                 ) {
                     let message = format!("usage persistence failed: {e}");
                     self.record_trace(trace.finish(
@@ -901,6 +903,12 @@ impl Engine {
                                                 attempt_started.elapsed().as_millis() as u64;
                                             match finish {
                                                 StreamFinish::Clean => {
+                                                    let speed = attempt_speed(
+                                                        &usage,
+                                                        &first_token,
+                                                        attempt_started,
+                                                        Instant::now(),
+                                                    );
                                                     resolver.report_success(&pid, &acct);
                                                     trace.attempt(sb_trace::Attempt::success(
                                                         &tid,
@@ -952,7 +960,8 @@ impl Engine {
                                                         )
                                                         .with_tenant(tnt)
                                                         .with_project(prj)
-                                                        .with_cache_savings(Some(cache_savings));
+                                                        .with_cache_savings(Some(cache_savings))
+                                                        .with_speed(speed);
                                                     if usage_required {
                                                         if let Err(e) = ledger
                                                             .record_checked_post_commit(
@@ -1130,6 +1139,12 @@ impl Engine {
                                             response.usage.clone(),
                                             started,
                                             false,
+                                            attempt_speed(
+                                                &response.usage,
+                                                &first_token,
+                                                attempt_started,
+                                                Instant::now(),
+                                            ),
                                         ) {
                                             let message = format!("usage persistence failed: {e}");
                                             self.record_trace(trace.finish(

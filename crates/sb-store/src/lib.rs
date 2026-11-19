@@ -144,6 +144,21 @@ pub struct UsageEvent {
     /// column; NULL otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
+    /// How fast the request was served (migration 20; additive nullable
+    /// columns, NULL for older rows and media jobs). `*_source` is `engine`
+    /// (the engine's own timing) or `gateway` (the gateway's clocks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tps_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_tps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_tps_source: Option<String>,
 }
 
 /// One metadata-only request trace, durably recorded for searchable execution
@@ -1264,6 +1279,20 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
             }
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 20, "usage_request_speed", |tx| {
+            if !Self::table_exists(tx, "usage")? {
+                return Ok(());
+            }
+            // Additive + nullable only, so a previous binary on the same file
+            // keeps working: it names its columns in every INSERT and SELECT,
+            // never reads these, and its rows leave them NULL (no speed).
+            for (column, ty) in USAGE_SPEED_COLUMNS {
+                if !Self::column_exists(tx, "usage", column)? {
+                    tx.execute(&format!("ALTER TABLE usage ADD COLUMN {column} {ty}"), [])?;
+                }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1360,6 +1389,16 @@ fn energy_rollup_from_row(
         energy_kwh_charged: row.get(offset + 5)?,
     })
 }
+
+/// The per-request speed columns migration 20 adds to `usage`.
+const USAGE_SPEED_COLUMNS: [(&str, &str); 6] = [
+    ("ttft_ms", "INTEGER"),
+    ("ttft_source", "TEXT"),
+    ("prompt_tps", "REAL"),
+    ("prompt_tps_source", "TEXT"),
+    ("decode_tps", "REAL"),
+    ("decode_tps_source", "TEXT"),
+];
 
 fn energy_rollup_select() -> &'static str {
     "COALESCE(SUM(CASE WHEN COALESCE(energy_measurement_available, 1) != 0
@@ -2204,9 +2243,11 @@ impl StateStore for SqliteStore {
               energy_duration_seconds, energy_measurement_available, energy_attribution_method,
               energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
               energy_total_cost_usd, created_at, cached_input_tokens, cache_savings_micros,
-              requested_model)
+              requested_model, ttft_ms, ttft_source, prompt_tps, prompt_tps_source,
+              decode_tps, decode_tps_source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
+                     ?29, ?30, ?31, ?32, ?33, ?34)",
             params![
                 e.request_id,
                 e.provider_id,
@@ -2237,6 +2278,12 @@ impl StateStore for SqliteStore {
                 e.cached_input_tokens as i64,
                 e.cache_savings_micros.map(|micros| micros as i64),
                 e.requested_model,
+                e.ttft_ms.map(|ms| ms.min(i64::MAX as u64) as i64),
+                e.ttft_source,
+                e.prompt_tps,
+                e.prompt_tps_source,
+                e.decode_tps,
+                e.decode_tps_source,
             ],
         )?;
         if rows == 0 {
@@ -2314,7 +2361,8 @@ impl StateStore for SqliteStore {
                     energy_measurement_available, energy_attribution_method,
                     energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
                     energy_total_cost_usd, created_at, cached_input_tokens,
-                    cache_savings_micros, requested_model
+                    cache_savings_micros, requested_model, ttft_ms, ttft_source,
+                    prompt_tps, prompt_tps_source, decode_tps, decode_tps_source
              FROM usage ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -2355,6 +2403,12 @@ impl StateStore for SqliteStore {
                         .get::<_, Option<i64>>(26)?
                         .map(|micros| micros as u64),
                     requested_model: row.get(27)?,
+                    ttft_ms: row.get::<_, Option<i64>>(28)?.map(|ms| ms.max(0) as u64),
+                    ttft_source: row.get(29)?,
+                    prompt_tps: row.get(30)?,
+                    prompt_tps_source: row.get(31)?,
+                    decode_tps: row.get(32)?,
+                    decode_tps_source: row.get(33)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3454,12 +3508,14 @@ mod tests {
         #[cfg(feature = "eval")]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
             ]
         }
         #[cfg(not(feature = "eval"))]
         {
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19]
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20,
+            ]
         }
     }
 
@@ -4177,6 +4233,128 @@ mod tests {
         assert!(SqliteStore::column_exists(&conn, "usage", "tenant").unwrap());
         assert!(SqliteStore::column_exists(&conn, "audit", "source").unwrap());
         assert!(SqliteStore::column_exists(&conn, "idempotency_inflight", "lease_id").unwrap());
+    }
+
+    /// The usage INSERT and SELECT of the binary before migration 20 (column
+    /// lists copied from it), run against the migrated file: a rollback to
+    /// that binary keeps writing and reading usage.
+    const PRE_V20_USAGE_INSERT: &str = "INSERT OR IGNORE INTO usage
+         (request_id, provider_id, model, account_id, tenant, project, cost_micros,
+          cost_known, workload_kind, pricing_unit, units_consumed,
+          input_tokens, output_tokens, latency_ms, streamed, energy_joules, energy_kwh,
+          energy_duration_seconds, energy_measurement_available, energy_attribution_method,
+          energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
+          energy_total_cost_usd, created_at, cached_input_tokens, cache_savings_micros,
+          requested_model)
+         VALUES (?1, ?2, ?3, NULL, NULL, NULL, 7, 1, NULL, NULL, NULL, 3, 4, 5, 1, NULL, NULL,
+                 NULL, NULL, NULL, NULL, NULL, NULL, NULL, 99, 0, NULL, NULL)";
+    const PRE_V20_USAGE_SELECT: &str = "SELECT request_id, provider_id, model, account_id, tenant,
+            project, cost_micros, cost_known, workload_kind, pricing_unit, units_consumed,
+            input_tokens, output_tokens, latency_ms, streamed,
+            energy_joules, energy_kwh, energy_duration_seconds,
+            energy_measurement_available, energy_attribution_method,
+            energy_kwh_consumed, energy_kwh_charged, energy_accounting_method,
+            energy_total_cost_usd, created_at, cached_input_tokens,
+            cache_savings_micros, requested_model
+         FROM usage ORDER BY id DESC LIMIT ?1";
+
+    // Migration 20 adds the speed columns to a v19 file with rows in it;
+    // new rows keep their speed, old rows read back with none; and the
+    // previous binary's own INSERT, SELECT and rollup still work on the
+    // migrated file (a rollback is safe).
+    #[test]
+    fn migration_20_adds_request_speed_and_a_rollback_keeps_working() {
+        let path = std::env::temp_dir().join(format!(
+            "sb_store_migration_20_{}_{}.sqlite",
+            std::process::id(),
+            now_millis()
+        ));
+        let path = path.to_str().unwrap().to_string();
+        // A file as the previous binary left it: migrations 1..19 only.
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let conn = store.conn.lock().unwrap();
+            for (column, _) in USAGE_SPEED_COLUMNS {
+                conn.execute(&format!("ALTER TABLE usage DROP COLUMN {column}"), [])
+                    .unwrap();
+            }
+            conn.execute("DELETE FROM schema_migrations WHERE version = 20", [])
+                .unwrap();
+            conn.execute(PRE_V20_USAGE_INSERT, params!["old-row", "gpu-box", "m"])
+                .unwrap();
+            assert!(!SqliteStore::column_exists(&conn, "usage", "decode_tps").unwrap());
+        }
+
+        // The new binary opens it: migration 20 runs, old rows survive.
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store.schema_versions().unwrap().contains(&20));
+        store
+            .record_usage(&UsageEvent {
+                request_id: "new-row".into(),
+                provider_id: "gpu-box".into(),
+                model: "m".into(),
+                cost_micros: Some(1),
+                input_tokens: 10,
+                output_tokens: 20,
+                ttft_ms: Some(250),
+                ttft_source: Some("gateway".into()),
+                prompt_tps: Some(1200.5),
+                prompt_tps_source: Some("engine".into()),
+                decode_tps: Some(48.25),
+                decode_tps_source: Some("engine".into()),
+                ..UsageEvent::default()
+            })
+            .unwrap();
+        let rows = store.recent_usage(10).unwrap();
+        let new = rows.iter().find(|row| row.request_id == "new-row").unwrap();
+        assert_eq!(
+            (new.ttft_ms, new.prompt_tps, new.decode_tps),
+            (Some(250), Some(1200.5), Some(48.25))
+        );
+        assert_eq!(new.decode_tps_source.as_deref(), Some("engine"));
+        let old = rows.iter().find(|row| row.request_id == "old-row").unwrap();
+        assert_eq!(
+            (
+                old.ttft_ms,
+                old.decode_tps,
+                old.decode_tps_source.as_deref()
+            ),
+            (None, None, None)
+        );
+        drop(store);
+
+        // Rollback: the previous binary's statements on the migrated file.
+        // It skips migrations it does not know (it only checks the ones it
+        // has), writes without the new columns and reads its own list.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            PRE_V20_USAGE_INSERT,
+            params!["after-rollback", "gpu-box", "m"],
+        )
+        .unwrap();
+        let mut stmt = conn.prepare(PRE_V20_USAGE_SELECT).unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([10], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, ["after-rollback", "new-row", "old-row"]);
+        let speed: Option<f64> = conn
+            .query_row(
+                "SELECT decode_tps FROM usage WHERE request_id = 'after-rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(speed, None, "an old binary's row has no speed");
+        drop(stmt);
+        drop(conn);
+
+        // And the new binary again reads all three.
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.usage_rollup().unwrap().requests, 3);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -108,16 +108,18 @@ pub trait LaneStatus: Send + Sync {
 
     /// Like [`Self::begin_request`] for a dispatch that must not wait: a
     /// lane in an exclusive GPU group (`exclusive_group`) that does not hold
-    /// its group right now refuses with `Err(reason)`, and the target is
-    /// skipped. Never waits. The runtime calls this, not `begin_request`.
+    /// its group right now, or a lane at its `max_in_flight`, refuses with
+    /// `Err(reason)`, and the target is skipped. Never waits. The runtime calls this, not `begin_request`.
     fn try_begin_request(&self, provider_id: &str) -> Result<Option<LaneBusy>, String> {
         Ok(self.begin_request(provider_id))
     }
 
-    /// For a lane in an exclusive GPU group: wait, bounded by the lane's
+    /// For a lane with `max_in_flight`: wait in the lane's FIFO queue,
+    /// bounded by its `queue_timeout_secs`, for a place. For a lane in an
+    /// exclusive GPU group: then wait, bounded by the lane's
     /// `group_wait_secs`, until the lane holds the group (the previous
-    /// holder's `release_command` runs once when it has nothing in flight),
-    /// then hold the lane busy like [`Self::try_begin_request`]. Called
+    /// holder's `release_command` runs once when it has nothing in flight).
+    /// Then hold the lane busy like [`Self::try_begin_request`]. Called
     /// before the first byte for the target a route would choose first.
     fn acquire_for_request<'a>(&'a self, provider_id: &'a str) -> BoxFuture<'a, LaneAcquire> {
         Box::pin(std::future::ready(
@@ -129,6 +131,16 @@ pub trait LaneStatus: Send + Sync {
                 },
             },
         ))
+    }
+
+    /// `Some(detail)` while new work on the provider's lane would have to
+    /// wait for a place under its `max_in_flight` (the limit is reached, or
+    /// others already wait). `None` with room, without a limit, or for a
+    /// provider that is not a managed lane. Never waits; the answer may be
+    /// stale by the time the request dispatches (the dispatch then takes
+    /// its place, or waits for one, through [`Self::acquire_for_request`]).
+    fn lane_full(&self, _provider_id: &str) -> Option<String> {
+        None
     }
 
     /// The engine published a new config (reload or control-plane publish).
@@ -145,6 +157,10 @@ pub type LaneBusy = Box<dyn Send + Sync>;
 /// busy: about one short media job.
 pub const LANE_GROUP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// `Retry-After` hint for a request that waited its lane's whole
+/// `queue_timeout_secs` for a place under `max_in_flight`.
+pub const LANE_QUEUE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What waiting for a lane's GPU group ended with.
 pub enum LaneAcquire {
     /// The lane holds its group; `busy` holds it (and the lane) until
@@ -156,6 +172,12 @@ pub enum LaneAcquire {
     },
     /// The lane did not get its group; `detail` says why.
     NotReady {
+        detail: String,
+        retry_after: std::time::Duration,
+    },
+    /// The lane stayed full (`max_in_flight`) for its whole
+    /// `queue_timeout_secs`; `detail` says how long the request waited.
+    QueueTimeout {
         detail: String,
         retry_after: std::time::Duration,
     },

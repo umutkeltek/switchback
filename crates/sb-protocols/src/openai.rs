@@ -1,6 +1,6 @@
 use sb_core::{
-    AiRequest, AiResponse, AiStreamEvent, ContentPart, EnergyUsage, FinishReason, ImageDetail,
-    ImageSource, Message, ResponseFormat, Role, ToolCallStart, ToolSpec, Usage,
+    AiRequest, AiResponse, AiStreamEvent, ContentPart, EnergyUsage, EngineTimings, FinishReason,
+    ImageDetail, ImageSource, Message, ResponseFormat, Role, ToolCallStart, ToolSpec, Usage,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
@@ -43,6 +43,20 @@ fn parse_energy_usage(value: Option<&Value>) -> Option<EnergyUsage> {
     } else {
         None
     }
+}
+
+/// A llama.cpp-style `timings` object (`prompt_n`, `prompt_ms`,
+/// `predicted_n`, `predicted_ms`), as the engine's own timing of the request.
+/// `None` when absent or carrying none of those fields.
+fn parse_engine_timings(value: Option<&Value>) -> Option<EngineTimings> {
+    let value = value.and_then(Value::as_object)?;
+    let timings = EngineTimings {
+        prompt_tokens: value.get("prompt_n").and_then(Value::as_u64),
+        prompt_ms: value.get("prompt_ms").and_then(Value::as_f64),
+        decode_tokens: value.get("predicted_n").and_then(Value::as_u64),
+        decode_ms: value.get("predicted_ms").and_then(Value::as_f64),
+    };
+    (timings != EngineTimings::default()).then_some(timings)
 }
 
 fn energy_usage_json(energy: &EnergyUsage) -> Value {
@@ -599,7 +613,9 @@ impl OpenAiStreamEncoder {
             // Responses/Anthropic surfaces instead).
             AiStreamEvent::OutputImage { .. }
             | AiStreamEvent::Citation { .. }
-            | AiStreamEvent::ServerToolCall { .. } => Vec::new(),
+            | AiStreamEvent::ServerToolCall { .. }
+            // Gateway metadata: never sent to a client.
+            | AiStreamEvent::EngineTimings { .. } => Vec::new(),
             AiStreamEvent::TextDelta { text } => self.chunk(
                 json!([{
                     "index": 0,
@@ -917,6 +933,7 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
             .unwrap_or(0),
         energy: parse_energy_usage(body.get("energy"))
             .or_else(|| parse_energy_usage(usage.and_then(|usage| usage.get("energy")))),
+        engine_timings: parse_engine_timings(body.get("timings")),
         ..Usage::default()
     };
 
@@ -994,6 +1011,13 @@ impl OpenAiStreamDecoder {
                     ..Usage::default()
                 },
             });
+        }
+        // A llama.cpp server adds its own timing to the last chunk (the
+        // usage chunk when the client asked for one, else the finish
+        // chunk). It travels as its own event so no client sees an extra
+        // usage chunk it did not ask for.
+        if let Some(timings) = parse_engine_timings(chunk_json.get("timings")) {
+            events.push(AiStreamEvent::EngineTimings { timings });
         }
 
         let Some(choice) = chunk_json
@@ -1526,5 +1550,73 @@ mod tests {
         assert!(parsed.message.content.iter().any(
             |p| matches!(p, sb_core::ContentPart::ToolUse { name, .. } if name == "get_weather")
         ));
+    }
+
+    // A llama.cpp server's non-streamed answer carries `timings`; they
+    // become the engine timings on the usage.
+    #[test]
+    fn llama_cpp_timings_ride_a_collected_response() {
+        let body = json!({
+            "id": "x", "object": "chat.completion", "model": "local",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 40, "total_tokens": 160},
+            "timings": {"prompt_n": 120, "prompt_ms": 60.0, "predicted_n": 40,
+                "predicted_ms": 800.0, "predicted_per_second": 50.0}
+        });
+        let response = parse_openai_chat_response(&body).unwrap();
+        let timings = response.usage.engine_timings.expect("timings parsed");
+        assert_eq!(timings.prompt_tokens, Some(120));
+        assert_eq!(timings.decode_tokens, Some(40));
+        assert_eq!(timings.prompt_tokens_per_sec(), Some(2000.0));
+        assert_eq!(timings.decode_tokens_per_sec(), Some(50.0));
+        assert_eq!(response.usage.output_tokens, 40, "token counts unchanged");
+    }
+
+    // On a stream the timings come on the last chunk; they travel as their
+    // own event, and no client encoder writes them out.
+    #[test]
+    fn llama_cpp_timings_on_the_last_stream_chunk_are_an_event_no_client_sees() {
+        let mut decoder = OpenAiStreamDecoder::new();
+        let first = decoder.decode(&json!({"id": "x", "model": "local",
+            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]}));
+        assert!(!first
+            .iter()
+            .any(|event| matches!(event, AiStreamEvent::EngineTimings { .. })));
+        let last = decoder.decode(&json!({"id": "x", "model": "local",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "timings": {"prompt_n": 10, "prompt_ms": 5.0, "predicted_n": 3, "predicted_ms": 30.0}}));
+        let timings = last
+            .iter()
+            .find_map(|event| match event {
+                AiStreamEvent::EngineTimings { timings } => Some(timings.clone()),
+                _ => None,
+            })
+            .expect("timings event");
+        assert_eq!(timings.decode_tokens_per_sec(), Some(100.0));
+        assert!(
+            !last
+                .iter()
+                .any(|event| matches!(event, AiStreamEvent::UsageDelta { .. })),
+            "no usage chunk the client did not ask for"
+        );
+        let mut encoder = OpenAiStreamEncoder::new("x".to_string(), "local".to_string());
+        let frames = encoder.encode(&AiStreamEvent::EngineTimings { timings });
+        assert!(frames.is_empty(), "never sent to a client: {frames:?}");
+    }
+
+    #[test]
+    fn a_response_without_timings_has_none() {
+        let body = json!({"choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}});
+        assert_eq!(
+            parse_openai_chat_response(&body)
+                .unwrap()
+                .usage
+                .engine_timings,
+            None
+        );
+        assert_eq!(parse_engine_timings(Some(&json!({"cache_n": 3}))), None);
     }
 }

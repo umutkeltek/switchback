@@ -39,6 +39,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/uploads", post(handlers::workloads::upload))
         .route("/v1/workflows", get(handlers::workloads::workflows))
         .route("/v1/workloads/capacity", get(handlers::workloads::capacity))
+        .route("/v1/targets/stats", get(handlers::meta::target_stats))
         .route("/v1/admin/alerts/test", post(handlers::hosts::alerts_test))
         .route(
             "/v1/hosts/{host}/holds",

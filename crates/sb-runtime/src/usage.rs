@@ -22,6 +22,7 @@ impl Engine {
         usage: Usage,
         started: Instant,
         streamed: bool,
+        speed: sb_ledger::RequestSpeed,
     ) -> Result<(), String> {
         let cost = registry.cost_micros(provider_id, model, &usage);
         let cache_savings = registry.cache_savings_micros(provider_id, model, &usage);
@@ -37,7 +38,8 @@ impl Engine {
         )
         .with_tenant(tenant.map(str::to_string))
         .with_project(project.map(str::to_string))
-        .with_cache_savings(Some(cache_savings));
+        .with_cache_savings(Some(cache_savings))
+        .with_speed(speed);
         if self.store_required {
             self.ledger.record_checked(record)
         } else {

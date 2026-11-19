@@ -24,6 +24,12 @@ pub enum WorkloadError {
     TooManyJobs(String),
     Upstream(String),
     Internal(String),
+    /// A managed lane stayed full (`max_in_flight`) for its whole
+    /// `queue_timeout_secs` (503 `local_lane_queue_timeout`, `Retry-After`).
+    LaneQueueTimeout {
+        message: String,
+        retry_after_secs: u64,
+    },
 }
 
 impl WorkloadError {
@@ -32,7 +38,8 @@ impl WorkloadError {
             Self::InvalidRequest(message)
             | Self::TooManyJobs(message)
             | Self::Upstream(message)
-            | Self::Internal(message) => message,
+            | Self::Internal(message)
+            | Self::LaneQueueTimeout { message, .. } => message,
         }
     }
 }
@@ -691,6 +698,7 @@ impl WorkloadStore {
             WorkloadError::TooManyJobs(_) => "too_many_jobs",
             WorkloadError::Upstream(_) => "upstream",
             WorkloadError::Internal(_) => "internal",
+            WorkloadError::LaneQueueTimeout { .. } => "local_lane_queue_timeout",
         };
         self.fail_class_locked(inner, job_id, class, error.message());
     }
@@ -3260,6 +3268,13 @@ fn lane_error(provider_id: &str, error: JobError<WorkloadError>) -> WorkloadErro
         JobError::GpuUnavailable(detail) | JobError::Refused(detail) => {
             WorkloadError::Upstream(format!("local executor `{provider_id}` {detail}"))
         }
+        JobError::QueueTimeout {
+            detail,
+            retry_after,
+        } => WorkloadError::LaneQueueTimeout {
+            message: format!("local executor `{provider_id}` {detail}; retry later"),
+            retry_after_secs: retry_after.as_secs().max(1),
+        },
     }
 }
 
