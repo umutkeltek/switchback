@@ -29,6 +29,9 @@ struct Observation {
     enabled: bool,
 }
 
+/// Readers trust a sample for 15 minutes; refresh well inside that.
+const SAMPLE_INTERVAL_MS: i64 = 600_000;
+
 fn plan(observation: &Observation, now: i64) -> Value {
     let o = observation;
     let stopped = if !o.enabled {
@@ -50,10 +53,12 @@ fn plan(observation: &Observation, now: i64) -> Value {
     let used = o
         .used_percent
         .filter(|n| n.is_finite() && (0.0..=100.0).contains(n));
+    // Every interval stays below the 15-minute trust window readers apply, so a healthy
+    // collector is re-read before its sample stops counting as current.
     let interval = match used {
         Some(n) if n >= 90.0 => 120_000,
         Some(n) if n >= 70.0 => 300_000,
-        Some(_) => 900_000,
+        Some(_) => SAMPLE_INTERVAL_MS,
         None => 120_000,
     };
     let (mut next, mut reason) = match (sample, used) {
@@ -115,6 +120,8 @@ pub(super) fn run(args: RefreshArgs, json_output: bool) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     const NOW: i64 = 1_800_000_000_000;
+    /// The trust window readers apply to a sample (`FRESH_SECONDS` in the collector).
+    const TRUST_WINDOW_MS: i64 = 900_000;
     fn observation() -> Observation {
         Observation {
             key: "fixture/one".into(),
@@ -130,11 +137,22 @@ mod tests {
     #[test]
     fn refresh_policy_adapts_without_refreshing_sample_timestamps() {
         let mut o = observation();
-        assert_eq!(plan(&o, NOW)["next_refresh_at_ms"], NOW + 800_000);
+        assert_eq!(plan(&o, NOW)["next_refresh_at_ms"], NOW + 500_000);
         o.used_percent = Some(95.0);
         assert_eq!(plan(&o, NOW)["next_refresh_at_ms"], NOW + 20_000);
         assert_eq!(plan(&o, NOW + 20_000)["due"], true);
         assert_eq!(o.sampled_at_ms, Some(NOW - 100_000));
+    }
+    #[test]
+    fn refresh_policy_rereads_before_the_trust_window_ends() {
+        // Worst case: the bar asks once a minute and a batch takes another minute.
+        for used in [0.0, 50.0, 69.9, 70.0, 89.9, 90.0, 100.0] {
+            let mut o = observation();
+            o.sampled_at_ms = Some(NOW);
+            o.used_percent = Some(used);
+            let next = plan(&o, NOW)["next_refresh_at_ms"].as_i64().unwrap();
+            assert!(next - NOW + 120_000 < TRUST_WINDOW_MS, "used {used}");
+        }
     }
     #[test]
     fn refresh_policy_backoff_caps_and_survives_elapsed_resets() {
