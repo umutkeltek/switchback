@@ -453,6 +453,27 @@ impl WorkloadStore {
                 }
                 ensure_image_inputs_bound(provider, workflow, &spec.request)?;
                 check_input_transforms(workflow, &spec.request, spec.frames, spec.fps)?;
+                // A prompt the workflow cannot take is refused now, before a
+                // machine is woken for a job that would fail at binding.
+                if !spec.request.prompt.trim().is_empty()
+                    && !workflow.bindings.contains_key("prompt")
+                {
+                    return Err(WorkloadError::InvalidRequest(format!(
+                        "workflow `{}` does not bind `prompt`",
+                        workflow.public_id(&provider.id)
+                    )));
+                }
+                // A workflow that binds an input image runs on one: without
+                // it the graph would run on whatever its own node holds.
+                if spec.kind == WorkloadKind::WorkflowExecution
+                    && workflow.bindings.contains_key("image")
+                    && spec.image.is_none()
+                {
+                    return Err(WorkloadError::InvalidRequest(format!(
+                        "workflow `{}` needs an `image` input (an uploaded artifact id)",
+                        workflow.public_id(&provider.id)
+                    )));
+                }
                 for (name, given) in extras {
                     if given && !workflow.bindings.contains_key(name) {
                         return Err(WorkloadError::InvalidRequest(format!(
@@ -2158,15 +2179,29 @@ fn workflow_fields_for(workflow: &ComfyUiWorkflowConfig) -> Vec<WorkflowField> {
             workflow_field("prompt", "string", true, None),
             workflow_field("seed", "integer", false, None),
         ],
+        // A workflow may run without a prompt, and takes one only where it
+        // binds it.
+        WorkloadKind::WorkflowExecution => image_fields_for(workflow.kind)
+            .into_iter()
+            .filter(|field| field.name != "prompt" || workflow.bindings.contains_key("prompt"))
+            .map(|field| WorkflowField {
+                required: field.required && field.name != "prompt",
+                ..field
+            })
+            .collect(),
         kind => image_fields_for(kind),
     };
+    // A workflow job runs on its input image: where it binds one, it is
+    // required.
+    let image_required = workflow.kind == WorkloadKind::WorkflowExecution;
     for (name, field_type, media_type) in [
         ("image", "artifact", Some("image/*")),
         ("frames", "integer", None),
         ("fps", "integer", None),
     ] {
         if workflow.bindings.contains_key(name) {
-            fields.push(workflow_field(name, field_type, false, media_type));
+            let required = name == "image" && image_required;
+            fields.push(workflow_field(name, field_type, required, media_type));
         }
     }
     fields

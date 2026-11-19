@@ -450,6 +450,12 @@ async fn a_workflow_job_is_checked_before_the_job_exists() {
                    "inputs": {"image": image, "frames": 9}}),
             400,
         ),
+        // A workflow that binds an image runs on one: none given.
+        (
+            json!({"kind": "workflow_execution", "model": "segment/sam3",
+                   "inputs": {"prompt": "the cat"}}),
+            400,
+        ),
         // An input image the caller may not read.
         (
             json!({"kind": "workflow_execution", "model": "segment/sam3",
@@ -490,6 +496,17 @@ async fn a_workflow_job_lists_its_workflow() {
         .collect();
     assert!(inputs.contains(&"image"), "{inputs:?}");
     assert!(inputs.contains(&"prompt"), "{inputs:?}");
+    let required = |name: &str| {
+        workflow["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"] == name)
+            .unwrap()["required"]
+            .clone()
+    };
+    assert_eq!(required("prompt"), false, "a workflow may run without one");
+    assert_eq!(required("image"), true, "a workflow job runs on its image");
 
     // A client key may not list the workflows (it may still run one by id).
     let response = reqwest::Client::new()
@@ -499,4 +516,60 @@ async fn a_workflow_job_lists_its_workflow() {
         .await
         .unwrap();
     assert_eq!(response.status(), 403);
+}
+
+/// A gateway whose `workflow_execution` workflow binds an image but no
+/// text prompt.
+fn config_without_prompt(comfy_url: &str) -> String {
+    config(comfy_url).replace(
+        "          prompt: { path: [\"2\", \"inputs\", \"text\"] }\n",
+        "",
+    )
+}
+
+// A prompt the workflow cannot take is refused before the job exists, so
+// no machine is woken for a job that would fail at binding; and the
+// workflow lists no prompt input.
+#[tokio::test]
+async fn a_prompt_the_workflow_does_not_bind_is_refused_before_the_job_exists() {
+    let fake = FakeComfy::default();
+    let comfy_url = spawn_comfy(fake.clone()).await;
+    let config = config_without_prompt(&comfy_url);
+    assert!(!config.contains("prompt: {"), "{config}");
+    let base = serve(&config).await;
+    let image = upload_image(&base, CLIENT).await;
+    let response = submit(
+        &base,
+        CLIENT,
+        json!({"kind": "workflow_execution", "model": "segment/sam3",
+               "inputs": {"image": image, "prompt": "the cat"}}),
+    )
+    .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not bind `prompt`"),
+        "{body}"
+    );
+    let listed: Value = get_json(&base, CLIENT, "/v1/jobs").await;
+    assert!(listed["data"].as_array().unwrap().is_empty(), "{listed}");
+    assert!(fake.calls.lock().unwrap().is_empty(), "ComfyUI was reached");
+
+    let workflows = get_json(&base, OPERATOR, "/v1/workflows").await;
+    let workflow = workflows["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "segment/sam3")
+        .expect("the workflow is listed");
+    let inputs: Vec<&str> = workflow["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field["name"].as_str().unwrap())
+        .collect();
+    assert!(!inputs.contains(&"prompt"), "{inputs:?}");
 }
