@@ -703,6 +703,7 @@ async fn audio_bytes_are_stored_nowhere() {
     assert!(!contains(&stored, b"RIFF-AUDIO-MARKER"), "no audio bytes");
     assert!(!contains(&stored, b"ID3-SPEECH"), "no speech audio");
     assert!(!contains(&stored, b"say this"), "no speech text");
+    assert!(!contains(&stored, b"hello world"), "no transcript text");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -817,17 +818,32 @@ async fn bad_audio_requests_are_refused_before_routing() {
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
+    // Speech with a body that is not JSON: an OpenAI-shaped error.
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/audio/speech", gw.base))
+        .header("content-type", "application/json")
+        .body("{\"model\": \"speak\", ")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["error"]["type"], "invalid_request_error", "{value}");
     assert_eq!(e.stt1.calls() + e.tts.calls(), 0);
 }
 
 #[tokio::test]
 async fn models_lists_audio_models_with_their_kind() {
     let e = engines().await;
-    let gw = spawn_gateway(
-        &config(&e.urls, &["stt1/whisper-large"], &["tts/kokoro"], ""),
-        sb_ledger::UsageLedger::in_memory(),
-    )
-    .await;
+    let cfg = config(&e.urls, &["stt1/whisper-large"], &["tts/kokoro"], "")
+        + r#"
+combos:
+  voices:
+    models: ["speak", "tts/other"]
+  mixed:
+    models: ["transcribe", "speak"]
+"#;
+    let gw = spawn_gateway(&cfg, sb_ledger::UsageLedger::in_memory()).await;
     let models: Value = reqwest::get(format!("{}/v1/models", gw.base))
         .await
         .unwrap()
@@ -852,4 +868,393 @@ async fn models_lists_audio_models_with_their_kind() {
     assert_eq!(kind("speak"), Some(json!("audio_speech")));
     assert_eq!(kind("tts"), Some(json!("audio_speech")));
     assert_eq!(kind("text"), None, "text models carry no kind");
+    assert_eq!(
+        kind("voices"),
+        Some(json!("audio_speech")),
+        "a speech combo"
+    );
+    assert_eq!(kind("mixed"), None, "a combo of both kinds has none");
+}
+
+// ------------------------------------------- streamed answers end-to-end
+
+/// A speech engine that sends one chunk, then waits for `gate`, then either
+/// finishes (`fail == false`) or breaks the stream (`fail == true`).
+#[derive(Clone)]
+struct SlowSpeech {
+    gate: Arc<tokio::sync::Notify>,
+    fail: bool,
+    calls: Arc<AtomicUsize>,
+}
+
+impl SlowSpeech {
+    fn new(gate: Arc<tokio::sync::Notify>, fail: bool) -> Self {
+        SlowSpeech {
+            gate,
+            fail,
+            calls: Arc::default(),
+        }
+    }
+}
+
+async fn slow_speech(State(s): State<SlowSpeech>) -> Response {
+    use futures::StreamExt;
+    s.calls.fetch_add(1, Ordering::SeqCst);
+    let first = futures::stream::once(async {
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"ID3-PART1"))
+    });
+    let gate = s.gate.clone();
+    let fail = s.fail;
+    let rest = futures::stream::once(async move {
+        gate.notified().await;
+        if fail {
+            Err(std::io::Error::other("engine died mid-answer"))
+        } else {
+            Ok(Bytes::from_static(b"PART2"))
+        }
+    });
+    (
+        [("content-type", "audio/mpeg")],
+        axum::body::Body::from_stream(first.chain(rest)),
+    )
+        .into_response()
+}
+
+async fn spawn_slow(s: SlowSpeech) -> String {
+    let app = Router::new()
+        .route("/audio/speech", post(slow_speech))
+        .route("/health", get(|| async { StatusCode::OK }))
+        .with_state(s);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// A `speak` route over a speech lane (`tts`, one place, spills when
+/// full) and a second speech provider (`tts2`).
+fn speech_cfg(lane_url: &str, other_url: &str) -> String {
+    format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: tts
+    type: openai_compatible
+    base_url: "{lane_url}"
+    capabilities: {{ audio_out: true }}
+    accounts:
+      - {{ id: a, auth: {{ kind: none }} }}
+  - id: tts2
+    type: openai_compatible
+    base_url: "{other_url}"
+    capabilities: {{ audio_out: true }}
+    accounts:
+      - {{ id: a, auth: {{ kind: none }} }}
+routes:
+  - name: speak
+    match: {{ model: "speak" }}
+    pin_order: true
+    targets:
+      - "tts/voice"
+      - "tts2/voice"
+local_executors:
+  - name: tts
+    base_url: "{lane_url}"
+    health_endpoint: "{lane_url}/health"
+    max_in_flight: 1
+    on_full: spill
+"#
+    )
+}
+
+async fn speak(base: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/audio/speech"))
+        .json(&json!({"model": "speak", "input": "hello", "voice": "a"}))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Poll a trace until it has a final status (the finish guard runs as the
+/// body ends, a moment after the client sees the end).
+async fn final_trace(base: &str, request_id: &str) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..100 {
+        let response = reqwest::get(format!("{base}/v1/traces/{request_id}"))
+            .await
+            .unwrap();
+        if response.status() == 200 {
+            last = response.json().await.unwrap();
+            if last["final_status"].is_u64() {
+                return last;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no finished trace for {request_id}: {last}");
+}
+
+#[tokio::test]
+async fn probe_streamed_speech_holds_the_lane_until_the_body_ends() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let lane = SlowSpeech::new(gate.clone(), false);
+    let other = SlowSpeech::new(Arc::new(tokio::sync::Notify::new()), false);
+    let lane_url = spawn_slow(lane.clone()).await;
+    let other_url = spawn_slow(other.clone()).await;
+    let gw = spawn_gateway(
+        &speech_cfg(&lane_url, &other_url),
+        sb_ledger::UsageLedger::in_memory(),
+    )
+    .await;
+
+    let mut first = speak(&gw.base).await;
+    assert_eq!(first.status(), 200);
+    let chunk = first.chunk().await.unwrap().unwrap();
+    assert!(chunk.starts_with(b"ID3-PART1"));
+    assert_eq!(lane.calls.load(Ordering::SeqCst), 1);
+
+    // Body 1 still streaming: the lane is full, so this spills to tts2.
+    let second = speak(&gw.base).await;
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        other.calls.load(Ordering::SeqCst),
+        1,
+        "spilled while body 1 streams"
+    );
+    assert_eq!(lane.calls.load(Ordering::SeqCst), 1);
+    drop(second);
+
+    gate.notify_one();
+    while first.chunk().await.unwrap().is_some() {}
+    drop(first);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Place given back: the lane serves again.
+    let third = speak(&gw.base).await;
+    assert_eq!(third.status(), 200);
+    assert_eq!(
+        lane.calls.load(Ordering::SeqCst),
+        2,
+        "lane free after body end"
+    );
+    // Client goes away mid-stream: the place must come back too.
+    drop(third);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let fourth = speak(&gw.base).await;
+    assert_eq!(fourth.status(), 200);
+    assert_eq!(
+        lane.calls.load(Ordering::SeqCst),
+        3,
+        "lane free after client abort"
+    );
+}
+
+#[tokio::test]
+async fn probe_a_speech_stream_that_breaks_off_is_not_traced_as_success() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let lane = SlowSpeech::new(gate.clone(), true);
+    let lane_url = spawn_slow(lane.clone()).await;
+    let gw = spawn_gateway(
+        &speech_cfg(&lane_url, &lane_url),
+        sb_ledger::UsageLedger::in_memory(),
+    )
+    .await;
+    let mut response = speak(&gw.base).await;
+    assert_eq!(response.status(), 200);
+    let id = request_id(&response);
+    let _ = response.chunk().await;
+    gate.notify_one();
+    let mut broke = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => {
+                broke = true;
+                break;
+            }
+        }
+    }
+    assert!(broke, "the client saw the answer break off");
+    let trace = final_trace(&gw.base, &id).await;
+    assert_ne!(
+        trace["final_status"], 200,
+        "a broken answer traced as success: {trace}"
+    );
+    assert_eq!(trace["attempts"][0]["outcome"], "failed", "{trace}");
+    assert!(
+        gw.ledger.snapshot().is_empty(),
+        "a broken answer writes no usage"
+    );
+}
+
+#[tokio::test]
+async fn probe_a_client_abort_mid_speech_is_traced_499() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let lane = SlowSpeech::new(gate.clone(), false);
+    let lane_url = spawn_slow(lane.clone()).await;
+    let gw = spawn_gateway(
+        &speech_cfg(&lane_url, &lane_url),
+        sb_ledger::UsageLedger::in_memory(),
+    )
+    .await;
+    let mut response = speak(&gw.base).await;
+    let id = request_id(&response);
+    let _ = response.chunk().await;
+    drop(response);
+    let trace = final_trace(&gw.base, &id).await;
+    assert_eq!(trace["final_status"], 499, "{trace}");
+    assert_eq!(trace["attempts"][0]["class"], "client_aborted", "{trace}");
+    assert!(gw.ledger.snapshot().is_empty(), "an abort writes no usage");
+}
+
+#[tokio::test]
+async fn a_full_speech_stream_is_traced_200_with_usage_after_its_end() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let lane = SlowSpeech::new(gate.clone(), false);
+    let lane_url = spawn_slow(lane.clone()).await;
+    let gw = spawn_gateway(
+        &speech_cfg(&lane_url, &lane_url),
+        sb_ledger::UsageLedger::in_memory(),
+    )
+    .await;
+    let mut response = speak(&gw.base).await;
+    let id = request_id(&response);
+    let _ = response.chunk().await;
+    assert!(
+        gw.ledger.snapshot().is_empty(),
+        "no usage while the answer is still streaming"
+    );
+    gate.notify_one();
+    while response.chunk().await.unwrap().is_some() {}
+    let trace = final_trace(&gw.base, &id).await;
+    assert_eq!(trace["final_status"], 200, "{trace}");
+    assert_eq!(gw.ledger.snapshot().len(), 1);
+}
+
+// ------------------------------------------------- pricing and budgets
+
+#[tokio::test]
+async fn priced_audio_has_a_cost_and_a_budget_refuses_past_its_limit() {
+    let e = engines().await;
+    let cost_map = std::env::temp_dir().join(format!("{}.json", sb_core::new_id("audio-cost")));
+    // $0.10 per second of audio; $0.01 per character spoken.
+    std::fs::write(
+        &cost_map,
+        r#"{"schema":"switchback/provider-registry@3","models":[
+  {"provider_id":"stt1","model_id":"whisper-large","pricing_unit":"per_second","unit_price_micros":100000},
+  {"provider_id":"tts","model_id":"voice","pricing_unit":"per_character","unit_price_micros":10000}
+]}"#,
+    )
+    .unwrap();
+    let extra = format!(
+        "  cost_map: \"{}\"\n  budget: {{ max_usd: 0.5 }}",
+        cost_map.display()
+    );
+    let gw = spawn_gateway(
+        &config(&e.urls, &["stt1/whisper-large"], &["tts/voice"], &extra),
+        sb_ledger::UsageLedger::in_memory(),
+    )
+    .await;
+
+    // Speech: 5 characters x $0.01 = 50_000 micro-USD, written at body end.
+    let speech = reqwest::Client::new()
+        .post(format!("{}/v1/audio/speech", gw.base))
+        .json(&json!({"model": "speak", "input": "hello", "voice": "a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(speech.status(), 200);
+    let speech_id = request_id(&speech);
+    speech.bytes().await.unwrap();
+    final_trace(&gw.base, &speech_id).await;
+    let record = serde_json::to_value(&gw.ledger.snapshot()[0]).unwrap();
+    assert_eq!(record["workload_kind"], "audio_speech");
+    assert_eq!(record["cost_micros"], 50_000, "{record}");
+
+    // Transcript: 7 seconds x $0.10 = 700_000 micro-USD.
+    let response = transcribe(&gw.base, &[("model", "transcribe")]).await;
+    assert_eq!(response.status(), 200);
+    let records = gw.ledger.snapshot();
+    let record = serde_json::to_value(&records[1]).unwrap();
+    assert_eq!(record["pricing_unit"], "per_second");
+    assert_eq!(record["cost_micros"], 700_000, "{record}");
+
+    // $0.75 spent of a $0.50 cap: the next request is refused unsent.
+    let calls = e.stt1.calls();
+    let response = transcribe(&gw.base, &[("model", "transcribe")]).await;
+    assert_eq!(response.status(), 402);
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["error"]["type"], "budget_exceeded", "{value}");
+    assert_eq!(e.stt1.calls(), calls, "nothing sent past the budget");
+    let _ = std::fs::remove_file(&cost_map);
+}
+
+// ------------------------------------------------------ auth and tenants
+
+#[tokio::test]
+async fn a_client_key_without_the_audio_route_is_refused() {
+    let e = engines().await;
+    let cfg = config(&e.urls, &["stt1/whisper-large"], &["tts/voice"], "")
+        + r#"
+api_keys:
+  - key: "sk-text-only"
+    tenant: textonly
+    role: client
+  - key: "sk-audio"
+    tenant: audio
+    role: client
+tenants:
+  - id: textonly
+    allowed_routes: ["chat"]
+  - id: audio
+    allowed_routes: ["transcribe", "speak"]
+"#;
+    let gw = spawn_gateway(&cfg, sb_ledger::UsageLedger::in_memory()).await;
+    let send = |key: Option<&'static str>| {
+        let base = gw.base.clone();
+        async move {
+            let mut request = reqwest::Client::new()
+                .post(format!("{base}/v1/audio/transcriptions"))
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(multipart(&[("model", "transcribe")], &audio_bytes()));
+            if let Some(key) = key {
+                request = request.bearer_auth(key);
+            }
+            request.send().await.unwrap()
+        }
+    };
+
+    assert_eq!(send(None).await.status(), 401, "no key");
+    let refused = send(Some("sk-text-only")).await;
+    assert_eq!(refused.status(), 403, "a tenant without the audio route");
+    let value: Value = refused.json().await.unwrap();
+    assert_eq!(value["error"]["type"], "tenant_policy_denied", "{value}");
+    let speech = reqwest::Client::new()
+        .post(format!("{}/v1/audio/speech", gw.base))
+        .bearer_auth("sk-text-only")
+        .json(&json!({"model": "speak", "input": "hello", "voice": "a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(speech.status(), 403, "speech refused too");
+    let value: Value = speech.json().await.unwrap();
+    assert_eq!(value["error"]["type"], "tenant_policy_denied", "{value}");
+    assert_eq!(
+        e.stt1.calls() + e.tts.calls(),
+        0,
+        "nothing reached an engine"
+    );
+
+    let allowed = send(Some("sk-audio")).await;
+    let status = allowed.status();
+    assert_eq!(status, 200, "{}", allowed.text().await.unwrap());
+    assert_eq!(e.stt1.calls(), 1);
 }

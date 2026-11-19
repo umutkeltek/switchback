@@ -785,10 +785,16 @@ Each served request writes one usage record with `workload_kind`
 the latency and, when known, the amount: seconds of audio
 (`pricing_unit: per_second`) from the answer's `duration`
 (`verbose_json`, `diarized_json`) or a `usage` object of type `duration`,
-and characters of input for speech (`per_character`). A streamed transcript
-or speech is recorded when the engine starts answering. `GET /v1/models`
-marks audio models with `"kind": "audio_transcription"` or
-`"kind": "audio_speech"`.
+and characters of input for speech (`per_character`). When the cost map
+prices the target's model in that same unit (`pricing_unit: per_second` or
+`per_character` with `unit_price_micros`), the record carries the cost and
+budgets count it. A streamed transcript or speech is recorded when its last
+byte has gone out, like a streamed chat answer: an engine that breaks off
+mid-answer is a failed attempt traced with the error's status, a client that
+hangs up is traced `client_aborted` (499), and neither writes usage.
+`GET /v1/models` marks audio models with `"kind": "audio_transcription"` or
+`"kind": "audio_speech"`; a combo gets a kind when every target of every
+member has it.
 
 A speech-to-text engine on an always-on machine: a provider that takes audio,
 a lane with no wake or power-off command (the machine is never powered off)
