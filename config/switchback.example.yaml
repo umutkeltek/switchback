@@ -497,7 +497,10 @@ routes:
 #     big_prompt_tokens: 8000   # a big prompt goes to the fastest measured prefill
 #     hosts:                    # machine numbers for ceilings (else calibrated)
 #       gpu-box: { bandwidth_gbs: 900, peak_tflops: 160 }
-#     quiet_windows: ["00:30-03:00"]   # UTC; `sb ai tune` refuses to start inside
+#     timezone: Asia/Tokyo   # IANA zone of plain windows (absent = UTC)
+#     quiet_windows: ["00:30-03:00", {start: "12:00", end: "12:30", tz: UTC}]
+#                                 # `sb ai tune` will not start inside one, and stops at
+#                                 # its next safe point when one begins
 #     report: { decode_ceiling_pct: 40, swaps_per_hour: 6, unused_days: 14 }
 # A route may replace a field: `optimize: { stickiness: false }`. Set the
 # router's --models-max on the lane's engine block (`models_max: 1`) so the

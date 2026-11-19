@@ -38,8 +38,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   22); a rejected change is skipped until the engine build or model file
   changes. The winner is one settings revision noted `tune <run id>`
   (settings writes take an optional `note`), so `sb ai revert` undoes it.
-  `GET /v1/engines` now shows each lane's engine build, each model file's
-  identity (a hash, never the path) and its sidecar file names.
+  `GET /v1/engines` now shows each lane's engine build (`GET /props`
+  `build_info`), each model file's identity (a hash, never the path), its
+  sidecar file names, and `speculative` (spec type and whether MTP or a
+  draft model is known, from the preset/overlay keys or a loaded
+  instance's `status.args`; a real router lists `sidecars` only for cached
+  Hugging Face models). Quiet windows take an IANA time zone
+  (`{start, end, tz}`, or `server.optimize.timezone` for plain strings;
+  plain strings stay UTC) and are checked during a run too: the lock
+  heartbeat (`PATCH /v1/optimize/locks/{id}`) names a window that began,
+  and the run stops at its next safe point, restores the best settings and
+  lets the lock and hold go; a lock lost to a restart (404) stops it the
+  same way. The tuner follows the settings safety shapes: writes carry a
+  quoted `If-Match`, a held-back apply (`apply.pending: true`) is waited
+  for and never measured as applied, and a 503 `model_paused` is retried.
+  The speed report labels its decode figure "all requests, median"; the
+  tuner's own decode row is measured at concurrency 1 and says so.
+- **Loaded-model freshness**: the engine control polls `GET /models` every
+  30 s (3 s timeout) on engine lanes that are up (never off, waking,
+  powering off or draining ones; never a wake) and refreshes the listing
+  after every load, unload and apply it does.
 - **Speed tricks for local engines, layer 1** (`server.optimize`,
   `routes[].optimize`, all off by default; method from
   <https://github.com/sybil-solutions/inference-optimisation-skill>):

@@ -429,7 +429,23 @@ lock) and keeps its ledger in the store (`optimize_experiments`, migration
 22, through `StateStore::optimize_experiment_*`; in memory without a
 store). The tuning lock is runtime state on `OptimizeState`: after
 resolving, candidates on a locked lane leave a request that does not carry
-the lock's id (a typed 503 `lane_tuning` when none is left).
+the lock's id (a typed 503 `lane_tuning` when none is left). The lock lives in memory; the tuner's
+heartbeat (`PATCH`) learns from a 404 that it is gone (a restart) and from
+`quiet_window` that a quiet window began (zones evaluated with `jiff`), and
+stops at its next safe point.
+
+The optimizer sits on top of the model-settings safety layer and never
+around it. The ordering pass runs before `admit_first_choice`, which plans
+with the same hints, so the request is admitted on the model it will
+actually reach first; a first choice at a closed gate leaves the plan as a
+rejected target, whatever the hints said. Stickiness pins an engine slot
+only when no other admitted request is on the model (the request's own
+admission does not count). Embeddings and audio take the same admissions
+and have no ordering tricks. The loaded-model view comes from the engine
+control's listing, kept fresh by a poller (`GET /models` every 30 s with a
+3 s timeout, only on lanes the lifecycle has healthy or idle-counting and
+whose last probe did not see them down) and by a refresh after every load,
+unload and apply.
 
 ### Durable state (opt-in)
 Point `server.state_store` at a SQLite file and every published config revision +

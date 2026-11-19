@@ -1202,7 +1202,11 @@ keeps its order. What they did rides the response header
   router with `--models-max 1` a request for another model unloads the
   current one, which costs seconds. The gateway knows what is loaded from
   the engine control's last listing (`GET /v1/engines`, loads, applies) and
-  from what it served itself; it never asks a sleeping machine. Set
+  from what it served itself; it never asks a sleeping machine. The listing stays fresh on its own: every 30 s
+  the gateway asks each engine lane that is up (healthy or counting down
+  to idle) for `GET /models`, with a 3 s timeout, and again right after
+  every load, unload and apply it does itself; a lane that is off,
+  waking, powering off or draining is never asked, and nothing is woken. Set
   `models_max` on the lane's `engine:` block to the router's
   `--models-max` so the gateway knows a load unloads another model. Every
   load a request caused counts as a swap, per target and per hour, with the
@@ -1289,8 +1293,9 @@ findings, each with its evidence and one suggested action:
 
 ```bash
 sb ai doctor
-# target         decode  prompt  ttft   ceiling  swaps/h  cache  accept  empty  waits  wakes
+# target         decode* prompt  ttft   ceiling  swaps/h  cache  accept  empty  waits  wakes
 # gpu-box/qwen   118     9850    190ms  41%      9        3%     71%     0      2      4
+# * decode: all requests, median (any concurrency, not a single-stream c1 figure)
 # host gpu-box: 900 GB/s (configured)
 # findings
 #   gpu-box/qwen: 9 model swaps to gpu-box/qwen in the last hour (limit 6), replacing gemma
@@ -1343,7 +1348,7 @@ in `cli/ai_tune.py`, so other engine kinds can add their own):
 
 | lever | settings | metric | gate | notes |
 |---|---|---|---|---|
-| `spec_type` | `spec_type` | decode | greedy | MTP when the model has an MTP head (a sidecar) or a draft file; +22% to +76% measured on large GPUs, can lose on bandwidth-poor chips |
+| `spec_type` | `spec_type` | decode | greedy | MTP when the model has an MTP head or a draft file; +22% to +76% measured on large GPUs, can lose on bandwidth-poor chips |
 | `draft_max` | `draft_max` 1 to 4 | weighted aggregate | greedy | swept at every `--concurrency`: there is no per-request draft length, so the value with the best workload-weighted aggregate wins; the table per concurrency is in the report |
 | `flash_attn` | `flash_attn` | decode | greedy | |
 | `ubatch_size` | `batch_size`, `ubatch_size` (512, 1024, 2048) | prefill | greedy | |
@@ -1354,11 +1359,18 @@ in `cli/ai_tune.py`, so other engine kinds can add their own):
 | `mmap` | `mmap` on/off | load time | none | |
 | `sleep_idle_seconds` | — | — | — | advice from the measured swaps |
 
+Whether MTP or a draft model is known comes from `GET /v1/engines`
+`models[].speculative`: first the settings the gateway writes into the
+preset overlay (`load.spec_type`, `load.spec_draft_model`, or `engine_args`
+`spec-type` / `spec-draft-model`), then a loaded instance's `status.args`
+(`--spec-type`, `--spec-draft-model`, `-md`), and only then the engine's
+`sidecars`. A real llama.cpp router lists `sidecars` only for cached Hugging
+Face models, never for preset ones. The engine build comes from `GET /props`
+`build_info` (for example `b12359-b1b770d90`).
+
 **Safety.** `sb ai tune` refuses to start (exit 1, with the reason) when
 the machine is asleep and `--wake` is not given, when the lane has a request
-in flight or queued, inside a quiet window (`server.optimize.quiet_windows`,
-`HH:MM-HH:MM` in UTC, for example `["00:30-03:00"]` while a nightly job
-runs), or when a lever it was asked for would change a locked load key
+in flight or queued, inside a quiet window (`server.optimize.quiet_windows`, see below), or when a lever it was asked for would change a locked load key
 (`locked: ["load.ctx_size"]`, or `sb ai set MODEL ctx_size=65536 --load
 --lock`; without `--levers` such a lever is skipped and said). While it
 runs it holds the machine on (a host hold, so the idle timer cannot power it
@@ -1372,9 +1384,41 @@ reload waits for the model to drain), and the lock and the hold are let go.
 ```
 POST   /v1/optimize/locks {"target", "ttl_secs", "reason"}   201 | 409 quiet_window | lane_busy | locked
 GET    /v1/optimize/locks
-PATCH  /v1/optimize/locks/{id} {"ttl_secs"}
+PATCH  /v1/optimize/locks/{id} {"ttl_secs"}                  200 {…, "quiet_window"} | 404 (lock gone)
 DELETE /v1/optimize/locks/{id}
 ```
+
+**Quiet windows** hold off tuning while something else needs the machine
+(a nightly job, for example). Each window is a plain `"HH:MM-HH:MM"`
+string or `{start, end, tz}` with an IANA time zone; a plain string uses
+`server.optimize.timezone`, else UTC. A window may wrap midnight; an
+unknown zone is a config error.
+
+```yaml
+server:
+  optimize:
+    timezone: Asia/Tokyo                 # for plain windows; absent = UTC
+    quiet_windows:
+      - "00:30-03:00"                         # Asia/Tokyo (from timezone)
+      - {start: "12:00", end: "12:30", tz: UTC}
+```
+
+A window is checked when a run starts and again during the run: between
+measurements (never during one) the tuner renews its lock with `PATCH`,
+whose answer names the window in force. When one begins, the run stops at
+that safe point, applies the best known settings again, and lets the lock
+and the hold go (exit 0, `stopped: the quiet window … began`). Tuning locks
+live in the gateway's memory: after a restart the heartbeat gets 404, and
+the run stops the same way (exit 1).
+
+**Busy and paused models.** The tuner writes each candidate with `apply:
+now` and the revision it edits in `If-Match` (a quoted ETag). When the
+model still serves a request the gateway answers 200 with `apply.pending:
+true` (`reason: model_busy`); the tuner then waits until `GET /v1/engines`
+shows nothing pending for the model, and never measures before. Still
+pending after 10 minutes: the run stops. A request answered 503
+`model_paused` (an apply or unload holds the model) is asked again a few
+seconds later, never counted as a failed answer.
 
 **The ledger.** Every run of every experiment is a row in the gateway's
 store (`GET /v1/optimize/experiments?model=TARGET`, `sb ai tune MODEL
@@ -1401,7 +1445,7 @@ sb ai tune gpu-box/qwen: run tune_3f9a0c21d4, engine b12464, 6 samples per run, 
   cache_type {"cache_type_k": "q8_0", "cache_type_v": "q8_0"}: rejected (decode 170.2 did not beat both controls (322.0, 319.8))
 
 metric                     baseline        now    ceiling  how measured
-decode tok/s (c1)             218.0      323.1      410.0  median of 6, warm, fresh prompts, through the gateway (client clock)
+decode tok/s (c1, median)     218.0      323.1      410.0  median of 6, warm, fresh prompts, through the gateway (client clock)
 time to first token ms        182.0      179.0          -  median of 6, warm, fresh prompts, through the gateway (client clock)
 draft_max by concurrency (aggregate tok/s):
   {"draft_max": 1}: c1 290, c2 455
