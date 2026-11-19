@@ -496,6 +496,9 @@ async fn a_workflow_job_lists_its_workflow() {
         .collect();
     assert!(inputs.contains(&"image"), "{inputs:?}");
     assert!(inputs.contains(&"prompt"), "{inputs:?}");
+    // The workflow binds no `width`/`height` and no `seed`: a request with
+    // `size` or `seed` answers 400, so the list must not offer them.
+    assert_eq!(inputs, vec!["prompt", "image"], "only what it accepts");
     let required = |name: &str| {
         workflow["inputs"]
             .as_array()
@@ -572,4 +575,51 @@ async fn a_prompt_the_workflow_does_not_bind_is_refused_before_the_job_exists() 
         .map(|field| field["name"].as_str().unwrap())
         .collect();
     assert!(!inputs.contains(&"prompt"), "{inputs:?}");
+}
+
+/// Every input `GET /v1/workflows` lists for a workflow is one a job may
+/// send without a 400 for an unbound input; `size` and `seed` appear once the
+/// workflow binds them.
+#[tokio::test]
+async fn the_workflow_list_offers_size_and_seed_only_where_bound() {
+    let fake = FakeComfy::default();
+    let comfy_url = spawn_comfy(fake.clone()).await;
+    let base = serve(&config(&comfy_url)).await;
+    let image = upload_image(&base, OPERATOR).await;
+    for (name, value) in [("size", json!("512x512")), ("seed", json!(7))] {
+        let mut inputs = json!({"image": image, "prompt": "cat"});
+        inputs[name] = value;
+        let response = submit(
+            &base,
+            OPERATOR,
+            json!({"kind": "workflow_execution", "model": "segment/sam3", "inputs": inputs}),
+        )
+        .await;
+        assert_eq!(response.status(), 400, "{name} is refused when unbound");
+    }
+
+    let bound = config(&comfy_url).replace(
+        "          prompt: { path: [\"2\", \"inputs\", \"text\"] }\n",
+        "          prompt: { path: [\"2\", \"inputs\", \"text\"] }\n          seed: { path: [\"3\", \"inputs\", \"seed\"] }\n          width: { path: [\"3\", \"inputs\", \"width\"] }\n          height: { path: [\"3\", \"inputs\", \"height\"] }\n",
+    );
+    assert!(
+        bound.contains("seed: { path"),
+        "the fixture gained bindings"
+    );
+    let base = serve(&bound).await;
+    let listed = get_json(&base, OPERATOR, "/v1/workflows").await;
+    let workflow = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "segment/sam3")
+        .expect("the workflow listed")
+        .clone();
+    let inputs: Vec<&str> = workflow["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(inputs, vec!["prompt", "size", "seed", "image"]);
 }

@@ -2176,7 +2176,21 @@ fn workflow_field(
 
 /// The inputs a configured workflow takes: the image inputs, plus `image`
 /// (an artifact id), `frames` and `fps` where the workflow binds them.
+/// `size` and `seed` show only where the workflow binds them (`width` and
+/// `height`, `seed`): the same rule [`ensure_image_inputs_bound`] refuses a
+/// request by, so the list never offers an input that answers 400.
 fn workflow_fields_for(workflow: &ComfyUiWorkflowConfig) -> Vec<WorkflowField> {
+    let binds = |name: &str| workflow.bindings.contains_key(name);
+    let mut fields = workflow_kind_fields(workflow);
+    fields.retain(|field| match field.name.as_str() {
+        "size" => binds("width") && binds("height"),
+        "seed" => binds("seed"),
+        _ => true,
+    });
+    fields
+}
+
+fn workflow_kind_fields(workflow: &ComfyUiWorkflowConfig) -> Vec<WorkflowField> {
     let mut fields = match workflow.kind {
         WorkloadKind::VideoGeneration => vec![
             workflow_field("prompt", "string", true, None),
