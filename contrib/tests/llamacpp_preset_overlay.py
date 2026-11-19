@@ -93,6 +93,22 @@ class Overlay(unittest.TestCase):
             self.assertEqual(run.returncode, 2, overlay)
         self.assertFalse(self.out.exists())
 
+    def test_a_section_the_base_lacks_is_refused(self):
+        # A typo, or a variant of a model the base file lacks, would become
+        # a section without `model =`.
+        for overlay in ({"models": {"qwen-typo": {"settings": {"ctx-size": "4096"}}}},
+                        {"models": {"nope~1a2b3c4d": {"base": "nope",
+                                                      "settings": {"ctx-size": "4096"}}}},
+                        {"models": {"small~1a2b3c4d": {"settings": {"ctx-size": "4096"}}}}):
+            run = self.run_script(overlay)
+            self.assertEqual(run.returncode, 2, overlay)
+            self.assertIn("base file", run.stderr)
+        self.assertFalse(self.out.exists())
+        # A variant of a base section is fine.
+        run = self.run_script({"models": {"small~1a2b3c4d": {
+            "base": "small", "settings": {"ctx-size": "8192"}}}})
+        self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_same_overlay_twice_is_unchanged(self):
         overlay = {"models": {"small": {"settings": {"ctx-size": "4096"}}}}
         self.assertEqual(self.run_script(overlay).returncode, 0)

@@ -22,6 +22,8 @@ with `--models-preset`):
   `; switchback-pinned: ctx-size, n-gpu-layers` in a section pins those keys
   there (in `[*]`, everywhere). An overlay that would change a pinned key is
   refused (exit 2) and OUT is left as it was;
+- a model that is neither a section of BASE nor a variant of one is refused
+  (exit 2): its section would have no `model =` line;
 - OUT is written atomically (a temporary file in the same folder, then a
   rename), and only when its content changes.
 
@@ -136,6 +138,12 @@ def merge(base_text, overlay):
                     for key, value in (entry.get("settings") or {}).items()}
         base = entry.get("base")
         own = by_name.get(model)
+        if own is None and (base is None or base not in by_name):
+            # A typo or a model the base file lacks would become a section
+            # with no `model =` line, which the router cannot load.
+            if base is None:
+                raise Refused(f"{model}: no [{model}] section in the base file")
+            raise Refused(f"{model}: variant of [{base}], which the base file lacks")
         pins = set(global_pins)
         if own is not None:
             pins |= pinned_of(own)
