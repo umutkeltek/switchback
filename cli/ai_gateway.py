@@ -31,7 +31,8 @@ sb ai: images, video and machine status through a Switchback gateway
   sb ai video "prompt" --image FIRST_FRAME [--model NAME] [--seconds N] [--frames N]
                        [--aspect W:H] [--mp N] [--size WxH] [--seed N] [-o FILE]
   sb ai status [--json]          lanes and machine power; never wakes anything
-  sb ai models [--json]          what the gateway offers, by job (text, image, video)
+  sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video);
+                                 --all also shows internal provider ids
   sb ai hold DURATION [REASON] [--wake] [--host NAME]
                                  keep the machine on for direct work (30m, 2h, 1h30m)
   sb ai release [ID | --all] [--host NAME]
@@ -216,7 +217,7 @@ def gateway_fail(error, doing):
 
 # ---------------------------------------------------------------- models
 
-def catalog(gw):
+def catalog(gw, every_id=False):
     """{"text": [...], "image": [...], "video": [...], "listed": bool, "test": set}."""
     result = {"text": [], "image": [], "video": [], "listed": False, "test": set()}
     try:
@@ -249,22 +250,26 @@ def catalog(gw):
             media.add(model_id)
         else:
             result["text"].append(model_id)
-    result["text"] = plain_text_names(result["text"])
+    if not every_id:
+        result["text"] = plain_text_names(result["text"])
     return result
 
 
 def plain_text_names(ids):
-    """/v1/models lists each text route twice (`fast` and `<provider>/fast`) and
-    the providers themselves (`<provider>`). Keep one name per model: drop
-    `<provider>/x` when `x` is listed too, and a bare id that is only the prefix
-    of other ids (a provider, not a model)."""
+    """/v1/models lists each text route (`fast`), each provider's own model
+    names (`<provider>/<engine name>`) and the provider itself (`<provider>`).
+    People use the route names; the rest are internal and repeat them. Drop
+    `<provider>/x` when `x` or the provider is listed too, and a bare id that
+    only prefixes other ids. `sb ai models --all` shows every id."""
     listed = set(ids)
     prefixes = {i.split("/", 1)[0] for i in ids if "/" in i}
     keep = []
     for model_id in ids:
-        if "/" in model_id and model_id.split("/", 1)[1] in listed:
-            continue
-        if "/" not in model_id and model_id in prefixes:
+        if "/" in model_id:
+            provider, name = model_id.split("/", 1)
+            if name in listed or provider in listed:
+                continue
+        elif model_id in prefixes:
             continue
         keep.append(model_id)
     return keep
@@ -435,7 +440,7 @@ def cmd_status(gw, args):
 
 
 def cmd_models(gw, args):
-    cat = catalog(gw)
+    cat = catalog(gw, every_id=args.all)
     groups = {name: cat[name] for name in ("text", "image", "video")}
     if args.json:
         print(json.dumps(groups, indent=2))
@@ -901,6 +906,7 @@ def parser():
             cmd.add_argument("--frames", type=int)
     for name in ("status", "models"):
         sub.add_parser(name, add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
+    sub.choices["models"].add_argument("--all", action="store_true")
     hold = sub.add_parser("hold", add_help=False, allow_abbrev=False)
     hold.add_argument("duration")
     hold.add_argument("reason", nargs="?", default="")

@@ -382,14 +382,18 @@ class SbAi(unittest.TestCase):
         self.assertEqual({r["method"] for r in self.fake.seen}, {"GET"})
 
     def test_models_lists_each_text_model_once(self):
-        # A real gateway lists every route twice (`chat-a`, `lane-txt/chat-a`) and
-        # its providers as bare ids (`lane-txt`); a target with no plain twin stays.
+        # A real gateway lists each route (`chat-a`), its provider's own ids
+        # (`lane-txt/chat-a`, `lane-txt/engine-x`) and the provider (`lane-txt`).
+        # Only route names show; an id whose provider is not listed stays.
         self.fake.models.extend([{"id": "lane-txt/chat-a"}, {"id": "lane-txt/chat-b"},
-                                 {"id": "lane-txt"}, {"id": "lane-txt/only-direct"},
+                                 {"id": "lane-txt"}, {"id": "lane-txt/engine-x"}, {"id": "other/only-direct"},
                                  {"id": "lane-img"}])  # the image workflows' provider
         run = self.sb("models", "--json")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(json.loads(run.stdout)["text"], ["chat-a", "chat-b", "lane-txt/only-direct"])
+        self.assertEqual(json.loads(run.stdout)["text"], ["chat-a", "chat-b", "other/only-direct"])
+        run = self.sb("models", "--all", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("lane-txt/engine-x", json.loads(run.stdout)["text"])
         run = self.sb("models")
         self.assertNotIn("lane-txt/chat-a", run.stdout)
         self.assertNotRegex(run.stdout, r"(?m)^  lane-txt$")
