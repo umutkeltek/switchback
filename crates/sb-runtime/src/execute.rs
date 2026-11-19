@@ -409,16 +409,26 @@ impl Engine {
         // first success, cancel the losers. On total hedge failure, fall through to
         // the normal sequential fallback loop below.
         if scope.is_none() && rt.hedge_enabled && !req.stream && plan.candidates.len() >= 2 {
-            if let Some(win) = run_hedge(
+            // The place the first choice's lane gave this request goes to
+            // that lane's racer; an unused one comes back for the loop.
+            let held = lane_gpu.as_mut().map(|note| note.lend_to_hedge());
+            let hedged = run_hedge(
                 snap,
                 &req,
                 &plan.candidates,
                 &self.scorecard,
                 &snap.config.server.scorecard,
-                &|provider_id: &str| self.lane_busy(snap, provider_id),
+                &|provider_id: &str| match held.as_ref().and_then(|held| held.take_for(provider_id))
+                {
+                    Some(busy) => Ok(Some(busy)),
+                    None => self.lane_busy(snap, provider_id),
+                },
             )
-            .await
-            {
+            .await;
+            if let (Some(note), Some(held)) = (lane_gpu.as_mut(), held) {
+                note.give_back(held);
+            }
+            if let Some(win) = hedged {
                 tracing::info!(
                     request_id = %req.id, model = %req.model, target = %win.target_id,
                     account = %win.account_id, status = 200u16,

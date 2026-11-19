@@ -98,6 +98,51 @@ impl LaneGpuNote {
             None
         }
     }
+
+    /// Lend the held guard to the hedge race, which runs before the
+    /// dispatch loop: the lane's own racer uses the place taken for it
+    /// instead of asking for a second one (with `max_in_flight: 1` that
+    /// second ask always fails, and with more it costs two places).
+    pub(crate) fn lend_to_hedge(&mut self) -> HeldPlace {
+        HeldPlace {
+            provider_id: self.note.provider_id.clone(),
+            busy: std::sync::Mutex::new(self.busy.take()),
+        }
+    }
+
+    /// Take back a lent guard the race did not use, for the dispatch loop.
+    pub(crate) fn give_back(&mut self, held: HeldPlace) {
+        if let Some(busy) = held.into_unused() {
+            self.busy = Some(busy);
+        }
+    }
+}
+
+/// The first choice's held place, lent to the hedge race (see
+/// [`LaneGpuNote::lend_to_hedge`]). The first racer on that lane takes it;
+/// any other racer asks the lane for its own place as usual.
+pub(crate) struct HeldPlace {
+    provider_id: String,
+    busy: std::sync::Mutex<Option<LaneBusy>>,
+}
+
+impl HeldPlace {
+    /// The lent guard, once, for a racer on the lane it was taken for.
+    pub(crate) fn take_for(&self, provider_id: &str) -> Option<LaneBusy> {
+        if self.provider_id != provider_id {
+            return None;
+        }
+        self.busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn into_unused(self) -> Option<LaneBusy> {
+        self.busy
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// What a request-triggered wake did, kept until the plan is known.

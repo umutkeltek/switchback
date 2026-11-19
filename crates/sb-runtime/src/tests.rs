@@ -3201,3 +3201,107 @@ fn max_in_flight_must_be_at_least_one() {
         "{error}"
     );
 }
+
+/// A lane with `max_in_flight: 1` that really counts: a place is free only
+/// while nothing holds one, and `peak` records the most places ever held.
+struct OnePlaceLanes {
+    active: Arc<AtomicUsize>,
+    peak: AtomicUsize,
+    refused: AtomicUsize,
+}
+
+impl OnePlaceLanes {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: AtomicUsize::new(0),
+            refused: AtomicUsize::new(0),
+        })
+    }
+
+    fn take(&self) -> Option<crate::LaneBusy> {
+        if self
+            .active
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
+        self.peak.fetch_max(1, Ordering::SeqCst);
+        Some(Box::new(Busy(self.active.clone())))
+    }
+}
+
+impl crate::LaneStatus for OnePlaceLanes {
+    fn known_down(&self, _provider_id: &str) -> Option<String> {
+        None
+    }
+
+    fn lane_full(&self, _provider_id: &str) -> Option<String> {
+        (self.active.load(Ordering::SeqCst) >= 1).then(|| LANE_FULL.to_string())
+    }
+
+    fn try_begin_request(&self, _provider_id: &str) -> Result<Option<crate::LaneBusy>, String> {
+        self.take().map(Some).ok_or_else(|| LANE_FULL.to_string())
+    }
+
+    fn acquire_for_request<'a>(
+        &'a self,
+        _provider_id: &'a str,
+    ) -> crate::BoxFuture<'a, crate::LaneAcquire> {
+        Box::pin(std::future::ready(match self.take() {
+            Some(busy) => crate::LaneAcquire::Ready {
+                busy: Some(busy),
+                detail: None,
+            },
+            None => crate::LaneAcquire::QueueTimeout {
+                detail: LANE_TIMED_OUT.to_string(),
+                retry_after: crate::LANE_QUEUE_RETRY_AFTER,
+            },
+        }))
+    }
+}
+
+// Hedging runs before the dispatch loop. The place the first choice's lane
+// gave the request must go to that lane's racer: with `max_in_flight: 1` a
+// second ask is always refused, so the lane never raced and the cloud
+// target (the second racer, after its delay) always won while the held
+// place blocked the lane.
+#[tokio::test]
+async fn a_hedged_request_races_its_lane_on_the_place_it_already_holds() {
+    let mut cfg = slot_lane_config(sb_core::LaneOnFull::Spill);
+    cfg.local_executors[0].max_in_flight = Some(1);
+    cfg.server.hedge.enabled = true;
+    cfg.server.hedge.max_parallel = 2;
+    // The second racer starts long after the lane answers.
+    cfg.server.hedge.delay_ms = 2_000;
+    let lanes = OnePlaceLanes::new();
+    let engine = engine_from_config(cfg).with_lane_status(lanes.clone());
+    let (_revision, outcome) = engine
+        .execute(hello("local-text", false), Instant::now())
+        .await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+    let trace = engine.traces().recent(1).pop().unwrap();
+    let winner = trace
+        .attempts
+        .iter()
+        .find(|attempt| matches!(attempt.outcome, sb_trace::AttemptOutcome::Success))
+        .map(|attempt| attempt.target_id.clone());
+    assert_eq!(
+        winner.as_deref(),
+        Some("lane/echo"),
+        "the lane raced and won"
+    );
+    assert_eq!(lanes.refused.load(Ordering::SeqCst), 0, "no second ask");
+    assert_eq!(
+        lanes.peak.load(Ordering::SeqCst),
+        1,
+        "one place per request"
+    );
+    assert_eq!(
+        lanes.active.load(Ordering::SeqCst),
+        0,
+        "the place is given back"
+    );
+}
