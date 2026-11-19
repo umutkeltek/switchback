@@ -744,10 +744,13 @@ after it has been idle; `sb ai` itself never wakes anything, except
 ```
 sb ai image "a lighthouse at dusk" --model flux --aspect 16:9 -o light.png
 sb ai video "waves roll in" --image light.png --seconds 2 -o waves.mp4
+sb ai segment photo.png "the cat"   # segment an image; the mask is saved next to it
 sb ai bench             # measure the text models: first token, prompt and decode speed
 sb ai status            # one line per lane, and whether the machine is on; never wakes it
-sb ai models            # text, image and video models the gateway offers
+sb ai models            # text, image, video and segment models the gateway offers
 sb ai hold 2h "batch"   # keep the machine on for direct work (--wake turns it on now)
+sb ai on 1h "batch"     # keep the machine on and wake it (1h by default)
+sb ai off               # power the machine off now
 sb ai release           # let it go again (ID or --all when there are several holds)
 ```
 
@@ -766,6 +769,16 @@ sb ai release           # let it go again (ID or --all when there are several ho
   (a square one at `--mp` if given).
   `--seconds` becomes frames at 24 fps, `--frames` sends an exact count.
 - Ctrl-C during a video cancels the job on the gateway.
+- `segment` uploads the image, runs the gateway's segmentation workflow (a
+  `workflow_execution` job: an image in, a mask out) and saves the mask. The
+  text after the image is optional and goes to the workflow's `prompt`
+  binding. Ctrl-C cancels the job on the gateway, as for a video.
+- `on` is a hold with a wake: the machine comes up and stays on for
+  `DURATION` (1h by default) and the answer says how to let it go again.
+- `off` asks the gateway to power the machine off now. It refuses while a
+  hold is active (unless `--release-holds` ends it first), while the machine
+  has work, or while the machine's guard says somebody else is using it,
+  and it prints the gateway's reason. `sb ai` needs an operator key for it.
 - `bench` measures text models through the gateway's OpenAI-compatible API and
   reports the time to the first token, the prompt and the decode speed (tokens
   per second), the total time and the token counts. The first run of each model

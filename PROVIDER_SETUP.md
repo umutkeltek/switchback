@@ -464,6 +464,51 @@ and survive a restart, so a restart never powers off a held machine;
 otherwise they live in memory only. The capacity report's `holds.durable`
 says which, and `holds.last_save_error` shows a failed write.
 
+**Power a machine now.** An operator (or an admin) can power a managed
+machine off or on, without waiting for the idle timer. A client key may
+not: it gets 403.
+
+```sh
+curl -s -X POST "$SB/v1/hosts/gpu-box/power" -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"action": "off"}'
+# 200 {"host":"gpu-box","action":"off","powered_off":true,"lanes":2,"released_holds":[]}
+curl -s -X POST "$SB/v1/hosts/gpu-box/power" -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"action": "on"}'
+# 202 {"host":"gpu-box","action":"on","status":"waking","lanes":2}
+```
+
+`off` runs the machine's `poweroff_command`, exactly as the idle timer does,
+and asks the same `poweroff_guard_command` first. It is refused with 409 and
+a typed `reason` while the machine must stay on:
+
+| `reason` | why |
+|---|---|
+| `hold_active` | a hold is active; the message names the holds. `{"action": "off", "release_holds": true}` ends them first and names them in the answer (`released_holds`). |
+| `lane_busy` | a lane of the machine has work in flight or queued. |
+| `guard_busy` | the machine's power-off guard says somebody else is using it. |
+| `guard_unavailable` | the guard gave no answer; the machine stays on. |
+| `uptime_too_short` | the machine has not been up long enough (see `poweroff_min_uptime_secs` below). |
+| `no_poweroff_command` | the machine has no power-off command: it is always on and the gateway never powers it off. |
+| `wake_in_flight` | a wake is running on the machine; it is coming up now. |
+| `poweroff_in_flight` | another power-off is already running. |
+
+`on` wakes the machine through the same wake path a hold with `wake: true`
+uses and answers at once (202): the wake runs in the background. It takes
+no hold, so the idle timer still applies and the machine powers off again
+once it has been idle long enough. A machine with no `wake_command` answers
+409 (`no_wake_command`): it is always on.
+
+Every refusal and every action is written to the gateway log. A power-off
+that fails escalates the lane and fires the same `poweroff_failed` alert
+the idle power-off fires; a successful one alerts nothing.
+
+`poweroff_min_uptime_secs` on a lane (default 0, no minimum) is the
+shortest time a machine may have been up before a power-off runs. The idle
+timer waits for the idle timeout anyway; this is the rule that keeps an
+operator's request from cutting off a machine that booted a second ago.
+The uptime is counted from the moment the gateway last woke the machine,
+or from the moment it first saw it up.
+
 **The capacity report.** Each lane in `GET /v1/workloads/capacity` carries
 `poweroff_in_secs`: seconds until its machine's idle power-off, `null` while
 the machine has work or a waiting request, is held, is off, or has no
@@ -738,6 +783,65 @@ workflow's `image` binding. The video is read from ComfyUI's history
 workflow bounds one job, ComfyUI queue included (default 900); give a
 video workflow more. A commented `img2vid` workflow is in
 `config/switchback.example.yaml`.
+
+**Workflows: image in, image out.** A ComfyUI workflow of
+`kind: workflow_execution` is the shape for a job that takes an image (and
+an optional text) and gives an image back — a segmentation, an inpainting, a
+background removal. It runs on the media lane like any other media job
+(GPU sharing, wake, queue) and its output becomes an artifact, exactly like
+a generated image:
+
+```sh
+curl -s "$SB/v1/uploads" -H "authorization: Bearer $KEY" \
+  -H 'content-type: image/png' --data-binary @photo.png
+# {"artifact_id":"art_...","media_type":"image/png",...}
+curl -s "$SB/v1/jobs" -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"kind":"workflow_execution","workflow":"segment/sam3",
+       "inputs":{"image":"art_...","prompt":"the cat"}}'
+```
+
+The image goes to ComfyUI (`POST /upload/image`) and the name ComfyUI gives
+it is bound at the workflow's `image` binding. The `prompt` is optional and
+is bound at the workflow's `prompt` binding: with no text the graph keeps
+its own default. A workflow job needs no prompt (an image job does: an
+empty one is refused with 400). The output is read from ComfyUI's history
+(`images`), stored as an artifact and recorded in the ledger as
+`workflow_execution`.
+
+A segmentation workflow looks like this. The node ids and the two node
+types below are **placeholders**: the graph is whatever the operator
+exports from ComfyUI, and the ids are whatever that export names.
+
+```yaml
+providers:
+  - id: media
+    type: comfyui
+    base_url: "http://executor-1.example:8188"
+    workflows:
+      - id: sam3
+        kind: workflow_execution
+        model_id: segment/sam3
+        timeout_secs: 300
+        # The graph below is an EXAMPLE shape, not a real SAM 3 graph:
+        # "ExampleSegmenter" stands for whatever node runs the model on
+        # the machine. Replace the graph, the node ids and the bindings
+        # with the ones your ComfyUI export has.
+        graph:
+          "10": { class_type: LoadImage, inputs: { image: "" } }
+          "11": { class_type: CLIPTextEncode, inputs: { text: "" } }
+          "12": { class_type: ExampleSegmenter, inputs: { image: ["10", 0], text: ["11", 0] } }
+          "20": { class_type: SaveImage, inputs: { images: ["12", 0], filename_prefix: "mask" } }
+        bindings:
+          image:  { path: ["10", "inputs", "image"] }   # the uploaded file's name
+          prompt: { path: ["11", "inputs", "text"] }    # the optional text
+        output_node_ids: ["20"]                         # the node that saves the mask
+```
+
+The `path` of a binding is the place in the graph the value goes; the
+parent nodes must exist in the graph already. `output_node_ids` names the
+nodes whose output is the artifact; without it every output of the graph is
+taken. `GET /v1/workflows` lists the workflow with the inputs it binds
+(`image` as an artifact, `prompt` as text) and one `artifact` output.
 
 **Public model ids.** A workflow's id for callers is `<provider id>/<workflow
 id>` by default, so the provider's name shows in every caller's model name.
