@@ -874,7 +874,7 @@ curl -s localhost:8765/v1/chat/completions -H 'content-type: application/json' \
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8765/v1", api_key="sk-...")
+client = OpenAI(base_url="http://gateway.example.invalid:8765/v1", api_key="sk-...")
 client.chat.completions.create(
     model="fast",
     messages=[{"role": "user", "content": "hi"}],
@@ -1030,8 +1030,8 @@ request_load:
   bounds: {ctx_size: [4096, 131072]}   # inclusive, for every key
   max_variants: 2
   variant_idle_ttl_secs: 3600
-  # estimate: {weights_bytes: 21474836480, budget_bytes: 25769803776,
-  #            kv_layers: 48, kv_heads: 8, head_dim: 128}   # see the fit check
+  # estimate: {weights_bytes: N, budget_bytes: N,       # bytes; see the fit check
+  #            kv_layers: 48, kv_heads: 8, head_dim: 128}
 ```
 
 Without a policy the request is refused (400 `request_load_disabled`). Client
