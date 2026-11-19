@@ -116,6 +116,10 @@ class Fake:
         self.holds = None  # None: the gateway has no holds route (bare 404)
         # A refused power request: (status, message, reason). None: it works.
         self.power_refusal = None
+        self.power_on_status = "waking"  # what `on` answers: "waking" or "up"
+        self.already_off = False  # what `off` answers
+        self.released_holds = []
+        self.jobs_delay = 0.0  # seconds POST /v1/jobs takes to answer
         self.chat_plans = []  # one plan per chat request; the last one is used again
         self.chat_count = 0
         self.chat_fail_at = None  # the request number from which the gateway refuses
@@ -130,7 +134,7 @@ class Fake:
             ("GET", "/v1/artifacts/art1"): lambda r: (200, PNG, "image/png"),
             ("GET", "/v1/artifacts/vid1"): lambda r: (200, MP4, "video/mp4"),
             ("POST", "/v1/uploads"): lambda r: self.json({"artifact_id": "up1", "kind": "image"}, 201),
-            ("POST", "/v1/jobs"): lambda r: self.json({"id": "job-v1", "status": "accepted", "events": []}, 202),
+            ("POST", "/v1/jobs"): self.jobs_route,
             ("GET", "/v1/jobs/job-v1"): self.job_route,
             ("POST", "/v1/jobs/job-v1/cancel"): lambda r: self.json({"id": "job-v1", "status": "cancelled"}),
         }
@@ -188,6 +192,11 @@ class Fake:
         self.holds = [h for h in self.holds if h["id"] != hold_id]
         return self.json({"id": hold_id, "host": host, "deleted": True})
 
+    def jobs_route(self, request):
+        """`POST /v1/jobs`: the job starts (after `jobs_delay`)."""
+        time.sleep(self.jobs_delay)
+        return self.json({"id": "job-v1", "status": "accepted", "events": []}, 202)
+
     def power_route(self, request):
         """`POST /v1/hosts/{host}/power`: the gateway's power endpoint."""
         if self.power_refusal:
@@ -195,8 +204,13 @@ class Fake:
             return self.json({"error": {"message": message, "type": "power_refused",
                                         "reason": reason}}, status)
         host = request["path"].split("/")[3]
+        if request["json"].get("action") == "on":
+            if self.power_on_status == "up":
+                return self.json({"host": host, "action": "on", "status": "up", "lanes": 1})
+            return self.json({"host": host, "action": "on", "status": "waking", "lanes": 1}, 202)
         return self.json({"host": host, "action": request["json"].get("action"),
-                           "powered_off": True, "lanes": 1, "released_holds": []})
+                          "powered_off": True, "already_off": self.already_off, "lanes": 1,
+                          "released_holds": self.released_holds})
 
     def chat_plan_for(self):
         """The plan for the next chat request, or None when the gateway refuses it."""
@@ -721,6 +735,31 @@ class SbAi(unittest.TestCase):
         self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
                          {"ttl_secs": 7200, "reason": "render batch", "wake": True})
 
+    def test_on_says_when_the_machine_is_already_up(self):
+        self.fake.holds = []
+        self.fake.power_on_status = "up"
+        run = self.sb("on")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/hosts/box/power")["json"], {"action": "on"})
+        # The machine is up: the hold keeps it on, and wakes nothing.
+        self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
+                         {"ttl_secs": 3600, "reason": "sb ai on", "wake": False})
+        self.assertIn("box is already up", run.stdout)
+
+    def test_on_says_the_machine_is_waking(self):
+        self.fake.holds = []
+        run = self.sb("on")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("box is waking", run.stdout)
+
+    def test_on_with_a_key_that_may_not_power_still_holds_and_wakes(self):
+        self.fake.holds = []
+        self.fake.power_refusal = (403, "operator keys only", "")
+        run = self.sb("on")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
+                         {"ttl_secs": 3600, "reason": "sb ai on", "wake": True})
+
     def test_on_needs_a_duration_unit(self):
         run = self.sb("on", "30")
         self.assertEqual(run.returncode, 2)
@@ -731,6 +770,20 @@ class SbAi(unittest.TestCase):
         run = self.sb("off")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.posted("/v1/hosts/box/power")["json"], {"action": "off"})
+        self.assertIn("box is powering off", run.stdout)
+
+    def test_off_says_when_the_machine_is_already_off(self):
+        self.fake.already_off = True
+        run = self.sb("off")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("box is already off", run.stdout)
+        self.assertNotIn("powering off", run.stdout)
+
+    def test_off_names_the_released_holds(self):
+        self.fake.released_holds = ["hold-1"]
+        run = self.sb("off", "--release-holds")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("released hold hold-1 on box", run.stdout)
         self.assertIn("box is powering off", run.stdout)
 
     def test_off_releases_the_holds_when_asked(self):
@@ -842,6 +895,25 @@ class SbAi(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertEqual(len(self.requests("POST", "/v1/jobs/job-v1/cancel")), 1)
         self.assertIn("cancelled job job-v1", stderr)
+
+    def test_segment_interrupt_while_the_job_is_sent_says_it_may_still_run(self):
+        picture = self.root / "cat.png"
+        picture.write_bytes(PNG)
+        self.fake.jobs_delay = 5.0  # the answer to POST /v1/jobs is slow
+        process = subprocess.Popen(["zsh", str(SB), "ai", "segment", str(picture)],
+                                   env=self.env, cwd=self.root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        deadline = time.time() + 20
+        while time.time() < deadline and not self.requests("POST", "/v1/jobs"):
+            time.sleep(0.05)
+        self.assertTrue(self.requests("POST", "/v1/jobs"), "the job was never sent")
+        os.killpg(process.pid, signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 130, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn("may still run", stderr)
+        self.assertIn("/v1/jobs/ID/cancel", stderr)
+        self.assertNotIn("before the job started", stderr)
 
     # ------------------------------------------------------------ bench
 

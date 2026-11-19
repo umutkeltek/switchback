@@ -56,12 +56,15 @@ video without --aspect or --size keeps the first frame's shape (0.4 MP, or --mp)
 Ctrl-C during a video cancels the job on the gateway.
 
 on is a hold with a wake: the machine comes up and stays on for DURATION
-(1h by default) and the answer says how to let it go again. off powers the
+(1h by default) and the answer says how to let it go again; a machine that
+already runs is held without a wake, and on says it is up. off powers the
 machine off now, through the gateway: it refuses while a hold is active
 (unless --release-holds ends it first), while the machine has work, or
-while the machine's guard says somebody else is using it, and it says why.
+while the machine's guard says somebody else is using it, and it says why;
+a machine that already sleeps is left alone, and off says it is off.
 segment runs a workflow that takes an image (and an optional text) and
-gives back a mask; Ctrl-C cancels the job on the gateway, as for video.
+gives back a mask; Ctrl-C cancels the job on the gateway, as for video
+(during the moment the job is being sent, it says how to stop it instead).
 
 bench measures text models through the gateway's OpenAI-compatible API: it sends a
 fixed prompt and reports the time to the first token, the prompt and the decode
@@ -820,7 +823,7 @@ def cmd_video(gw, config, args):
     if size:
         inputs["size"] = size
     note_machine(gw)
-    started, job_id = time.time(), None
+    started, job_id, submitting = time.time(), None, False
     try:
         try:
             upload = gw.post("/v1/uploads", frame, content_type=media_type, timeout=120)
@@ -833,6 +836,7 @@ def cmd_video(gw, config, args):
             raise
         inputs["image"] = upload["artifact_id"]
         log(f"first frame uploaded ({len(frame) // 1024} KB)")
+        submitting = True  # from here the gateway may have the job
         try:
             job = gw.post("/v1/jobs", {"kind": VIDEO_KIND, "model": model, "inputs": inputs})
         except GatewayError as error:
@@ -843,15 +847,7 @@ def cmd_video(gw, config, args):
             + (f", {size}" if size else ""))
         job = poll(gw, job, args.timeout, started)
     except KeyboardInterrupt:
-        if job_id:
-            try:
-                gw.post(f"/v1/jobs/{urllib.parse.quote(job_id, safe='')}/cancel", {}, timeout=20)
-                log(f"\ncancelled job {job_id} on the gateway")
-            except (Fail, GatewayError) as error:
-                log(f"\ninterrupted; cancelling job {job_id} failed ({getattr(error, 'message', error)})")
-        else:
-            log("\ninterrupted before the job started")
-        return 130
+        return interrupted(gw, job_id, submitting)
     videos = [a for a in job.get("artifacts") or []
               if a.get("kind") == "video" or str(a.get("media_type", "")).startswith("video/")]
     if not videos:
@@ -861,6 +857,26 @@ def cmd_video(gw, config, args):
     for index, video in enumerate(videos):
         save_artifact(gw, video, output_path(args, config, model, tag, index, video.get("media_type")), args.timeout)
     return OK
+
+
+def interrupted(gw, job_id, submitting):
+    """Ctrl-C during a job: cancel it on the gateway when its id is known.
+
+    Between sending the job and reading its answer the id is not known yet,
+    and the gateway may already run it: say so, and how to stop it, rather
+    than guess which job is ours."""
+    if job_id:
+        try:
+            gw.post(f"/v1/jobs/{urllib.parse.quote(job_id, safe='')}/cancel", {}, timeout=20)
+            log(f"\ncancelled job {job_id} on the gateway")
+        except (Fail, GatewayError) as error:
+            log(f"\ninterrupted; cancelling job {job_id} failed ({getattr(error, 'message', error)})")
+    elif submitting:
+        log("\ninterrupted while the job was being sent: the gateway may still run it. "
+            "Find it with GET /v1/jobs and stop it with POST /v1/jobs/ID/cancel")
+    else:
+        log("\ninterrupted before the job started")
+    return 130
 
 
 def poll(gw, job, timeout, started):
@@ -912,7 +928,7 @@ def cmd_segment(gw, config, args):
     if args.text:
         inputs["prompt"] = args.text
     note_machine(gw)
-    started, job_id = time.time(), None
+    started, job_id, submitting = time.time(), None, False
     try:
         try:
             upload = gw.post("/v1/uploads", picture, content_type=media_type, timeout=120)
@@ -925,6 +941,7 @@ def cmd_segment(gw, config, args):
             raise
         inputs["image"] = upload["artifact_id"]
         log(f"image uploaded ({len(picture) // 1024} KB)")
+        submitting = True  # from here the gateway may have the job
         try:
             job = gw.post("/v1/jobs", {"kind": SEGMENT_KIND, "model": model, "inputs": inputs})
         except GatewayError as error:
@@ -934,15 +951,7 @@ def cmd_segment(gw, config, args):
             + (f" ({inputs['prompt']})" if "prompt" in inputs else ""))
         job = poll(gw, job, args.timeout, started)
     except KeyboardInterrupt:
-        if job_id:
-            try:
-                gw.post(f"/v1/jobs/{urllib.parse.quote(job_id, safe='')}/cancel", {}, timeout=20)
-                log(f"\ncancelled job {job_id} on the gateway")
-            except (Fail, GatewayError) as error:
-                log(f"\ninterrupted; cancelling job {job_id} failed ({getattr(error, 'message', error)})")
-        else:
-            log("\ninterrupted before the job started")
-        return 130
+        return interrupted(gw, job_id, submitting)
     masks = [a for a in job.get("artifacts") or []
              if a.get("kind") == "image" or str(a.get("media_type", "")).startswith("image/")]
     if not masks:
@@ -1068,14 +1077,34 @@ def power_path(host):
     return f"/v1/hosts/{urllib.parse.quote(host, safe='')}/power"
 
 
+def machine_up(gw, host):
+    """Ask the gateway to wake `host`: True when it answers that the machine
+    is up (no wake sent), False when the wake started, None when this key
+    may not use the power endpoint or the gateway has none."""
+    try:
+        answer = gw.post(power_path(host), {"action": "on"})
+    except GatewayError:
+        return None
+    return answer.get("status") == "up"
+
+
 def cmd_on(gw, args):
     """Keep the machine on and wake it: a hold with a wake."""
     if not args.duration:
         args.duration = DEFAULT_HOLD_DURATION
     if not args.reason:
         args.reason = "sb ai on"
-    args.wake = True
-    return cmd_hold(gw, args)
+    ttl = parse_duration(args.duration)
+    host = host_for(gw, args)
+    up = machine_up(gw, host)
+    hold = create_hold(gw, host, ttl, args.reason, wake=not up)
+    if args.json:
+        print(json.dumps(hold, indent=2))
+        return OK
+    state = f"{host} is already up" if up else f"{host} is waking"
+    print(f"{state}; holding it on for {duration_words(ttl)}: hold {hold.get('id', '?')}")
+    print(f"let it go: sb ai release {hold.get('id', '')}".rstrip())
+    return OK
 
 
 def cmd_off(gw, args):
@@ -1085,14 +1114,17 @@ def cmd_off(gw, args):
     if args.release_holds:
         body["release_holds"] = True
     try:
-        gw.post(power_path(host), body)
+        answer = gw.post(power_path(host), body)
     except GatewayError as error:
         if error.reason:
             raise Fail(GATEWAY_ERROR,
                        f"the gateway refused to power {host} off ({error.reason}): {error.message}"
                        ) from None
         raise gateway_fail(error, f"powering {host} off") from None
-    print(f"{host} is powering off")
+    released = [str(i) for i in answer.get("released_holds") or []]
+    if released:
+        print(f"released {'hold' if len(released) == 1 else 'holds'} {', '.join(released)} on {host}")
+    print(f"{host} is already off" if answer.get("already_off") else f"{host} is powering off")
     return OK
 
 

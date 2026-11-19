@@ -775,10 +775,12 @@ sb ai release           # let it go again (ID or --all when there are several ho
   binding. Ctrl-C cancels the job on the gateway, as for a video.
 - `on` is a hold with a wake: the machine comes up and stays on for
   `DURATION` (1h by default) and the answer says how to let it go again.
+  A machine that already runs is held without a wake, and `on` says it is up.
 - `off` asks the gateway to power the machine off now. It refuses while a
   hold is active (unless `--release-holds` ends it first), while the machine
   has work, or while the machine's guard says somebody else is using it,
-  and it prints the gateway's reason. `sb ai` needs an operator key for it.
+  and it prints the gateway's reason. A machine that already sleeps is left
+  alone, and `off` says it is already off. `sb ai` needs an operator key for it.
 - `bench` measures text models through the gateway's OpenAI-compatible API and
   reports the time to the first token, the prompt and the decode speed (tokens
   per second), the total time and the token counts. The first run of each model
