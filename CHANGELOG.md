@@ -19,8 +19,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   (`prefer_awake=[gpu-box asleep (wake ~65s), chose small-host/small]`) rides
   `x-switchback-route`. Each machine's wake time is measured and shown in
   `GET /v1/workloads/capacity` (`wake_duration_ms`, `wake_duration_ewma_ms`)
-  and `GET /v1/targets/stats` (`wake`). On a `latency_aware` route a
-  long-output request ranks awake targets on measured decode tokens/s.
+  and `GET /v1/targets/stats` (`wake`; a tenant key sees only machines behind
+  lanes it can reach). On a `latency_aware` route a long-output request ranks
+  awake targets on measured decode tokens/s. A route's `prefer_awake` merges
+  over the server default field by field. A full awake lane makes a small
+  request queue instead of spilling onto a machine that needs a wake; it
+  falls back to the sleeper only after `queue_timeout_secs`. Embeddings are
+  sized from their `input` and read `x-switchback-wake` too. Each image counts
+  as 1600 prompt tokens toward `wake_for_prompt_tokens`.
 - **A limit and queue per local lane** (`max_in_flight`, `queue_timeout_secs`,
   `on_full: spill | queue` on a `local_executors` entry): work past the limit
   waits in a FIFO queue or, by default, spills to the route's next target; a

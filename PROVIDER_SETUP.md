@@ -276,26 +276,52 @@ routes:
       - "small-host/small" # always on
 ```
 
+A route's `prefer_awake` merges over `server.prefer_awake` field by field: a
+field the route sets replaces the server's, a field it leaves out keeps the
+server's. So with `server.prefer_awake: { enabled: true }` a route that sets
+only `wake_for_prompt_tokens` stays on, and `prefer_awake: { enabled: false }`
+turns one route off.
+
 A target needs a wake while its lane (with `wake_on_request: true`) is asleep,
 is waking, or is powering off. A small request (estimated prompt under
 `wake_for_prompt_tokens`, `max_tokens` not over `wake_for_output_tokens`) is
 served by the targets that are up first; targets that need a wake stay
 fallbacks in their old order and are woken only when the request reaches one
 (every target before it failed, was skipped, or its lane was closed). A bigger
-request keeps the route's order, so the strong machine is woken. A client can
-steer one request with the header `x-switchback-wake`: `always` keeps the
-route's order, `never` drops every target that needs a wake (a 503
+request keeps the route's order, so the strong machine is woken.
+
+The prompt estimate is rough: characters / 4 over the system prompt, message
+text and tool schemas, plus 1600 tokens per image. So about four images cross
+the default `wake_for_prompt_tokens: 6000` and may wake the machine. An
+embeddings request is sized from its `input`: characters / 4 over every input
+string, plus the length of every token array, so a large batch may wake the
+machine up front.
+
+When the awake first choice is full (`max_in_flight` reached), a small
+request does not spill onto a target that needs a wake, even with the default
+`on_full: spill`: it waits in the full lane's queue like `on_full: queue`, and
+falls back to (and wakes) the sleeper only when `queue_timeout_secs` runs out
+with the awake lane still busy. The decision then says so, for example
+`prefer_awake=[small-host full, queued, waited 60 s in its queue and is still
+full (1 of 1 in flight); wakes gpu-box asleep (wake ~65s) for gpu-box/big]`. A
+spill to another target that is up works as before.
+
+A client can steer one request with the header `x-switchback-wake`: `always`
+keeps the route's order, `never` drops every target that needs a wake (a 503
 `local_lane_asleep` when nothing else can serve), `auto` is the default. The
-header is read on `/v1/chat/completions`, `/v1/responses`, `/v1/messages` and
-route preview. The decision says what happened, in `reason` and on the
+header is read on `/v1/chat/completions`, `/v1/responses`, `/v1/messages`,
+`/v1/embeddings` and route preview (which never wakes anything). The decision
+says what happened in one `prefer_awake` line, in `reason` and on the
 `x-switchback-route` header, for example
 `prefer_awake=[gpu-box asleep (wake ~65s), chose small-host/small]`. The wake
 time is measured per machine (start of the wake to its first healthy probe)
 and shown as `wake_duration_ms` / `wake_duration_ewma_ms` in
-`GET /v1/workloads/capacity` and under `wake` in `GET /v1/targets/stats`. On
-a `latency_aware` route, a request with `max_tokens` over
-`wake_for_output_tokens` ranks targets that are up on measured decode tokens
-per second instead of time to first token, when each of them has a sample.
+`GET /v1/workloads/capacity` and under `wake` in `GET /v1/targets/stats`. An
+admin key sees every machine there; a tenant key sees the wake cost only of
+machines behind lanes its routes can reach. On a `latency_aware` route, a
+request with `max_tokens` over `wake_for_output_tokens` ranks targets that are
+up on measured decode tokens per second instead of time to first token, when
+each of them has a sample.
 
 
 Every operator command of a lane (wake, power-off, restart) runs for at

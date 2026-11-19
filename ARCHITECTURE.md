@@ -188,7 +188,12 @@ inside each demote rank: targets that are up first, sleepers after them in
 their old order (`never` drops sleepers instead). Sleepers are no longer
 skipped as "known down" on such a route; they are fallbacks, and the dispatch
 loop wakes one (bounded by `wake_wait_secs`) only when the request reaches
-it. The decision's `prefer_awake` line rides `x-switchback-route`.
+it. A full awake first choice never spills a small request onto a sleeper:
+`take_lane_before_dispatch` queues it instead (as `on_full: queue`), and the
+sleeper is reached only when the queue times out. A route's `prefer_awake`
+merges over the server default field by field (`PreferAwakeOverride`). The
+decision's one `prefer_awake` line (the runtime's account of a wake or a
+queue replaces the router's) rides `x-switchback-route`.
 
 Operator commands are bounded by the lane's `command_timeout_secs` (the wake
 command by `boot_timeout_secs` when that is longer; on the activator's clock

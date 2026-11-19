@@ -472,8 +472,11 @@ routes:
   # up; a target on a sleeping `wake_on_request` lane stays a fallback and is
   # woken only if the request reaches it. A bigger request (prompt or
   # max_tokens over the thresholds) keeps the route's order. Off by default;
-  # `server.prefer_awake` sets it for every route. Request header
-  # `x-switchback-wake: always | never | auto` steers one request.
+  # `server.prefer_awake` sets it for every route, and each field a route
+  # sets replaces the server's (a field left out keeps it). Each image counts
+  # as 1600 prompt tokens (about four cross the default 6000); embeddings are
+  # sized from their input. Request header `x-switchback-wake: always |
+  # never | auto` steers one request (chat, responses, messages, embeddings).
   # - name: chat
   #   match:
   #     model: "chat"
