@@ -42,12 +42,26 @@ sb ai: images, video and machine status through a Switchback gateway
                                  keep the machine on for direct work (30m, 2h, 1h30m)
   sb ai release [ID | --all] [--host NAME]
                                  let the machine go again
+  sb ai on [DURATION] [REASON] [--host NAME]
+                                 keep the machine on and wake it (1h by default)
+  sb ai off [--release-holds] [--host NAME]
+                                 power the machine off now
+  sb ai segment IMAGE ["what to segment"] [--model ID] [-o FILE]
+                                 segment an image; the mask is saved next to it
 
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
 --model takes the full id or its last part (flux for <lane>/flux or image/flux).
 video without --aspect or --size keeps the first frame's shape (0.4 MP, or --mp).
 Ctrl-C during a video cancels the job on the gateway.
+
+on is a hold with a wake: the machine comes up and stays on for DURATION
+(1h by default) and the answer says how to let it go again. off powers the
+machine off now, through the gateway: it refuses while a hold is active
+(unless --release-holds ends it first), while the machine has work, or
+while the machine's guard says somebody else is using it, and it says why.
+segment runs a workflow that takes an image (and an optional text) and
+gives back a mask; Ctrl-C cancels the job on the gateway, as for video.
 
 bench measures text models through the gateway's OpenAI-compatible API: it sends a
 fixed prompt and reports the time to the first token, the prompt and the decode
@@ -66,15 +80,22 @@ prompt it read before; --keep-cache sends the same prompt every run instead
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
-SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL (defaults), SWITCHBACK_AI_OUT_DIR.
+SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL, SWITCHBACK_AI_SEGMENT_MODEL
+(defaults), SWITCHBACK_AI_OUT_DIR.
 Exit codes: 0 ok, 1 the gateway reported an error, 2 usage error, 3 the gateway does
 not answer, or the machine is off.
 """
 
 CONFIG_KEYS = ("SWITCHBACK_AI_URL", "SWITCHBACK_AI_KEY", "SWITCHBACK_AI_IMAGE_MODEL",
-               "SWITCHBACK_AI_VIDEO_MODEL", "SWITCHBACK_AI_OUT_DIR")
+               "SWITCHBACK_AI_VIDEO_MODEL", "SWITCHBACK_AI_SEGMENT_MODEL",
+               "SWITCHBACK_AI_OUT_DIR")
 IMAGE_KIND, VIDEO_KIND = "image_generation", "video_generation"
+SEGMENT_KIND = "workflow_execution"
+# The kinds of work the gateway offers, each with its own models.
+MODEL_GROUPS = ("image", "video", "segment")
 VIDEO_FPS = 24
+# How long `sb ai on` keeps the machine on when no duration is given.
+DEFAULT_HOLD_DURATION = "1h"
 POLL_SECS = float(os.environ.get("SB_AI_POLL_SECS") or 2.0)  # tests shorten it
 VIDEO_MP = 0.4
 LANE_WORDS = {"offline": "off", "waking": "waking", "healthy": "idle", "draining": "busy",
@@ -96,11 +117,14 @@ class Fail(Exception):
 class GatewayError(Exception):
     """The gateway answered with an HTTP error."""
 
-    def __init__(self, status, message, has_body):
+    def __init__(self, status, message, has_body, reason=""):
         super().__init__(message)
         self.status = status
         self.message = message
         self.has_body = has_body  # False for a bare 404: the route does not exist
+        # The gateway's typed reason, when it gave one (a refused power-off
+        # says why: `hold_active`, `guard_busy`, ...).
+        self.reason = reason
 
 
 # ---------------------------------------------------------------- config
@@ -196,16 +220,19 @@ class Gateway:
             payload = error.read()
         except OSError:
             payload = b""
-        message, has_body = "", False
+        message, has_body, reason = "", False, ""
         try:
             parsed = json.loads(payload)
             if isinstance(parsed, dict):
                 inner = parsed.get("error")
                 message = inner.get("message", "") if isinstance(inner, dict) else str(inner or "")
+                if isinstance(inner, dict):
+                    reason = str(inner.get("reason") or "")
                 has_body = True
         except ValueError:
             pass
-        return GatewayError(error.code, self.scrub(message or error.reason or "error"), has_body)
+        return GatewayError(error.code, self.scrub(message or error.reason or "error"), has_body,
+                            reason)
 
     def get(self, path, **kw):
         return self.call("GET", path, **kw)
@@ -287,8 +314,8 @@ def gateway_fail(error, doing):
 # ---------------------------------------------------------------- models
 
 def catalog(gw, every_id=False):
-    """{"text": [...], "image": [...], "video": [...], "listed": bool, "test": set}."""
-    result = {"text": [], "image": [], "video": [], "listed": False, "test": set()}
+    """{"text": [...], "image": [...], "video": [...], "segment": [...], ...}."""
+    result = {"text": [], "image": [], "video": [], "segment": [], "listed": False, "test": set()}
     try:
         models = gw.get("/v1/models")
     except GatewayError as error:
@@ -300,21 +327,21 @@ def catalog(gw, every_id=False):
         if error.status not in (401, 403, 404):
             raise gateway_fail(error, "listing workflows")
         workflows = {"data": []}  # this key may not list workflows; media ids are then not known
+    kinds = {IMAGE_KIND: "image", VIDEO_KIND: "video", SEGMENT_KIND: "segment"}
     for row in workflows.get("data") or []:
-        kind = row.get("kind")
-        group = "image" if kind == IMAGE_KIND else "video" if kind == VIDEO_KIND else None
+        group = kinds.get(row.get("kind"))
         if group and row.get("id") and row["id"] not in result[group]:
             result[group].append(row["id"])
             if str(row.get("provider", "")).endswith("-mock"):
                 result["test"].add(row["id"])
-    media = set(result["image"]) | set(result["video"])
+    media = set(result["image"]) | set(result["video"]) | set(result["segment"])
     media_providers = {str(row.get("provider")) for row in workflows.get("data") or [] if row.get("provider")}
     for row in models.get("data") or []:
         model_id = row.get("id") if isinstance(row, dict) else None
         if not model_id or model_id in media or model_id in media_providers:
             continue  # a media provider's bare id is listed as a model, but it is not one
         prefix = model_id.split("/", 1)[0]
-        if prefix in ("image", "video") and "/" in model_id:
+        if prefix in MODEL_GROUPS and "/" in model_id:
             result[prefix].append(model_id)
             media.add(model_id)
         else:
@@ -345,7 +372,7 @@ def plain_text_names(ids):
 
 
 def resolve_model(name, group, cat, default=""):
-    other = "video" if group == "image" else "image"
+    others = [g for g in MODEL_GROUPS if g != group]
     choices = cat[group]
     real = [c for c in choices if c not in cat["test"]]
     name = name or default
@@ -364,8 +391,9 @@ def resolve_model(name, group, cat, default=""):
     if len(matches) > 1:
         raise Fail(USAGE, f"--model {name} matches several {group} models: {', '.join(matches)}; "
                           "give the full id")
-    if name in cat[other] or any(c.rsplit("/", 1)[-1] == name for c in cat[other]):
-        raise Fail(USAGE, f"--model {name} is a {other} model, not a {group} model")
+    for other in others:
+        if name in cat[other] or any(c.rsplit("/", 1)[-1] == name for c in cat[other]):
+            raise Fail(USAGE, f"--model {name} is a {other} model, not a {group} model")
     if not cat["listed"]:
         raise Fail(USAGE, f"this key cannot list the gateway's {group} models; give the full id "
                           f"(like <lane>/{name})")
@@ -510,7 +538,7 @@ def cmd_status(gw, args):
 
 def cmd_models(gw, args):
     cat = catalog(gw, every_id=args.all)
-    groups = {name: cat[name] for name in ("text", "image", "video")}
+    groups = {name: cat[name] for name in ("text",) + MODEL_GROUPS}
     if args.json:
         print(json.dumps(groups, indent=2))
         return OK
@@ -867,6 +895,67 @@ def poll(gw, job, timeout, started):
                 raise Fail(failure.code, f"lost the gateway while job {job_id} runs: {failure.message}")
 
 
+# ---------------------------------------------------------------- segment
+
+def cmd_segment(gw, config, args):
+    """Segment an image: upload it, run the workflow, save the mask."""
+    try:
+        with open(args.image, "rb") as handle:
+            picture = handle.read()
+    except OSError as error:
+        raise Fail(USAGE, f"cannot read {args.image}: {error.strerror}")
+    media_type = image_type(picture)
+    if not media_type:
+        raise Fail(USAGE, f"{args.image} must be a PNG, JPEG or WebP file")
+    model = resolve_model(args.model, "segment", catalog(gw), config["SWITCHBACK_AI_SEGMENT_MODEL"])
+    inputs = {}
+    if args.text:
+        inputs["prompt"] = args.text
+    note_machine(gw)
+    started, job_id = time.time(), None
+    try:
+        try:
+            upload = gw.post("/v1/uploads", picture, content_type=media_type, timeout=120)
+        except GatewayError as error:
+            raise gateway_fail(error, "the image was refused")
+        except Fail as failure:
+            if failure.code == UNREACHABLE and gw.answers():
+                raise Fail(GATEWAY_ERROR, f"the upload broke off ({len(picture) / 2 ** 20:.1f} MiB); the "
+                                          "gateway may refuse files above its upload limit") from None
+            raise
+        inputs["image"] = upload["artifact_id"]
+        log(f"image uploaded ({len(picture) // 1024} KB)")
+        try:
+            job = gw.post("/v1/jobs", {"kind": SEGMENT_KIND, "model": model, "inputs": inputs})
+        except GatewayError as error:
+            raise gateway_fail(error, "the segmentation was refused")
+        job_id = job["id"]
+        log(f"segmentation job {job_id} started with {model}"
+            + (f" ({inputs['prompt']})" if "prompt" in inputs else ""))
+        job = poll(gw, job, args.timeout, started)
+    except KeyboardInterrupt:
+        if job_id:
+            try:
+                gw.post(f"/v1/jobs/{urllib.parse.quote(job_id, safe='')}/cancel", {}, timeout=20)
+                log(f"\ncancelled job {job_id} on the gateway")
+            except (Fail, GatewayError) as error:
+                log(f"\ninterrupted; cancelling job {job_id} failed ({getattr(error, 'message', error)})")
+        else:
+            log("\ninterrupted before the job started")
+        return 130
+    masks = [a for a in job.get("artifacts") or []
+             if a.get("kind") == "image" or str(a.get("media_type", "")).startswith("image/")]
+    if not masks:
+        raise Fail(GATEWAY_ERROR, f"job {job_id} succeeded without a mask")
+    log(f"job {job_id} done in {time.time() - started:.0f}s")
+    tag = str(job_id)[-8:]
+    for index, mask in enumerate(masks):
+        save_artifact(gw, mask,
+                      output_path(args, config, model, tag, index, mask.get("media_type")),
+                      args.timeout)
+    return OK
+
+
 
 # ---------------------------------------------------------------- holds
 
@@ -970,6 +1059,40 @@ def cmd_release(gw, args):
     for hold_id in ids:
         release_hold(gw, host, hold_id)
         print(f"released hold {hold_id} on {host}")
+    return OK
+
+
+# ---------------------------------------------------------------- power
+
+def power_path(host):
+    return f"/v1/hosts/{urllib.parse.quote(host, safe='')}/power"
+
+
+def cmd_on(gw, args):
+    """Keep the machine on and wake it: a hold with a wake."""
+    if not args.duration:
+        args.duration = DEFAULT_HOLD_DURATION
+    if not args.reason:
+        args.reason = "sb ai on"
+    args.wake = True
+    return cmd_hold(gw, args)
+
+
+def cmd_off(gw, args):
+    """Power the machine off now, through the gateway."""
+    host = host_for(gw, args)
+    body = {"action": "off"}
+    if args.release_holds:
+        body["release_holds"] = True
+    try:
+        gw.post(power_path(host), body)
+    except GatewayError as error:
+        if error.reason:
+            raise Fail(GATEWAY_ERROR,
+                       f"the gateway refused to power {host} off ({error.reason}): {error.message}"
+                       ) from None
+        raise gateway_fail(error, f"powering {host} off") from None
+    print(f"{host} is powering off")
     return OK
 
 
@@ -1307,6 +1430,20 @@ def parser():
     release.add_argument("id", nargs="?")
     release.add_argument("--all", action="store_true")
     release.add_argument("--host")
+    on = sub.add_parser("on", add_help=False, allow_abbrev=False)
+    on.add_argument("duration", nargs="?", default="")
+    on.add_argument("reason", nargs="?", default="")
+    on.add_argument("--host")
+    on.add_argument("--json", action="store_true")
+    off = sub.add_parser("off", add_help=False, allow_abbrev=False)
+    off.add_argument("--release-holds", action="store_true")
+    off.add_argument("--host")
+    segment = sub.add_parser("segment", add_help=False, allow_abbrev=False)
+    segment.add_argument("image")
+    segment.add_argument("text", nargs="?", default="")
+    segment.add_argument("--model", default="")
+    segment.add_argument("-o", "--output")
+    segment.add_argument("--timeout", type=float, default=900)
     return top
 
 
@@ -1335,6 +1472,12 @@ def main(argv=None, environ=None):
             return cmd_hold(gw, args)
         if args.command == "release":
             return cmd_release(gw, args)
+        if args.command == "on":
+            return cmd_on(gw, args)
+        if args.command == "off":
+            return cmd_off(gw, args)
+        if args.command == "segment":
+            return cmd_segment(gw, config, args)
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
         message = gw.scrub(failure.message) if gw else failure.message

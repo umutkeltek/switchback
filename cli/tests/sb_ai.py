@@ -109,10 +109,13 @@ class Fake:
             {"id": "mock-image", "kind": "image_generation", "provider": "switchback-mock"},
             {"id": "lane-img/flux", "kind": "image_generation", "provider": "lane-img"},
             {"id": "lane-img/clip", "kind": "video_generation", "provider": "lane-img"},
+            {"id": "segment/sam3", "kind": "workflow_execution", "provider": "lane-img"},
         ]
         self.workflows_status = 200
         self.job_states = []
         self.holds = None  # None: the gateway has no holds route (bare 404)
+        # A refused power request: (status, message, reason). None: it works.
+        self.power_refusal = None
         self.chat_plans = []  # one plan per chat request; the last one is used again
         self.chat_count = 0
         self.chat_fail_at = None  # the request number from which the gateway refuses
@@ -185,6 +188,16 @@ class Fake:
         self.holds = [h for h in self.holds if h["id"] != hold_id]
         return self.json({"id": hold_id, "host": host, "deleted": True})
 
+    def power_route(self, request):
+        """`POST /v1/hosts/{host}/power`: the gateway's power endpoint."""
+        if self.power_refusal:
+            status, message, reason = self.power_refusal
+            return self.json({"error": {"message": message, "type": "power_refused",
+                                        "reason": reason}}, status)
+        host = request["path"].split("/")[3]
+        return self.json({"host": host, "action": request["json"].get("action"),
+                           "powered_off": True, "lanes": 1, "released_holds": []})
+
     def chat_plan_for(self):
         """The plan for the next chat request, or None when the gateway refuses it."""
         with self.lock:
@@ -247,6 +260,8 @@ class Fake:
                     fake.stream_answer(self)
                     return
                 route = fake.routes.get((self.command, self.path))
+                if route is None and self.path.startswith("/v1/hosts/") and self.path.endswith("/power"):
+                    route = fake.power_route
                 if route is None and self.path.startswith("/v1/hosts/"):
                     route = fake.holds_route
                 if route is None:
@@ -446,7 +461,8 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout), {"text": ["chat-a", "chat-b"],
                                                   "image": ["mock-image", "lane-img/flux"],
-                                                  "video": ["lane-img/clip", "video/clip2"]})
+                                                  "video": ["lane-img/clip", "video/clip2"],
+                                                  "segment": ["segment/sam3"]})
         self.assertEqual({r["method"] for r in self.fake.seen}, {"GET"})
 
     def test_models_lists_each_text_model_once(self):
@@ -685,6 +701,147 @@ class SbAi(unittest.TestCase):
         run = self.sb("hold", "10m")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(len(self.requests("POST", "/v1/hosts/lane-solo/holds")), 1)
+
+    # ------------------------------------------------------------ power
+
+    def test_on_takes_a_hold_with_a_wake_and_says_how_to_let_it_go(self):
+        self.fake.holds = []
+        run = self.sb("on")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # One hour by default, and the gateway wakes the machine.
+        self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
+                         {"ttl_secs": 3600, "reason": "sb ai on", "wake": True})
+        self.assertIn("hold hold-1", run.stdout)
+        self.assertIn("let it go: sb ai release hold-1", run.stdout)
+
+    def test_on_takes_a_duration_and_a_reason(self):
+        self.fake.holds = []
+        run = self.sb("on", "2h", "render batch")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/hosts/box/holds")["json"],
+                         {"ttl_secs": 7200, "reason": "render batch", "wake": True})
+
+    def test_on_needs_a_duration_unit(self):
+        run = self.sb("on", "30")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("DURATION wants a unit", run.stderr)
+        self.assertEqual(self.requests("POST"), [])
+
+    def test_off_asks_the_gateway_to_power_the_machine_off(self):
+        run = self.sb("off")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/hosts/box/power")["json"], {"action": "off"})
+        self.assertIn("box is powering off", run.stdout)
+
+    def test_off_releases_the_holds_when_asked(self):
+        run = self.sb("off", "--release-holds")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/hosts/box/power")["json"],
+                         {"action": "off", "release_holds": True})
+
+    def test_off_prints_the_reason_when_the_gateway_refuses(self):
+        self.fake.power_refusal = (409, "1 hold active on this machine (hold-1)", "hold_active")
+        run = self.sb("off")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("hold_active", run.stderr)
+        self.assertIn("hold-1", run.stderr)
+
+    def test_off_needs_one_machine(self):
+        self.fake.lanes = [lane("lane-a", host="one"), lane("lane-b", host="two")]
+        run = self.sb("off")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("one, two", run.stderr)
+        self.assertEqual(self.requests("POST", "/v1/hosts/one/power"), [])
+
+    def test_off_with_an_unreachable_gateway_exits_3(self):
+        dead = f"http://127.0.0.1:{closed_port()}"
+        env = dict(self.env, SWITCHBACK_AI_URL=dead)
+        run = self.sb("off", env=env)
+        self.assertEqual(run.returncode, 3)
+
+    # ------------------------------------------------------------ segment
+
+    def segment_states(self):
+        return [{"id": "job-v1", "status": "succeeded", "events": [],
+                 "artifacts": [{"artifact_id": "art1", "kind": "image",
+                                "media_type": "image/png"}]}]
+
+    def test_segment_uploads_the_image_and_saves_the_mask(self):
+        picture = self.root / "cat.png"
+        picture.write_bytes(PNG)
+        self.fake.job_states = self.segment_states()
+        mask = self.root / "mask.png"
+        run = self.sb("segment", str(picture), "-o", str(mask))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # The image went up as an upload, and its id is the job's image input.
+        upload = self.posted("/v1/uploads")
+        self.assertEqual(upload["headers"].get("Content-Type"), "image/png")
+        self.assertEqual(upload["body"], PNG)
+        job = self.posted("/v1/jobs")
+        self.assertEqual(job["json"]["kind"], "workflow_execution")
+        self.assertEqual(job["json"]["model"], "segment/sam3")
+        self.assertEqual(job["json"]["inputs"], {"image": "up1"})
+        # The mask came back as an artifact and was saved.
+        self.assertEqual(run.stdout, f"{mask}\n")
+        self.assertEqual(mask.read_bytes(), PNG)
+
+    def test_segment_sends_the_text_prompt(self):
+        picture = self.root / "cat.png"
+        picture.write_bytes(PNG)
+        self.fake.job_states = self.segment_states()
+        run = self.sb("segment", str(picture), "the cat", "-o", str(self.root / "m.png"))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/jobs")["json"]["inputs"],
+                         {"prompt": "the cat", "image": "up1"})
+
+    def test_segment_needs_a_model_the_gateway_offers(self):
+        picture = self.root / "cat.png"
+        picture.write_bytes(PNG)
+        run = self.sb("segment", str(picture), "--model", "nope")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("unknown segment model nope", run.stderr)
+        self.assertEqual(self.requests("POST"), [])
+
+    def test_segment_refuses_a_file_that_is_not_an_image(self):
+        picture = self.root / "cat.txt"
+        picture.write_bytes(b"not an image")
+        run = self.sb("segment", str(picture))
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("must be a PNG, JPEG or WebP file", run.stderr)
+        self.assertEqual(self.requests("POST"), [])
+
+    def test_segment_refuses_a_file_it_cannot_read(self):
+        run = self.sb("segment", str(self.root / "missing.png"))
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("cannot read", run.stderr)
+
+    def test_segment_failure_shows_the_reason(self):
+        picture = self.root / "cat.png"
+        picture.write_bytes(PNG)
+        self.fake.job_states = [{"id": "job-v1", "status": "failed", "events": [
+            {"event": "failed", "status": "failed", "created_at_ms": 1,
+             "detail": {"error": "the lane refused the job"}}]}]
+        run = self.sb("segment", str(picture))
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("the lane refused the job", run.stderr)
+
+    def test_segment_interrupt_cancels_the_job_on_the_gateway(self):
+        picture = self.root / "cat.png"
+        picture.write_bytes(PNG)
+        self.fake.job_states = [{"id": "job-v1", "status": "running", "events": []}]
+        process = subprocess.Popen(["zsh", str(SB), "ai", "segment", str(picture)],
+                                   env=self.env, cwd=self.root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        deadline = time.time() + 20
+        while time.time() < deadline and not self.requests("GET", "/v1/jobs/job-v1"):
+            time.sleep(0.05)
+        self.assertTrue(self.requests("GET", "/v1/jobs/job-v1"), "the job was never polled")
+        os.killpg(process.pid, signal.SIGINT)  # what Ctrl-C sends to the foreground group
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 130, stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(self.requests("POST", "/v1/jobs/job-v1/cancel")), 1)
+        self.assertIn("cancelled job job-v1", stderr)
 
     # ------------------------------------------------------------ bench
 
