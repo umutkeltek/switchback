@@ -7,14 +7,23 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 type Seen = Arc<Mutex<Vec<Bytes>>>;
 
-async fn record(State(seen): State<Seen>, body: Bytes) -> Json<Value> {
+async fn record(State(seen): State<Seen>, body: Bytes) -> Response {
+    let streamed = serde_json::from_slice::<Value>(&body)
+        .is_ok_and(|request| request["stream"] == json!(true));
     seen.lock().unwrap().push(body);
+    if streamed {
+        let sse = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                   data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n\
+                   data: [DONE]\n\n";
+        return ([("content-type", "text/event-stream")], sse).into_response();
+    }
     Json(json!({
         "id": "chatcmpl-x",
         "object": "chat.completion",
@@ -25,6 +34,7 @@ async fn record(State(seen): State<Seen>, body: Bytes) -> Json<Value> {
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     }))
+    .into_response()
 }
 
 async fn record_embeddings(State(seen): State<Seen>, body: Bytes) -> Json<Value> {
@@ -139,7 +149,7 @@ fn hi(model: &str) -> Value {
 }
 
 /// What main (a1ade2d, before model settings) sent upstream for these
-/// requests, byte for byte: a target without settings must still get
+/// requests (plain, streamed and embeddings), byte for byte: a target without settings must still get
 /// exactly this.
 const GOLDEN: &[(&str, &str)] = &[
     (
@@ -165,6 +175,26 @@ const GOLDEN: &[(&str, &str)] = &[
     (
         "vllm_both",
         r#"{"messages":[{"content":"hi","role":"user"}],"model":"m","repeat_penalty":1.1,"repetition_penalty":1.3,"stream":false}"#,
+    ),
+    (
+        "llama_stream_plain",
+        r#"{"messages":[{"content":"s","role":"system"},{"content":"hi","role":"user"}],"model":"m","stream":true}"#,
+    ),
+    (
+        "llama_stream_sampled",
+        r#"{"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64,"messages":[{"content":"s","role":"system"},{"content":"hi","role":"user"}],"min_p":0.05,"model":"m","repeat_penalty":1.1,"seed":7,"stop":["x"],"stream":true,"temperature":0.699999988079071,"top_k":20,"top_p":0.9}"#,
+    ),
+    (
+        "vllm_stream_sampled",
+        r#"{"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64,"messages":[{"content":"s","role":"system"},{"content":"hi","role":"user"}],"min_p":0.05,"model":"m","repeat_penalty":1.1,"seed":7,"stop":["x"],"stream":true,"temperature":0.699999988079071,"top_k":20,"top_p":0.9}"#,
+    ),
+    (
+        "llama_embeddings",
+        r#"{"encoding_format":"float","input":"hello","model":"m"}"#,
+    ),
+    (
+        "vllm_embeddings",
+        r#"{"dimensions":8,"input":["a","b"],"model":"m"}"#,
     ),
 ];
 
@@ -239,11 +269,49 @@ async fn no_settings_means_byte_identical_upstream_request() {
         ("vllm_sampled", sampled("vtext/m")),
         ("vllm_both", both("vtext/m")),
     ];
+    let streamed = |mut body: Value| {
+        body["stream"] = json!(true);
+        body
+    };
+    let stream_cases = [
+        ("llama_stream_plain", streamed(plain("text/m"))),
+        ("llama_stream_sampled", streamed(sampled("text/m"))),
+        ("vllm_stream_sampled", streamed(sampled("vtext/m"))),
+    ];
+    let embedding_cases = [
+        (
+            "llama_embeddings",
+            json!({"model": "text/m", "input": "hello", "encoding_format": "float"}),
+        ),
+        (
+            "vllm_embeddings",
+            json!({"model": "vtext/m", "input": ["a", "b"], "dimensions": 8}),
+        ),
+    ];
     for gateway in [&a, &b] {
-        for (name, body) in &cases {
+        for (name, body) in cases.iter().chain(&stream_cases) {
             let r = chat(gateway, None, body.clone(), None).await;
             assert_eq!(r.status(), 200);
             assert!(r.headers().get("x-switchback-settings").is_none());
+            let text = r.text().await.unwrap();
+            if body["stream"] == json!(true) {
+                assert!(text.contains("[DONE]"), "{name}: {text}");
+            }
+            let sent = seen.lock().unwrap().last().unwrap().clone();
+            assert_eq!(
+                std::str::from_utf8(&sent).unwrap(),
+                golden(name),
+                "{name}: a target without settings changed its request"
+            );
+        }
+        for (name, body) in &embedding_cases {
+            let r = reqwest::Client::new()
+                .post(format!("{gateway}/v1/embeddings"))
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "{name}");
             let sent = seen.lock().unwrap().last().unwrap().clone();
             assert_eq!(
                 std::str::from_utf8(&sent).unwrap(),
