@@ -40,6 +40,10 @@ enum PanelMotion {
     var expandedAccounts: Set<String> = []
     var preferredHeight: Double {
         let groups = visibleProviders
+        if style.isDirection {
+            let height = DirectionLayout.height(Presenter.directions(presentation), style: style)
+            return min(maximumHeight, max(PanelMetrics.minimumHeight, height))
+        }
         if style == .ledger {
             return fitted(LedgerList.contentHeight(groups, expanded: expandedAccounts))
         }
@@ -95,6 +99,13 @@ struct UsagePanelView: View {
     var solidBackground = false
 
     var body: some View {
+        if state.style.isDirection {
+            DirectionPanelView(state: state, solidBackground: solidBackground)
+        } else {
+            classic
+        }
+    }
+    private var classic: some View {
         VStack(spacing: 0) {
             header
             providerFilters.padding(.horizontal, 12).padding(.bottom, 8)
@@ -116,7 +127,7 @@ struct UsagePanelView: View {
                         ForEach(state.visibleProviders, id: \.key) { provider in
                             ProviderSection(provider: provider, state: state)
                         }
-                    case .ledger:
+                    case .ledger, .rings, .gauge, .strip:
                         LedgerList(providers: state.visibleProviders, state: state)
                     }
                     if state.visibleProviders.isEmpty {

@@ -335,6 +335,8 @@ import UsagePresentation
     state.checkedText = "Checked just now"
     state.selectedProvider = provider
     state.style = style
+    // Explorations render their whole content so a preview shows every section; the live panel scrolls.
+    if style.isDirection { state.maximumHeight = 1_000 }
     let view = UsagePanelView(state: state, interactive: false, solidBackground: reduceTransparency)
         .environment(\.colorScheme, theme == "dark" ? .dark : .light)
         .environment(\.controlActiveState, .active)
@@ -378,6 +380,33 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
     } catch {
         FileHandle.standardError.write(Data("Could not render account panel\n".utf8)); exit(1)
     }
+} else if let index = arguments.firstIndex(of: "--render-status"), arguments.indices.contains(index + 1) {
+    // A preview of a direction's menu bar item inside a mock menu bar crop. Synthetic input only.
+    func value(_ key: String, fallback: String) -> String {
+        guard let i = arguments.firstIndex(of: key), arguments.indices.contains(i + 1) else { return fallback }
+        return arguments[i + 1]
+    }
+    do {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let data = try Data(contentsOf: URL(fileURLWithPath: arguments[index + 1]))
+        guard data.count <= 1_048_576 else { throw OwnerError.outputTooLarge }
+        let snapshot = try UsageSnapshot.decode(data)
+        let style = PanelStyle(preference: value("--style", fallback: "rings"))
+        let output = value("--output", fallback: "")
+        guard style.isDirection, !output.isEmpty else { throw OwnerError.failed }
+        let theme = value("--theme", fallback: "light")
+        let directions = Presenter.directions(Presenter.panel(snapshot, pins: Set(snapshot.accounts.map(\.key))))
+        let claude = directions.sections.first { $0.id == "claude" }?.seats ?? []
+        let view = StatusItemMock(style: style, data: directions, claude: claude)
+            .environment(\.colorScheme, theme == "dark" ? .dark : .light)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { throw OwnerError.failed }
+        try png.write(to: URL(fileURLWithPath: output), options: .atomic)
+    } catch {
+        FileHandle.standardError.write(Data("Could not render status item\n".utf8)); exit(1)
+    }
 } else if arguments == [arguments[0], "--open-panel"] {
     // Asks a running Switchback Bar to open its panel; does nothing else.
     OpenPanelRequest.post()
@@ -402,7 +431,7 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         exit(1)
     }
 } else if arguments.count != 1 {
-    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --open-panel | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style a|cards]]\n".utf8))
+    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --open-panel | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style a|cards|rings|gauge|strip] | --render-status snapshot.json --output item.png [--theme light|dark] --style rings|gauge|strip]\n".utf8))
     exit(2)
 } else {
     let application = NSApplication.shared

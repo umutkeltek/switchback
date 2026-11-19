@@ -143,5 +143,6 @@ private func costField(today: Any = 4.12, week: Any = 61.4, sample: TimeInterval
     #expect(PanelStyle(preference: "unknown") == .ledger)
     #expect(PanelStyle(preference: "a") == .ledger)
     #expect(PanelStyle(preference: "cards") == .cards)
-    #expect(PanelStyle.allCases == [.ledger, .cards])
+    // The three explorations are reachable only through the hidden flag.
+    #expect(PanelStyle.allCases == [.ledger, .cards, .rings, .gauge, .strip])
 }

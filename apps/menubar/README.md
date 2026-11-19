@@ -110,6 +110,11 @@ The earlier account cards stay reachable while they remain tested code:
 
 The app reads the preference on every refresh. `--render-panel` draws the ledger; add `--style cards` for the cards.
 
+Three visual explorations sit behind the same hidden preference and are not the default: `rings` (one tile per account, weekly on the outer arc, 5-hour on the inner arc, a model's own limit as a tick), `gauge` (one segmented gauge per provider, one segment per account) and `strip` (one colour line per account under a strip of upcoming 5-hour resets). Each leads with the seat to use now; colour always comes with a symbol, and money stays out of the default view. Preview them and their menu bar item with synthetic input:
+
+    SwitchbackBar --render-panel snapshot.json --output rings.png --theme dark --style rings
+    SwitchbackBar --render-status snapshot.json --output rings-item.png --theme dark --style rings
+
 ## Limit notifications
 
 Options has a `Limit notifications (80%, 95%, reset)` switch. It is off by default and remembered across launches. macOS notification permission is requested only when the switch is turned on, never at launch. When on, a pinned account's generation window posts one local notification when it passes 80% used, one when it passes 95% used, and one when a window that was above 95% resets (falls back under 80%). The first reading of a window after the switch is turned on only records its level, so switching on never floods. The last notified level per account window is kept in preferences, so the next refresh or a relaunch does not repeat a notice. Untrusted readings change nothing. The crossing rule is `Presenter.limitNotices` in `UsagePresentation`; the app only posts its result. Inspection and render modes never touch the notification center.
