@@ -43,9 +43,15 @@ pub(crate) async fn speech(
     State(state): State<AppState>,
     Extension(principal): Extension<tenancy::Principal>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    body: Bytes,
 ) -> Response {
     let started = Instant::now();
+    // Parsed here rather than by axum's `Json`, so a bad body gets an
+    // OpenAI-shaped error a client can read.
+    let body: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(e) => return bad_request(&format!("the body is not valid JSON: {e}")),
+    };
     let Some(object) = body.as_object() else {
         return bad_request("the body must be a JSON object");
     };
@@ -92,7 +98,7 @@ async fn upload(
     if declared.is_some_and(|length| length > limit) {
         return too_large(limit);
     }
-    let bytes = match read_limited(body, limit).await {
+    let bytes = match read_limited(body, limit, declared).await {
         Ok(bytes) => bytes,
         Err(ReadError::TooLarge) => return too_large(limit),
         Err(ReadError::Broken(message)) => return bad_request(&message),
@@ -217,10 +223,12 @@ enum ReadError {
     Broken(String),
 }
 
-/// Read the whole body, stopping as soon as it passes `limit`.
-async fn read_limited(body: Body, limit: u64) -> Result<Bytes, ReadError> {
+/// Read the whole body, stopping as soon as it passes `limit`. A declared
+/// `Content-Length` (already checked against `limit`) sizes the buffer once.
+async fn read_limited(body: Body, limit: u64, declared: Option<u64>) -> Result<Bytes, ReadError> {
     let mut stream = body.into_data_stream();
-    let mut collected = Vec::new();
+    let capacity = declared.unwrap_or(0).min(limit);
+    let mut collected = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| ReadError::Broken(format!("the upload broke off: {e}")))?;
         if (collected.len() + chunk.len()) as u64 > limit {
@@ -295,13 +303,28 @@ fn parse_multipart(body: &Bytes, boundary: &str) -> Result<Vec<FormPart>, String
             };
             let key = key.trim();
             if key.eq_ignore_ascii_case("content-disposition") {
-                name = disposition_param(value, "name");
-                filename = disposition_param(value, "filename");
+                let params = disposition_params(value);
+                let param = |wanted: &str| {
+                    params
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(wanted))
+                        .map(|(_, value)| value.clone())
+                };
+                name = param("name");
+                // RFC 6266/5987: `filename*` wins over `filename`.
+                filename = param("filename*")
+                    .and_then(|value| extended_value(&value))
+                    .or_else(|| param("filename"));
             } else if key.eq_ignore_ascii_case("content-type") {
                 content_type = Some(value.trim().to_string());
             }
         }
         let name = name.ok_or_else(|| malformed("part without a name"))?;
+        // A client that sends the audio without a filename still sent a
+        // file: forward it as one, named after its content type.
+        if name == "file" && filename.is_none() {
+            filename = Some(default_filename(content_type.as_deref()));
+        }
         parts.push(FormPart {
             name,
             filename,
@@ -312,20 +335,113 @@ fn parse_multipart(body: &Bytes, boundary: &str) -> Result<Vec<FormPart>, String
     }
 }
 
-/// One parameter of a `Content-Disposition: form-data; name="x"` value.
-fn disposition_param(value: &str, wanted: &str) -> Option<String> {
-    value.split(';').skip(1).find_map(|param| {
-        let (key, value) = param.split_once('=')?;
-        if !key.trim().eq_ignore_ascii_case(wanted) {
-            return None;
+/// The parameters of a `Content-Disposition: form-data; name="x"; ...`
+/// value, in order. A `;` inside a quoted value belongs to the value, and
+/// `\"` inside quotes is a quote.
+fn disposition_params(value: &str) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    let mut chars = value.chars().peekable();
+    // Skip the disposition type (`form-data`).
+    for c in chars.by_ref() {
+        if c == ';' {
+            break;
         }
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .unwrap_or(value);
-        Some(value.to_string())
-    })
+    }
+    loop {
+        let mut key = String::new();
+        for c in chars.by_ref() {
+            if c == '=' || c == ';' {
+                break;
+            }
+            key.push(c);
+        }
+        let key = key.trim().to_string();
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut value = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => {
+                        if let Some(escaped) = chars.next() {
+                            value.push(escaped);
+                        }
+                    }
+                    c => value.push(c),
+                }
+            }
+            // Anything after the closing quote up to `;` is ignored.
+            for c in chars.by_ref() {
+                if c == ';' {
+                    break;
+                }
+            }
+        } else {
+            for c in chars.by_ref() {
+                if c == ';' {
+                    break;
+                }
+                value.push(c);
+            }
+            value = value.trim().to_string();
+        }
+        if !key.is_empty() {
+            params.push((key, value));
+        }
+        if chars.peek().is_none() {
+            return params;
+        }
+    }
+}
+
+/// An RFC 5987 extended value (`UTF-8''t%C3%BCr.wav`), percent-decoded.
+/// `None` for another charset or bytes that are not UTF-8.
+fn extended_value(value: &str) -> Option<String> {
+    let (charset, rest) = value.split_once('\'')?;
+    let (_language, encoded) = rest.split_once('\'')?;
+    if !charset.eq_ignore_ascii_case("utf-8") {
+        return None;
+    }
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
+/// A filename for a file part sent without one, with the extension its
+/// content type implies (engines often guess the format from the name).
+fn default_filename(content_type: Option<&str>) -> String {
+    let essence = content_type
+        .and_then(|value| value.split(';').next())
+        .map(|value| value.trim().to_ascii_lowercase());
+    let extension = match essence.as_deref() {
+        Some("audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave") => "wav",
+        Some("audio/mpeg" | "audio/mp3") => "mp3",
+        Some("audio/mp4" | "audio/m4a" | "audio/x-m4a") => "m4a",
+        Some("audio/aac") => "aac",
+        Some("audio/ogg") => "ogg",
+        Some("audio/opus") => "opus",
+        Some("audio/flac" | "audio/x-flac") => "flac",
+        Some("audio/webm" | "video/webm") => "webm",
+        Some("video/mp4") => "mp4",
+        _ => "bin",
+    };
+    format!("audio.{extension}")
 }
 
 #[cfg(test)]
@@ -370,5 +486,83 @@ Content-Type: audio/wav\r\n\r\nRIFF\x00\xff\r\n-B\r\n\
         let body =
             Bytes::from_static(b"--B\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\n1");
         assert!(parse_multipart(&body, "B").is_err());
+    }
+
+    #[test]
+    fn probe_a_filename_with_a_semicolon_survives() {
+        let body = Bytes::from_static(
+            b"--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"call; part 1.m4a\"\r\n\
+Content-Type: audio/mp4\r\n\r\nDATA\r\n--B--\r\n",
+        );
+        let parts = parse_multipart(&body, "B").unwrap();
+        assert_eq!(parts[0].name, "file");
+        assert_eq!(parts[0].filename.as_deref(), Some("call; part 1.m4a"));
+        assert_eq!(parts[0].content_type.as_deref(), Some("audio/mp4"));
+    }
+
+    #[test]
+    fn probe_a_filename_star_only_part_is_still_a_file() {
+        let body = Bytes::from_static(
+            b"--B\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''t%C3%BCr.wav\r\n\r\nDATA\r\n--B--\r\n",
+        );
+        let parts = parse_multipart(&body, "B").unwrap();
+        assert_eq!(parts[0].filename.as_deref(), Some("t\u{fc}r.wav"));
+    }
+
+    #[test]
+    fn filename_star_wins_and_a_bad_one_falls_back_to_filename() {
+        let params = disposition_params(
+            "form-data; name=\"file\"; filename=\"plain.wav\"; filename*=utf-8'en'%E2%82%AC.wav",
+        );
+        assert_eq!(
+            params,
+            vec![
+                ("name".to_string(), "file".to_string()),
+                ("filename".to_string(), "plain.wav".to_string()),
+                (
+                    "filename*".to_string(),
+                    "utf-8'en'%E2%82%AC.wav".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            extended_value("utf-8'en'%E2%82%AC.wav").as_deref(),
+            Some("\u{20ac}.wav")
+        );
+        assert_eq!(extended_value("iso-8859-1''a.wav"), None);
+        assert_eq!(extended_value("UTF-8''%FF.wav"), None, "not UTF-8");
+        let body = Bytes::from_static(
+            b"--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"plain.wav\"; filename*=latin1''x.wav\r\n\r\nDATA\r\n--B--\r\n",
+        );
+        let parts = parse_multipart(&body, "B").unwrap();
+        assert_eq!(parts[0].filename.as_deref(), Some("plain.wav"));
+    }
+
+    #[test]
+    fn quoted_values_keep_escaped_quotes_and_unquoted_values_are_trimmed() {
+        let params = disposition_params(r#"form-data;name=model ; filename="say \"hi\"; ok.wav" "#);
+        assert_eq!(params[0], ("name".to_string(), "model".to_string()));
+        assert_eq!(
+            params[1],
+            ("filename".to_string(), "say \"hi\"; ok.wav".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_part_without_a_filename_is_forwarded_as_a_file() {
+        let body = Bytes::from_static(
+            b"--B\r\nContent-Disposition: form-data; name=\"file\"\r\n\
+Content-Type: audio/x-m4a\r\n\r\nDATA\r\n\
+--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--B--\r\n",
+        );
+        let parts = parse_multipart(&body, "B").unwrap();
+        assert_eq!(parts[0].filename.as_deref(), Some("audio.m4a"));
+        assert_eq!(parts[1].filename, None, "a text field stays a field");
+        assert_eq!(default_filename(None), "audio.bin");
+        assert_eq!(default_filename(Some("audio/wav; codecs=1")), "audio.wav");
+        assert_eq!(
+            default_filename(Some("application/octet-stream")),
+            "audio.bin"
+        );
     }
 }

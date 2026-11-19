@@ -1903,32 +1903,24 @@ pub(crate) async fn models(
 
 /// `audio_transcription` for a model whose every target takes audio in
 /// (`/v1/audio/transcriptions` and `/translations`), `audio_speech` for one
-/// whose every target makes speech (`/v1/audio/speech`). Other models carry
-/// no `kind`, as before.
+/// whose every target makes speech (`/v1/audio/speech`). A combo counts
+/// every target of every member. Other models carry no `kind`, as before.
 fn audio_kind(
     config: &Config,
     registry: &sb_adapters::AdapterRegistry,
     id: &str,
 ) -> Option<&'static str> {
-    let capabilities: Vec<sb_core::CapabilityProfile> = if let Some(route) = config
-        .routes
-        .iter()
-        .find(|route| route.match_.model.as_deref() == Some(id))
-    {
-        route
-            .targets
+    let capabilities = match config.combos.get(id) {
+        // Every member must be known: one unknown member could be anything.
+        Some(combo) => combo
+            .models
             .iter()
-            .filter_map(|target| registry.target_for(target))
-            .map(|target| target.capabilities)
-            .collect()
-    } else if let Some(target) = registry.target_for(id) {
-        vec![target.capabilities]
-    } else if let Some(provider) = config.providers.iter().find(|p| p.id == id) {
-        let mut caps = sb_core::CapabilityProfile::default();
-        provider.capabilities.apply_to(&mut caps);
-        vec![caps]
-    } else {
-        return None;
+            .map(|member| model_capabilities(config, registry, member))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
+        None => model_capabilities(config, registry, id)?,
     };
     if capabilities.is_empty() {
         None
@@ -1938,6 +1930,36 @@ fn audio_kind(
         Some("audio_speech")
     } else {
         None
+    }
+}
+
+/// The capabilities of every target a route name, `provider/model` target
+/// or provider id can reach; `None` when `id` is none of those.
+fn model_capabilities(
+    config: &Config,
+    registry: &sb_adapters::AdapterRegistry,
+    id: &str,
+) -> Option<Vec<sb_core::CapabilityProfile>> {
+    if let Some(route) = config
+        .routes
+        .iter()
+        .find(|route| route.match_.model.as_deref() == Some(id))
+    {
+        Some(
+            route
+                .targets
+                .iter()
+                .filter_map(|target| registry.target_for(target))
+                .map(|target| target.capabilities)
+                .collect(),
+        )
+    } else if let Some(target) = registry.target_for(id) {
+        Some(vec![target.capabilities])
+    } else {
+        let provider = config.providers.iter().find(|p| p.id == id)?;
+        let mut caps = sb_core::CapabilityProfile::default();
+        provider.capabilities.apply_to(&mut caps);
+        Some(vec![caps])
     }
 }
 
