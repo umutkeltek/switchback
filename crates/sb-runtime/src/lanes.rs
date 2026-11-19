@@ -323,7 +323,9 @@ impl Engine {
                                 retry_after: LANE_QUEUE_RETRY_AFTER,
                             },
                             provider_id,
-                            code: "local_lane_full",
+                            // Never answered: a spill happens only when
+                            // another target serves the request.
+                            code: "local_lane_unavailable",
                             spilled: true,
                         },
                         busy: None,

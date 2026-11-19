@@ -509,15 +509,31 @@ What a request does when its route's first choice is on a full lane:
 
 A request still waiting after `queue_timeout_secs` falls through to the next
 target, or, when nothing else can serve, gets a retryable 503 with
-`Retry-After` and the error code `local_lane_queue_timeout`. A full lane
-reached as a later fallback (or by a hedge racer) is skipped at once, never
-waited for. A media job always queues, and one that waits past the timeout
-fails with the same code (503 on the blocking image route). The wait for a
-place comes before the wake and before the GPU group: a queued request holds
-no GPU, so a waiting media job can still take the group when the running work
-ends. So a request waits at most `wake_wait_secs` + `queue_timeout_secs` +
-`group_wait_secs`. A reload that changes the limit keeps the work that holds a
-place and the order of the queue; a lower limit only makes new work wait.
+`Retry-After: 5` and the error code `local_lane_queue_timeout`. A full lane
+reached as a later fallback (or by a hedge racer other than the first
+choice's own) is skipped at once, never waited for; when every target of the
+route is skipped that way, the 503 carries `Retry-After: 10` (the same hint
+as a lane that does not hold its GPU group), not 5. A media job always
+queues, and one that waits past the timeout fails with the same code (503 on
+the blocking image route).
+
+The order of the waits differs by kind. A text or embeddings request first
+waits for any wake (`wake_wait_secs`), then for a place, then for the GPU
+group. A media job waits for its place before the wake and before the GPU
+group: a queued job holds no GPU, so a waiting media job can still take the
+group when the running work ends. Either way a request waits at most
+`wake_wait_secs` + `queue_timeout_secs` + `group_wait_secs`. A reload that
+changes the limit keeps the work that holds a place and the order of the
+queue; a lower limit only makes new work wait.
+
+With hedging on, the place the first choice's lane gave the request goes to
+that lane's racer: one hedged request takes one place on the lane.
+
+Known limit: a request that spilled does not come back to the lane. Once the
+lane is full and the request spills, the lane's targets are skipped for the
+rest of that request, so when the spill target then fails (a 5xx, a 429) the
+request falls through to the route's later targets, or fails, even if the lane
+has room again by then.
 
 Each lane in `GET /v1/workloads/capacity` shows its places:
 
@@ -541,7 +557,8 @@ it was served, each number with its source:
   ttft` (a lower bound: it includes the network and any upstream queue).
 
 A number nothing measured is left out rather than made up: no token, no
-tokens counted, or a response that arrived in one piece (no decode window).
+tokens counted, or a response that arrived in one piece (no decode window;
+a gateway decode window under 50 ms counts as none).
 Engine timings never reach the client. They are stored with the usage
 (SQLite migration 20; older rows have none) and summarized, read-only, at
 `GET /v1/targets/stats` (any key, client keys included):
@@ -558,7 +575,10 @@ curl -s "$SB/v1/targets/stats?limit=2000" -H "authorization: Bearer $KEY"
 ```
 
 The window is the most recent `limit` usage records (default 2000, at most
-10000). A target's medians mix sources when it reported both; the
+5000). A client or operator key sees only its own tenant's records within
+that window, on targets its tenant can reach (`records` then counts those
+only), and nothing of another tenant; an admin key sees every target. A
+target's medians mix sources when it reported both; the
 `*_sources` counts say how. Routing does not read these numbers yet.
 
 **Alerts.** Set `server.alert_command` to hear about a problem without

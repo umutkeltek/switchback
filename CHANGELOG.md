@@ -21,7 +21,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   from a llama.cpp server's `timings`, else `gateway` clocks); store
   migration 20 adds them (rollback-safe). `GET /v1/targets/stats` shows
   per-target p50 decode and prompt speed, p50 time to first token, count and
-  last seen. Routing does not use them yet.
+  last seen; a client key sees only its own tenant's records on targets it
+  can reach. Routing does not use them yet.
 
 - **Public model ids for workflows** (`model_id`, `aliases` on a ComfyUI
   workflow): callers see and send a name by job (`image/flux`, `video/i2v`)

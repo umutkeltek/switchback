@@ -253,7 +253,10 @@ targets are skipped, and the plan's 503 when nothing else serves is typed
 in `run_job_noted` (before wake and group) and fail with
 `JobError::QueueTimeout`. Waiting is counted in the lane's `waiting`, which
 the host's idle check already reads, so a queue keeps the machine on. The
-capacity report shows the lane's `slots`.
+capacity report shows the lane's `slots`. The hedge race runs before the
+dispatch loop, so the first choice's held guard is lent to it
+(`LaneGpuNote::lend_to_hedge`): that lane's racer uses it instead of asking
+for a second place, and an unused guard comes back for the loop.
 
 Each text attempt also measures its speed (`sb-ledger::RequestSpeed`): the
 OpenAI codec turns a llama.cpp `timings` object into `Usage.engine_timings`
@@ -262,7 +265,9 @@ a separate event so no egress encoder emits it; the stream meter and the
 collector fold it into the usage). `stream::attempt_speed` takes the attempt
 start, the first-token time and token-event count from `watch_first_token`,
 and the end; engine numbers win, gateway numbers fill the rest, each tagged
-with its source. The record carries it into the ledger, the JSONL line and
+with its source. A gateway decode window needs two or more token events over
+at least 50 ms (a body that came in one piece yields its token events
+microseconds apart). The record carries it into the ledger, the JSONL line and
 the store (migration 20: six nullable `usage` columns; the previous binary
 names its columns in every statement, so it keeps working on a migrated
 file). `GET /v1/targets/stats` folds the most recent usage records into

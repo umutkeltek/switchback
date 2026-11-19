@@ -22,7 +22,7 @@ fn holds_path(path: &str, with_id: bool) -> bool {
 /// own tenant and project made (another's answers 404). The capacity report
 /// is on it too: a client key gets its read-only view. So is the per-target
 /// speed summary (`/v1/targets/stats`), which is read-only aggregate
-/// metadata.
+/// metadata scoped to the key's own tenant.
 fn client_surface(method: &Method, path: &str) -> bool {
     if (matches!(*method, Method::GET | Method::POST) && holds_path(path, false))
         || (matches!(*method, Method::PATCH | Method::DELETE) && holds_path(path, true))
