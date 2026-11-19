@@ -898,6 +898,19 @@ class SbAi(unittest.TestCase):
         self.assertIn("unknown text model nope", run.stderr)
         self.assertEqual(self.requests("POST", "/v1/chat/completions"), [])
 
+    def test_bench_takes_a_route_named_like_a_provider_id(self):
+        # Route `mac/chat-a` on a lane `mac` whose provider is also `mac`: the plain
+        # list hides it as an internal id, but named on its own it is benched.
+        self.fake.lanes = [lane("lane-text", "healthy"),
+                           lane("mac", "healthy", host="desk", wake_configured=False,
+                                poweroff_configured=False)]
+        self.fake.models = [{"id": "chat-a"}, {"id": "mac"}, {"id": "mac/chat-a"}]
+        run = self.bench("mac/chat-a", "--runs", "1", "--workload", "chat")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        sent = [r["json"]["model"] for r in self.requests("POST", "/v1/chat/completions")]
+        self.assertEqual(sent, ["mac/chat-a"])
+        self.assertEqual(self.requests("POST", "/v1/hosts/desk/holds"), [])
+
     def test_bench_without_a_model_uses_the_only_text_model(self):
         self.fake.models = [{"id": "chat-a"}]
         self.healthy()

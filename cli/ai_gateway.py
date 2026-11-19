@@ -1014,8 +1014,11 @@ BENCH_COLUMNS = (("model", "model"), ("workload", "workload"), ("kind", "kind"),
                  ("decode tok/s", "decode_tok_s"), ("total s", "total_s"), ("source", "source"))
 
 
-def bench_models(cat, names):
-    """The models to measure: the ones asked for, else the default text model."""
+def bench_models(cat, names, gw=None):
+    """The models to measure: the ones asked for, else the default text model.
+
+    A name the plain list hides (a route named like `<provider>/<model>`, say
+    `mac/qwen38-35b`) still counts when the gateway lists that exact id."""
     if not names:
         try:
             return [resolve_model("", "text", cat, "")]
@@ -1023,7 +1026,18 @@ def bench_models(cat, names):
             listed = ", ".join(cat["text"]) or "none"
             raise Fail(USAGE, f"choose a text model to bench (the gateway offers: {listed}); "
                               "give its name") from None
-    return [resolve_model(name, "text", cat, "") for name in names]
+    every = None
+    out = []
+    for name in names:
+        try:
+            out.append(resolve_model(name, "text", cat, ""))
+        except Fail:
+            if gw is not None and every is None:
+                every = catalog(gw, every_id=True)["text"]
+            if not every or name not in every:
+                raise
+            out.append(name)
+    return out
 
 
 def model_host(model, lanes):
@@ -1206,7 +1220,7 @@ def cmd_bench(gw, args):
     if args.runs < 1:
         raise Fail(USAGE, "--runs must be 1 or more")
     workloads = list(WORKLOADS) if args.workload == "all" else [args.workload]
-    models = bench_models(catalog(gw), args.model)
+    models = bench_models(catalog(gw), args.model, gw)
     lanes = (capacity(gw).get("data") or [])
     hosts = []
     for model in models:
