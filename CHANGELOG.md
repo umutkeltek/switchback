@@ -9,6 +9,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Speed tricks for local engines, layer 1** (`server.optimize`,
+  `routes[].optimize`, all off by default; method from
+  <https://github.com/sybil-solutions/inference-optimisation-skill>):
+  conversation stickiness (`x-switchback-session`, or the `user` field plus
+  a hash of the opening) keeps a conversation on the machine that served
+  it while that machine is up, healthy and has room, and names its engine
+  slot (`id_slot`) when the target runs `parallel > 1`; loaded-model
+  preference puts the target whose model is loaded first among targets on
+  one awake machine (`engine.models_max` tells the gateway the router's
+  limit); big-prompt placement (`big_prompt_tokens`) sends a big prompt to
+  the awake target with the best measured prompt speed; the reasoning guard
+  (`reasoning: true` and `reasoning_guard` in a target's settings) turns
+  thinking off for a request with a small `max_tokens` unless the request
+  asked for thinking. None of them wakes a machine or makes a request wait,
+  and a pinned route keeps its order. `x-switchback-optimize` (and
+  `optimize=[...]` on `x-switchback-route`) says what they did. Cached
+  prompt tokens are recorded on every usage record (llama.cpp
+  `timings.cache_n`/`tokens_cached`, OpenAI
+  `usage.prompt_tokens_details.cached_tokens`), and per target the gateway
+  counts cache hits, speculative acceptance (`draft_n`,
+  `draft_n_accepted`), model swaps a request caused (per hour, with the
+  model replaced), empty answers after thinking, reasoning-guard uses and
+  lane queue waits. `sb ai set` writes `reasoning=true`,
+  `reasoning_guard.*` and `ceiling.*`, and `--load --lock` locks a load key.
 - **Model settings** (`/v1/models/{model}/settings`, `sb ai settings|set|unset|revert|chat`):
   every setting of a local model through one API. Per target model
   (`provider/model`): request-time `defaults` (temperature, top_p, top_k,

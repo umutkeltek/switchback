@@ -46,17 +46,42 @@ fn parse_energy_usage(value: Option<&Value>) -> Option<EnergyUsage> {
 }
 
 /// A llama.cpp-style `timings` object (`prompt_n`, `prompt_ms`,
-/// `predicted_n`, `predicted_ms`), as the engine's own timing of the request.
-/// `None` when absent or carrying none of those fields.
-fn parse_engine_timings(value: Option<&Value>) -> Option<EngineTimings> {
-    let value = value.and_then(Value::as_object)?;
+/// `predicted_n`, `predicted_ms`, `cache_n`, `draft_n`, `draft_n_accepted`)
+/// plus the response's own `tokens_cached` and `id_slot`, as the engine's
+/// own timing of the request. `None` when absent or carrying none of those
+/// fields.
+fn parse_engine_timings(body: &Value) -> Option<EngineTimings> {
+    let empty = serde_json::Map::new();
+    let value = body
+        .get("timings")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let u64_of = |key: &str| value.get(key).and_then(Value::as_u64);
     let timings = EngineTimings {
-        prompt_tokens: value.get("prompt_n").and_then(Value::as_u64),
+        prompt_tokens: u64_of("prompt_n"),
         prompt_ms: value.get("prompt_ms").and_then(Value::as_f64),
-        decode_tokens: value.get("predicted_n").and_then(Value::as_u64),
+        decode_tokens: u64_of("predicted_n"),
         decode_ms: value.get("predicted_ms").and_then(Value::as_f64),
+        cache_tokens: u64_of("cache_n")
+            .or_else(|| body.get("tokens_cached").and_then(Value::as_u64)),
+        draft_tokens: u64_of("draft_n"),
+        draft_accepted: u64_of("draft_n_accepted"),
+        slot: body
+            .get("id_slot")
+            .and_then(Value::as_u64)
+            .and_then(|slot| u32::try_from(slot).ok()),
     };
     (timings != EngineTimings::default()).then_some(timings)
+}
+
+/// Prompt tokens served from a cache, as OpenAI reports them
+/// (`usage.prompt_tokens_details.cached_tokens`). 0 when absent.
+fn openai_cached_tokens(usage: Option<&serde_json::Map<String, Value>>) -> u64 {
+    usage
+        .and_then(|usage| usage.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn energy_usage_json(energy: &EnergyUsage) -> Value {
@@ -933,7 +958,8 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
             .unwrap_or(0),
         energy: parse_energy_usage(body.get("energy"))
             .or_else(|| parse_energy_usage(usage.and_then(|usage| usage.get("energy")))),
-        engine_timings: parse_engine_timings(body.get("timings")),
+        engine_timings: parse_engine_timings(body),
+        cached_input_tokens: openai_cached_tokens(usage),
         ..Usage::default()
     };
 
@@ -1008,6 +1034,7 @@ impl OpenAiStreamDecoder {
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
                     energy,
+                    cached_input_tokens: openai_cached_tokens(usage),
                     ..Usage::default()
                 },
             });
@@ -1016,7 +1043,9 @@ impl OpenAiStreamDecoder {
         // usage chunk when the client asked for one, else the finish
         // chunk). It travels as its own event so no client sees an extra
         // usage chunk it did not ask for.
-        if let Some(timings) = parse_engine_timings(chunk_json.get("timings")) {
+        if let Some(timings) = parse_engine_timings(chunk_json).filter(|_| {
+            chunk_json.get("timings").is_some() || chunk_json.get("tokens_cached").is_some()
+        }) {
             events.push(AiStreamEvent::EngineTimings { timings });
         }
 
@@ -1605,6 +1634,41 @@ mod tests {
         assert!(frames.is_empty(), "never sent to a client: {frames:?}");
     }
 
+    // Prefix-cache reuse and speculative acceptance ride the timings; the
+    // OpenAI form of cached tokens fills usage directly.
+    #[test]
+    fn cache_draft_and_slot_numbers_are_parsed() {
+        let body = json!({
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 40,
+                      "prompt_tokens_details": {"cached_tokens": 800}},
+            "id_slot": 2,
+            "timings": {"prompt_n": 100, "prompt_ms": 10.0, "cache_n": 800,
+                        "predicted_n": 40, "predicted_ms": 400.0,
+                        "draft_n": 30, "draft_n_accepted": 21}
+        });
+        let response = parse_openai_chat_response(&body).unwrap();
+        assert_eq!(response.usage.cached_input_tokens, 800);
+        let timings = response.usage.engine_timings.unwrap();
+        assert_eq!(timings.cache_tokens, Some(800));
+        assert_eq!(
+            (timings.draft_tokens, timings.draft_accepted),
+            (Some(30), Some(21))
+        );
+        assert_eq!(timings.slot, Some(2));
+        // The native endpoint's `tokens_cached` counts when `cache_n` is absent.
+        let body = json!({"choices": [{"index": 0, "finish_reason": "stop",
+                          "message": {"role": "assistant", "content": "hi"}}],
+                          "tokens_cached": 64, "timings": {"prompt_n": 4, "prompt_ms": 1.0}});
+        let timings = parse_openai_chat_response(&body)
+            .unwrap()
+            .usage
+            .engine_timings
+            .unwrap();
+        assert_eq!(timings.cache_tokens, Some(64));
+    }
+
     #[test]
     fn a_response_without_timings_has_none() {
         let body = json!({"choices": [{"index": 0, "finish_reason": "stop",
@@ -1617,6 +1681,9 @@ mod tests {
                 .engine_timings,
             None
         );
-        assert_eq!(parse_engine_timings(Some(&json!({"cache_n": 3}))), None);
+        assert_eq!(
+            parse_engine_timings(&json!({"timings": {"unknown_n": 3}})),
+            None
+        );
     }
 }

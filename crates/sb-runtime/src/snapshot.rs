@@ -79,7 +79,13 @@ impl Engine {
                 Arc::new(registry)
             },
             model_variants: OnceLock::new(),
+            optimize: Arc::new(crate::optimize::OptimizeState::new()),
         })
+    }
+
+    /// The speed-trick state (shared; survives reloads).
+    pub fn optimize(&self) -> Arc<crate::optimize::OptimizeState> {
+        self.optimize.clone()
     }
 
     /// Attach the engine variants seam (once; later calls are ignored).
@@ -464,6 +470,9 @@ impl Engine {
     /// construction publishes the already-validated snapshot.
     pub fn validate_config(config: &Config) -> Result<(), String> {
         let mut problems = config.semantic_problems();
+        if let Err(e) = config.server.optimize.validate() {
+            problems.push(e);
+        }
         if let Some(catalog) = &config.catalog {
             problems.extend(
                 catalog

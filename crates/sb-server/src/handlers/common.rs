@@ -56,6 +56,7 @@ fn observed_effort(body: &serde_json::Value) -> Option<(String, String)> {
 
 pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
     [
+        "x-switchback-session",
         "x-switchback-session-id",
         "x-codex-session-id",
         "x-session-id",

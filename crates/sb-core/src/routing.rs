@@ -415,6 +415,12 @@ pub struct RouteDecision {
     /// `x-switchback-settings`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<String>,
+    /// What the per-request speed tricks did (stickiness, loaded-model
+    /// preference, big-prompt placement, the reasoning guard), e.g.
+    /// `sticky=gpu-box/qwen; loaded=gpu-box/qwen`. Rides
+    /// `x-switchback-route` and `x-switchback-optimize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimize: Option<String>,
 }
 
 impl RouteDecision {
@@ -433,7 +439,19 @@ impl RouteDecision {
             unverified: false,
             prefer_awake: None,
             settings: None,
+            optimize: None,
         }
+    }
+
+    /// Add one part to the speed-trick line (`a; b`), also a reason line
+    /// `optimize: <part>`.
+    pub fn add_optimize(&mut self, part: impl Into<String>) {
+        let part = part.into().replace(['[', ']'], "");
+        self.add_reason(format!("optimize: {part}"));
+        self.optimize = Some(match self.optimize.take() {
+            Some(existing) => format!("{existing}; {part}"),
+            None => part,
+        });
     }
 
     /// Record what wake-aware ordering did: a `prefer_awake: …` reason line,
@@ -523,8 +541,13 @@ impl RouteDecision {
             .as_deref()
             .map(|effect| format!(" settings=[{effect}]"))
             .unwrap_or_default();
+        let optimize = self
+            .optimize
+            .as_deref()
+            .map(|effect| format!(" optimize=[{effect}]"))
+            .unwrap_or_default();
         format!(
-            "strategy={} selected={} fallbacks=[{}] rejected={}{degraded}{awake}{settings}",
+            "strategy={} selected={} fallbacks=[{}] rejected={}{degraded}{awake}{settings}{optimize}",
             self.strategy,
             sel,
             fb.join(","),

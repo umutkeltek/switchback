@@ -2154,6 +2154,7 @@ mod tests {
             prompt_ms: Some(60.0),
             decode_tokens: Some(40),
             decode_ms: Some(800.0),
+            ..Default::default()
         });
         let speed = RequestSpeed::measure(&usage, Some(300), Some(2_000));
         assert_eq!(speed.prompt_tps, Some(2000.0));

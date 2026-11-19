@@ -1255,7 +1255,7 @@ impl EngineControls {
         Ok(models)
     }
 
-    fn cached_models(&self, lane: &str) -> Option<(i64, Vec<Value>)> {
+    pub(crate) fn cached_models(&self, lane: &str) -> Option<(i64, Vec<Value>)> {
         self.lock().models.get(lane).cloned()
     }
 
@@ -2499,6 +2499,25 @@ pub(crate) fn install_hooks(
                 controls.model_idle(ctx, key);
             }
         }));
+}
+
+/// The runtime's loaded-model view over the engine control's last listing
+/// of each lane (`GET /models`, taken by `GET /v1/engines`, loads and
+/// applies). Never calls a machine.
+pub(crate) struct ListingView(pub Arc<EngineControls>);
+
+impl sb_runtime::optimize::EngineView for ListingView {
+    fn loaded_models(&self, provider_id: &str) -> Option<(i64, Vec<String>)> {
+        let (at, models) = self.0.cached_models(provider_id)?;
+        Some((
+            at,
+            models
+                .iter()
+                .filter(|row| matches!(row["status"]["value"].as_str(), Some("loaded" | "loading")))
+                .filter_map(|row| row["id"].as_str().map(str::to_string))
+                .collect(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------- settings API hooks

@@ -1012,6 +1012,35 @@ impl SettingsPlan {
         planned.model = Some(model);
     }
 
+    /// Set one top-level field on the request attempts on `target` send
+    /// (the sticky conversation's `id_slot`).
+    pub(crate) fn set_passthrough(
+        &mut self,
+        target: &ExecutionTarget,
+        req: &AiRequest,
+        key: &str,
+        value: Json,
+    ) {
+        let planned = self
+            .per_target
+            .entry(target.id.clone())
+            .or_insert_with(|| PlannedTarget {
+                request: req.clone(),
+                model: None,
+                summary: String::new(),
+            });
+        planned.request.passthrough.insert(key.to_string(), value);
+    }
+
+    /// The engine model attempts on `target` name (its variant, else its
+    /// own model).
+    pub(crate) fn engine_model(&self, target: &ExecutionTarget) -> String {
+        self.per_target
+            .get(&target.id)
+            .and_then(|planned| planned.model.clone())
+            .unwrap_or_else(|| target.model.clone())
+    }
+
     /// The settings summary for a target, if any.
     pub(crate) fn summary_for(&self, target_id: &str) -> Option<&str> {
         self.per_target
@@ -1077,9 +1106,11 @@ pub(crate) fn plan_settings(
     }
     for (target, entry) in entries {
         let doc = entry.as_ref().map(|entry| entry.doc.as_ref());
+        let guard = doc.and_then(|doc| doc.active_reasoning_guard());
         if doc.is_none_or(|doc| !doc.has_request_settings() && doc.locked.is_empty())
             && request
                 .is_none_or(|request| request.settings.is_empty() && request.profile.is_none())
+            && guard.is_none()
         {
             continue;
         }
@@ -1091,15 +1122,28 @@ pub(crate) fn plan_settings(
             &layered,
             settings_engine(snap, &target.provider_id),
         );
-        if applied.is_empty() {
-            continue;
+        let mut summary = (!applied.is_empty()).then(|| applied.header_value());
+        // The reasoning guard (`reasoning: true` + `reasoning_guard`): a
+        // small `max_tokens` turns thinking off for this request.
+        if let (Some(doc), Some(guard)) = (doc, guard) {
+            if let Some(note) =
+                crate::optimize::apply_reasoning_guard(&mut prepared, req, request, doc, guard)
+            {
+                summary = Some(match summary {
+                    Some(summary) => format!("{summary}; {note}"),
+                    None => note,
+                });
+            }
         }
+        let Some(summary) = summary else {
+            continue;
+        };
         plan.per_target.insert(
             target.id.clone(),
             PlannedTarget {
                 request: prepared,
                 model: None,
-                summary: applied.header_value(),
+                summary,
             },
         );
     }

@@ -89,6 +89,11 @@ pub(crate) struct CandidateResolution {
     /// `enabled: true`), else `None`. When set, candidates on a lane that
     /// wakes on request carry [`ExecutionTarget::wake`].
     pub(crate) prefer_awake: Option<PreferAwakeConfig>,
+    /// The per-request speed tricks' view of the candidates (stickiness,
+    /// loaded models, prompt speeds), set by the runtime after resolving
+    /// when the route has any trick on; every plan of the request applies
+    /// it the same way.
+    pub(crate) optimize: Option<crate::optimize::Hints>,
 }
 
 /// What a model resolved to before candidates are stamped: route name,
@@ -465,6 +470,7 @@ pub(crate) fn resolve_candidates(
         pin_order,
         lane_down,
         prefer_awake,
+        optimize: None,
     })
 }
 
@@ -704,6 +710,9 @@ pub(crate) fn plan_candidates(
         &resolved.candidates,
         &policy,
     );
+    if let Some(hints) = &resolved.optimize {
+        crate::optimize::apply_hints(&mut plan, hints, resolved.pin_order);
+    }
     if let Some(combo) = &resolved.combo {
         plan.decision.strategy = match combo.strategy {
             ComboStrategy::Fallback => "combo_fallback",

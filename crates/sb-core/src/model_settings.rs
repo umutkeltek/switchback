@@ -614,6 +614,18 @@ pub struct ModelSettingsDoc {
     /// Per-request load settings (variants). Absent = refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_load: Option<RequestLoadPolicy>,
+    /// The model thinks before it answers (a reasoning model). Turns on
+    /// what `reasoning_guard` does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning: bool,
+    /// For a `reasoning: true` target: a request with a small `max_tokens`
+    /// gets thinking off unless it asked for thinking itself. Absent = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_guard: Option<crate::ReasoningGuard>,
+    /// The target's speed ceiling on its machine (decode and prefill
+    /// tokens per second, bytes read per token), for the speed report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<crate::Ceiling>,
 }
 
 impl ModelSettingsDoc {
@@ -634,6 +646,15 @@ impl ModelSettingsDoc {
             validate_layer(layer).map_err(|e| SettingsError(format!("profile `{name}`: {e}")))?;
         }
         for path in &self.locked {
+            // `load.KEY`: a load-time key `sb ai tune` must never change.
+            if let Some(load) = path.strip_prefix("load.") {
+                if crate::load_settings::load_key(load).is_none() {
+                    return err(format!(
+                        "locked key `{path}`: `{load}` is not a load setting"
+                    ));
+                }
+                continue;
+            }
             let (top, field) = split_path(path);
             let Some(key) = request_key(top) else {
                 return err(format!(
@@ -663,7 +684,22 @@ impl ModelSettingsDoc {
             crate::load_settings::validate_request_load_policy(policy)
                 .map_err(|e| SettingsError(format!("request_load: {e}")))?;
         }
+        if let Some(guard) = &self.reasoning_guard {
+            if guard.min_tokens == 0 || guard.min_tokens > 1_000_000 {
+                return err("reasoning_guard.min_tokens must be 1 to 1000000");
+            }
+        }
+        if let Some(ceiling) = &self.ceiling {
+            ceiling.validate().map_err(SettingsError)?;
+        }
         Ok(())
+    }
+
+    /// The reasoning guard in force: the target thinks and its guard is on.
+    pub fn active_reasoning_guard(&self) -> Option<&crate::ReasoningGuard> {
+        self.reasoning_guard
+            .as_ref()
+            .filter(|guard| self.reasoning && guard.enabled)
     }
 
     /// Whether `path` (or the key it belongs to) is locked.

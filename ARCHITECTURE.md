@@ -393,6 +393,31 @@ settings reach it through the runtime's `ModelVariants` seam: the runtime
 checks the policy, the engine control fit-checks, adds a `<model>~<hash8>`
 variant to the overlay and applies it, and the attempt names the variant.
 
+### Speed tricks ("optimize")
+
+Three layers, after the method of
+<https://github.com/sybil-solutions/inference-optimisation-skill>.
+Layer 1 runs on the request path. `sb-core::optimize` holds the config
+(`server.optimize`, `routes[].optimize`), the per-target settings fields
+(`reasoning`, `reasoning_guard`, `ceiling`) and the pure helpers (the
+conversation key, a hash that never holds prompt text; the reasoning-guard
+edit). `sb-runtime::optimize::OptimizeState` lives on the Engine beside the
+settings registry (state, not config): where each conversation was served
+last and on which slot, what each engine lane has loaded (from the engine
+control's last listing through the `EngineView` seam, and from what the
+gateway served), and per-target evidence (cache hits, speculative
+acceptance, swaps, empty answers after thinking, guard uses, queue waits).
+After resolving candidates the runtime computes `Hints` once (which targets
+are up, healthy and not full; their machine; loaded or not; measured prompt
+speed; the sticky target) and stores them on the `CandidateResolution`;
+`plan_candidates` applies them after the router with `apply_hints`, so the
+wake, lane-place and real plans of one request agree. Only targets that are
+up move forward, so wake-aware ordering is never crossed; `pin_order` is
+kept. The reasoning guard is part of the settings plan (it edits the
+request one target's attempts send). Attempts report back through an
+`Observer` from the collect path and from the stream finalizer (a content
+watcher tells an empty answer after thinking).
+
 ### Durable state (opt-in)
 Point `server.state_store` at a SQLite file and every published config revision +
 a change **audit log** + every request's **usage** are persisted as metadata (no

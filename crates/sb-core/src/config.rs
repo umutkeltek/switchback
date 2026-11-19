@@ -302,6 +302,11 @@ pub struct LaneEngineConfig {
     /// Default 600.
     #[serde(default = "default_engine_load_timeout_secs")]
     pub load_timeout_secs: u64,
+    /// The router's `--models-max`: how many models it keeps loaded at
+    /// once. Lets the gateway know a load unloads another model (swap
+    /// counting, loaded-model preference). Absent = unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_max: Option<u32>,
 }
 
 fn default_engine_apply_wait_secs() -> u64 {
@@ -2154,6 +2159,12 @@ pub struct ServerConfig {
     /// ([`PreferAwakeOverride`]). Off by default. See [`PreferAwakeConfig`].
     #[serde(default)]
     pub prefer_awake: PreferAwakeConfig,
+    /// Speed tricks for local engines (stickiness, loaded-model preference,
+    /// big-prompt placement), machine numbers for ceilings, and the quiet
+    /// windows of `sb ai tune`. Everything off by default. See
+    /// [`crate::OptimizeConfig`].
+    #[serde(default)]
+    pub optimize: crate::OptimizeConfig,
     /// Cost-routing policy gates (all default-allow). Set false to exclude that
     /// lane from routing: `cost_allow_free` (free tiers / price 0),
     /// `cost_allow_promo` (time-boxed promo prices), `cost_allow_aggregator`
@@ -2711,6 +2722,7 @@ impl Default for ServerConfig {
             cost_max_per_mtok: None,
             latency_aware: false,
             prefer_awake: PreferAwakeConfig::default(),
+            optimize: crate::OptimizeConfig::default(),
             cost_allow_free: true,
             cost_allow_promo: true,
             cost_allow_aggregator: true,
@@ -3801,6 +3813,11 @@ pub struct RouteConfig {
     /// gets its defaults only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_profile: Option<String>,
+    /// The route's own speed-trick switches (stickiness, loaded-model
+    /// preference, big-prompt placement); a field set replaces
+    /// `server.optimize`'s. Absent = the server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimize: Option<crate::RouteOptimizeOverride>,
 }
 
 /// A route's `prefer_awake`: each field set replaces the server default's

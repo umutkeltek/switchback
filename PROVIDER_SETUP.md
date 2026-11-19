@@ -1135,6 +1135,107 @@ overlay without them (the reference script then drops their sections), and
 `GET /v1/engines` says so until that apply. `GET /v1/engines` lists the
 variants.
 
+### Making local models fast
+
+Switchback applies the method of the inference-optimisation skill
+(<https://github.com/sybil-solutions/inference-optimisation-skill>) to its
+local engines, in three layers:
+
+1. **Per-request tricks** (always on once configured, no experiments):
+   conversation stickiness, loaded-model preference, big-prompt placement
+   and the reasoning guard.
+2. **Watching** (read-only): ceilings per target and a speed report with
+   findings, each with its evidence and one suggested action.
+3. **Experiments** (`sb ai tune`): controlled A/B/A runs that keep a
+   settings change only when it measurably wins.
+
+#### Layer 1: per-request tricks
+
+Every trick is off by default. `server.optimize` turns one on for every
+route; a route's `optimize` block replaces a field for that route (a field
+left out keeps the server's):
+
+```yaml
+server:
+  optimize:
+    stickiness: true            # keep a conversation on its machine
+    sticky_ttl_secs: 1800       # how long a conversation stays sticky
+    sticky_max_conversations: 10000
+    loaded_aware: true          # prefer the target whose model is loaded
+    big_prompt_tokens: 8000     # a prompt this big goes to the fastest prefill
+routes:
+  - name: chat
+    match: { model: chat }
+    optimize: { stickiness: false }   # this route: no stickiness
+    targets: ["gpu-box/qwen", "small-host/gemma"]
+```
+
+None of them wakes a machine or makes a request wait. They only reorder
+targets that are already up, healthy and have room (a target that needs a
+wake never overtakes one that is up), and a route with `pin_order: true`
+keeps its order. What they did rides the response header
+`x-switchback-optimize` and the route summary (`optimize=[...]` on
+`x-switchback-route`), for example
+`sticky=gpu-box/qwen; slot=1` or `loaded=gpu-box/b over gpu-box/a (no model swap)`.
+
+- **Conversation stickiness.** A conversation is the session the client
+  names (header `x-switchback-session`, or `x-switchback-session-id`,
+  `metadata.session_id`), else the OpenAI `user` field plus a hash of the
+  system prompt and the first user message (both stay the same for every
+  turn). While the target that served the conversation last is up, healthy
+  and not full, the next turn goes there first, so the engine reuses its
+  prefix cache. When it is asleep, full or failing, the turn goes where the
+  route sends it and the header says why
+  (`sticky=gpu-box/qwen not kept (gpu-box asleep (wake ~65s))`). When the
+  engine says which slot served the turn (llama.cpp `id_slot`) and the
+  target has `load.parallel` above 1, the next turn names that slot
+  (`id_slot`), but only while no other request runs on that model, so the
+  pinned slot cannot make it wait. The gateway keeps only a hash of the
+  conversation, never its text.
+- **Cached prompt tokens** are recorded for every request: from llama.cpp's
+  `timings.cache_n` (or `tokens_cached`) and from OpenAI's
+  `usage.prompt_tokens_details.cached_tokens`, into the usage record's
+  `cached_input_tokens`. The speed report shows the hit rate per target.
+- **Loaded-model preference** (`loaded_aware`). When a route has several
+  targets on one awake machine (two names on one llama.cpp router, for
+  example), the one whose model the engine has loaded goes first: on a
+  router with `--models-max 1` a request for another model unloads the
+  current one, which costs seconds. The gateway knows what is loaded from
+  the engine control's last listing (`GET /v1/engines`, loads, applies) and
+  from what it served itself; it never asks a sleeping machine. Set
+  `models_max` on the lane's `engine:` block to the router's
+  `--models-max` so the gateway knows a load unloads another model. Every
+  load a request caused counts as a swap, per target and per hour, with the
+  model it replaced.
+- **Big-prompt placement** (`big_prompt_tokens`). On a route with
+  `latency_aware` or `prefer_awake`, a prompt of at least that many
+  (estimated) tokens goes to the awake target with the best measured prompt
+  speed (`big_prompt ~9000 tok -> gpu-box/qwen (10000 prompt tok/s)`). The
+  existing ordering does not do this (a long-output request ranks on decode
+  speed, a streaming one on time to first token), so it is its own step.
+  Stickiness wins over it: a conversation's cached prefix is cheaper than a
+  faster prefill.
+- **Reasoning guard.** A model that thinks before it answers can spend a
+  small `max_tokens` budget on thinking and return an empty answer with
+  `finish_reason: length`. Mark the target in its settings and turn the
+  guard on:
+
+  ```bash
+  sb ai set gpu-box/qwen reasoning=true reasoning_guard.min_tokens=1024
+  ```
+
+  A request whose `max_tokens` is below `min_tokens` (default 1024) then
+  gets thinking off for that request (`reasoning_effort: none`, which the
+  engine codec turns into `chat_template_kwargs.enable_thinking: false` on
+  llama.cpp and vLLM), unless the request asked for thinking itself
+  (`reasoning_effort` other than `none`, `enable_thinking: true`, or
+  `reasoning` in its own `switchback.settings`). A locked `reasoning` is
+  left alone. `x-switchback-settings` says
+  `reasoning_guard=off (max_tokens 256 < 1024)` (or `kept (the request
+  asked for thinking)`). The gateway counts the failure the guard prevents
+  on every target, guard or not: an answer with no text after thinking,
+  ended by the token limit.
+
 ### Speech to text and text to speech (`/v1/audio/*`)
 
 The gateway carries OpenAI's three audio endpoints, so any OpenAI client

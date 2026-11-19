@@ -19,7 +19,22 @@ pub(crate) fn with_route_header(mut response: Response, summary: &str) -> Respon
                 .insert(sb_core::SETTINGS_RESPONSE_HEADER, value);
         }
     }
+    if let Some(optimize) = optimize_from_summary(summary) {
+        if let Ok(value) = HeaderValue::from_str(optimize) {
+            response
+                .headers_mut()
+                .insert(sb_core::OPTIMIZE_RESPONSE_HEADER, value);
+        }
+    }
     response
+}
+
+/// The speed-trick part of a route summary (` optimize=[...]`), which also
+/// rides its own `x-switchback-optimize` header.
+pub(crate) fn optimize_from_summary(summary: &str) -> Option<&str> {
+    let start = summary.find(" optimize=[")? + " optimize=[".len();
+    let rest = &summary[start..];
+    rest.find(']').map(|end| &rest[..end])
 }
 
 /// The model-settings part of a route summary (` settings=[...]`), which

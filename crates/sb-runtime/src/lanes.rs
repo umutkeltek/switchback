@@ -78,6 +78,22 @@ pub(crate) struct LaneGpuNote {
 }
 
 impl LaneGpuNote {
+    /// The lane whose queue (or GPU group) this request waited for, when
+    /// it waited.
+    pub(crate) fn waited_on(&self) -> Option<&str> {
+        let queued = self
+            .note
+            .prefer_awake
+            .as_deref()
+            .is_some_and(|effect| effect.contains("queued"));
+        let waited = match &self.note.wake {
+            LaneWake::Ready { detail } | LaneWake::NotReady { detail, .. } => {
+                detail.contains("waited")
+            }
+        };
+        (queued || waited).then_some(self.note.provider_id.as_str())
+    }
+
     /// Say on the decision what happened; a 503 when the lane did not get
     /// its group and the plan still selected it (see [`LaneWakeNote::apply`]).
     pub(crate) fn apply(&self, plan: &mut sb_router::RoutePlan) -> Result<(), ExecError> {

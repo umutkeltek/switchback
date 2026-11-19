@@ -680,6 +680,19 @@ pub struct EngineTimings {
     pub decode_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_ms: Option<f64>,
+    /// Prompt tokens the engine reused from its prefix cache (llama.cpp
+    /// `timings.cache_n`, or `tokens_cached`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_tokens: Option<u64>,
+    /// Draft tokens speculative decoding proposed (`draft_n`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_tokens: Option<u64>,
+    /// Draft tokens the model accepted (`draft_n_accepted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_accepted: Option<u64>,
+    /// The engine slot that served the request (llama.cpp `id_slot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
 }
 
 impl EngineTimings {
@@ -714,6 +727,15 @@ impl Usage {
 
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Fill `cached_input_tokens` from the engine's own count of prompt
+    /// tokens reused from its prefix cache (llama.cpp `cache_n` /
+    /// `tokens_cached`) when the usage report did not say.
+    pub fn fill_cached_from_timings(&mut self) {
+        if let Some(cached) = self.engine_timings.as_ref().and_then(|t| t.cache_tokens) {
+            self.cached_input_tokens = self.cached_input_tokens.max(cached);
+        }
     }
 }
 

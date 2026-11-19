@@ -313,6 +313,13 @@ impl Engine {
                 allowed
             });
         }
+        // Speed tricks (`server.optimize`, `routes[].optimize`): what the
+        // ordering pass needs, computed once so every plan of this request
+        // agrees. Nothing configured = nothing computed.
+        let conversation = crate::optimize::conversation_of(&req);
+        let prompt_key = sb_core::conversation_key(&req, None);
+        let sticky = self.sticky_for(snap, conversation.as_deref());
+        resolved.optimize = self.optimize_hints(snap, &req, &resolved, sticky.as_ref());
         let unknown = resolved.unknown.clone();
         // Lanes with an engine control: the request counts on its first
         // choice's engine model from here (before any wake or lane wait), so
@@ -350,6 +357,9 @@ impl Engine {
         let mut lane_gpu = self
             .take_lane_before_dispatch(snap, &req, client_profile.as_ref(), &mut resolved)
             .await;
+        if let Some(provider) = lane_gpu.as_ref().and_then(|note| note.waited_on()) {
+            self.optimize.count_queue_wait(provider);
+        }
 
         let planned = plan_resolved_route(
             &self.combo_rr,
@@ -516,6 +526,15 @@ impl Engine {
                     return ExecOutcome::Error(e);
                 }
             }
+        }
+        self.pin_sticky_slot(snap, &req, sticky.as_ref(), &mut plan, &mut settings_plan);
+        if let Some(note) = plan
+            .candidates
+            .first()
+            .and_then(|first| settings_plan.summary_for(&first.id))
+            .and_then(crate::optimize::guard_note)
+        {
+            plan.decision.add_optimize(note);
         }
         if !settings_plan.is_empty() {
             if let Some(summary) = plan
@@ -1160,6 +1179,15 @@ impl Engine {
                                     let (pid_ttft, mdl_ttft) =
                                         (target.provider_id.clone(), target.model.clone());
                                     let (stream, first_token) = watch_first_token(stream);
+                                    let (stream, content_seen) =
+                                        crate::optimize::watch_content(stream);
+                                    let observer = self.observer(
+                                        snap,
+                                        target,
+                                        &settings_plan,
+                                        conversation.clone(),
+                                        prompt_key.clone(),
+                                    );
                                     let lane_busy = lane_busy.take();
                                     let metered = meter_stream(
                                         stream,
@@ -1178,11 +1206,23 @@ impl Engine {
                                                 attempt_started.elapsed().as_millis() as u64;
                                             match finish {
                                                 StreamFinish::Clean => {
+                                                    let mut usage = usage;
+                                                    usage.fill_cached_from_timings();
                                                     let speed = attempt_speed(
                                                         &usage,
                                                         &first_token,
                                                         attempt_started,
                                                         Instant::now(),
+                                                    );
+                                                    observer.served(
+                                                        &usage,
+                                                        speed.prompt_tps,
+                                                        crate::optimize::empty_after_thinking(
+                                                            finish_reason,
+                                                            content_seen.text(),
+                                                            content_seen.reasoning(),
+                                                            &usage,
+                                                        ),
                                                     );
                                                     resolver.report_success(&pid, &acct);
                                                     trace.attempt(sb_trace::Attempt::success(
@@ -1406,6 +1446,28 @@ impl Engine {
                                                 cost_micros: Some(cost),
                                             },
                                         );
+                                        let mut response = response;
+                                        response.usage.fill_cached_from_timings();
+                                        let speed = attempt_speed(
+                                            &response.usage,
+                                            &first_token,
+                                            attempt_started,
+                                            Instant::now(),
+                                        );
+                                        self.observer(
+                                            snap,
+                                            target,
+                                            &settings_plan,
+                                            conversation.clone(),
+                                            prompt_key.clone(),
+                                        )
+                                        .served(
+                                            &response.usage,
+                                            speed.prompt_tps,
+                                            crate::optimize::response_empty_after_thinking(
+                                                &response,
+                                            ),
+                                        );
                                         if let Err(e) = self.record_usage(
                                             &snap.registry,
                                             &req.id,
@@ -1417,12 +1479,7 @@ impl Engine {
                                             response.usage.clone(),
                                             started,
                                             false,
-                                            attempt_speed(
-                                                &response.usage,
-                                                &first_token,
-                                                attempt_started,
-                                                Instant::now(),
-                                            ),
+                                            speed,
                                         ) {
                                             let message = format!("usage persistence failed: {e}");
                                             self.record_trace(trace.finish(

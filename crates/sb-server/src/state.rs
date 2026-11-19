@@ -77,6 +77,13 @@ impl AppState {
         // Pending applies are retried when a lane comes up and when the
         // last request on a held-back model ends.
         crate::engine_control::install_hooks(&engine, &capacity, &engines);
+        // Loaded-model preference and swap counting read the engine
+        // control's last listing (never a call to a machine).
+        engine
+            .optimize()
+            .set_engine_view(Arc::new(crate::engine_control::ListingView(
+                engines.clone(),
+            )));
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),

@@ -488,6 +488,18 @@ routes:
   #     - "gpu-box/big"
   #     - "small-host/small"
 
+# Speed tricks for local engines (all off by default; see PROVIDER_SETUP.md
+# "Making local models fast"). Under `server:`:
+#   optimize:
+#     stickiness: true          # a conversation stays on the machine that served it
+#     sticky_ttl_secs: 1800
+#     loaded_aware: true        # prefer the target whose model is loaded (no swap)
+#     big_prompt_tokens: 8000   # a big prompt goes to the fastest measured prefill
+# A route may replace a field: `optimize: { stickiness: false }`. Set the
+# router's --models-max on the lane's engine block (`models_max: 1`) so the
+# gateway knows a load unloads another model. A thinking model gets the
+# reasoning guard in its settings: `sb ai set gpu-box/qwen reasoning=true
+# reasoning_guard.min_tokens=1024`.
 # Managed local lanes. An entry whose `name` equals a provider id makes that
 # provider a managed lane. Routing reads a lane's health only with
 # `route_health: true`. It is off by default: the lane then gets no routing

@@ -1751,6 +1751,21 @@ REQUEST_KEYS = ("temperature", "top_p", "top_k", "min_p", "typical_p", "repeat_p
                 "extra")
 
 
+# Document-level keys (not request settings): what the speed tricks and the
+# speed report read. `reasoning=true` (a boolean) marks a model that thinks;
+# `reasoning.enabled=...` stays a request setting.
+DOC_KEYS = ("reasoning_guard", "ceiling")
+
+
+def doc_level(key, value=None, doc=None):
+    top = key.partition(".")[0]
+    if top in DOC_KEYS:
+        return True
+    if key == "reasoning":
+        return isinstance(value, bool) or (doc is not None and isinstance(doc.get("reasoning"), bool))
+    return False
+
+
 def model_path(model, suffix):
     return f"/v1/models/{urllib.parse.quote(model, safe='/')}/{suffix}"
 
@@ -1909,9 +1924,11 @@ def layer_of(doc, args):
 
 
 def clean_empty(doc):
-    for name in ("defaults", "load", "engine_args"):
+    for name in ("defaults", "load", "engine_args") + DOC_KEYS:
         if name in doc and not doc[name]:
             doc.pop(name)
+    if doc.get("reasoning") is False:
+        doc.pop("reasoning")
     profiles = doc.get("profiles")
     if isinstance(profiles, dict) and not profiles:
         doc.pop("profiles")
@@ -1922,10 +1939,14 @@ def clean_empty(doc):
 def cmd_set(gw, args):
     pairs = [parse_assignment(text) for text in args.pairs]
     load = getattr(args, "load", False)
-    for key, _ in pairs:
+    for key, value in pairs:
         top = key.partition(".")[0]
         if load and top not in LOAD_KEYS and top != "engine_args":
             raise Fail(USAGE, f"{key} is not a load setting ({', '.join(LOAD_KEYS)}, engine_args.KEY)")
+        if not load and doc_level(key, value):
+            if args.profile:
+                raise Fail(USAGE, f"{key} belongs to the target, not to a profile")
+            continue
         if not load and top not in REQUEST_KEYS:
             hint = " (a load setting: add --load)" if top in LOAD_KEYS else ""
             raise Fail(USAGE, f"{key} is not a request setting{hint}")
@@ -1937,6 +1958,12 @@ def cmd_set(gw, args):
                     set_key(doc.setdefault("engine_args", {}), key.partition(".")[2], value)
                 else:
                     set_key(doc.setdefault("load", {}), key, value)
+                    # A locked load key: `sb ai tune` never changes it.
+                    if args.lock and f"load.{key}" not in doc.setdefault("locked", []):
+                        doc["locked"].append(f"load.{key}")
+                continue
+            if doc_level(key, value):
+                set_key(doc, key, value)
                 continue
             set_key(layer_of(doc, args), key, value)
             if args.lock and key not in doc.setdefault("locked", []):
@@ -1963,8 +1990,12 @@ def cmd_unset(gw, args):
     def change(doc):
         for key in args.keys:
             top = key.partition(".")[0]
-            if getattr(args, "load", False) or (top in LOAD_KEYS and top not in REQUEST_KEYS):
+            if doc_level(key, doc=doc) and not args.profile:
+                set_key(doc, key, None)
+            elif getattr(args, "load", False) or (top in LOAD_KEYS and top not in REQUEST_KEYS):
                 set_key(doc.setdefault("load", {}), key, None)
+                if f"load.{key}" in doc.get("locked", []):
+                    doc["locked"].remove(f"load.{key}")
             elif key.startswith("engine_args."):
                 set_key(doc.setdefault("engine_args", {}), key.partition(".")[2], None)
             else:

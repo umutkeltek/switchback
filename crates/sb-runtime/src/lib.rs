@@ -31,6 +31,7 @@ mod hedge;
 mod helpers;
 mod lanes;
 pub mod model_settings;
+pub mod optimize;
 mod outcome;
 mod prefer_awake;
 mod profiles;
@@ -279,6 +280,9 @@ pub struct Engine {
     /// Engine variants for per-request load settings (`sb-server`'s engine
     /// control). Unset = such requests are refused.
     model_variants: OnceLock<Arc<dyn model_settings::ModelVariants>>,
+    /// Speed-trick state (stickiness, loaded models, per-target evidence
+    /// for the speed report). State, not config: survives a publish.
+    optimize: Arc<optimize::OptimizeState>,
 }
 
 /// Outcome of an optimistic-concurrency publish ([`Engine::publish_with_audit`]).
