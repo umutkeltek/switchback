@@ -743,6 +743,108 @@ refuses the credential` (level `fail`), instead of waking the machine and
 waiting out `boot_timeout_secs`. Without `api_key_env` nothing is sent, as
 before.
 
+### Speech to text and text to speech (`/v1/audio/*`)
+
+The gateway carries OpenAI's three audio endpoints, so any OpenAI client
+works against it:
+
+- `POST /v1/audio/transcriptions` and `POST /v1/audio/translations`:
+  `multipart/form-data` with `file` and `model` (both required), and
+  `language`, `prompt`, `response_format` (`json` by default, `text`, `srt`,
+  `vtt`, `verbose_json`, `diarized_json`), `temperature`,
+  `timestamp_granularities[]` and `stream`. Other fields (`num_speakers`,
+  `min_speakers`, `max_speakers`, ...) reach the engine unchanged.
+- `POST /v1/audio/speech`: JSON (`model`, `input`, `voice`,
+  `response_format`, `speed`, other fields unchanged); the answer is the
+  audio bytes, streamed.
+
+`model` resolves through routes and aliases like any model. Only targets
+whose provider declares `capabilities: { audio_in: true }` (speech to text
+and translation) or `capabilities: { audio_out: true }` (text to speech) are
+chosen; any other target is rejected with the reason (`audio input required
+but target does not support it`), and with no audio target left the request
+is refused with 400. The gateway forwards the form to the target's
+`{base_url}/audio/transcriptions` (or `/audio/translations`,
+`/audio/speech`) with the provider's own auth, changing only `model` (to the
+target's own model id), and gives back the engine's status, content type and
+bytes: `text/plain` for `text`, `srt` and `vtt`, JSON otherwise, or the
+engine's event stream for `stream=true`.
+
+An upload larger than `server.audio_max_upload_bytes` (default 25 MiB, as
+OpenAI; `max_request_bytes` does not apply here) is refused with 413 and the
+error type `audio_too_large`, before any target is chosen. The file is read
+once and shared by every attempt, so fallback to a second target sends the
+same bytes without a second copy. Audio requests go through admission,
+tenants, budgets, plugins, local lanes (wake, `max_in_flight` with spill or
+queue, GPU groups, idle power-off), account and target fallback and traces,
+like chat. They are never cached, and no audio, transcript or input text is
+stored: traces and usage carry metadata only.
+
+Each served request writes one usage record with `workload_kind`
+`audio_transcription`, `audio_translation` or `audio_speech`, the target,
+the latency and, when known, the amount: seconds of audio
+(`pricing_unit: per_second`) from the answer's `duration`
+(`verbose_json`, `diarized_json`) or a `usage` object of type `duration`,
+and characters of input for speech (`per_character`). A streamed transcript
+or speech is recorded when the engine starts answering. `GET /v1/models`
+marks audio models with `"kind": "audio_transcription"` or
+`"kind": "audio_speech"`.
+
+A speech-to-text engine on an always-on machine: a provider that takes audio,
+a lane with no wake or power-off command (the machine is never powered off)
+and a limit of one transcription at a time, and two routes. `sb ai transcribe`
+uses the route `transcribe`, and `sb ai transcribe --speakers` the route
+`diarize`:
+
+```yaml
+providers:
+  - id: speech
+    type: openai_compatible
+    base_url: "http://small-host.example.invalid:8300/v1"
+    capabilities: { audio_in: true }
+    accounts:
+      - { id: local, auth: { kind: api_key, env: SPEECH_ENGINE_KEY } }
+
+local_executors:
+  - name: speech                 # the provider id
+    host: small-host
+    base_url: "http://small-host.example.invalid:8300"
+    health_endpoint: "http://small-host.example.invalid:8300/health"
+    route_health: true           # skip it while it is down
+    max_in_flight: 1             # one long file at a time
+    on_full: queue
+    queue_timeout_secs: 600
+    # no wake_command, no poweroff_command: the machine stays on
+
+routes:
+  - name: transcribe
+    match: { model: transcribe }
+    targets: ["speech/whisper-large-v3"]
+  - name: diarize                # the same engine; it diarizes on diarized_json
+    match: { model: diarize }
+    targets: ["speech/whisper-large-v3"]
+```
+
+A second engine on `gpu-box` behind the first target of a route works as for
+text: put it in `targets` after the first, and the request falls over to it
+when the first fails or, with `on_full: spill`, while the first lane is full.
+A text-to-speech engine is the same with `capabilities: { audio_out: true }`.
+
+The `diarized_json` answer the CLI reads (other fields pass through):
+
+```json
+{"task": "transcribe", "language": "en", "duration": 70.0, "text": "hi there all good",
+ "segments": [
+   {"id": 0, "speaker": "SPEAKER_00", "start": 0.4, "end": 2.0, "text": "hi there"},
+   {"id": 1, "speaker": "SPEAKER_01", "start": 63.2, "end": 65.0, "text": "all good"}
+ ]}
+```
+
+`sb ai transcribe FILE --speakers` prints one line per turn (segments in a
+row from the same speaker are one turn): `[00:00:00] SPEAKER_00: hi there`.
+`duration` (or `"usage": {"type": "duration", "seconds": 70.0}`) is what the
+usage record counts.
+
 ### Media jobs, video and artifacts
 
 **Background jobs.** `POST /v1/jobs` starts a job and answers `202` at once
