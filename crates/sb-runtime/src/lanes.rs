@@ -239,15 +239,20 @@ impl Engine {
     /// Admit the request to the engine model of the target the route would
     /// choose first, when its lane has an engine control: from here on the
     /// request counts on that model (queued for its lane or waiting for a
-    /// wake included), so an unload or `apply: now` waits for it, and it
-    /// waits (bounded) while one runs. `Ok(None)`: no such lane among the
-    /// candidates. `Err` is the 503 for a gate that stayed closed.
+    /// wake included), so an unload or `apply: now` waits for it.
+    ///
+    /// The model's gate closed (an unload, `apply: now` or preset re-read in
+    /// progress): when another candidate can serve the request, the first
+    /// choice is skipped at once with the reason (routing goes on to the next
+    /// target, never a wait); only when none can does the request wait
+    /// (bounded) for the gate. `Ok(None)`: no admission taken. `Err` is the
+    /// 503 when the gate stayed closed.
     pub(crate) async fn admit_first_choice(
         &self,
         snap: &Snapshot,
         req: &AiRequest,
         client_profile: Option<&ClientProfileConfig>,
-        resolved: &CandidateResolution,
+        resolved: &mut CandidateResolution,
     ) -> Result<Option<(String, crate::model_settings::ModelInFlight)>, ExecError> {
         use crate::model_settings::{gate_error, gate_wait};
         if !resolved
@@ -273,6 +278,7 @@ impl Engine {
                 .candidates
                 .iter()
                 .find(|candidate| candidate.id == selected.target_id)
+                .cloned()
         }) else {
             return Ok(None);
         };
@@ -280,6 +286,23 @@ impl Engine {
             return Ok(None);
         };
         let key = format!("{}/{}", first.provider_id, first.model);
+        if let Some(admission) = self.model_settings.try_admit(&key) {
+            return Ok(Some((first.id.clone(), admission)));
+        }
+        let others = would_be
+            .candidates
+            .iter()
+            .any(|candidate| candidate.id != first.id);
+        if others {
+            resolved.lane_down.push((
+                first.id.clone(),
+                format!(
+                    "`{key}` is being unloaded or reloaded with new settings; skipped before \
+                     dispatch, not counted as a failure"
+                ),
+            ));
+            return Ok(None);
+        }
         match self.model_settings.admit(&key, wait).await {
             Ok(admission) => Ok(Some((first.id.clone(), admission))),
             Err(e) => Err(gate_error(&e)),

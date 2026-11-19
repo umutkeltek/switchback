@@ -293,7 +293,9 @@ pub struct LaneEngineConfig {
     #[serde(default)]
     pub allow_model_path: bool,
     /// How long `apply: now` and unload wait for a model's in-flight
-    /// requests to end before answering 409. Default 120.
+    /// requests to end before answering 409. Default 120. A request waits
+    /// at a model's closed gate this long too, but never less than an apply
+    /// can hold the model (the lane's `command_timeout_secs` plus 30 s).
     #[serde(default = "default_engine_apply_wait_secs")]
     pub apply_wait_secs: u64,
     /// How long a load may take before it is reported as not done.

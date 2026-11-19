@@ -437,7 +437,9 @@ const ROUTER_CONTROLLED: &[&str] = &[
 /// decoding from local files, chat template and reasoning. Anything else
 /// (tools and agents that run commands, MCP servers, downloads from a URL
 /// or a model hub, remote back ends, server-wide switches) is refused by
-/// name. File arguments also need `engine.allow_model_path`.
+/// name, as is any argument that makes the engine write a file
+/// (`lookup-cache-dynamic`). File arguments also need
+/// `engine.allow_model_path`.
 const SAFE_ARGS: &[&str] = &[
     // speed, memory, offload
     "batch-size",
@@ -642,7 +644,6 @@ const SAFE_ARGS: &[&str] = &[
     "spec-synth-len",
     "spec-synth-rates",
     "lookup-cache-static",
-    "lookup-cache-dynamic",
     // local model files
     "mmproj",
     "no-mmproj",
@@ -1068,6 +1069,9 @@ struct ControlState {
     applied: BTreeMap<String, Map<String, Value>>,
     /// Per lane: when the last apply ran and whether the machine was up.
     last_attempt: BTreeMap<String, (i64, bool)>,
+    /// Per lane: failed applies in a row (the retry before a request backs
+    /// off with it).
+    apply_failures: BTreeMap<String, u32>,
     /// Per lane: the engine's last model listing, and when.
     models: BTreeMap<String, (i64, Vec<Value>)>,
     /// Per target: the settings revision whose load part last changed.
@@ -1078,9 +1082,33 @@ struct ControlState {
     variants: BTreeMap<String, BTreeMap<String, Variant>>,
 }
 
-/// How soon a failed apply is retried before a request (unless the machine
-/// was down when it failed and is up now).
+/// How soon a failed apply is first retried before a request; each failure
+/// in a row doubles it, up to [`APPLY_RETRY_MAX_MS`]. (A lane that comes up
+/// retries at once, from its up hook.)
 const APPLY_RETRY_MS: i64 = 15_000;
+const APPLY_RETRY_MAX_MS: i64 = 600_000;
+
+/// The wait before the next retry of a failed apply after `failures` in a
+/// row.
+fn apply_backoff_ms(failures: u32) -> i64 {
+    let doublings = failures.saturating_sub(1).min(16);
+    APPLY_RETRY_MS
+        .saturating_mul(1i64 << doublings)
+        .min(APPLY_RETRY_MAX_MS)
+}
+
+/// Whether an apply reached the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reached {
+    /// The engine has the sections (or reads them when it starts).
+    Yes,
+    /// The command or the re-read failed: pending, retried with backoff.
+    Failed,
+    /// Written while the machine wakes: the engine may have read its
+    /// presets already, so it re-reads them once the lane is up (pending,
+    /// not a failure).
+    WhenUp,
+}
 
 /// The engine controls of every lane: shared state plus the seams.
 pub struct EngineControls {
@@ -1288,6 +1316,23 @@ impl EngineControls {
     /// it is idle (`deferred`; retried when its last request ends). The
     /// caller holds the lane's apply lock.
     async fn apply_locked(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
+        let result = self.apply_locked_once(state, lane).await;
+        // A held-back model whose last request ended while this apply ran
+        // found nothing held back yet (its idle hook came too early): retry
+        // it now, after this apply lets go of the lock.
+        let registry = state.engine.model_settings();
+        let idle_now = self.lock().deferred.get(&lane.name).is_some_and(|models| {
+            models
+                .iter()
+                .any(|model| registry.dispatched(&format!("{}/{model}", lane.name)) == 0)
+        });
+        if idle_now {
+            state.engines.retry_in_background(state.clone(), &lane.name);
+        }
+        result
+    }
+
+    async fn apply_locked_once(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
         use sb_runtime::model_settings::GateKind;
         self.gc_variants(state, lane);
         let overlay = self.overlay(state, lane);
@@ -1302,7 +1347,7 @@ impl EngineControls {
         let Some(command) = lane.engine.settings_command.clone() else {
             result["ok"] = json!(false);
             result["error"] = json!("the lane has no engine.settings_command");
-            self.finish_apply(lane, &mut result, true, BTreeSet::new());
+            self.finish_apply(lane, &mut result, Reached::Failed, BTreeSet::new());
             return result;
         };
         let last = self.lock().applied.get(&lane.name).cloned();
@@ -1319,7 +1364,7 @@ impl EngineControls {
             result["ok"] = json!(true);
             result["reloaded"] = json!(false);
             result["note"] = json!("nothing changed for the engine");
-            self.finish_apply(lane, &mut result, false, BTreeSet::new());
+            self.finish_apply(lane, &mut result, Reached::Yes, BTreeSet::new());
             return result;
         }
         // Hold every model whose section changes. A model with a request
@@ -1347,7 +1392,7 @@ impl EngineControls {
                     "held back: {} serve(s) requests; applied when idle",
                     deferred.iter().cloned().collect::<Vec<_>>().join(", ")
                 ));
-                self.finish_apply(lane, &mut result, false, deferred);
+                self.finish_apply(lane, &mut result, Reached::Yes, deferred);
                 return result;
             }
             return self
@@ -1375,7 +1420,7 @@ impl EngineControls {
                 "held back: {} serve(s) requests; applied when idle",
                 deferred.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
-            self.finish_apply(lane, &mut result, false, deferred);
+            self.finish_apply(lane, &mut result, Reached::Yes, deferred);
             return result;
         }
         self.write_and_reread(
@@ -1407,10 +1452,10 @@ impl EngineControls {
             drop(held);
             result["ok"] = json!(false);
             result["error"] = json!(format!("settings_command failed: {e}"));
-            self.finish_apply(lane, &mut result, true, deferred);
+            self.finish_apply(lane, &mut result, Reached::Failed, deferred);
             return result;
         }
-        let failed = match awake {
+        let reached = match awake {
             Awake::Up => match self
                 .call(
                     state,
@@ -1426,7 +1471,7 @@ impl EngineControls {
                     result["ok"] = json!(true);
                     result["reloaded"] = json!(true);
                     self.lock().applied.insert(lane.name.clone(), models);
-                    false
+                    Reached::Yes
                 }
                 Err(e) => {
                     // The file changed but the engine did not re-read it:
@@ -1437,9 +1482,21 @@ impl EngineControls {
                     result["error"] = json!(format!(
                         "settings written; the engine did not re-read them: {e}"
                     ));
-                    true
+                    Reached::Failed
                 }
             },
+            // Waking: the engine may be starting and have read its presets
+            // before this write. `applied` stays as it was, so the apply
+            // when the lane is up writes and re-reads these models again.
+            Awake::Asleep(why @ "waking") => {
+                result["ok"] = json!(true);
+                result["reloaded"] = json!(false);
+                result["note"] = json!(format!(
+                    "settings written; the machine is {why}, so the engine re-reads them once \
+                     it is up"
+                ));
+                Reached::WhenUp
+            }
             Awake::Asleep(why) => {
                 result["ok"] = json!(true);
                 result["reloaded"] = json!(false);
@@ -1447,11 +1504,11 @@ impl EngineControls {
                     "settings written; the machine is {why} and the engine reads them when it starts"
                 ));
                 self.lock().applied.insert(lane.name.clone(), models);
-                false
+                Reached::Yes
             }
         };
         drop(held);
-        self.finish_apply(lane, &mut result, failed, deferred);
+        self.finish_apply(lane, &mut result, reached, deferred);
         result
     }
 
@@ -1459,9 +1516,10 @@ impl EngineControls {
         &self,
         lane: &EngineLane,
         result: &mut Value,
-        failed: bool,
+        reached: Reached,
         deferred: BTreeSet<String>,
     ) {
+        let failed = reached != Reached::Yes;
         if !deferred.is_empty() {
             result["deferred"] = json!(deferred.iter().collect::<Vec<_>>());
         }
@@ -1470,6 +1528,12 @@ impl EngineControls {
         st.last_apply.insert(lane.name.clone(), result.clone());
         st.failed_apply.insert(lane.name.clone(), failed);
         st.deferred.insert(lane.name.clone(), deferred);
+        let failures = st.apply_failures.entry(lane.name.clone()).or_default();
+        match reached {
+            Reached::Yes => *failures = 0,
+            Reached::Failed => *failures = failures.saturating_add(1),
+            Reached::WhenUp => {}
+        }
     }
 
     /// The lane has an apply that did not fully reach the engine.
@@ -1482,22 +1546,56 @@ impl EngineControls {
                 .is_some_and(|models| !models.is_empty())
     }
 
-    /// A failed apply is due again: the machine was down when it failed,
-    /// or it failed long enough ago.
+    /// A failed apply is due again before a request: its backoff (15 s,
+    /// doubling with each failure in a row, at most 10 min) has passed. A
+    /// lane that comes up retries at once from its up hook instead.
     fn failed_apply_due(&self, lane: &str) -> bool {
         let st = self.lock();
         if !st.failed_apply.get(lane).copied().unwrap_or(false) {
             return false;
         }
+        let failures = st.apply_failures.get(lane).copied().unwrap_or(0);
         match st.last_attempt.get(lane) {
-            Some((at, was_up)) => !was_up || now_ms() - at >= APPLY_RETRY_MS,
+            Some((at, _)) => now_ms() - at >= apply_backoff_ms(failures),
             None => true,
         }
     }
 
+    /// The models of a lane whose section the engine does not have yet:
+    /// those an apply that did not reach the engine changed (against what
+    /// the engine last read; every managed model when that is unknown), and
+    /// those held back while busy.
+    fn pending_models(&self, state: &EngineCtx, lane: &EngineLane) -> BTreeSet<String> {
+        let overlay = self.overlay(state, lane);
+        let desired = overlay["models"].as_object().cloned().unwrap_or_default();
+        let st = self.lock();
+        let mut out = BTreeSet::new();
+        if st.failed_apply.get(&lane.name).copied().unwrap_or(false) {
+            match st.applied.get(&lane.name) {
+                Some(applied) => out.extend(
+                    desired
+                        .keys()
+                        .chain(applied.keys())
+                        .filter(|model| desired.get(*model) != applied.get(*model))
+                        .cloned(),
+                ),
+                None => out.extend(desired.keys().cloned()),
+            }
+        }
+        if let Some(deferred) = st.deferred.get(&lane.name) {
+            out.extend(deferred.iter().cloned());
+        }
+        out
+    }
+
     /// Run the lane's apply again in the background when it is pending
-    /// (the lane came up, a held-back model went idle).
+    /// (the lane came up, a held-back model went idle). When no apply is
+    /// running, the lane's apply lock and a hold on every pending model are
+    /// taken here, before this returns: a request for one of them that
+    /// reaches the lane first waits (bounded) for its new section instead of
+    /// being served with the old one.
     pub(crate) fn retry_in_background(self: &Arc<Self>, state: EngineCtx, lane_name: &str) {
+        use sb_runtime::model_settings::GateKind;
         if !self.pending_apply(lane_name) {
             return;
         }
@@ -1507,30 +1605,54 @@ impl EngineControls {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let lock = self.apply_lock(&lane.name);
+        let (guard, held) = match lock.clone().try_lock_owned() {
+            Ok(guard) => {
+                let registry = state.engine.model_settings();
+                let held: Vec<_> = self
+                    .pending_models(&state, &lane)
+                    .iter()
+                    .map(|model| registry.close(&format!("{}/{model}", lane.name), GateKind::Hold))
+                    .collect();
+                (Some(guard), held)
+            }
+            Err(_) => (None, Vec::new()),
+        };
         let controls = self.clone();
         runtime.spawn(async move {
-            let lock = controls.apply_lock(&lane.name);
-            let _guard = lock.lock().await;
+            let _guard = match guard {
+                Some(guard) => guard,
+                None => lock.lock_owned().await,
+            };
             if controls.pending_apply(&lane.name) {
                 let result = controls.apply_locked(&state, &lane).await;
                 tracing::info!(lane = %lane.name, ok = %result["ok"], pending = %result["pending"], "engine control: pending apply retried");
             }
+            drop(held);
         });
     }
 
-    /// Before a request reaches a lane's engine: a failed apply that is due
-    /// runs first (waiting for one already running), so the model loads
-    /// with its current settings.
-    pub(crate) async fn before_dispatch(&self, state: &EngineCtx, provider_id: &str) {
+    /// Before a request for `model` takes its lane's place: when an apply
+    /// failed to reach the engine, `model`'s own section is among what it
+    /// did not deliver, its backoff has passed and no apply is running (the
+    /// lock is never waited for), run it now, so the model loads with its
+    /// current settings. A model whose section the engine has is never
+    /// delayed.
+    pub(crate) async fn before_dispatch(&self, state: &EngineCtx, provider_id: &str, model: &str) {
         if !self.failed_apply_due(provider_id) {
             return;
         }
         let Some(lane) = engine_lane(&state.snapshot().config, provider_id) else {
             return;
         };
+        if !self.pending_models(state, &lane).contains(model) {
+            return;
+        }
         let lock = self.apply_lock(&lane.name);
-        let _guard = lock.lock().await;
-        if self.failed_apply_due(&lane.name) {
+        let Ok(_guard) = lock.try_lock() else {
+            return;
+        };
+        if self.failed_apply_due(&lane.name) && self.pending_models(state, &lane).contains(model) {
             self.apply_locked(state, &lane).await;
         }
     }
@@ -2331,10 +2453,14 @@ impl sb_runtime::model_settings::ModelVariants for EngineVariants {
         })
     }
 
-    fn before_dispatch<'a>(&'a self, provider_id: &'a str) -> sb_runtime::BoxFuture<'a, ()> {
+    fn before_dispatch<'a>(
+        &'a self,
+        provider_id: &'a str,
+        model: &'a str,
+    ) -> sb_runtime::BoxFuture<'a, ()> {
         Box::pin(async move {
             if let Some(ctx) = self.ctx() {
-                ctx.engines.before_dispatch(&ctx, provider_id).await;
+                ctx.engines.before_dispatch(&ctx, provider_id, model).await;
             }
         })
     }
@@ -3042,6 +3168,8 @@ mod tests {
             "video-ffmpeg-dir",
             "ui-mcp-proxy",
             "gpt-oss-20b-default",
+            // writes a cache file at a path it is given
+            "lookup-cache-dynamic",
         ] {
             let args = map(json!({name: true}));
             let e = LlamaCppRouter.check_args(&args, true).unwrap_err();
@@ -3112,6 +3240,10 @@ mod tests {
     /// A machine that is down (nothing answers on port 1), so the control
     /// never calls an engine; the settings command always succeeds.
     fn asleep_ctx() -> EngineCtx {
+        asleep_ctx_with(Arc::new(OkRunner))
+    }
+
+    fn asleep_ctx_with(runner: Arc<dyn SettingsCommandRunner>) -> EngineCtx {
         let cfg = sb_core::Config::from_yaml(
             r#"
 providers:
@@ -3144,8 +3276,99 @@ local_executors:
         EngineCtx {
             engine: app.engine.clone(),
             capacity: app.capacity.clone(),
-            engines: Arc::new(EngineControls::with_runner(Arc::new(OkRunner))),
+            engines: Arc::new(EngineControls::with_runner(runner)),
         }
+    }
+
+    /// A settings command that succeeds; while `block` is set, its next run
+    /// says it started and waits for `release`.
+    #[derive(Default)]
+    struct BlockingRunner {
+        block: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl SettingsCommandRunner for BlockingRunner {
+        async fn run(&self, _: &str, _: &[u8], _: Duration) -> Result<String, String> {
+            if self.block.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(String::new())
+        }
+    }
+
+    fn load_doc(ctx_size: u64) -> ModelSettingsDoc {
+        serde_json::from_value(json!({"load": {"ctx_size": ctx_size}})).unwrap()
+    }
+
+    /// A model held back while busy whose last request ends while the apply
+    /// that held it back still runs (its idle hook finds nothing held back
+    /// yet) is applied once that apply ends, not left pending.
+    #[tokio::test]
+    async fn a_model_that_goes_idle_during_the_apply_that_held_it_back_is_applied() {
+        let runner = Arc::new(BlockingRunner::default());
+        let ctx = asleep_ctx_with(runner.clone());
+        install_hooks(&ctx.engine, &ctx.capacity, &ctx.engines);
+        let registry = ctx.engine.model_settings();
+        let actor = Default::default();
+        registry
+            .write("text/m", load_doc(8192), 0, &actor, "put")
+            .unwrap();
+        registry
+            .write("text/other", load_doc(4096), 0, &actor, "put")
+            .unwrap();
+        let lane = engine_lane(&ctx.snapshot().config, "text").unwrap();
+        let first = ctx.engines.apply_lane(&ctx, &lane).await;
+        assert_eq!(first["pending"], json!(false), "{first}");
+        // A request is dispatched on `m`.
+        let mut request = registry.try_admit("text/m").unwrap();
+        request.dispatch(Duration::from_secs(1)).await.unwrap();
+        // Both models change; the apply holds `m` back and blocks in its command.
+        registry
+            .write("text/m", load_doc(16384), 1, &actor, "put")
+            .unwrap();
+        registry
+            .write("text/other", load_doc(2048), 1, &actor, "put")
+            .unwrap();
+        runner
+            .block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let apply = tokio::spawn({
+            let (ctx, lane) = (ctx.clone(), lane.clone());
+            async move { ctx.engines.apply_lane(&ctx, &lane).await }
+        });
+        runner.started.notified().await;
+        // The request on `m` ends while that apply still runs.
+        drop(request);
+        runner.release.notify_one();
+        let held_back = apply.await.unwrap();
+        assert_eq!(held_back["deferred"], json!(["m"]), "{held_back}");
+        let mut pending = true;
+        for _ in 0..200 {
+            pending = ctx.engines.pending_apply("text");
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!pending, "`m` stayed held back after it went idle");
+        let applied = ctx.engines.lock().applied["text"].clone();
+        assert_eq!(applied["m"]["settings"]["ctx-size"], json!("16384"));
+    }
+
+    /// Failed applies in a row back off: 15 s, doubling, at most 10 min.
+    #[test]
+    fn a_failing_apply_backs_off() {
+        assert_eq!(apply_backoff_ms(0), 15_000);
+        assert_eq!(apply_backoff_ms(1), 15_000);
+        assert_eq!(apply_backoff_ms(2), 30_000);
+        assert_eq!(apply_backoff_ms(4), 120_000);
+        assert_eq!(apply_backoff_ms(6), 480_000);
+        assert_eq!(apply_backoff_ms(7), 600_000);
+        assert_eq!(apply_backoff_ms(u32::MAX), 600_000);
     }
 
     #[tokio::test]

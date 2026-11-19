@@ -222,6 +222,32 @@ impl Engine {
                 }
             };
         let unknown = resolved.unknown.clone();
+        // Lanes with an engine control: the request counts on its first
+        // choice's engine model from here, as for chat (see `execute`).
+        let first_admission = match self
+            .admit_first_choice(snap, &req, None, &mut resolved)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: false,
+                });
+                return EmbeddingsOutcome::Error {
+                    request_id: req.id,
+                    error: e,
+                };
+            }
+        };
         let lane_wake = self
             .wake_lane_before_dispatch(snap, &req, None, &mut resolved)
             .await;
@@ -259,6 +285,21 @@ impl Engine {
                 };
             }
         };
+        // Per-model admissions (engine control): the first choice's, kept
+        // while the plan still has its target.
+        let mut admissions = crate::model_settings::admissions_only(
+            &self.model_settings,
+            self.model_variants.get().cloned(),
+        );
+        if let Some((target_id, admission)) = first_admission {
+            if plan
+                .candidates
+                .iter()
+                .any(|candidate| candidate.id == target_id)
+            {
+                admissions.add_admission(&target_id, admission);
+            }
+        }
         snap.plugins.post_route(&req, &plan.decision);
         let summary = format!("{} embeddings", plan.decision.summary());
         let mut trace = sb_trace::RequestTrace::start(
@@ -275,11 +316,13 @@ impl Engine {
 
         let mut woken_for_fallback: HashSet<String> = HashSet::new();
 
-        'targets: for target in plan.candidates.iter() {
+        'targets: for (index, target) in plan.candidates.iter().enumerate() {
             let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
+                admissions.release(&target.id);
                 continue 'targets;
             };
             if !snap.resolver.circuit_allows(&target.provider_id) {
+                admissions.release(&target.id);
                 continue 'targets;
             }
             if let Some(cap) = snap
@@ -312,6 +355,7 @@ impl Engine {
                     }
                 };
                 if spent >= *cap {
+                    admissions.release(&target.id);
                     continue 'targets;
                 }
             }
@@ -328,16 +372,36 @@ impl Engine {
                             request_id = %req.id, target = %target.id,
                             "target skipped: local lane down ({detail})"
                         );
+                        admissions.release(&target.id);
                         continue 'targets;
                     }
                 }
             }
+            // The engine model's admission, before the lane's place (a
+            // closed gate is waited for only by the last target).
+            let may_wait = index + 1 == plan.candidates.len();
+            let model_admission = match admissions.admission_for(snap, target, may_wait).await {
+                Ok(admission) => admission,
+                Err(e) => {
+                    tracing::info!(
+                        request_id = %req.id, target = %target.id,
+                        "target skipped: {}", e.message
+                    );
+                    trace.warning(format!("target {} skipped: {}", target.id, e.message));
+                    let retry_after = e.retry_after.unwrap_or(crate::LANE_GROUP_RETRY_AFTER);
+                    unavailable_retry_after = Some(
+                        unavailable_retry_after
+                            .map_or(retry_after, |current| current.min(retry_after)),
+                    );
+                    continue 'targets;
+                }
+            };
             // Opt-in lanes (`wake_on_request`) count this request as
             // in-flight work until this target's attempts end.
             let held = lane_gpu
                 .as_mut()
                 .and_then(|note| note.take_busy(&target.provider_id));
-            let _lane_busy = match held {
+            let mut lane_busy = match held {
                 Some(busy) => Some(busy),
                 None => match self.lane_busy(snap, &target.provider_id) {
                     Ok(busy) => busy,
@@ -350,6 +414,24 @@ impl Engine {
                     }
                 },
             };
+            // Dispatch on the engine model; counted until this target's
+            // attempts end, so an unload or preset re-read waits for it.
+            if let Some(mut model_busy) = model_admission {
+                if let Err(e) = admissions.dispatch(snap, target, &mut model_busy).await {
+                    trace.warning(format!("target {} skipped: {}", target.id, e.message));
+                    let retry_after = e.retry_after.unwrap_or(crate::LANE_GROUP_RETRY_AFTER);
+                    unavailable_retry_after = Some(
+                        unavailable_retry_after
+                            .map_or(retry_after, |current| current.min(retry_after)),
+                    );
+                    continue 'targets;
+                }
+                lane_busy = Some(crate::model_settings::hold_with_lane(
+                    lane_busy.take(),
+                    model_busy,
+                ));
+            }
+            let _lane_busy = lane_busy;
             let mut tried_accounts = HashSet::new();
             let allowed_accounts = req
                 .tenant

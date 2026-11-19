@@ -319,7 +319,7 @@ impl Engine {
         // an unload or `apply: now` waits for it; a closed gate holds it
         // here (bounded).
         let first_admission = match self
-            .admit_first_choice(snap, &req, client_profile.as_ref(), &resolved)
+            .admit_first_choice(snap, &req, client_profile.as_ref(), &mut resolved)
             .await
         {
             Ok(admission) => admission,
@@ -698,13 +698,18 @@ impl Engine {
 
         // Lanes a `prefer_awake` fallback already woke for this request.
         let mut woken_for_fallback: HashSet<String> = HashSet::new();
-        'targets: for target in plan.candidates.iter() {
+        let candidate_count = plan.candidates.len();
+        'targets: for (index, target) in plan.candidates.iter().enumerate() {
+            // A target skipped before dispatch lets go of the admission
+            // taken for it earlier (it is never reached).
             let Some(adapter) = snap.registry.adapter(&target.provider_id) else {
+                settings_plan.release(&target.id);
                 continue 'targets;
             };
             // Circuit breaker: if this provider is OPEN (it's been failing), don't
             // even attempt it — fall straight over to the next target.
             if !snap.resolver.circuit_allows(&target.provider_id) {
+                settings_plan.release(&target.id);
                 tracing::info!(
                     request_id = %req.id, target = %target.id, provider = %target.provider_id,
                     "circuit open — skipping provider"
@@ -748,6 +753,7 @@ impl Engine {
                         request_id = %req.id, provider = %target.provider_id,
                         spent_usd = spent, cap_usd = *cap, "provider over budget — skipping"
                     );
+                    settings_plan.release(&target.id);
                     continue 'targets;
                 }
             }
@@ -784,14 +790,17 @@ impl Engine {
                             unavailable_retry_after
                                 .map_or(retry_after, |current| current.min(retry_after)),
                         );
+                        settings_plan.release(&target.id);
                         continue 'targets;
                     }
                 }
             }
             // The engine model's admission (lanes with an engine control),
             // before the lane's place: a request never holds a place while
-            // it waits at a closed gate.
-            let model_admission = match settings_plan.admission_for(snap, target).await {
+            // it waits at a closed gate or for a pending apply. A closed gate
+            // is waited for only by the last target; any other is skipped.
+            let may_wait = index + 1 == candidate_count;
+            let model_admission = match settings_plan.admission_for(snap, target, may_wait).await {
                 Ok(admission) => admission,
                 Err(e) => {
                     trace.warning(format!("target {} skipped: {}", target.id, e.message));
@@ -825,10 +834,10 @@ impl Engine {
                     }
                 },
             };
-            // Dispatch on the engine model (after the lane's pending apply,
-            // never during a preset re-read); the count is held as long as
-            // the lane's busy guard (to the stream's end): unload, `apply:
-            // now` and a preset re-read wait for it.
+            // Dispatch on the engine model (never during a preset re-read);
+            // the count is held as long as the lane's busy guard (to the
+            // stream's end): unload, `apply: now` and a preset re-read wait
+            // for it.
             if let Some(mut model_busy) = model_admission {
                 if let Err(e) = settings_plan.dispatch(snap, target, &mut model_busy).await {
                     trace.warning(format!("target {} skipped: {}", target.id, e.message));
@@ -839,10 +848,10 @@ impl Engine {
                     );
                     continue 'targets;
                 }
-                lane_busy = Some(match lane_busy.take() {
-                    Some(busy) => Box::new((busy, model_busy)) as crate::LaneBusy,
-                    None => Box::new(model_busy),
-                });
+                lane_busy = Some(crate::model_settings::hold_with_lane(
+                    lane_busy.take(),
+                    model_busy,
+                ));
             }
             let mut tried_accounts: HashSet<String> = HashSet::new();
             let allowed_accounts = req

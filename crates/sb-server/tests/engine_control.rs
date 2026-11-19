@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde_json::{json, Value};
 
 #[derive(Default)]
@@ -162,6 +163,30 @@ async fn unload(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value
 async fn chat(State(stub): State<Stub>, body: Bytes) -> Response {
     let body: Value = serde_json::from_slice(&body).unwrap();
     let slow = body.to_string().contains("slow please");
+    if body["stream"] == json!(true) {
+        // A streamed answer: 40 chunks, 50 ms apart.
+        stub.inner
+            .lock()
+            .unwrap()
+            .calls
+            .push("POST /v1/chat/completions stream".to_string());
+        let chunks = (0..40)
+            .map(|i| {
+                format!(
+                    "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"t{i}\"}},\"finish_reason\":null}}]}}\n\n"
+                )
+            })
+            .chain(std::iter::once("data: [DONE]\n\n".to_string()));
+        let stream = futures::stream::iter(chunks).then(|chunk| async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, std::io::Error>(Bytes::from(chunk))
+        });
+        return (
+            [("content-type", "text/event-stream")],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response();
+    }
     {
         let mut inner = stub.inner.lock().unwrap();
         inner.calls.push("POST /v1/chat/completions".to_string());
@@ -183,6 +208,29 @@ async fn chat(State(stub): State<Stub>, body: Bytes) -> Response {
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
     }))
     .into_response()
+}
+
+/// An embeddings or audio call that stays in the engine for 1.2 s.
+async fn slow_engine_call(stub: &Stub, call: &str) {
+    {
+        let mut inner = stub.inner.lock().unwrap();
+        inner.calls.push(call.to_string());
+        inner.busy += 1;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    stub.inner.lock().unwrap().busy -= 1;
+}
+
+async fn embeddings(State(stub): State<Stub>, _body: Bytes) -> Json<Value> {
+    slow_engine_call(&stub, "POST /v1/embeddings").await;
+    Json(json!({"object": "list", "model": "m",
+        "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+        "usage": {"prompt_tokens": 1, "total_tokens": 1}}))
+}
+
+async fn transcription(State(stub): State<Stub>, _body: Bytes) -> Json<Value> {
+    slow_engine_call(&stub, "POST /v1/audio/transcriptions").await;
+    Json(json!({"text": "hello"}))
 }
 
 fn temp(name: &str) -> PathBuf {
@@ -218,6 +266,8 @@ async fn spawn_stub(up: bool) -> (String, Stub) {
         .route("/models/load", post(load))
         .route("/models/unload", post(unload))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/v1/audio/transcriptions", post(transcription))
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -247,6 +297,10 @@ struct Opts<'a> {
     /// A settings command writing the overlay JSON, with `{marker}` (the
     /// machine-up marker) and `{overlay}` filled in.
     command_template: Option<&'a str>,
+    /// The lane's wake command, with `{marker}` filled in (default: touch it).
+    wake_template: Option<&'a str>,
+    /// More `server:` keys, each on its own line, indented two spaces.
+    server: &'a str,
 }
 
 impl Default for Opts<'_> {
@@ -258,6 +312,8 @@ impl Default for Opts<'_> {
             lane: "",
             apply_wait_secs: 1,
             command_template: None,
+            wake_template: None,
+            server: "",
         }
     }
 }
@@ -291,11 +347,13 @@ async fn setup_with(opts: Opts<'_>) -> (Setup, sb_server::AppState) {
         r#"
 server:
   bind: "127.0.0.1:0"
+{server}
 providers:
   - id: text
     type: openai_compatible
     engine: llama_cpp
     base_url: "{stub_url}/v1"
+    capabilities: {{ audio_in: true }}
     accounts:
       - id: a
         auth: {{ kind: api_key, inline: "k" }}
@@ -309,7 +367,7 @@ local_executors:
   - name: text
     base_url: "{stub_url}"
     health_endpoint: "{stub_url}/health"
-    wake_command: "touch {marker}"
+    wake_command: "{wake}"
     boot_timeout_secs: 10
     health_poll_interval_ms: 50
 {lane}
@@ -320,9 +378,13 @@ local_executors:
       load_timeout_secs: 5
 {extra}
 "#,
-        marker = quoted(&stub.up_marker),
+        wake = opts
+            .wake_template
+            .unwrap_or("touch {marker}")
+            .replace("{marker}", &quoted(&stub.up_marker)),
         command = command.replace('"', "\\\""),
         lane = opts.lane,
+        server = opts.server,
         wait = opts.apply_wait_secs,
         extra = opts.extra,
     );
@@ -1184,5 +1246,337 @@ async fn revert_needs_a_revision_and_applies_like_a_put() {
     assert_eq!(
         overlay_of(&s)["models"]["m"]["settings"]["ctx-size"],
         json!("8192")
+    );
+}
+
+fn spawn_embedding(gw: &str) -> tokio::task::JoinHandle<u16> {
+    let gw = gw.to_string();
+    tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{gw}/v1/embeddings"))
+            .json(&json!({"model": "text/m", "input": "hello"}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    })
+}
+
+fn spawn_transcription(gw: &str) -> tokio::task::JoinHandle<u16> {
+    const BOUNDARY: &str = "engine-control-boundary";
+    let mut body = format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ntext/m\r\n\
+         --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+         Content-Type: audio/wav\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend(b"RIFF-AUDIO");
+    body.extend(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    let gw = gw.to_string();
+    tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{gw}/v1/audio/transcriptions"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    })
+}
+
+/// An embeddings request in flight on `m` holds off an unload of `m`.
+#[tokio::test]
+async fn rr_unload_waits_for_an_embeddings_request() {
+    let (s, _) = setup_with(Opts {
+        apply_wait_secs: 10,
+        ..Opts::default()
+    })
+    .await;
+    let emb = spawn_embedding(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/unload", json!({})).await;
+    assert_eq!(emb.await.unwrap(), 200);
+    assert_eq!(status, 200, "{body}");
+    let busy = s.stub.inner.lock().unwrap().busy_at_unload.clone();
+    assert_eq!(
+        busy,
+        vec![0],
+        "the unload reached the router with an embeddings request in flight on m"
+    );
+}
+
+/// An embeddings request in flight on `m` holds off a preset re-read of `m`.
+#[tokio::test]
+async fn rr_reload_waits_for_an_embeddings_request() {
+    let s = setup(true, "", None).await;
+    let emb = spawn_embedding(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 65536}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(emb.await.unwrap(), 200);
+    let calls = s.stub.calls();
+    let busy = s.stub.inner.lock().unwrap().busy_at_reload.clone();
+    assert!(
+        busy.iter().all(|b| *b == 0) && !calls.contains(&"reload unloaded m".to_string()),
+        "reload=1 reached the router with {busy:?} embeddings request(s) in flight: {calls:?}"
+    );
+}
+
+/// An audio transcription in flight on `m` holds off an unload of `m`.
+#[tokio::test]
+async fn unload_waits_for_an_audio_transcription() {
+    let (s, _) = setup_with(Opts {
+        apply_wait_secs: 10,
+        ..Opts::default()
+    })
+    .await;
+    let audio = spawn_transcription(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/unload", json!({})).await;
+    assert_eq!(audio.await.unwrap(), 200);
+    assert_eq!(status, 200, "{body}");
+    let busy = s.stub.inner.lock().unwrap().busy_at_unload.clone();
+    assert_eq!(
+        busy,
+        vec![0],
+        "the unload reached the router with a transcription in flight on m"
+    );
+}
+
+/// An audio transcription in flight on `m` holds off a preset re-read of `m`.
+#[tokio::test]
+async fn reload_waits_for_an_audio_transcription() {
+    let s = setup(true, "", None).await;
+    let audio = spawn_transcription(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 65536}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(audio.await.unwrap(), 200);
+    let calls = s.stub.calls();
+    let busy = s.stub.inner.lock().unwrap().busy_at_reload.clone();
+    assert!(
+        busy.iter().all(|b| *b == 0) && !calls.contains(&"reload unloaded m".to_string()),
+        "reload=1 reached the router with {busy:?} transcription(s) in flight: {calls:?}"
+    );
+}
+
+/// While `text/m`'s gate is closed (an unload in progress), a request on a
+/// route with a healthy second target falls back to it at once instead of
+/// waiting for the gate and failing with 503.
+#[tokio::test]
+async fn rr_closed_gate_on_first_choice_falls_back_instead_of_503() {
+    let (s, _) = setup_with(Opts {
+        extra: "routes:\n  - name: r\n    match: { model: r }\n    targets: [\"text/m\", \"other/m\"]\n",
+        ..Opts::default()
+    })
+    .await;
+    s.stub.inner.lock().unwrap().unload_delay_ms = 6000;
+    let gw = s.gw.clone();
+    let unload =
+        tokio::spawn(async move { post_to(&gw, "/v1/models/text/m/unload", json!({})).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    let r = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", s.gw))
+        .json(&json!({"model": "r", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let route = r
+        .headers()
+        .get("x-switchback-route")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = r.text().await.unwrap();
+    let elapsed = started.elapsed();
+    let _ = unload.await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "after {elapsed:?}: {body}; calls {:?}",
+        s.stub.calls()
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "waited {elapsed:?} at the gate"
+    );
+    assert!(route.contains("other/m"), "{route}");
+}
+
+async fn in_flight_on_m(gw: &str) -> u64 {
+    let engines = get_json(format!("{gw}/v1/engines")).await;
+    engines["data"][0]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "m")
+        .map(|row| row["in_flight"].as_u64().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// A streamed request counts on `m` until its body ends, and a client that
+/// disconnects mid-stream releases the count.
+#[tokio::test]
+async fn rr_stream_counts_to_body_end_and_disconnect_releases() {
+    let s = setup(true, "", None).await;
+    let body =
+        json!({"model": "text/m", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let r = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", s.gw))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(in_flight_on_m(&s.gw).await, 1, "released at headers");
+    let text = r.text().await.unwrap();
+    assert!(text.contains("[DONE]"), "{text}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(in_flight_on_m(&s.gw).await, 0, "leaked after a full stream");
+    let r = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", s.gw))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let mut bytes = r.bytes_stream();
+    let _ = bytes.next().await;
+    assert_eq!(in_flight_on_m(&s.gw).await, 1);
+    drop(bytes);
+    let mut left = 1;
+    for _ in 0..100 {
+        left = in_flight_on_m(&s.gw).await;
+        if left == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(left, 0, "leaked after a client disconnect");
+    let (status, view) = post_to(&s.gw, "/v1/models/text/m/unload", json!({})).await;
+    assert_eq!(status, 200, "{view}");
+}
+
+/// A lane whose settings command always fails: a request for a model of the
+/// lane WITHOUT settings is never delayed by a retry of that apply and never
+/// runs the command.
+#[tokio::test]
+async fn a_failing_apply_never_delays_a_model_without_settings() {
+    let runs = temp("runs");
+    let command = format!("echo run >> {}; sleep 2; false", quoted(&runs));
+    let (s, _) = setup_with(Opts {
+        up: false,
+        settings_command: Some(command),
+        ..Opts::default()
+    })
+    .await;
+    let count = || {
+        std::fs::read_to_string(&runs)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    };
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["ok"], json!(false), "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    assert_eq!(count(), 1);
+    // `other` has no settings: its request goes straight to the engine.
+    let started = std::time::Instant::now();
+    let r = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", s.gw))
+        .json(&json!({"model": "text/other", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(r.status(), 200);
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "a request without settings waited {elapsed:?} for a failing apply"
+    );
+    assert_eq!(count(), 1, "the request ran the failing settings command");
+}
+
+/// A first choice skipped for its provider's budget lets go of its admission
+/// at once: an unload of it does not wait for a request served elsewhere.
+#[tokio::test]
+async fn a_first_choice_skipped_for_budget_drops_its_admission() {
+    let (s, _) = setup_with(Opts {
+        server: "  budget:\n    per_provider_usd: { text: 0.0 }\n",
+        extra: "routes:\n  - name: r\n    match: { model: r }\n    targets: [\"text/m\", \"other/m\"]\n",
+        ..Opts::default()
+    })
+    .await;
+    // Served by other/m (text is over its budget), slowly.
+    let slow = tokio::spawn({
+        let gw = s.gw.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{gw}/v1/chat/completions"))
+                .json(&json!({"model": "r", "messages": [{"role": "user", "content": "slow please"}]}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    });
+    wait_for_chat(&s).await;
+    assert_eq!(in_flight_on_m(&s.gw).await, 0, "still counted on text/m");
+    let (status, view) = post_to(&s.gw, "/v1/models/text/m/unload", json!({})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(slow.await.unwrap(), 200);
+}
+
+/// Settings written while the lane wakes: the engine may already have read
+/// its presets, so the write stays pending and the engine re-reads them once
+/// the lane is up, before the waking request reaches it.
+#[tokio::test]
+async fn a_write_on_a_waking_lane_is_re_read_when_it_comes_up() {
+    let (s, state) = setup_with(Opts {
+        up: false,
+        lane: "    route_health: true\n    wake_on_request: true\n    wake_wait_secs: 10",
+        wake_template: Some("sleep 1 && touch {marker}"),
+        ..Opts::default()
+    })
+    .await;
+    state.capacity.observe_all().await; // the supervisor saw the machine off
+    let waking = spawn_chat(&s.gw, "hi");
+    let mut lane_state = Value::Null;
+    for _ in 0..100 {
+        let engines = get_json(format!("{}/v1/engines", s.gw)).await;
+        lane_state = engines["data"][0]["state"].clone();
+        if lane_state == json!("waking") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 32768}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert!(
+        !s.stub.up_marker.exists(),
+        "the lane came up before the write ({lane_state})"
+    );
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    assert_eq!(waking.await.unwrap(), 200);
+    let calls = s.stub.calls();
+    let reload = calls.iter().position(|c| c == "GET /models?reload=1");
+    let chat = calls.iter().position(|c| c == "POST /v1/chat/completions");
+    assert!(
+        reload.is_some() && reload < chat,
+        "the engine never re-read the settings written while waking: {calls:?}"
+    );
+    let engines = get_json(format!("{}/v1/engines", s.gw)).await;
+    assert_eq!(
+        engines["data"][0]["pending_apply"],
+        json!(false),
+        "{engines}"
     );
 }

@@ -47,10 +47,17 @@ pub trait ModelVariants: Send + Sync {
         role: &'a str,
     ) -> crate::BoxFuture<'a, Result<VariantLease, ExecError>>;
 
-    /// Right before an attempt reaches a lane's engine: run the lane's
-    /// pending apply when one is due, so the model loads with its current
-    /// settings. Never fails the request (a failed apply stays pending).
-    fn before_dispatch<'a>(&'a self, _provider_id: &'a str) -> crate::BoxFuture<'a, ()> {
+    /// Before an attempt takes its lane's place: when an earlier apply did
+    /// not reach the engine and `model`'s own section is still pending, run
+    /// it now (when due and no apply is running), so the model loads with
+    /// its current settings. Never waits for another apply, never runs for a
+    /// model whose section is current, and never fails the request (a failed
+    /// apply stays pending).
+    fn before_dispatch<'a>(
+        &'a self,
+        _provider_id: &'a str,
+        _model: &'a str,
+    ) -> crate::BoxFuture<'a, ()> {
         Box::pin(async {})
     }
 }
@@ -756,21 +763,66 @@ pub fn settings_engine(snap: &Snapshot, provider_id: &str) -> SettingsEngine {
 }
 
 /// How long a request waits at a closed admission gate of a model on
-/// `provider_id`'s lane: its engine's `apply_wait_secs`. `None` = the lane
-/// has no engine control, so nothing closes the gate and nothing is counted.
+/// `provider_id`'s lane: its engine's `apply_wait_secs`, and never less than
+/// an apply can hold a model (`command_timeout_secs` for the settings
+/// command plus 30 s for the engine's re-read), so a request is never failed
+/// while an apply that will finish is still running. `None` = the lane has
+/// no engine control, so nothing closes the gate and nothing is counted.
 pub fn gate_wait(snap: &Snapshot, provider_id: &str) -> Option<std::time::Duration> {
     snap.config
         .local_executors
         .iter()
         .find(|lane| lane.name == provider_id)
-        .and_then(|lane| lane.engine.as_ref())
-        .map(|engine| std::time::Duration::from_secs(engine.apply_wait_secs.max(1)))
+        .and_then(|lane| {
+            let engine = lane.engine.as_ref()?;
+            let apply_hold = lane.command_timeout_secs.max(1).saturating_add(30);
+            Some(std::time::Duration::from_secs(
+                engine.apply_wait_secs.max(apply_hold),
+            ))
+        })
 }
 
 /// A closed gate answered: 503 with a retry delay and a typed reason.
 pub(crate) fn gate_error(e: &GateTimeout) -> ExecError {
     ExecError::new(503, "model_paused", e.to_string(), None)
         .with_retry_after(std::time::Duration::from_secs(5))
+}
+
+/// A closed gate met by a request that another target can serve: skipped
+/// at once, never waited for.
+pub(crate) fn gate_closed_error(key: &str) -> ExecError {
+    ExecError::new(
+        503,
+        "model_paused",
+        format!("`{key}` is being unloaded or reloaded with new settings"),
+        None,
+    )
+    .with_retry_after(std::time::Duration::from_secs(5))
+}
+
+/// Admissions only (embeddings and audio: no request settings), for the
+/// same per-model counting and gates as chat.
+pub(crate) fn admissions_only(
+    registry: &Arc<ModelSettingsRegistry>,
+    variants: Option<Arc<dyn ModelVariants>>,
+) -> SettingsPlan {
+    SettingsPlan {
+        registry: Some(registry.clone()),
+        variants,
+        ..SettingsPlan::default()
+    }
+}
+
+/// The lane's busy guard with the engine model's admission added: both held
+/// until the answer (or the stream) ends.
+pub(crate) fn hold_with_lane(
+    lane_busy: Option<crate::LaneBusy>,
+    admission: ModelInFlight,
+) -> crate::LaneBusy {
+    match lane_busy {
+        Some(busy) => Box::new((busy, admission)),
+        None => Box::new(admission),
+    }
 }
 
 /// The request each attempt sends, per target, with that target's
@@ -841,48 +893,61 @@ impl SettingsPlan {
     }
 
     /// The admission of an attempt on `target`'s engine model: the one
-    /// taken earlier when there is one, else a new one (waiting, bounded,
-    /// at a closed gate). Taken before the attempt's lane place, so a
-    /// request never holds a place while it waits for a gate. `Ok(None)`:
-    /// the lane has no engine control.
+    /// taken earlier when there is one, else a new one. At a closed gate the
+    /// request waits (bounded) only when `may_wait` (no later target can
+    /// serve it); otherwise the target is skipped at once. Then the lane's
+    /// pending apply of this model, when one is due. All of it before the
+    /// attempt's lane place, so a request never holds a place while it waits
+    /// for a gate or an apply. `Ok(None)`: the lane has no engine control.
     pub(crate) async fn admission_for(
         &mut self,
         snap: &Snapshot,
         target: &ExecutionTarget,
+        may_wait: bool,
     ) -> Result<Option<ModelInFlight>, ExecError> {
         let key = self.model_key(target);
         let stored = self
             .admissions
             .remove(&target.id)
             .filter(|admission| admission.key() == key);
-        self.admit_on(snap, target, &key, stored).await
-    }
-
-    async fn admit_on(
-        &self,
-        snap: &Snapshot,
-        target: &ExecutionTarget,
-        key: &str,
-        stored: Option<ModelInFlight>,
-    ) -> Result<Option<ModelInFlight>, ExecError> {
         let (Some(registry), Some(wait)) =
             (self.registry.as_ref(), gate_wait(snap, &target.provider_id))
         else {
             return Ok(None);
         };
-        match stored {
-            Some(admission) => Ok(Some(admission)),
-            None => registry
-                .admit(key, wait)
+        let admission = match stored {
+            Some(admission) => admission,
+            None if may_wait => registry
+                .admit(&key, wait)
                 .await
-                .map(Some)
-                .map_err(|e| gate_error(&e)),
+                .map_err(|e| gate_error(&e))?,
+            None => registry
+                .try_admit(&key)
+                .ok_or_else(|| gate_closed_error(&key))?,
+        };
+        self.pending_apply(target).await;
+        Ok(Some(admission))
+    }
+
+    /// Let go of an admission taken earlier for `target` (the attempt
+    /// skipped it before dispatch: circuit open, over budget, lane down).
+    pub(crate) fn release(&mut self, target_id: &str) {
+        self.admissions.remove(target_id);
+    }
+
+    async fn pending_apply(&self, target: &ExecutionTarget) {
+        if let Some(variants) = &self.variants {
+            let key = self.model_key(target);
+            let model = key
+                .strip_prefix(&format!("{}/", target.provider_id))
+                .unwrap_or(&target.model);
+            variants.before_dispatch(&target.provider_id, model).await;
         }
     }
 
-    /// Right before the attempt reaches the engine: the lane's pending
-    /// apply when one is due, then the dispatch (waiting, bounded, while a
-    /// preset re-read holds the model).
+    /// Right before the attempt reaches the engine (the lane's place held):
+    /// the dispatch, waiting (bounded) while a preset re-read holds the
+    /// model.
     pub(crate) async fn dispatch(
         &self,
         snap: &Snapshot,
@@ -891,24 +956,31 @@ impl SettingsPlan {
     ) -> Result<(), ExecError> {
         let wait =
             gate_wait(snap, &target.provider_id).unwrap_or(std::time::Duration::from_secs(1));
-        if let Some(variants) = &self.variants {
-            variants.before_dispatch(&target.provider_id).await;
-        }
         admission.dispatch(wait).await.map_err(|e| gate_error(&e))
     }
 
-    /// A hedge racer's admission and dispatch (always a new admission;
-    /// the plan's own stays with the sequential path).
+    /// A hedge racer's admission and dispatch: always a new admission (the
+    /// plan's own stays with the sequential path), and never a wait: a racer
+    /// whose model's gate is closed or held is not started. A racer already
+    /// holds its lane's place, so it never runs a pending apply either.
     pub(crate) async fn admit_racer(
         &self,
         snap: &Snapshot,
         target: &ExecutionTarget,
     ) -> Result<Option<ModelInFlight>, ExecError> {
-        let key = self.model_key(target);
-        let Some(mut admission) = self.admit_on(snap, target, &key, None).await? else {
+        let (Some(registry), Some(_)) =
+            (self.registry.as_ref(), gate_wait(snap, &target.provider_id))
+        else {
             return Ok(None);
         };
-        self.dispatch(snap, target, &mut admission).await?;
+        let key = self.model_key(target);
+        let mut admission = registry
+            .try_admit(&key)
+            .ok_or_else(|| gate_closed_error(&key))?;
+        admission
+            .dispatch(std::time::Duration::ZERO)
+            .await
+            .map_err(|e| gate_error(&e))?;
         Ok(Some(admission))
     }
 
@@ -1110,6 +1182,82 @@ pub fn request_settings_map(request: &RequestSettings) -> Map<String, Json> {
 
 #[cfg(test)]
 mod tests {
+    fn engine_snapshot(extra: &str) -> Arc<crate::Snapshot> {
+        let cfg = sb_core::Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: text
+    type: openai_compatible
+    base_url: "http://127.0.0.1:1/v1"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+local_executors:
+  - name: text
+    base_url: "http://127.0.0.1:1"
+    health_endpoint: "http://127.0.0.1:1/health"
+{extra}
+    engine:
+      kind: llama_cpp_router
+      settings_command: "true"
+      apply_wait_secs: 5
+"#
+        ))
+        .unwrap();
+        let cfg = Arc::new(cfg);
+        let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+        let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+        crate::Engine::new(
+            cfg,
+            registry,
+            resolver,
+            Arc::new(sb_ledger::UsageLedger::in_memory()),
+        )
+        .snapshot()
+    }
+
+    /// A hedge racer never waits at a closed or held gate: it is not
+    /// started, at once.
+    #[tokio::test]
+    async fn a_hedge_racer_never_waits_at_a_gate() {
+        let snap = engine_snapshot("");
+        let registry = Arc::new(ModelSettingsRegistry::new());
+        let plan = admissions_only(&registry, None);
+        let target = ExecutionTarget::new("text", "m", sb_core::ExecutionTargetKind::ModelApi);
+        for kind in [GateKind::Drain, GateKind::Hold] {
+            let gate = registry.close("text/m", kind);
+            let started = std::time::Instant::now();
+            let racer = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                plan.admit_racer(&snap, &target),
+            )
+            .await
+            .expect("the racer waited at the gate");
+            assert!(racer.is_err(), "{kind:?}: started at a closed gate");
+            assert!(started.elapsed() < std::time::Duration::from_millis(500));
+            assert_eq!(registry.in_flight("text/m"), 0, "{kind:?}: still counted");
+            drop(gate);
+        }
+        let racer = plan.admit_racer(&snap, &target).await.unwrap().unwrap();
+        assert_eq!(registry.dispatched("text/m"), 1);
+        drop(racer);
+        assert_eq!(registry.in_flight("text/m"), 0);
+    }
+
+    #[test]
+    fn a_request_waits_at_a_gate_at_least_as_long_as_an_apply_holds_it() {
+        // Default command timeout 60 s: the 5 s apply wait becomes 90 s.
+        assert_eq!(
+            gate_wait(&engine_snapshot(""), "text"),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            gate_wait(&engine_snapshot("    command_timeout_secs: 2"), "text"),
+            Some(std::time::Duration::from_secs(32))
+        );
+        assert_eq!(gate_wait(&engine_snapshot(""), "other"), None);
+    }
+
     use super::*;
     use serde_json::json;
 
