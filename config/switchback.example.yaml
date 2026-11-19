@@ -616,7 +616,8 @@ routes:
 #       kind: llama_cpp_router
 #       settings_command: "ssh executor-1 python3 /opt/switchback/llamacpp-preset-overlay.py --base /etc/llama/models.base.ini --out /etc/llama/models.ini"
 #       allow_model_path: false        # true lets load settings name files
-#       apply_wait_secs: 120           # apply-now and unload wait for in-flight requests
+#       apply_wait_secs: 120           # apply-now and unload wait for in-flight requests;
+#                                      # a request waits at a closed model at least command_timeout_secs + 30
 #       load_timeout_secs: 600
 #
 # Holds. An agent working on the machine directly takes a hold so the idle

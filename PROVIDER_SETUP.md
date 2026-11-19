@@ -1047,10 +1047,15 @@ request ends. A change to other, idle models goes ahead at once.
 
 A failed `settings_command` (or a router that does not re-read) leaves the
 write in place, shows in the answer and in `GET /v1/engines`
-(`pending_apply`), and is retried when the lane comes up, before the next
-load, and before a request reaches the engine (at most every 15 s while the
-machine stays up), so a model woken for a request starts with its current
-settings.
+(`pending_apply`), and is retried when the lane comes up (a request for a
+changed model that reaches the lane first waits for it), before the next
+load, and before a request for a model whose new settings did not reach the
+engine takes its lane place. That last retry backs off: 15 s after the first
+failure, doubling with each failure in a row, at most 10 minutes; it never
+runs while another apply runs, and a request for a model whose settings the
+engine already has is never delayed by it. A write while the machine wakes
+is kept pending too: the engine may have read its presets already, so it
+re-reads them once the lane is up.
 
 **Load and unload.** `POST /v1/models/{model}/load` preloads the model: on a
 sleeping lane it is a 409 `lane_asleep` unless `"wake": true`; it takes the
@@ -1061,9 +1066,12 @@ admitting new requests to the model, waits for the ones already admitted
 (including queued and waking ones) up to `apply_wait_secs`, then unloads;
 if they do not end in time it is a 409 `model_busy` and nothing is unloaded.
 It never powers anything off; on a sleeping machine it answers that nothing
-is loaded. While an unload or an `apply: now` holds a model, a new request
-for it waits (up to `apply_wait_secs`) and then gets 503 `model_paused` with
-`Retry-After`. `GET /v1/engines` never wakes anything and never calls an
+is loaded. Chat, embeddings and audio requests all count on their model, to
+the end of the answer (a stream's last byte). While an unload or an `apply:
+now` holds a model, a request whose route has another target goes there at
+once (the decision names the reason); one with no other target waits (up to
+`apply_wait_secs`, and never less than the lane's `command_timeout_secs` plus
+30 s) and then gets 503 `model_paused` with `Retry-After`. `GET /v1/engines` never wakes anything and never calls an
 engine the lane lifecycle knows to be down or going down: such a lane shows
 its listing from when it was last seen; the other lanes are asked at once,
 each with a short timeout. A hold can name a model to load once the machine
