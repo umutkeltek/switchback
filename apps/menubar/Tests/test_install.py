@@ -48,6 +48,11 @@ class InstallationTests(unittest.TestCase):
         config = plistlib.loads(agent.read_bytes())
         self.assertEqual(config["EnvironmentVariables"]["SWITCHBACK_RUNTIME_ROOT"], str(self.runtime))
         self.assertEqual(config["EnvironmentVariables"]["SB_RUNTIME_ROOT"], str(self.runtime))
+        # A crash relaunches the app; Quit (exit 0) leaves it quit.
+        self.assertEqual(config["KeepAlive"], {"SuccessfulExit": False})
+        self.assertTrue(config["RunAtLoad"])
+        self.assertGreaterEqual(config["ThrottleInterval"], 10)
+        self.assertEqual(config["LimitLoadToSessionType"], "Aqua")
 
     def test_refuses_unowned_existing_app_without_touching_it(self):
         self.bundle(self.destination, b"foreign")

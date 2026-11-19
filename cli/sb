@@ -7228,18 +7228,19 @@ exit $?
 fi
 
 case "$cmd" in
-  menubar)
+  menubar|bar)
     menubar_action="${1:-start}"
     (( $# )) && shift
     case "$menubar_action" in
       help|--help|-h)
-        print -r -- "Usage: sb menubar [start|status|build|install [--launch-at-login] --scratch-path PATH]" ;;
+        print -r -- "Usage: sb menubar [start|open|status|build|install [--launch-at-login] --scratch-path PATH]"
+        print -r -- "  open: show the account panel, even when macOS hides the menu bar item (sb bar open)" ;;
       build|install)
         menubar_installer="${SB_CLI_PATH:h}/menubar-install.sh"
         [[ -x "$menubar_installer" ]] || { print -u2 "Build or install the menu bar from a Switchback source checkout."; exit 1; }
         if [[ "$menubar_action" == install ]]; then exec "$menubar_installer" --install "$@"; fi
         exec "$menubar_installer" "$@" ;;
-      start|status)
+      start|status|open)
         menubar_app="$SB_RUNTIME_ROOT/apps/SwitchbackBar.app"
         menubar_marker="$menubar_app/Contents/Resources/switchback-owner"
         [[ -d "$menubar_app" && ! -L "$menubar_app" && -f "$menubar_marker" && ! -L "$menubar_marker" ]] &&
@@ -7247,6 +7248,15 @@ case "$cmd" in
             print -u2 "Switchback Bar is not installed. Use sb menubar install."; exit 1;
           }
         if [[ "$menubar_action" == start ]]; then exec /usr/bin/open -g "$menubar_app"; fi
+        if [[ "$menubar_action" == open ]]; then
+          menubar_exec="$menubar_app/Contents/MacOS/SwitchbackBar"
+          if ! /usr/bin/pgrep -qxf "$menubar_exec"; then
+            /usr/bin/open -g "$menubar_app" || exit 1
+            for _ in {1..20}; do /usr/bin/pgrep -qxf "$menubar_exec" && break; sleep 0.25; done
+            sleep 1  # let the new app register for the open request
+          fi
+          exec "$menubar_exec" --open-panel
+        fi
         python3 - "$menubar_app/Contents/MacOS/SwitchbackBar" <<'PY_MENUBAR_STATUS'
 import json, subprocess, sys
 executable = sys.argv[1]
@@ -7262,11 +7272,12 @@ try:
         presentation = candidate
 except (OSError, ValueError, subprocess.SubprocessError):
     pass
-print(json.dumps({"installed": True, "running": bool(pids), "pids": pids,
-                  "presentation": presentation, "on_screen_visibility": "unverified"}))
+on_screen = presentation.get("item_on_screen") if presentation else None
+print(json.dumps({"installed": True, "running": bool(pids), "pids": pids, "presentation": presentation,
+                  "on_screen_visibility": "visible" if on_screen is True else "hidden" if on_screen is False else "unverified"}))
 PY_MENUBAR_STATUS
         ;;
-      *) print -u2 "Usage: sb menubar [start|status|build|install]"; exit 2 ;;
+      *) print -u2 "Usage: sb menubar [start|open|status|build|install]"; exit 2 ;;
     esac ;;
   limits|account)
     # Export only existing fixed provider refs for the observation helpers.

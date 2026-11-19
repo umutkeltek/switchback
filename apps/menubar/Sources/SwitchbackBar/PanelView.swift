@@ -32,6 +32,8 @@ enum PanelMotion {
     var checkedText = "Waiting for a reading"
     var iconOnly = true
     var limitNotices = false
+    /// The global open-panel shortcut id, or `ShortcutChoice.off`.
+    var shortcutID = ShortcutChoice.off
     var maximumHeight = PanelMetrics.maximumHeight
     var style = PanelStyle.ledger
     @ObservationIgnored var onResize: (Double) -> Void = { _ in }
@@ -72,6 +74,7 @@ enum PanelMotion {
     @ObservationIgnored var onProviderChange: (String) -> Void = { _ in }
     @ObservationIgnored var onIconOnly: (Bool) -> Void = { _ in }
     @ObservationIgnored var onLimitNotices: (Bool) -> Void = { _ in }
+    @ObservationIgnored var onShortcut: (String) -> Void = { _ in }
 
     var visibleProviders: [ProviderPanel] {
         presentation.filtered(provider: selectedProvider, query: query, pinnedOnly: pinnedOnly)
@@ -263,6 +266,11 @@ struct UsagePanelView: View {
                     get: { state.iconOnly }, set: { state.onIconOnly($0) }))
                 Toggle("Limit notifications (80%, 95%, reset)", isOn: Binding(
                     get: { state.limitNotices }, set: { state.onLimitNotices($0) }))
+                Picker("Open panel shortcut", selection: Binding(
+                    get: { state.shortcutID }, set: { state.onShortcut($0) })) {
+                    Text("Off").tag(ShortcutChoice.off)
+                    ForEach(ShortcutChoice.all) { choice in Text(choice.title).tag(choice.id) }
+                }
                 Divider()
                 Button("Quit Switchback", action: state.onQuit).keyboardShortcut("q", modifiers: .command)
             } label: {
@@ -342,7 +350,7 @@ private struct AccountCard: View {
                             .lineLimit(1).help(account.label).layoutPriority(1)
                         if let notice = account.notice {
                             HStack(spacing: 3) {
-                                if notice == "At limit" {
+                                if notice.hasSuffix("at limit") || notice == "At limit" {
                                     Circle().fill(Color.red).frame(width: 4, height: 4).accessibilityHidden(true)
                                 }
                                 Text(notice)

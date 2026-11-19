@@ -1471,6 +1471,7 @@ Select an absolute build directory for your machine, then run:
 sb menubar build --scratch-path "$SWITCHBACK_MENUBAR_SCRATCH"
 sb menubar install --launch-at-login --scratch-path "$SWITCHBACK_MENUBAR_SCRATCH"
 sb menubar start
+sb bar open        # open the panel even when macOS hides the menu bar item
 sb menubar status
 ```
 

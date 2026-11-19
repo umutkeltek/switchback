@@ -116,7 +116,9 @@ def install_bundle(source, runtime, login_agent=None):
                 plistlib.dump({
                     "Label": "dev.switchback.menubar",
                     "ProgramArguments": [str(destination / "Contents/MacOS/SwitchbackBar")],
-                    "RunAtLoad": True, "KeepAlive": False, "SwitchbackOwner": OWNER,
+                    # Relaunch after a crash, never after Quit (a clean exit), and not in a tight loop.
+                    "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 30,
+                    "LimitLoadToSessionType": "Aqua", "ProcessType": "Interactive", "SwitchbackOwner": OWNER,
                     "EnvironmentVariables": {"SWITCHBACK_RUNTIME_ROOT": str(runtime),
                                              "SB_RUNTIME_ROOT": str(runtime)},
                 }, stream)
