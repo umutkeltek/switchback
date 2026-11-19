@@ -181,13 +181,19 @@ fn is_token(event: &AiStreamEvent) -> bool {
     }
 }
 
+/// Shortest decode window, first token to end on the gateway's clock, that
+/// gives a decode speed. Token events counts are not network chunks: a
+/// body that came in one piece with reasoning and text yields two or more
+/// token events microseconds apart, which would read as a huge speed.
+const MIN_GATEWAY_DECODE_MS: u64 = 50;
+
 /// How fast one attempt was served, for its usage record: time from the
 /// attempt's dispatch to its first token and from the first token to
 /// `ended`, on the gateway's clock, plus any engine timings in `usage`
 /// (which win). The gateway's decode window counts only for a response
-/// that streamed in (two or more token events): one that came in one piece
-/// has no decode window to measure, so its decode speed is left out rather
-/// than made up.
+/// that streamed in (two or more token events over at least
+/// [`MIN_GATEWAY_DECODE_MS`]): one that came in one piece has no decode
+/// window to measure, so its decode speed is left out rather than made up.
 pub(crate) fn attempt_speed(
     usage: &Usage,
     first: &FirstToken,
@@ -198,7 +204,8 @@ pub(crate) fn attempt_speed(
     let ttft = first_at.map(|at| at.saturating_duration_since(attempt_started).as_millis() as u64);
     let decode = first_at
         .filter(|_| first.events() >= 2)
-        .map(|at| ended.saturating_duration_since(at).as_millis() as u64);
+        .map(|at| ended.saturating_duration_since(at).as_millis() as u64)
+        .filter(|ms| *ms >= MIN_GATEWAY_DECODE_MS);
     sb_ledger::RequestSpeed::measure(usage, ttft, decode)
 }
 
@@ -213,6 +220,7 @@ pub(crate) fn ttft_ms(first: &FirstToken, request_started: Instant) -> Option<u6
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use sb_adapter::AdapterError;
 
@@ -345,5 +353,37 @@ mod tests {
             Some(StreamFinish::UpstreamError(ErrorClass::ServerError)),
             "in-band error must finalize as UpstreamError with its class, not Cancelled"
         );
+    }
+
+    // A body that came in one piece with reasoning and text gives two token
+    // events microseconds apart: no gateway decode speed from that, while
+    // a real decode window still gives one.
+    #[tokio::test]
+    async fn a_one_piece_body_with_two_token_events_has_no_decode_speed() {
+        let (tx, stream) = channel_stream();
+        let started = Instant::now();
+        let (mut watched, first) = watch_first_token(stream);
+        tx.unbounded_send(Ok(AiStreamEvent::ReasoningDelta {
+            text: "think".into(),
+        }))
+        .unwrap();
+        tx.unbounded_send(Ok(AiStreamEvent::TextDelta {
+            text: "answer".into(),
+        }))
+        .unwrap();
+        drop(tx);
+        while watched.next().await.is_some() {}
+        assert_eq!(first.events(), 2);
+        let at = *first.get().unwrap();
+        let usage = Usage {
+            output_tokens: 500,
+            ..Usage::default()
+        };
+
+        let speed = attempt_speed(&usage, &first, started, at + Duration::from_millis(2));
+        assert_eq!((speed.decode_tps, speed.decode_tps_source), (None, None));
+
+        let speed = attempt_speed(&usage, &first, started, at + Duration::from_millis(100));
+        assert_eq!(speed.decode_tps, Some(5_000.0));
     }
 }
