@@ -255,6 +255,59 @@ pub struct LocalExecutorConfig {
     /// full lane is always skipped, never waited for. Media jobs always queue.
     #[serde(default)]
     pub on_full: LaneOnFull,
+    /// The engine control of a local text engine on this lane: how
+    /// Switchback loads and unloads its models and applies their load-time
+    /// settings (see [`LaneEngineConfig`]). Absent = no engine control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<LaneEngineConfig>,
+}
+
+/// Which engine control a lane's engine speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineControlKind {
+    /// llama.cpp `llama-server` in router mode: `GET /models`,
+    /// `POST /models/load`, `POST /models/unload`, `GET /models?reload=1`,
+    /// per-model arguments from a presets INI (`--models-preset`).
+    LlamaCppRouter,
+}
+
+/// A lane's engine control (`local_executors[].engine`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaneEngineConfig {
+    pub kind: EngineControlKind,
+    /// The engine's own root URL (llama.cpp: where `/models` answers).
+    /// Default: the lane provider's `base_url` without a trailing `/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Shell command that writes the engine's per-model settings. It gets
+    /// the managed overlay (every managed load-time setting of this lane's
+    /// models and their variants) as JSON on stdin; Switchback then asks
+    /// the engine to re-read its presets. The gateway never writes files on
+    /// a machine itself. Absent = load settings are refused for this lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_command: Option<String>,
+    /// Let load settings and engine arguments name file paths (draft
+    /// model, projector, ...). Default `false`.
+    #[serde(default)]
+    pub allow_model_path: bool,
+    /// How long `apply: now` and unload wait for a model's in-flight
+    /// requests to end before answering 409. Default 120.
+    #[serde(default = "default_engine_apply_wait_secs")]
+    pub apply_wait_secs: u64,
+    /// How long a load may take before it is reported as not done.
+    /// Default 600.
+    #[serde(default = "default_engine_load_timeout_secs")]
+    pub load_timeout_secs: u64,
+}
+
+fn default_engine_apply_wait_secs() -> u64 {
+    120
+}
+
+fn default_engine_load_timeout_secs() -> u64 {
+    600
 }
 
 /// What a request does when its first choice's lane is full; see

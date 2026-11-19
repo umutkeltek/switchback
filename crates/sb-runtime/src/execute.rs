@@ -699,6 +699,15 @@ impl Engine {
                     }
                 },
             };
+            // The model's own in-flight count, held as long as the lane's
+            // busy guard (to the stream's end): unload and `apply: now`
+            // wait for it.
+            if let Some(model_busy) = settings_plan.enter(target) {
+                lane_busy = Some(match lane_busy.take() {
+                    Some(busy) => Box::new((busy, model_busy)) as crate::LaneBusy,
+                    None => Box::new(model_busy),
+                });
+            }
             let mut tried_accounts: HashSet<String> = HashSet::new();
             let allowed_accounts = req
                 .tenant

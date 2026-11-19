@@ -47,7 +47,7 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai status [--json]          lanes and machine power; never wakes anything
   sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video,
                                  segment, audio); --all also shows internal provider ids
-  sb ai hold DURATION [REASON] [--wake] [--host NAME]
+  sb ai hold DURATION [REASON] [--wake] [--host NAME] [--load MODEL]
                                  keep the machine on for direct work (30m, 2h, 1h30m)
   sb ai release [ID | --all] [--host NAME]
                                  let the machine go again
@@ -72,8 +72,13 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai unset MODEL key ... [--profile NAME]
                                  remove settings (and their locks)
   sb ai revert MODEL REVISION    put back the settings of an earlier revision
+  sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake]
+                                 change load settings (ctx_size=65536 cache_type_k=q8_0)
   sb ai chat MODEL "prompt" [--profile NAME] [--set key=value ...] [--json]
                                  one quick request to try settings: answer, tokens, speed, route
+  sb ai load MODEL [--wake]      load a model now (preload); never wakes without --wake
+  sb ai unload MODEL             unload a model; refused while it serves a request
+  sb ai engines [--json]         what each engine has loaded, with memory and pending settings
 
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
@@ -169,6 +174,22 @@ made meanwhile by someone else stops set with exit 1; run it again.
 chat streams one answer to stdout and prints the tokens, the first token time,
 the speed and the route on stderr; --set key=value sends a setting for this
 request only.
+
+Load settings change how the engine loads the model: ctx_size, n_gpu_layers,
+cache_type_k, cache_type_v, flash_attn, batch_size, ubatch_size, parallel,
+threads, threads_batch, mlock, mmap, load_mode, rope_scaling, rope_freq_base,
+rope_freq_scale, yarn_*, spec_type, spec_draft_model, draft_max, draft_min,
+mmproj, sleep_idle_seconds, fit, fit_ctx, reasoning_budget, temp, top_k,
+top_p, min_p, and engine_args.NAME for any other engine argument (operator
+keys). set --load writes them; the gateway hands them to the lane's
+settings_command and the engine re-reads its presets. --apply next-load (the
+default) leaves a loaded model on its old settings until it loads again;
+--apply now reloads it once nothing is in flight on it (exit 1 when it stays
+busy). Neither wakes a sleeping machine unless --wake. load preloads a model
+(exit 3 when the machine sleeps and --wake is not given); unload never powers
+anything off. engines never wakes anything: a sleeping lane shows what it had
+loaded when it was last seen. hold --load MODEL loads the model once the
+machine is up.
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
@@ -1308,9 +1329,11 @@ def holds_error(error, doing):
     return gateway_fail(error, doing)
 
 
-def create_hold(gw, host, ttl_secs, reason, wake=False):
+def create_hold(gw, host, ttl_secs, reason, wake=False, load=None):
     """Ask the gateway to hold a machine on; returns the hold it answers with."""
     body = {"ttl_secs": ttl_secs, "reason": reason, "wake": bool(wake)}
+    if load:
+        body["load"] = load
     try:
         return gw.post(holds_path(host), body)  # 201 with the hold itself
     except GatewayError as error:
@@ -1328,12 +1351,15 @@ def release_hold(gw, host, hold_id):
 def cmd_hold(gw, args):
     ttl = parse_duration(args.duration)
     host = host_for(gw, args)
-    hold = create_hold(gw, host, ttl, args.reason or "sb ai hold", bool(args.wake))
+    hold = create_hold(gw, host, ttl, args.reason or "sb ai hold", bool(args.wake),
+                       getattr(args, "load", None))
     if args.json:
         print(json.dumps(hold, indent=2))
         return OK
     woke = "; the gateway wakes it" if hold.get("state") == "waking" else ""
     print(f"holding {host} on for {duration_words(ttl)}: hold {hold.get('id', '?')}{woke}")
+    if isinstance(hold.get("load"), dict):
+        print(f"loading {hold['load'].get('target')}: {hold['load'].get('status')}")
     print(f"let it go: sb ai release {hold.get('id', '')}".rstrip())
     return OK
 
@@ -1866,6 +1892,8 @@ def write_settings(gw, model, change, extra=None):
         return gw.call("PUT", model_path(target["target"], "settings"), body=body,
                        headers={"If-Match": str(target.get("revision", 0))}, timeout=120)
     except GatewayError as error:
+        if error.status == 409 and error.reason == "model_busy":
+            raise Fail(GATEWAY_ERROR, error.message) from None
         if error.status == 409:
             raise Fail(GATEWAY_ERROR, f"the settings changed meanwhile ({error.message}); "
                                       "run the command again") from None
@@ -1957,6 +1985,77 @@ def cmd_revert(gw, args):
         raise gateway_fail(error, "reverting the settings") from None
     print(f"{answer.get('target')}: revision {answer.get('revision')} "
           f"(the settings of revision {args.revision})")
+    return OK
+
+
+def cmd_load(gw, args):
+    try:
+        answer = gw.call("POST", model_path(args.model, "load"), body={"wake": bool(args.wake)},
+                         timeout=args.timeout)
+    except GatewayError as error:
+        if error.status == 409:
+            raise Fail(MACHINE_OFF, f"{error.message}") from None
+        raise gateway_fail(error, f"loading {args.model}") from None
+    if args.json:
+        print(json.dumps(answer, indent=2))
+        return OK
+    line = f"{answer.get('target')}: {answer.get('status')}"
+    memory = answer.get("memory") or {}
+    for name in ("effective", "min"):
+        part = memory.get(name) if isinstance(memory, dict) else None
+        if isinstance(part, dict) and part.get("bytes"):
+            line += f" ({part['bytes'] / 2**30:.1f} GiB on GPU at ctx {part.get('n_ctx', '?')})"
+            break
+    print(line)
+    return OK
+
+
+def cmd_unload(gw, args):
+    try:
+        answer = gw.post(model_path(args.model, "unload"), {})
+    except GatewayError as error:
+        raise gateway_fail(error, f"unloading {args.model}") from None
+    print(f"{answer.get('target')}: {answer.get('message') or answer.get('status')}")
+    return OK
+
+
+def cmd_engines(gw, args):
+    try:
+        answer = gw.get("/v1/engines")
+    except GatewayError as error:
+        raise gateway_fail(error, "reading the engines") from None
+    if args.json:
+        print(json.dumps(answer, indent=2))
+        return OK
+    lanes = answer.get("data") or []
+    if not lanes:
+        print("no lane has an engine control")
+        return OK
+    for lane in lanes:
+        seen = lane.get("seen_at_ms")
+        when = (" (last seen " + time.strftime("%H:%M", time.localtime(seen / 1000)) + ")"
+                if seen and lane.get("state") != "up" else "")
+        print(f"{lane.get('lane')} ({lane.get('kind')}): {lane.get('state')}{when}")
+        for row in lane.get("models") or []:
+            notes = []
+            memory = row.get("memory") or {}
+            part = memory.get("effective") or memory.get("min") if isinstance(memory, dict) else None
+            if isinstance(part, dict) and part.get("bytes"):
+                notes.append(f"{part['bytes'] / 2**30:.1f} GiB at ctx {part.get('n_ctx', '?')}")
+            if row.get("pending"):
+                notes.append("settings pending until reload")
+            if row.get("in_flight"):
+                notes.append(f"{row['in_flight']} in flight")
+            if row.get("failed"):
+                notes.append("last load failed")
+            extra = f"  ({'; '.join(notes)})" if notes else ""
+            print(f"  {row.get('id')}  {row.get('status')}{extra}")
+        for variant in lane.get("variants") or []:
+            print(f"  variant {variant.get('name')} of {variant.get('target')}: "
+                  f"{json.dumps(variant.get('load'))}")
+        apply = lane.get("last_apply")
+        if isinstance(apply, dict) and not apply.get("ok", True):
+            print(f"  last apply failed: {apply.get('error')}")
     return OK
 
 
@@ -2061,6 +2160,7 @@ def parser():
     hold.add_argument("reason", nargs="?", default="")
     hold.add_argument("--wake", action="store_true")
     hold.add_argument("--host")
+    hold.add_argument("--load")
     hold.add_argument("--json", action="store_true")
     release = sub.add_parser("release", add_help=False, allow_abbrev=False)
     release.add_argument("id", nargs="?")
@@ -2118,6 +2218,14 @@ def parser():
     revert = sub.add_parser("revert", add_help=False, allow_abbrev=False)
     revert.add_argument("model")
     revert.add_argument("revision", type=int)
+    load = sub.add_parser("load", add_help=False, allow_abbrev=False)
+    load.add_argument("model")
+    load.add_argument("--wake", action="store_true")
+    load.add_argument("--json", action="store_true")
+    load.add_argument("--timeout", type=float, default=900)
+    unload_cmd = sub.add_parser("unload", add_help=False, allow_abbrev=False)
+    unload_cmd.add_argument("model")
+    sub.add_parser("engines", add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
     chat = sub.add_parser("chat", add_help=False, allow_abbrev=False)
     chat.add_argument("model")
     chat.add_argument("prompt")
@@ -2176,6 +2284,12 @@ def main(argv=None, environ=None):
             return cmd_revert(gw, args)
         if args.command == "chat":
             return cmd_chat(gw, args)
+        if args.command == "load":
+            return cmd_load(gw, args)
+        if args.command == "unload":
+            return cmd_unload(gw, args)
+        if args.command == "engines":
+            return cmd_engines(gw, args)
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
         message = gw.scrub(failure.message) if gw else failure.message

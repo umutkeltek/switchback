@@ -172,7 +172,17 @@ class Fake:
                  "history": self.settings_history}),
             ("POST", "/v1/models/text/m/settings/revert"): lambda r: self.json(
                 {"target": "text/m", "revision": self.settings_revision + 1}),
+            ("POST", "/v1/models/text/m/load"): self.load_route,
+            ("POST", "/v1/models/text/m/unload"): lambda r: self.json(
+                {"target": "text/m", "model": "m", "status": "unloaded"}),
+            ("GET", "/v1/engines"): lambda r: self.json({"object": "list", "data": [
+                {"lane": "text", "kind": "llama_cpp_router", "state": "asleep",
+                 "seen_at_ms": 0, "models": [
+                     {"id": "m", "status": "loaded", "pending": True, "in_flight": 0,
+                      "memory": {"min": {"n_ctx": 4096, "bytes": 2 * 2**30}}}],
+                 "variants": [], "last_apply": {"ok": False, "error": "exit 2: pinned"}}]}),
         }
+        self.machine_asleep = False  # load without --wake answers 409
         handler = self.handler()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -185,6 +195,13 @@ class Fake:
     @staticmethod
     def json(value, status=200):
         return status, json.dumps(value).encode(), "application/json"
+
+    def load_route(self, request):
+        if self.machine_asleep and not (request["json"] or {}).get("wake"):
+            return self.json({"error": {"message": "lane `text` is asleep; send \"wake\": true",
+                                        "type": "lane_asleep"}}, 409)
+        return self.json({"target": "text/m", "model": "m", "status": "loaded",
+                          "memory": {"min": {"n_ctx": 4096, "bytes": 3 * 2**30}}})
 
     def settings_view(self):
         effective = {"temperature": {"value": None, "source": "engine", "locked": False}}
@@ -1579,6 +1596,31 @@ class SbAi(unittest.TestCase):
         result = json.loads(run.stdout)
         self.assertEqual(result["completion_tokens"], 256)
         self.assertNotIn("switchback", self.requests("POST", "/v1/chat/completions")[-1]["json"])
+
+    def test_load_unload_and_engines(self):
+        self.fake.machine_asleep = True
+        run = self.sb("load", "text/m")
+        self.assertEqual(run.returncode, 3)
+        self.assertIn("asleep", run.stderr)
+        run = self.sb("load", "text/m", "--wake")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("text/m: loaded (3.0 GiB on GPU at ctx 4096)", run.stdout)
+        self.assertEqual(self.requests("POST", "/v1/models/text/m/load")[-1]["json"], {"wake": True})
+        run = self.sb("unload", "text/m")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("text/m: unloaded", run.stdout)
+        run = self.sb("engines")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("text (llama_cpp_router): asleep", run.stdout)
+        self.assertIn("m  loaded  (2.0 GiB at ctx 4096; settings pending until reload)", run.stdout)
+        self.assertIn("last apply failed: exit 2: pinned", run.stdout)
+
+    def test_hold_can_name_a_model_to_load(self):
+        self.fake.holds = []
+        run = self.sb("hold", "2h", "eval", "--wake", "--load", "text/m", "--host", "box")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        posted = [r for r in self.requests("POST") if r["path"].endswith("/holds")]
+        self.assertEqual(posted[-1]["json"]["load"], "text/m")
 
     def posted_with(self, method, path):
         found = self.requests(method, path)

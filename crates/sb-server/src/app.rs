@@ -13,6 +13,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/requests/{id}", get(handlers::meta::request_detail_shell))
         .route("/health", get(handlers::meta::health))
         .route("/v1/models", get(handlers::meta::models))
+        .route("/v1/engines", get(crate::engine_control::engines_endpoint))
         .route(
             "/v1/models/{*tail}",
             get(handlers::model_settings::get)

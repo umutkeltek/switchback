@@ -249,6 +249,7 @@ fn write_error(e: SettingsWriteError) -> Response {
     let mut body = json!({"error": {"message": e.to_string(), "type": kind}});
     if let SettingsWriteError::Conflict { current, .. } = e {
         body["error"]["current_revision"] = json!(current);
+        body["error"]["reason"] = json!("revision_conflict");
     }
     (status, Json(body)).into_response()
 }
@@ -589,10 +590,19 @@ async fn write(
     )
     .await;
     let mut view = target_view(state, &named, Some(&entry), None, true);
+    let mut status = StatusCode::OK;
     if let Some(apply) = apply {
-        view["apply"] = apply;
+        if apply.conflict {
+            status = StatusCode::CONFLICT;
+            view["error"] = json!({
+                "type": "model_busy",
+                "reason": "model_busy",
+                "message": apply.value["message"],
+            });
+        }
+        view["apply"] = apply.value;
     }
-    let mut response = Json(view).into_response();
+    let mut response = (status, Json(view)).into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(&entry.revision.to_string()) {
         response
             .headers_mut()

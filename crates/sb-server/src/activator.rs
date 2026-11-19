@@ -4546,6 +4546,7 @@ mod tests {
             max_in_flight: None,
             queue_timeout_secs: 60,
             on_full: sb_core::LaneOnFull::Spill,
+            engine: None,
             poweroff_min_uptime_secs: 0,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
@@ -4696,6 +4697,7 @@ mod tests {
             max_in_flight: None,
             queue_timeout_secs: 60,
             on_full: sb_core::LaneOnFull::Spill,
+            engine: None,
             poweroff_min_uptime_secs: 0,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
@@ -5209,6 +5211,7 @@ local_executors:
             max_in_flight: None,
             queue_timeout_secs: 60,
             on_full: sb_core::LaneOnFull::Spill,
+            engine: None,
             poweroff_min_uptime_secs: 0,
         };
         LocalExecutor::new(

@@ -24,6 +24,10 @@ pub(crate) struct HoldRequest {
     reason: String,
     #[serde(default)]
     wake: bool,
+    /// A model to load once the machine is up (`provider/model` or a
+    /// public name with one target). Operator and admin keys only.
+    #[serde(default)]
+    load: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +124,18 @@ pub(crate) async fn create(
             "reason is at most 200 characters".to_string(),
         );
     }
+    // A preload is engine control: operator business, checked before the
+    // hold is taken.
+    let preload = match &body.load {
+        None => None,
+        Some(_) if !principal.is_operator_or_admin() => return tenancy::forbidden(),
+        Some(name) => {
+            match crate::handlers::model_settings::resolve_one(&state, &principal, name) {
+                Ok(named) => Some(named.target),
+                Err(response) => return response,
+            }
+        }
+    };
     match state.capacity.take_hold(
         &host,
         &body.reason,
@@ -127,7 +143,17 @@ pub(crate) async fn create(
         (principal.tenant.clone(), principal.project.clone()),
         body.wake,
     ) {
-        Ok(Some(hold)) => (StatusCode::CREATED, Json(hold_json(&hold))).into_response(),
+        Ok(Some(hold)) => {
+            let mut answer = hold_json(&hold);
+            if let Some(target) = preload {
+                crate::engine_control::preload_after_hold(&state, target.clone(), body.wake);
+                answer["load"] = json!({
+                    "target": target,
+                    "status": if body.wake { "loading after the wake" } else { "loading if the machine is up" },
+                });
+            }
+            (StatusCode::CREATED, Json(answer)).into_response()
+        }
         Ok(None) => no_host(&host),
         Err(HoldError::TooMany) => error(
             StatusCode::TOO_MANY_REQUESTS,

@@ -35,6 +35,9 @@ pub struct AppState {
     /// On-demand local executor capacity (wake/drain/idle-poweroff/self-heal).
     /// Built once from config; live lane state survives across requests.
     pub capacity: Arc<CapacityActivator>,
+    /// Engine controls of local text engines (load, unload, load-time
+    /// settings). Shared state per lane: last apply, variants, listings.
+    pub(crate) engines: Arc<crate::engine_control::EngineControls>,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             ),
             capacity,
             engine,
+            engines: Arc::new(crate::engine_control::EngineControls::default()),
         }
     }
 

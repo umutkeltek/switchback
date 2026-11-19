@@ -729,9 +729,11 @@ pub fn take_request_settings(
                     Json::Null => {}
                     _ => return err("`switchback.load` must be an object"),
                 },
-                other => return err(format!(
+                other => {
+                    return err(format!(
                     "unknown key `switchback.{other}`; `switchback` takes profile, settings, load"
-                )),
+                ))
+                }
             }
         }
     }

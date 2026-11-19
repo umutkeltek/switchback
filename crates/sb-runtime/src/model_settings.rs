@@ -78,11 +78,68 @@ pub struct ModelSettingsRegistry {
     /// Serializes writes so read-revision → check → write is atomic in
     /// this process (the store's transaction covers other processes).
     write_lock: Mutex<()>,
+    /// Requests in flight per engine model (`provider/model`, a variant's
+    /// own name included) and when each model was last used.
+    in_flight: Mutex<HashMap<String, ModelUse>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ModelUse {
+    count: usize,
+    last_used_ms: i64,
+}
+
+/// One request in flight on an engine model; dropping it ends it.
+pub struct ModelInFlight {
+    registry: Arc<ModelSettingsRegistry>,
+    key: String,
+}
+
+impl Drop for ModelInFlight {
+    fn drop(&mut self) {
+        let mut map = self
+            .registry
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(&self.key) {
+            entry.count = entry.count.saturating_sub(1);
+            entry.last_used_ms = sb_store::now_millis();
+        }
+    }
 }
 
 impl ModelSettingsRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Count one request in flight on an engine model (`provider/model`).
+    pub fn enter(self: &Arc<Self>, key: &str) -> ModelInFlight {
+        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(key.to_string()).or_default();
+        entry.count += 1;
+        entry.last_used_ms = sb_store::now_millis();
+        ModelInFlight {
+            registry: self.clone(),
+            key: key.to_string(),
+        }
+    }
+
+    /// Requests in flight on an engine model now.
+    pub fn in_flight(&self, key: &str) -> usize {
+        self.in_flight
+            .lock()
+            .map(|map| map.get(key).map(|entry| entry.count).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// When a request last started or ended on an engine model (ms).
+    pub fn last_used_ms(&self, key: &str) -> Option<i64> {
+        self.in_flight
+            .lock()
+            .ok()
+            .and_then(|map| map.get(key).map(|entry| entry.last_used_ms))
     }
 
     /// Attach the state store and load every stored document. A stored
@@ -363,6 +420,7 @@ pub fn settings_engine(snap: &Snapshot, provider_id: &str) -> SettingsEngine {
 #[derive(Default)]
 pub(crate) struct SettingsPlan {
     per_target: HashMap<String, PlannedTarget>,
+    registry: Option<Arc<ModelSettingsRegistry>>,
 }
 
 struct PlannedTarget {
@@ -396,6 +454,18 @@ impl SettingsPlan {
         self.per_target.is_empty()
     }
 
+    /// Count an attempt on `target` (its variant name when it has one) as
+    /// in flight on that engine model until the guard drops.
+    pub(crate) fn enter(&self, target: &ExecutionTarget) -> Option<ModelInFlight> {
+        let registry = self.registry.as_ref()?;
+        let model = self
+            .per_target
+            .get(&target.id)
+            .and_then(|planned| planned.model.as_deref())
+            .unwrap_or(&target.model);
+        Some(registry.enter(&format!("{}/{model}", target.provider_id)))
+    }
+
     /// The settings summary for a target, if any.
     pub(crate) fn summary_for(&self, target_id: &str) -> Option<&str> {
         self.per_target
@@ -408,14 +478,17 @@ impl SettingsPlan {
 /// Build the settings plan for a request's candidates. `Err` is a 400 for
 /// a profile no candidate defines.
 pub(crate) fn plan_settings(
-    registry: &ModelSettingsRegistry,
+    registry: &Arc<ModelSettingsRegistry>,
     snap: &Snapshot,
     route_name: &str,
     req: &AiRequest,
     request: Option<&RequestSettings>,
     candidates: &[ExecutionTarget],
 ) -> Result<SettingsPlan, ExecError> {
-    let mut plan = SettingsPlan::default();
+    let mut plan = SettingsPlan {
+        registry: Some(registry.clone()),
+        ..SettingsPlan::default()
+    };
     if request.is_none() && registry.is_empty() {
         return Ok(plan);
     }
