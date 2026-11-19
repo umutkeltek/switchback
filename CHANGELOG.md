@@ -9,6 +9,38 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Added
 
+- **Model settings** (`/v1/models/{model}/settings`, `sb ai settings|set|unset|revert|chat`):
+  every setting of a local model through one API. Per target model
+  (`provider/model`): request-time `defaults` (temperature, top_p, top_k,
+  min_p, typical_p, repeat penalties, presence/frequency penalties, seed,
+  max_tokens, stop, system prompt, response format, normalized `reasoning`,
+  and `extra` engine keys), named `profiles`, and `locked` keys.
+  Precedence: the request's own value (unless locked) > request profile
+  (`x-switchback-profile` or `"switchback": {"profile"}`) > route
+  `settings_profile` > defaults > the engine's default; a key nobody set is
+  never sent. `"switchback": {"settings": {...}}` sets keys for one request
+  and never reaches an upstream. Revisioned and durable in the state store
+  with history (who, when, which keys) and revert; a stale revision is a 409.
+  `x-switchback-settings` says which profile served and what a lock
+  overrode. Client keys read only their tenant's targets, never load
+  settings or engine arguments.
+- **Engine control** for llama.cpp in router mode (`local_executors[].engine:
+  {kind: llama_cpp_router, settings_command}`): typed load-time settings
+  (ctx_size, n_gpu_layers, KV cache types, flash_attn, batch sizes, parallel,
+  threads, mlock/mmap, RoPE/YaRN, speculative decoding, mmproj, sleep, fit,
+  reasoning budget, sampling defaults) and checked raw `engine_args`, applied
+  through the operator's `settings_command` (reference:
+  `contrib/llamacpp-preset-overlay.py`) and a preset reload, on the next load
+  or now (once nothing is in flight). `POST /v1/models/{model}/load|unload`,
+  `GET /v1/engines`, `sb ai load|unload|engines`, `sb ai set --load`, and a
+  hold that names a model to load after its wake. Nothing wakes a machine
+  unless asked (`wake: true`); unload never interrupts a request.
+- **Load settings per request** (`"switchback": {"load": {"ctx_size": 65536}}`,
+  `sb ai chat --load`): within the target's `request_load` policy (allowed
+  keys for client keys, bounds, `max_variants`, `variant_idle_ttl_secs`), the
+  gateway serves the request from a variant `<model>~<hash8>`, after a fit
+  check against the router's memory measurement (or the policy's estimate);
+  409 `would_not_fit` with the numbers otherwise.
 - **Wake-aware routing** (`prefer_awake` on a route or `server.prefer_awake`:
   `enabled`, `wake_for_prompt_tokens`, `wake_for_output_tokens`; off by
   default): a small request goes to a target whose machine is up, and a

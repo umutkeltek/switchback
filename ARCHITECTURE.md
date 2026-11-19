@@ -355,6 +355,44 @@ plugins, with a **draft → validate → publish** lifecycle (atomic hot-swap,
 `GET /cp/v1/watch` (SSE revision stream). The API is authoritative; YAML stays
 bootstrap.
 
+### Model settings and engine control
+Per-model settings are state, not config: a `ModelSettingsRegistry` on the
+`sb-runtime` Engine (beside the ledger and the scorecard, so a publish keeps
+it) holds one revisioned document per target model (`provider/model`):
+request-time `defaults`, `profiles` and `locked` keys, load-time `load` and
+`engine_args`, and the `request_load` policy. With a state store the
+documents and their change history are durable (`model_settings`,
+`model_settings_history`; a compare-and-set write in one transaction, so two
+gateways sharing a store cannot both win). The types, validation and the
+layering live in `sb-core` (`model_settings`, `load_settings`), engine-neutral.
+
+On the request path the runtime takes the `switchback` body object and the
+`x-switchback-profile` header out of the request first, so neither reaches
+an upstream. After routing it builds a settings plan: for each candidate
+target, the request that target's attempt sends, with defaults < route
+profile < request profile < the request's own values layered and locked
+keys forced. Targets with no settings are absent from the plan and their
+attempts send the request unchanged. Typed keys map onto the canonical
+request (typed fields or the OpenAI-shaped passthrough); the adapter's
+`EngineChatCodec` translates the few an engine spells differently
+(reasoning, `repeat_penalty` on vLLM). The plan also counts each attempt in
+flight per engine model, held as long as the lane's busy guard, which is
+what unload and apply-now wait for. The decision carries a `settings` line
+(key names only) that rides `x-switchback-route` and `x-switchback-settings`.
+
+The engine side lives in `sb-server::engine_control`: a lane with
+`engine: {kind: llama_cpp_router, settings_command}` gets load, unload,
+apply and a status view. Engine kinds plug in behind `EngineKindOps` (load
+keys to engine arguments, raw argument checks) and the kind's HTTP calls;
+llama.cpp's router is the first. The gateway never writes files on a
+machine: it pipes the lane's managed overlay to `settings_command` and asks
+an awake engine to re-read its presets. Reads never wake a machine; load and
+apply-now go through the activator (`ensure_ready` only when asked to wake,
+`acquire_for_request` for the lane's place and GPU group). Per-request load
+settings reach it through the runtime's `ModelVariants` seam: the runtime
+checks the policy, the engine control fit-checks, adds a `<model>~<hash8>`
+variant to the overlay and applies it, and the attempt names the variant.
+
 ### Durable state (opt-in)
 Point `server.state_store` at a SQLite file and every published config revision +
 a change **audit log** + every request's **usage** are persisted as metadata (no

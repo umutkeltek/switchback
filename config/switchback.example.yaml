@@ -596,10 +596,35 @@ routes:
 # PROVIDER_SETUP.md shows a script that answers busy while someone is logged
 # in or the GPU runs a process other than the managed engines.
 #
+# Model settings (PROVIDER_SETUP.md, "Model settings"). Request-time settings
+# (temperature, top_k, min_p, reasoning, profiles, locks) live in the state
+# store and are changed with PUT/PATCH /v1/models/{model}/settings or
+# `sb ai set`; a route can apply one profile to its requests:
+# routes:
+#   - name: careful
+#     match: { model: careful }
+#     targets: ["llamacpp/qwen3-35b"]
+#     settings_profile: precise
+# Load-time settings (ctx_size, n_gpu_layers, KV cache types, ...) and
+# load/unload need the lane's engine control. For a llama.cpp router the
+# gateway hands the managed overlay as JSON on stdin to `settings_command`
+# (here the reference script, run on the host) and then asks the router to
+# re-read its presets:
+#   - name: llamacpp
+#     ...
+#     engine:
+#       kind: llama_cpp_router
+#       settings_command: "ssh executor-1 python3 /opt/switchback/llamacpp-preset-overlay.py --base /etc/llama/models.base.ini --out /etc/llama/models.ini"
+#       allow_model_path: false        # true lets load settings name files
+#       apply_wait_secs: 120           # apply-now and unload wait for in-flight requests
+#       load_timeout_secs: 600
+#
 # Holds. An agent working on the machine directly takes a hold so the idle
 # power-off waits: POST /v1/hosts/gpu-box/holds {"ttl_secs": 7200, "reason":
 # "benchmark", "wake": true}; PATCH .../holds/{id} {"ttl_secs": N} extends it,
-# DELETE ends it. A hold keeps the machine on only (no GPU group).
+# DELETE ends it. A hold keeps the machine on only (no GPU group). An
+# operator's hold may add "load": "llamacpp/qwen3-35b" to load that model
+# once the machine is up.
 #
 # ComfyUI behind a token proxy: give the `comfyui` provider the credential
 # as for `openai_compatible` (`api_key_env`, and `auth_scheme` when the proxy
