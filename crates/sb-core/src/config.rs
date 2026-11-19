@@ -204,6 +204,16 @@ pub struct LocalExecutorConfig {
     /// (the default): the power-off runs as before, with no guard.
     #[serde(default)]
     pub poweroff_guard_command: Option<String>,
+    /// The shortest time a machine may have been up before a power-off
+    /// runs: the idle power-off waits for it anyway, but an operator's
+    /// `POST /v1/hosts/{host}/power` with `{"action": "off"}` refuses while
+    /// the machine is younger, so a machine that just booted (a wake a
+    /// second ago, a boot that is still settling) is never cut off under
+    /// its feet. Measured from the moment the gateway last woke the
+    /// machine, or from the moment it first saw it up. `0` (the default):
+    /// no minimum.
+    #[serde(default)]
+    pub poweroff_min_uptime_secs: u64,
     /// Take a machine that was woken outside Switchback (another tool, a
     /// person) as one Switchback woke: when this lane answers its health
     /// probe while Switchback did not wake its machine, the lane reads

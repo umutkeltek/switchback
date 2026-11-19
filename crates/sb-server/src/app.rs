@@ -49,6 +49,7 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/hosts/{host}/holds/{id}",
             patch(handlers::hosts::extend).delete(handlers::hosts::delete),
         )
+        .route("/v1/hosts/{host}/power", post(handlers::hosts::power))
         .route(
             "/v1/chat/completions",
             post(handlers::openai::chat_completions),

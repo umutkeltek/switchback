@@ -11,6 +11,7 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::activator::{PowerOffError, PowerOnError};
 use crate::handlers::workloads::may_read;
 use crate::holds::{Hold, HoldError, MAX_ACTIVE_HOLDS_PER_TENANT};
 use crate::{tenancy, AppState};
@@ -205,6 +206,108 @@ pub(crate) async fn delete(
             Json(json!({"id": hold.id, "host": hold.host, "deleted": true})).into_response()
         }
         None => no_hold(),
+    }
+}
+
+/// `POST /v1/hosts/{host}/power` with `{"action": "off" | "on"}`.
+///
+/// Operator and admin keys only: a machine's power is the operator's
+/// business, never a client's.
+///
+/// `off` powers the machine off now, through the same `poweroff_command`
+/// and the same `poweroff_guard_command` the idle timer uses. It is
+/// refused with 409 and a typed `reason` while a hold is active (unless
+/// `"release_holds": true`, which ends the holds first and names them),
+/// while a lane of the machine has work in flight or queued, while the
+/// guard says the machine is busy, while the machine has not been up long
+/// enough, and when the machine has no power-off command at all.
+///
+/// `on` wakes the machine through the same wake path a hold with
+/// `wake: true` uses and answers at once (202): the wake runs in the
+/// background. It takes no hold, so the idle timer still applies.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PowerRequest {
+    action: String,
+    /// End the active holds first (with `off`).
+    #[serde(default)]
+    release_holds: bool,
+}
+
+/// A refusal: 409 with a machine-readable `reason` beside the message.
+fn refused(status: StatusCode, reason: &str, message: String) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "power_refused",
+                "reason": reason,
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub(crate) async fn power(
+    State(state): State<AppState>,
+    Path(host): Path<String>,
+    Json(body): Json<PowerRequest>,
+) -> Response {
+    match body.action.as_str() {
+        "off" => power_off(&state, &host, body.release_holds).await,
+        "on" => power_on(&state, &host),
+        other => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("action must be `on` or `off` (got `{other}`)"),
+        ),
+    }
+}
+
+/// The machine is powered off now.
+async fn power_off(state: &AppState, host: &str, release_holds: bool) -> Response {
+    match state.capacity.power_off(host, release_holds).await {
+        Ok(outcome) => Json(json!({
+            "host": host,
+            "action": "off",
+            "powered_off": true,
+            "lanes": outcome.lanes,
+            "released_holds": outcome.released_holds,
+        }))
+        .into_response(),
+        Err(PowerOffError::UnknownHost) => no_host(host),
+        Err(PowerOffError::Refused(refusal)) => {
+            refused(StatusCode::CONFLICT, refusal.reason(), refusal.message())
+        }
+        Err(PowerOffError::Failed(message)) => {
+            refused(StatusCode::BAD_GATEWAY, "poweroff_failed", message)
+        }
+    }
+}
+
+/// The machine is woken now (the wake runs in the background).
+fn power_on(state: &AppState, host: &str) -> Response {
+    match state.capacity.power_on(host) {
+        Ok(outcome) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "host": host,
+                "action": "on",
+                "status": "waking",
+                "lanes": outcome.lanes,
+            })),
+        )
+            .into_response(),
+        Err(PowerOnError::UnknownHost) => no_host(host),
+        Err(PowerOnError::Refused(refusal)) => {
+            refused(StatusCode::CONFLICT, refusal.reason(), refusal.message())
+        }
+        Err(PowerOnError::Failed(message)) => refused(
+            StatusCode::BAD_GATEWAY,
+            crate::activator::power_on_reason(&PowerOnError::Failed(message.clone())),
+            message,
+        ),
     }
 }
 

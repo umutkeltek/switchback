@@ -17,6 +17,16 @@ fn holds_path(path: &str, with_id: bool) -> bool {
     }
 }
 
+/// `/v1/hosts/{host}/power` — a machine's power is the operator's
+/// business: operator and admin keys only, never a client key.
+fn power_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/v1/hosts/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    matches!(parts.as_slice(), [host, "power"] if !host.is_empty())
+}
+
 /// Client-facing endpoints that tenant/client keys may use. Job, artifact
 /// and hold reads are on it: the handlers then show a client only what its
 /// own tenant and project made (another's answers 404). The capacity report
@@ -61,6 +71,7 @@ fn operator_surface(method: &Method, path: &str) -> bool {
     method == Method::POST
         && (matches!(path, "/cp/v1/route-preview" | "/cp/v1/admission-preview")
             || (path.starts_with("/v1/jobs/") && path.ends_with("/cancel"))
+            || power_path(path)
             || (path.starts_with("/cp/v1/drafts/") && path.ends_with("/validate")))
 }
 
