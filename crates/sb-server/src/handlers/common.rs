@@ -88,6 +88,19 @@ pub(crate) fn attach_wake_preference(req: &mut sb_core::AiRequest, headers: &Hea
 /// with the body's `switchback` object before dispatch, so it never
 /// reaches an upstream. Bounded; the runtime checks the name.
 pub(crate) fn attach_settings_profile(req: &mut sb_core::AiRequest, headers: &HeaderMap) {
+    // A tuning run's lock id (`x-switchback-tune-lock`): its requests may
+    // use the lane the run holds.
+    if let Some(value) = headers
+        .get(sb_core::TUNE_LOCK_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        req.metadata.insert(
+            sb_core::TUNE_LOCK_METADATA_KEY.to_string(),
+            value.chars().take(64).collect(),
+        );
+    }
     if let Some(value) = headers
         .get(sb_core::SETTINGS_PROFILE_HEADER)
         .and_then(|value| value.to_str().ok())

@@ -58,6 +58,18 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/workloads/capacity", get(handlers::workloads::capacity))
         .route("/v1/targets/stats", get(handlers::meta::target_stats))
         .route("/v1/optimize/report", get(crate::optimize::report))
+        .route(
+            "/v1/optimize/locks",
+            get(crate::optimize::lock_list).post(crate::optimize::lock_create),
+        )
+        .route(
+            "/v1/optimize/locks/{id}",
+            patch(crate::optimize::lock_extend).delete(crate::optimize::lock_delete),
+        )
+        .route(
+            "/v1/optimize/experiments",
+            get(crate::optimize::experiment_list).post(crate::optimize::experiment_append),
+        )
         .route("/v1/admin/alerts/test", post(handlers::hosts::alerts_test))
         .route(
             "/v1/hosts/{host}/holds",

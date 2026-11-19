@@ -316,6 +316,24 @@ impl Engine {
         // Speed tricks (`server.optimize`, `routes[].optimize`): what the
         // ordering pass needs, computed once so every plan of this request
         // agrees. Nothing configured = nothing computed.
+        let tune_rejected = match self.apply_tune_locks(&req, &mut resolved) {
+            Ok(rejected) => rejected,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(e);
+            }
+        };
         let conversation = crate::optimize::conversation_of(&req);
         let prompt_key = sb_core::conversation_key(&req, None);
         let sticky = self.sticky_for(snap, conversation.as_deref());
@@ -399,6 +417,9 @@ impl Engine {
         for target_id in scope_rejected {
             plan.decision
                 .reject(target_id, "quality_eval scope: target not body-allowlisted");
+        }
+        for (target_id, reason) in tune_rejected {
+            plan.decision.reject(target_id, reason);
         }
         // The router admitted a text-only target for an image-bearing request
         // rather than failing it. Honour that decision by actually removing the

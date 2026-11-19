@@ -99,6 +99,10 @@ fn operator_surface(method: &Method, path: &str) -> bool {
     if model_control_write(method, path) {
         return true;
     }
+    // `sb ai tune`: tuning locks and the experiment ledger.
+    if path.starts_with("/v1/optimize/locks") || path == "/v1/optimize/experiments" {
+        return matches!(*method, Method::POST | Method::PATCH | Method::DELETE);
+    }
     method == Method::POST
         && (matches!(path, "/cp/v1/route-preview" | "/cp/v1/admission-preview")
             || (path.starts_with("/v1/jobs/") && path.ends_with("/cancel"))

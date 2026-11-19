@@ -459,6 +459,20 @@ impl ModelSettingsRegistry {
             .unwrap_or(0)
     }
 
+    /// Requests in flight on every engine model of a provider (lane).
+    pub fn in_flight_on_provider(&self, provider_id: &str) -> usize {
+        let prefix = format!("{provider_id}/");
+        self.in_flight
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(_, entry)| entry.count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
     /// When a request last started or ended on an engine model (ms).
     pub fn last_used_ms(&self, key: &str) -> Option<i64> {
         self.lock_use()

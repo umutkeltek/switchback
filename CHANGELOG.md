@@ -22,6 +22,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   [--bandwidth GBS]` writes bytes per token (and the decode ceiling);
   `server.optimize.hosts` holds machine bandwidth, else the report
   calibrates it from the best measured target and says so.
+- **Speed tricks, layer 3: `sb ai tune`**: the skill's hill-climbing loop on
+  one local model through the gateway (baseline, ceiling, one change at a
+  time, control/candidate/control with at least 6 samples each, keep only
+  what beats both controls with no other metric more than 3% worse, repeat
+  a win over 20% once (the repeat must clear the 5% noise), greedy/needle/soak gates, plateau after three flat
+  levers). The lever catalogue for `llama_cpp_router` is data. Safety:
+  refuses a sleeping machine without `--wake`, a busy lane, a quiet window
+  (`server.optimize.quiet_windows`) and a locked load key (`locked:
+  ["load.KEY"]`); holds the machine and takes the lane's tuning lock
+  (`/v1/optimize/locks`, header `x-switchback-tune-lock`; other requests go
+  elsewhere); Ctrl-C and the budget end restore the best settings without
+  cutting a request off. Every run is a ledger row in the store
+  (`/v1/optimize/experiments`, `sb ai tune --history`; SQLite migration
+  22); a rejected change is skipped until the engine build or model file
+  changes. The winner is one settings revision noted `tune <run id>`
+  (settings writes take an optional `note`), so `sb ai revert` undoes it.
+  `GET /v1/engines` now shows each lane's engine build, each model file's
+  identity (a hash, never the path) and its sidecar file names.
 - **Speed tricks for local engines, layer 1** (`server.optimize`,
   `routes[].optimize`, all off by default; method from
   <https://github.com/sybil-solutions/inference-optimisation-skill>):

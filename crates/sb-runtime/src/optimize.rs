@@ -142,11 +142,29 @@ pub(crate) struct Served<'a> {
     pub sticky_max: usize,
 }
 
+/// A tuning run's exclusive hold on a lane (`sb ai tune`): while it lasts,
+/// only requests that carry its id (`x-switchback-tune-lock`) use the
+/// lane's targets; every other request goes elsewhere.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TuneLock {
+    pub id: String,
+    pub target: String,
+    pub lane: String,
+    pub host: String,
+    pub reason: String,
+    pub created_ms: i64,
+    pub expires_at_ms: i64,
+}
+
 /// The speed-trick state of one gateway.
 #[derive(Default)]
 pub struct OptimizeState {
     inner: Mutex<Inner>,
     view: OnceLock<Arc<dyn EngineView>>,
+    /// Tuning locks by lane.
+    locks: Mutex<BTreeMap<String, TuneLock>>,
+    /// The tuning ledger when there is no state store (process lifetime).
+    experiments: Mutex<Vec<sb_store::ExperimentRecord>>,
 }
 
 fn now_ms() -> i64 {
@@ -412,6 +430,76 @@ impl OptimizeState {
                     },
                 )
             })
+            .collect()
+    }
+
+    /// The live tuning lock of a lane, if any (an expired one is dropped).
+    pub fn lock_for_lane(&self, lane: &str) -> Option<TuneLock> {
+        let now = now_ms();
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.expires_at_ms > now);
+        locks.get(lane).cloned()
+    }
+
+    /// Every live tuning lock.
+    pub fn locks(&self) -> Vec<TuneLock> {
+        let now = now_ms();
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.expires_at_ms > now);
+        locks.values().cloned().collect()
+    }
+
+    /// Take a lane's tuning lock; `Err` is the lock that already holds it.
+    pub fn take_lock(&self, lock: TuneLock) -> Result<TuneLock, Box<TuneLock>> {
+        let now = now_ms();
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, held| held.expires_at_ms > now);
+        if let Some(held) = locks.get(&lock.lane) {
+            return Err(Box::new(held.clone()));
+        }
+        locks.insert(lock.lane.clone(), lock.clone());
+        Ok(lock)
+    }
+
+    /// Set a lock's end to `expires_at_ms`; `None` when no such lock.
+    pub fn extend_lock(&self, id: &str, expires_at_ms: i64) -> Option<TuneLock> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = locks.values_mut().find(|lock| lock.id == id)?;
+        lock.expires_at_ms = expires_at_ms;
+        Some(lock.clone())
+    }
+
+    /// End a lock; `None` when no such lock.
+    pub fn release_lock(&self, id: &str) -> Option<TuneLock> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        let lane = locks
+            .iter()
+            .find(|(_, lock)| lock.id == id)
+            .map(|(lane, _)| lane.clone())?;
+        locks.remove(&lane)
+    }
+
+    /// Keep an experiment row in memory (no state store); answers its id.
+    pub fn remember_experiment(&self, mut record: sb_store::ExperimentRecord) -> u64 {
+        let mut rows = self.experiments.lock().unwrap_or_else(|e| e.into_inner());
+        record.id = rows.len() as u64 + 1;
+        let id = record.id;
+        rows.push(record);
+        id
+    }
+
+    /// Remembered experiment rows, newest first.
+    pub fn remembered_experiments(
+        &self,
+        target: Option<&str>,
+        limit: usize,
+    ) -> Vec<sb_store::ExperimentRecord> {
+        let rows = self.experiments.lock().unwrap_or_else(|e| e.into_inner());
+        rows.iter()
+            .rev()
+            .filter(|row| target.is_none_or(|target| row.target == target))
+            .take(limit)
+            .cloned()
             .collect()
     }
 
@@ -776,6 +864,54 @@ fn stickiness_configured(snap: &crate::Snapshot) -> bool {
 }
 
 impl crate::Engine {
+    /// Tuning locks: a candidate on a lane under a tuning run leaves the
+    /// request unless the request carries that run's lock id. Returns the
+    /// rejections for the decision; `Err` (503 `lane_tuning`) when nothing
+    /// is left to serve.
+    pub(crate) fn apply_tune_locks(
+        &self,
+        req: &sb_core::AiRequest,
+        resolved: &mut crate::profiles::CandidateResolution,
+    ) -> Result<Vec<(String, String)>, crate::ExecError> {
+        if resolved.candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let carried = req
+            .metadata
+            .get(sb_core::TUNE_LOCK_METADATA_KEY)
+            .map(String::as_str);
+        let mut rejected = Vec::new();
+        resolved.candidates.retain(|candidate| {
+            match self.optimize.lock_for_lane(&candidate.provider_id) {
+                Some(lock) if Some(lock.id.as_str()) != carried => {
+                    rejected.push((
+                        candidate.id.clone(),
+                        format!(
+                            "local lane `{}` is under a tuning run ({}); not counted as a failure",
+                            candidate.provider_id, lock.target
+                        ),
+                    ));
+                    false
+                }
+                _ => true,
+            }
+        });
+        if resolved.candidates.is_empty() {
+            let lanes: Vec<&str> = rejected.iter().map(|(target, _)| target.as_str()).collect();
+            return Err(crate::ExecError::new(
+                503,
+                "lane_tuning",
+                format!(
+                    "every target that can serve this ({}) is on a lane under a tuning run; retry later",
+                    lanes.join(",")
+                ),
+                None,
+            )
+            .with_retry_after(std::time::Duration::from_secs(30)));
+        }
+        Ok(rejected)
+    }
+
     /// Where the request's conversation was served last, when stickiness
     /// is on anywhere and the conversation is known.
     pub(crate) fn sticky_for(

@@ -1307,6 +1307,118 @@ paths and no engine arguments. Decode in the report is a median over all
 requests (single-user requests dominate on a home machine); `sb ai tune`
 measures concurrency separately.
 
+#### Layer 3: experiments (`sb ai tune`)
+
+`sb ai tune` runs the skill's loop on one local model, through the
+gateway's own APIs (operator key):
+
+```bash
+sb ai tune gpu-box/qwen [--levers LIST] [--budget 30m] [--wake]
+           [--workload chat|read|mixed] [--concurrency 1,2,3] [--samples 6]
+           [--dry-run] [--history] [--json]
+```
+
+The method, exactly:
+
+1. **Baseline**, then the **ceiling** (from the speed report).
+2. **One change per experiment**, derived from the current best settings,
+   applied with `apply: now` (the model reloads once nothing is in flight).
+3. **Control, candidate, control.** Each run is at least 6 samples, and
+   the median counts; prompts are fresh (a new first line every request), so
+   no run reads the prefix cache; the first request after a load is dropped.
+4. **Keep it only if** the candidate beats both neighbouring controls on its
+   metric and no other measured metric is more than 3% worse than the worse
+   of the two controls. A win of more than 20% is repeated once first, and
+   the repeat must win again by more than the noise (5%).
+5. **Gates:** every answer must be non-empty, not looping and not failed; a
+   change claimed lossless must give the same greedy answer at temperature 0;
+   a change to the KV cache or the context must find two needles (at about
+   50% and 100% of the context) exactly; a change to `parallel` must survive
+   a concurrent soak at full per-slot context.
+6. **Stop** after three levers in a row inside the noise (a plateau), at
+   the end of `--budget`, or on Ctrl-C.
+
+The levers for `llama_cpp_router`, by expected payoff (the catalogue is data
+in `cli/ai_tune.py`, so other engine kinds can add their own):
+
+| lever | settings | metric | gate | notes |
+|---|---|---|---|---|
+| `spec_type` | `spec_type` | decode | greedy | MTP when the model has an MTP head (a sidecar) or a draft file; +22% to +76% measured on large GPUs, can lose on bandwidth-poor chips |
+| `draft_max` | `draft_max` 1 to 4 | weighted aggregate | greedy | swept at every `--concurrency`: there is no per-request draft length, so the value with the best workload-weighted aggregate wins; the table per concurrency is in the report |
+| `flash_attn` | `flash_attn` | decode | greedy | |
+| `ubatch_size` | `batch_size`, `ubatch_size` (512, 1024, 2048) | prefill | greedy | |
+| `parallel` | `parallel` 1..N, `ctx_size` = N × per-slot context | aggregate | soak | fit check first (`request_load.estimate`) |
+| `cache_type` | `cache_type_k`, `cache_type_v` f16 / q8_0 | decode | needle | known to lose on models with few KV layers |
+| `n_gpu_layers` | `n_gpu_layers: all` against `fit: on` | decode | greedy | |
+| `threads` | `threads` | decode | greedy | only when named (Mac) |
+| `mmap` | `mmap` on/off | load time | none | |
+| `sleep_idle_seconds` | — | — | — | advice from the measured swaps |
+
+**Safety.** `sb ai tune` refuses to start (exit 1, with the reason) when
+the machine is asleep and `--wake` is not given, when the lane has a request
+in flight or queued, inside a quiet window (`server.optimize.quiet_windows`,
+`HH:MM-HH:MM` in UTC, for example `["00:30-03:00"]` while a nightly job
+runs), or when a lever it was asked for would change a locked load key
+(`locked: ["load.ctx_size"]`, or `sb ai set MODEL ctx_size=65536 --load
+--lock`; without `--levers` such a lever is skipped and said). While it
+runs it holds the machine on (a host hold, so the idle timer cannot power it
+off) and takes the lane's **tuning lock**: other requests skip that lane (to
+another target, or a retryable 503 `lane_tuning` when nothing else can
+serve), and only the run's own requests (header `x-switchback-tune-lock`)
+reach it. Ctrl-C or the end of the budget never cuts a request off: the
+requests in flight finish, the best known settings are applied again (the
+reload waits for the model to drain), and the lock and the hold are let go.
+
+```
+POST   /v1/optimize/locks {"target", "ttl_secs", "reason"}   201 | 409 quiet_window | lane_busy | locked
+GET    /v1/optimize/locks
+PATCH  /v1/optimize/locks/{id} {"ttl_secs"}
+DELETE /v1/optimize/locks/{id}
+```
+
+**The ledger.** Every run of every experiment is a row in the gateway's
+store (`GET /v1/optimize/experiments?model=TARGET`, `sb ai tune MODEL
+--history`): model, engine build (the engine's `build_info`), model file
+identity (a hash of its path, never the path), settings revision, lever,
+value, metrics, samples, verdict and reason. A rejected change is skipped
+next time unless the engine build or the model file changed, and the run
+says so either way. Without a state store the ledger lives as long as the
+process. The accepted winner is written as one settings revision with the
+note `tune <run id>` (the history shows `put: tune tune_…`), so `sb ai
+revert MODEL REVISION` undoes the whole run; the summary prints that
+command.
+
+An example session:
+
+```
+$ sb ai tune gpu-box/qwen --concurrency 1,2 --budget 45m
+sb ai tune gpu-box/qwen: run tune_3f9a0c21d4, engine b12464, 6 samples per run, budget 45 min
+  spec_type {"spec_type": "draft-mtp"}: +48%, a surprising win; repeating it once
+  spec_type {"spec_type": "draft-mtp"}: kept (decode +48% over both controls; repeated: decode +44% over both controls)
+  draft_max {"draft_max": 2}: kept (weighted +7% over both controls)
+  flash_attn {"flash_attn": "on"}: rejected (decode 321.0 did not beat both controls (318.4, 324.9))
+  ubatch_size {"ubatch_size": 1024, "batch_size": 2048}: rejected (prefill 9930.1 did not beat both controls (9871.2, 10044.0))
+  cache_type {"cache_type_k": "q8_0", "cache_type_v": "q8_0"}: rejected (decode 170.2 did not beat both controls (322.0, 319.8))
+
+metric                     baseline        now    ceiling  how measured
+decode tok/s (c1)             218.0      323.1      410.0  median of 6, warm, fresh prompts, through the gateway (client clock)
+time to first token ms        182.0      179.0          -  median of 6, warm, fresh prompts, through the gateway (client clock)
+draft_max by concurrency (aggregate tok/s):
+  {"draft_max": 1}: c1 290, c2 455
+  {"draft_max": 2}: c1 318, c2 471
+  {"draft_max": 3}: c1 322, c2 431
+  {"draft_max": 4}: c1 309, c2 398
+kept: spec_type {"spec_type": "draft-mtp"} (+44%); draft_max {"draft_max": 2} (+7%)
+stopped: plateau: 3 levers in a row inside the noise
+not verified: greedy equality on one fixed prompt only; needle checks at two depths, not a full long-context evaluation; quality beyond these checks (reasoning, tools) was not measured; numbers include the network and the gateway between this machine and the engine
+undo with: sb ai revert gpu-box/qwen 12
+```
+
+`--dry-run` prints the plan (levers, candidate values, gates, what would be
+skipped) and changes nothing. `--json` prints the summary as JSON. The
+numbers are measured on the client's clock through the gateway, the way a
+client sees them; the engine's own timings stay in the speed report.
+
 ### Speech to text and text to speech (`/v1/audio/*`)
 
 The gateway carries OpenAI's three audio endpoints, so any OpenAI client

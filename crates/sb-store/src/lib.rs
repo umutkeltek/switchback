@@ -65,6 +65,19 @@ pub struct RevisionRecord {
 /// One target model's settings document as stored (`provider/model`).
 /// `doc` is the document's JSON text; `revision` counts writes to this
 /// target from 1.
+/// One run of a tuning experiment (`sb ai tune`): which target and run,
+/// when, and the row itself as JSON (model, engine build, model file
+/// identity, settings revision, lever, value, metrics, samples, verdict and
+/// reason). `id` is the store's own (0 before it is stored).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExperimentRecord {
+    pub id: u64,
+    pub target: String,
+    pub run_id: String,
+    pub at_ms: i64,
+    pub row: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelSettingsRecord {
     pub target: String,
@@ -767,6 +780,24 @@ pub trait StateStore: Send + Sync {
     fn model_settings_prune(&self, _target: &str, _keep: usize) -> Result<usize> {
         Ok(0)
     }
+
+    // ---- tuning experiments --------------------------------------------
+
+    /// Append one experiment row; answers its id.
+    fn optimize_experiment_append(&self, _record: &ExperimentRecord) -> Result<u64> {
+        Err(StoreError(
+            "experiment persistence is not supported".to_string(),
+        ))
+    }
+
+    /// Experiment rows, newest first, of one target or of all.
+    fn optimize_experiment_list(
+        &self,
+        _target: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<ExperimentRecord>> {
+        Ok(Vec::new())
+    }
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). One connection
@@ -1383,6 +1414,22 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
                     at_ms INTEGER NOT NULL,
                     PRIMARY KEY (target, revision)
                 );",
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 22, "optimize_experiments", |tx| {
+            // The tuning ledger (`sb ai tune`): one row per experiment run.
+            // A new table only: an older binary never reads it.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS optimize_experiments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    at_ms INTEGER NOT NULL,
+                    row TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS optimize_experiments_target
+                    ON optimize_experiments (target, id);",
             )?;
             Ok(())
         })?;
@@ -3352,6 +3399,50 @@ impl StateStore for SqliteStore {
         )?;
         Ok(removed)
     }
+
+    fn optimize_experiment_append(&self, record: &ExperimentRecord) -> Result<u64> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO optimize_experiments (target, run_id, at_ms, row) VALUES (?1, ?2, ?3, ?4)",
+            params![record.target, record.run_id, record.at_ms, record.row],
+        )?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    fn optimize_experiment_list(
+        &self,
+        target: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ExperimentRecord>> {
+        let conn = self.conn()?;
+        let limit = limit.clamp(1, 10_000) as i64;
+        let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ExperimentRecord> {
+            Ok(ExperimentRecord {
+                id: row.get::<_, i64>(0)? as u64,
+                target: row.get(1)?,
+                run_id: row.get(2)?,
+                at_ms: row.get(3)?,
+                row: row.get(4)?,
+            })
+        };
+        let rows = match target {
+            Some(target) => conn
+                .prepare(
+                    "SELECT id, target, run_id, at_ms, row FROM optimize_experiments
+                     WHERE target = ?1 ORDER BY id DESC LIMIT ?2",
+                )?
+                .query_map(params![target, limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => conn
+                .prepare(
+                    "SELECT id, target, run_id, at_ms, row FROM optimize_experiments
+                     ORDER BY id DESC LIMIT ?1",
+                )?
+                .query_map(params![limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
 }
 
 const QUALITY_JUDGMENT_SELECT: &str =
@@ -3713,13 +3804,13 @@ mod tests {
         #[cfg(feature = "eval")]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
             ]
         }
         #[cfg(not(feature = "eval"))]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22,
             ]
         }
     }
@@ -5506,5 +5597,36 @@ mod model_settings_tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn experiments_append_and_list_newest_first_per_target() {
+        let store = SqliteStore::in_memory().unwrap();
+        for (target, run, at) in [
+            ("box/a", "tune_1", 1),
+            ("box/b", "tune_2", 2),
+            ("box/a", "tune_3", 3),
+        ] {
+            let id = store
+                .optimize_experiment_append(&ExperimentRecord {
+                    id: 0,
+                    target: target.to_string(),
+                    run_id: run.to_string(),
+                    at_ms: at,
+                    row: format!("{{\"lever\":\"{run}\"}}"),
+                })
+                .unwrap();
+            assert!(id > 0);
+        }
+        let a = store.optimize_experiment_list(Some("box/a"), 10).unwrap();
+        assert_eq!(
+            a.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            ["tune_3", "tune_1"]
+        );
+        assert_eq!(store.optimize_experiment_list(None, 2).unwrap().len(), 2);
+        assert!(store
+            .optimize_experiment_list(Some("none"), 5)
+            .unwrap()
+            .is_empty());
     }
 }

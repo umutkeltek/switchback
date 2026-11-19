@@ -422,7 +422,14 @@ Layer 2 is read-only: `sb-server::optimize::build_report` is a pure
 function over the usage ledger, the settings documents and their latest
 revision time, the runtime's per-target evidence, the lane reports and the
 host numbers (`server.optimize.hosts`); the handler gathers those without
-calling a machine.
+calling a machine. Layer 3 lives in the CLI (`cli/ai_tune.py`, standard
+library): it drives the gateway's own APIs (settings writes with `apply:
+now` and a `note`, load/unload, chat requests carrying the lane's tuning
+lock) and keeps its ledger in the store (`optimize_experiments`, migration
+22, through `StateStore::optimize_experiment_*`; in memory without a
+store). The tuning lock is runtime state on `OptimizeState`: after
+resolving, candidates on a locked lane leave a request that does not carry
+the lock's id (a typed 503 `lane_tuning` when none is left).
 
 ### Durable state (opt-in)
 Point `server.state_store` at a SQLite file and every published config revision +

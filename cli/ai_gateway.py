@@ -28,9 +28,11 @@ import uuid
 
 try:
     import ai_fit
+    import ai_tune
 except ImportError:  # the module sits next to this file
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import ai_fit
+    import ai_tune
 
 OK, GATEWAY_ERROR, USAGE, UNREACHABLE = 0, 1, 2, 3
 MACHINE_OFF = 3  # the same code as an unreachable gateway: the work cannot start
@@ -69,6 +71,10 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                   decode ceiling when the bandwidth is known)
   sb ai doctor [MODEL] [--json]   the speed report: measured speed against the ceiling,
                                   swaps, cache hits, acceptance, findings and what to do
+  sb ai tune MODEL [--levers LIST] [--budget 30m] [--wake] [--workload chat|read|mixed]
+                  [--concurrency 1,2,3] [--samples N] [--dry-run] [--history] [--json]
+                                  controlled A/B/A speed experiments on one local model;
+                                  keeps only what measurably wins (`sb ai revert` undoes it)
                                  where a model fits and which file to take
   sb ai settings MODEL [--profile NAME] [--history] [--json]
                                  a model's settings: each key, its value and where it comes from
@@ -2357,6 +2363,7 @@ def parser():
     doctor = sub.add_parser("doctor", add_help=False, allow_abbrev=False)
     doctor.add_argument("model", nargs="?", default="")
     doctor.add_argument("--json", action="store_true")
+    ai_tune.add_arguments(sub.add_parser("tune", add_help=False, allow_abbrev=False))
     settings = sub.add_parser("settings", add_help=False, allow_abbrev=False)
     settings.add_argument("model")
     settings.add_argument("--profile")
@@ -2456,6 +2463,9 @@ def main(argv=None, environ=None):
             return cmd_fit_store(gw, args)
         if args.command == "doctor":
             return cmd_doctor(gw, args)
+        if args.command == "tune":
+            return ai_tune.run(gw, args, (Fail, GatewayError),
+                               poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
         message = gw.scrub(failure.message) if gw else failure.message

@@ -458,6 +458,8 @@ pub(crate) struct WriteBody {
     pub revision: Option<u64>,
     pub apply: Option<sb_core::ApplyMode>,
     pub wake: bool,
+    /// A short note kept in the history's `action` (`put: tune run_...`).
+    pub note: Option<String>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -493,11 +495,25 @@ fn split_write_body(body: Value) -> Result<WriteBody, Response> {
         .remove("wake")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let note = match object.remove("note") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(note)) if note.len() <= 120 && note.chars().all(|c| !c.is_control()) => {
+            Some(note)
+        }
+        Some(_) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "`note` must be text of at most 120 characters",
+            ))
+        }
+    };
     Ok(WriteBody {
         doc: Value::Object(object),
         revision,
         apply,
         wake,
+        note,
     })
 }
 
@@ -578,6 +594,10 @@ async fn write(
         }
     };
     let action = if merge { "patch" } else { "put" };
+    let action = match &body.note {
+        Some(note) => format!("{action}: {note}"),
+        None => action.to_string(),
+    };
     commit_write(
         state,
         principal,
@@ -585,7 +605,7 @@ async fn write(
         &named,
         doc,
         expected,
-        action,
+        &action,
         body.apply.unwrap_or_default(),
         body.wake,
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sb ai doctor, sb ai fit --store and the new `sb ai set` keys,
+"""sb ai doctor, sb ai fit --store, the new `sb ai set` keys and sb ai tune,
 against a fake gateway on a local port.
 
 The fake's engine is fast and deterministic enough to tune: its decode and
@@ -36,8 +36,8 @@ class Engine:
     def __init__(self, seed=11):
         self.rng = random.Random(seed)
         self.rng_lock = threading.Lock()
-        self.base_decode = 1600.0     # tok/s; a 64-token answer takes ~40 ms
-        self.base_ttft_ms = 45.0
+        self.base_decode = 800.0      # tok/s; a 64-token answer takes ~80 ms
+        self.base_ttft_ms = 200.0     # long enough that scheduling noise stays under 1%
         self.base_prefill = 60000.0   # tok/s
         self.effects = {}             # (key, json value) -> {"decode": f, "ttft": f, "prefill": f}
         self.repeat_effects = {}      # (key, json value) -> [decode factor per apply]
@@ -60,9 +60,12 @@ class Engine:
                 out *= effect.get(metric, 1.0)
         return out
 
-    def jitter(self):
+    def jitter(self, spread=0.05):
+        """Seeded run-to-run noise: 5% on the tuned metrics (decode, prefill),
+        1% on time to first token, so the 3% rule on a metric a lever does
+        not touch is tested by its own case, not by chance."""
         with self.rng_lock:
-            return 1.0 + self.rng.uniform(-0.06, 0.06)
+            return 1.0 + self.rng.uniform(-spread, spread)
 
     def apply(self, load):
         for key, value in load.items():
@@ -156,7 +159,7 @@ class Fake:
         try:
             prompt_tokens = len(prompt) // 4
             ttft = (engine.base_ttft_ms / engine.factor("ttft")
-                    + prompt_tokens / (engine.base_prefill * engine.factor("prefill")) * 1000) * engine.jitter()
+                    + prompt_tokens / (engine.base_prefill * engine.factor("prefill")) * 1000) * engine.jitter(0.01)
             completion = 64 if body.get("max_tokens", 64) >= 64 else body["max_tokens"]
             decode_s = completion / (engine.base_decode * engine.factor("decode")) * engine.jitter()
             if long_request and engine.soak_breaks and engine.slot_count > 1:
@@ -316,6 +319,266 @@ class Base(unittest.TestCase):
                              capture_output=True, text=True, timeout=timeout)
         self.assertNotIn(KEY, run.stdout + run.stderr)
         return run
+
+
+class TuneTests(Base):
+    def tune(self, *args):
+        # Eight samples a run: the 3% rule on the other metrics must not trip
+        # on the fake's own jitter.
+        return self.sb("tune", TARGET, "--budget", "10m", "--json", "--samples", "8", *args)
+
+    def effect(self, key, value, **factors):
+        self.fake.engine.effects[(key, json.dumps(value))] = factors
+
+    def verdicts(self):
+        return [row for row in self.fake.ledger if row.get("role") == "verdict"]
+
+    def assert_released(self):
+        self.assertEqual(self.fake.locks, {}, "the tuning lock was not released")
+        self.assertEqual(self.fake.holds, {}, "the hold was not released")
+
+    # ------------------------------------------------------------ A/B/A
+
+    def test_a_clear_win_is_kept_as_a_settings_revision(self):
+        self.effect("flash_attn", "on", decode=1.18)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([g["lever"] for g in result["gains"]], ["flash_attn"], self.verdicts())
+        self.assertEqual(self.fake.doc["load"]["flash_attn"], "on")
+        # The winner is its own revision, noted with the run id, so revert undoes it.
+        self.assertEqual(self.fake.history[-1]["action"], f"put: tune {result['run_id']}")
+        self.assertEqual(result["undo"], f"sb ai revert {TARGET} 0")
+        verdict = self.verdicts()[-1]
+        self.assertEqual((verdict["verdict"], verdict["lever"]), ("accepted", "flash_attn"))
+        self.assertEqual(verdict["engine_build"], "b100")
+        roles = [row["role"] for row in self.fake.ledger]
+        self.assertIn("baseline", roles)
+        self.assertIn("candidate", roles)
+        # Every inference request carried the run's lock.
+        chats = self.fake.calls("POST", "/v1/chat/completions")
+        self.assertTrue(chats)
+        heads = [h for m, p, b, h in self.fake.seen if p == "/v1/chat/completions"]
+        self.assertTrue(all(h.get("x-switchback-tune-lock") == "tune-lock-1" for h in heads))
+        self.assertGreaterEqual(result["table"][0]["ceiling"], 4000.0)
+        self.assert_released()
+
+    def test_a_worse_candidate_is_rejected_and_the_settings_stay(self):
+        self.effect("flash_attn", "on", decode=0.8)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(result["gains"], [])
+        self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "rejected")
+        self.assertIn("did not beat both controls", verdict["reason"])
+        self.assert_released()
+
+    def test_a_win_that_costs_another_metric_more_than_three_percent_is_rejected(self):
+        # Decode +15%, but the first token comes 30% later.
+        self.effect("flash_attn", "on", decode=1.15, ttft=0.70)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "rejected", verdict)
+        self.assertIn("ttft_ms got", verdict["reason"])
+        self.assertIn("more than 3%", verdict["reason"])
+        self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
+
+    def test_a_surprising_win_is_repeated_and_a_fluke_is_dropped(self):
+        # +60% on the first apply only: the repeat finds nothing.
+        self.fake.engine.repeat_effects[("flash_attn", json.dumps("on"))] = [1.6, 1.0, 1.0]
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        candidates = [row for row in self.fake.ledger if row.get("role") == "candidate"]
+        self.assertEqual(len(candidates), 2, "the surprising win was not repeated")
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "rejected", verdict)
+        self.assertIn("did not repeat", verdict["reason"])
+        self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
+
+    def test_a_surprising_win_that_repeats_is_kept(self):
+        self.effect("flash_attn", "on", decode=1.5)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        candidates = [row for row in self.fake.ledger if row.get("role") == "candidate"]
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(self.verdicts()[-1]["verdict"], "accepted")
+        self.assertEqual(self.fake.doc["load"]["flash_attn"], "on")
+
+    def test_a_kv_change_that_loses_needles_is_rejected(self):
+        self.effect("cache_type_k", "q8_0", decode=1.15)
+        self.fake.engine.needle_breaks.add(("cache_type_k", json.dumps("q8_0")))
+        self.fake.doc = {"load": {"ctx_size": 8192}}
+        run = self.tune("--levers", "cache_type")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "rejected")
+        self.assertIn("needle", verdict["reason"])
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 8192})
+        longs = [r for r in self.fake.engine.requests if r[0] == "long"]
+        self.assertTrue(longs, "no long-context request was sent")
+
+    def test_a_lossy_change_must_keep_the_greedy_answer(self):
+        self.effect("flash_attn", "on", decode=1.15)
+        self.fake.engine.greedy_breaks.add(("flash_attn", json.dumps("on")))
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("greedy output changed", self.verdicts()[-1]["reason"])
+
+    def test_more_slots_need_a_concurrent_soak(self):
+        self.fake.doc = {"load": {"ctx_size": 4096}}
+        run = self.tune("--levers", "parallel", "--concurrency", "1,2")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "accepted", verdict)
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 8192, "parallel": 2})
+        # The soak: two long requests at once at the full per-slot context.
+        longs = [r for r in self.fake.engine.requests if r[0] == "long"]
+        self.assertGreaterEqual(len(longs), 2)
+
+    def test_a_failed_soak_rejects_more_slots(self):
+        self.fake.doc = {"load": {"ctx_size": 4096}}
+        self.fake.engine.soak_breaks = True
+        run = self.tune("--levers", "parallel", "--concurrency", "1,2")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "rejected")
+        self.assertIn("concurrent soak", verdict["reason"])
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 4096})
+
+    def test_draft_length_is_swept_per_concurrency(self):
+        self.fake.doc = {"load": {"spec_type": "draft-mtp", "draft_max": 1}}
+        self.effect("draft_max", 3, decode=1.35)
+        # Twelve samples: the 3% rule on time to first token, a metric this
+        # lever does not touch, must not trip on the fake's jitter.
+        run = self.tune("--levers", "draft_max", "--concurrency", "1,2", "--samples", "12")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        table = result["sweeps"]["draft_max"]
+        self.assertEqual(len(table), 4, table)
+        self.assertTrue(all(set(per) == {"1", "2"} for per in table.values()), table)
+        self.assertEqual(self.fake.doc["load"]["draft_max"], 3, self.verdicts())
+
+    def test_a_failed_load_is_a_rejection_not_a_crash(self):
+        self.fake.engine.load_fails.add(("flash_attn", json.dumps("on")))
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("did not load", self.verdicts()[-1]["reason"])
+        self.assert_released()
+
+    # ------------------------------------------------------------ ledger
+
+    def test_a_rejected_lever_is_skipped_until_the_engine_build_changes(self):
+        self.effect("flash_attn", "on", decode=0.8)
+        self.assertEqual(self.tune("--levers", "flash_attn").returncode, 0)
+        candidates_before = len([r for r in self.fake.ledger if r["role"] == "candidate"])
+        run = self.tune("--levers", "flash_attn")
+        result = json.loads(run.stdout)
+        self.assertTrue(any("skipped, rejected in" in note for note in result["notes"]), result["notes"])
+        self.assertEqual(len([r for r in self.fake.ledger if r["role"] == "candidate"]), candidates_before)
+        # A new engine build: tested again.
+        self.fake.build = "b200"
+        run = self.tune("--levers", "flash_attn")
+        result = json.loads(run.stdout)
+        self.assertTrue(any("engine build changed" in note for note in result["notes"]), result["notes"])
+        self.assertGreater(len([r for r in self.fake.ledger if r["role"] == "candidate"]), candidates_before)
+
+    def test_history_lists_the_verdicts(self):
+        self.effect("flash_attn", "on", decode=0.8)
+        self.tune("--levers", "flash_attn")
+        run = self.sb("tune", TARGET, "--history")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("flash_attn", run.stdout)
+        self.assertIn("rejected", run.stdout)
+
+    # ------------------------------------------------------------ safety
+
+    def test_an_asleep_machine_is_not_woken_without_wake(self):
+        self.fake.lane_state = "offline"
+        run = self.sb("tune", TARGET, "--levers", "flash_attn")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("add --wake", run.stderr)
+        self.assertEqual(self.fake.calls("POST", "/v1/hosts/"), [])
+        self.assertEqual(self.fake.calls("PUT"), [])
+        self.assertEqual(self.fake.calls("POST", "/v1/chat/completions"), [])
+
+    def test_wake_holds_the_machine_and_runs(self):
+        self.fake.lane_state = "offline"
+        self.effect("flash_attn", "on", decode=1.18)
+        run = self.tune("--levers", "flash_attn", "--wake")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        holds = self.fake.calls("POST", "/v1/hosts/gpu-box/holds")
+        self.assertEqual(holds[0][2]["wake"], True)
+        self.assert_released()
+
+    def test_a_busy_lane_is_refused(self):
+        self.fake.lock_refusal = ("lane_busy", "lane `box` has 1 request(s) in flight or queued")
+        run = self.sb("tune", TARGET, "--levers", "flash_attn")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("in flight", run.stderr)
+        self.assertEqual(self.fake.calls("PUT"), [])
+        self.assertEqual(self.fake.holds, {}, "the hold outlived the refusal")
+
+    def test_a_quiet_window_is_refused(self):
+        self.fake.lock_refusal = ("quiet_window", "inside the quiet window 00:30-03:00 (UTC)")
+        run = self.sb("tune", TARGET)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("quiet window", run.stderr)
+        self.assertEqual(self.fake.calls("POST", "/v1/chat/completions"), [])
+
+    def test_a_locked_load_key_is_refused(self):
+        self.fake.doc = {"load": {"flash_attn": "off"}, "locked": ["load.flash_attn"]}
+        run = self.sb("tune", TARGET, "--levers", "flash_attn")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("locks load.flash_attn", run.stderr)
+        self.assertEqual(self.fake.calls("POST"), [])
+        # Without naming it, the lever is skipped and said.
+        run = self.sb("tune", TARGET, "--dry-run", "--json")
+        plan = json.loads(run.stdout)
+        self.assertNotIn("flash_attn", [row["lever"] for row in plan["levers"]])
+        self.assertTrue(any("load.flash_attn is locked" in note for note in plan["notes"]))
+
+    def test_dry_run_changes_nothing(self):
+        run = self.sb("tune", TARGET, "--dry-run")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("spec_type", run.stdout)
+        self.assertIn("draft-mtp", run.stdout)
+        self.assertEqual(self.fake.calls("POST"), [])
+        self.assertEqual(self.fake.calls("PUT"), [])
+
+    def test_ctrl_c_restores_the_best_settings_and_interrupts_no_request(self):
+        self.fake.doc = {"load": {"ctx_size": 4096}}
+        self.effect("flash_attn", "on", decode=1.2)
+        proc = subprocess.Popen(["zsh", str(SB), "ai", "tune", TARGET, "--levers", "flash_attn",
+                                 "--samples", "12"],
+                                env=self.env, cwd=self.root, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        # Interrupt once the candidate is applied and being measured.
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if any(b.get("note", "").endswith("trial flash_attn") for m, p, b in self.fake.calls("PUT")):
+                break
+            time.sleep(0.02)
+        time.sleep(0.15)
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 4096}, "the best settings were not restored")
+        self.assertIn("restore", self.fake.history[-1]["action"])
+        self.assertTrue(all(done for _, done in self.fake.engine.requests),
+                        "a request was cut off mid-answer")
+        self.assert_released()
+
+    def test_plateau_stops_after_three_flat_levers(self):
+        self.fake.doc = {"load": {"spec_type": "draft-mtp"}}
+        run = self.tune("--levers", "spec_type,flash_attn,ubatch_size,mmap")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertIn("plateau", result["stopped"], self.verdicts())
+        levers = {row["lever"] for row in self.verdicts()}
+        self.assertNotIn("mmap", levers, "the run went on past the plateau")
 
 
 class DoctorAndFitTests(Base):

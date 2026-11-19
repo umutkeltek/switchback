@@ -1080,6 +1080,8 @@ struct ControlState {
     loaded_with: HashMap<String, u64>,
     /// Per lane: variants by name.
     variants: BTreeMap<String, BTreeMap<String, Variant>>,
+    /// Per lane: the engine's build (`GET /props` `build_info`), last seen.
+    builds: BTreeMap<String, String>,
 }
 
 /// How soon a failed apply is first retried before a request; each failure
@@ -1253,6 +1255,28 @@ impl EngineControls {
             .models
             .insert(lane.name.clone(), (now_ms(), models.clone()));
         Ok(models)
+    }
+
+    /// The engine's build (`GET /props` `build_info`, e.g. `b12359-b1b770d90`),
+    /// kept for the tuning ledger. Best effort: a failure keeps the last one.
+    async fn refresh_build(&self, state: &EngineCtx, lane: &EngineLane) {
+        if let Ok(props) = self
+            .call(
+                state,
+                lane,
+                reqwest::Method::GET,
+                "/props",
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+        {
+            if let Some(build) = props["build_info"].as_str() {
+                self.lock()
+                    .builds
+                    .insert(lane.name.clone(), build.chars().take(80).collect());
+            }
+        }
     }
 
     pub(crate) fn cached_models(&self, lane: &str) -> Option<(i64, Vec<Value>)> {
@@ -1893,6 +1917,24 @@ fn model_status(models: &[Value], model: &str) -> Option<String> {
         .find(|row| row["id"] == model)
         .and_then(|row| row["status"]["value"].as_str())
         .map(str::to_string)
+}
+
+/// A model row's sidecar files (projector, draft, MTP head) by file name
+/// only, never their paths: `sb ai tune` reads them to know an MTP head or a
+/// draft exists.
+fn sidecar_names(sidecars: &Value) -> Value {
+    let names: Vec<Value> = sidecars
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item["path"].as_str())
+                .or_else(|| item["name"].as_str())
+        })
+        .map(|path| json!(path.rsplit(['/', '\\']).next().unwrap_or(path)))
+        .collect();
+    Value::Array(names)
 }
 
 /// `memory` of a model row, summed per measurement: bytes on GPU devices
@@ -2878,13 +2920,17 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
     let registry = state.engine.model_settings();
     let controls = &state.engines;
     let (status, models, error_text) = match controls.awake(state, &lane).await {
-        Awake::Up => match controls
-            .models_within(state, &lane, Duration::from_secs(3))
-            .await
-        {
-            Ok(models) => ("up", Some((now_ms(), models)), None),
-            Err(e) => ("up", controls.cached_models(&lane.name), Some(e)),
-        },
+        Awake::Up => {
+            // The engine's build, for the tuning ledger (best effort).
+            controls.refresh_build(state, &lane).await;
+            match controls
+                .models_within(state, &lane, Duration::from_secs(3))
+                .await
+            {
+                Ok(models) => ("up", Some((now_ms(), models)), None),
+                Err(e) => ("up", controls.cached_models(&lane.name), Some(e)),
+            }
+        }
         Awake::Asleep(why) => (why, controls.cached_models(&lane.name), None),
     };
     let rows: Vec<Value> = models
@@ -2896,9 +2942,16 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
             let id = row["id"].as_str().unwrap_or("");
             let target = format!("{}/{id}", lane.name);
             let status = row["status"]["value"].as_str();
+            // The model file's identity: a hash of its path, never the
+            // path, so the tuning ledger can tell a new file apart.
+            let file = row["path"]
+                .as_str()
+                .map(|path| sb_core::fnv_hex(&[path])[..12].to_string());
             json!({
                 "id": id,
                 "target": target,
+                "file": file,
+                "sidecars": sidecar_names(&row["sidecars"]),
                 "status": status,
                 "failed": row["status"]["failed"],
                 "args": row["status"]["args"],
@@ -2959,6 +3012,7 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
         "pending_apply": pending_apply,
         "deferred": deferred,
         "settings_command": lane.engine.settings_command.is_some(),
+        "build": controls.lock().builds.get(&lane.name).cloned(),
     });
     if !overlay_known {
         view["note"] = json!(
@@ -3503,6 +3557,14 @@ local_executors:
             load_hash(&a),
             load_hash(&json!({"ctx_size": 1}).as_object().unwrap().clone())
         );
+    }
+
+    #[test]
+    fn sidecars_are_named_without_their_paths() {
+        let names =
+            sidecar_names(&json!(["/models/q/mtp-head.gguf", {"path": "C:\\m\\mmproj.gguf"}, 3]));
+        assert_eq!(names, json!(["mtp-head.gguf", "mmproj.gguf"]));
+        assert_eq!(sidecar_names(&Value::Null), json!([]));
     }
 
     #[test]

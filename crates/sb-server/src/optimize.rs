@@ -672,6 +672,287 @@ pub(crate) async fn report(
     Json(report).into_response()
 }
 
+fn refuse(status: axum::http::StatusCode, kind: &str, message: String) -> Response {
+    (
+        status,
+        Json(json!({"error": {"message": message, "type": kind, "reason": kind}})),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LockBody {
+    target: String,
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExtendBody {
+    ttl_secs: u64,
+}
+
+/// The longest a tuning lock may last (it is extended while a run goes on).
+const MAX_LOCK_SECS: u64 = 4 * 3600;
+
+/// `POST /v1/optimize/locks {"target", "ttl_secs", "reason"}` (operator):
+/// take a lane's tuning lock for `sb ai tune`. Refused (409, typed
+/// `reason`) inside a quiet window (`quiet_window`), while the lane has a
+/// request in flight or queued (`lane_busy`), or while another run holds it
+/// (`locked`). Never wakes anything.
+pub(crate) async fn lock_create(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<LockBody>,
+) -> Response {
+    use axum::http::StatusCode;
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    let snap = state.snapshot();
+    let Some((provider, _)) = body.target.split_once('/') else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("`{}` is not provider/model", body.target),
+        );
+    };
+    let Some(lane) = crate::engine_control::engine_lane(&snap.config, provider) else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "no_engine_control",
+            format!(
+                "`{}` has no engine control (its lane needs an `engine:` block)",
+                body.target
+            ),
+        );
+    };
+    let now = sb_store::now_millis();
+    let optimize = &snap.config.server.optimize;
+    let minute = ((now / 60_000) % (24 * 60)) as u32;
+    if let Some(window) = optimize.quiet_window_at(minute) {
+        return refuse(
+            StatusCode::CONFLICT,
+            "quiet_window",
+            format!("inside the quiet window {window} (UTC, server.optimize.quiet_windows); try after it"),
+        );
+    }
+    let report = state
+        .capacity
+        .reports()
+        .into_iter()
+        .find(|report| report.name == lane.name);
+    let busy = state
+        .engine
+        .model_settings()
+        .in_flight_on_provider(&lane.name)
+        + report
+            .as_ref()
+            .map(|r| r.in_flight as usize + r.queue_depth as usize)
+            .unwrap_or(0);
+    if busy > 0 {
+        return refuse(
+            StatusCode::CONFLICT,
+            "lane_busy",
+            format!(
+                "lane `{}` has {busy} request(s) in flight or queued; try when it is idle",
+                lane.name
+            ),
+        );
+    }
+    let host = snap
+        .config
+        .local_executors
+        .iter()
+        .find(|l| l.name == lane.name)
+        .and_then(|l| l.host.clone())
+        .unwrap_or_else(|| lane.name.clone());
+    let ttl = body.ttl_secs.unwrap_or(1800).clamp(1, MAX_LOCK_SECS);
+    let lock = sb_runtime::optimize::TuneLock {
+        id: sb_core::new_id("tune"),
+        target: body.target.clone(),
+        lane: lane.name.clone(),
+        host,
+        reason: body.reason.unwrap_or_default().chars().take(200).collect(),
+        created_ms: now,
+        expires_at_ms: now + (ttl as i64) * 1000,
+    };
+    match state.engine.optimize().take_lock(lock) {
+        Ok(lock) => {
+            tracing::info!(lane = %lock.lane, target = %lock.target, id = %lock.id, "tuning lock taken");
+            (StatusCode::CREATED, Json(json!(lock))).into_response()
+        }
+        Err(held) => refuse(
+            StatusCode::CONFLICT,
+            "locked",
+            format!(
+                "lane `{}` is under another tuning run ({}, {})",
+                held.lane, held.target, held.id
+            ),
+        ),
+    }
+}
+
+/// `GET /v1/optimize/locks` (operator): the live tuning locks.
+pub(crate) async fn lock_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Response {
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    Json(json!({"object": "list", "data": state.engine.optimize().locks()})).into_response()
+}
+
+/// `PATCH /v1/optimize/locks/{id} {"ttl_secs"}` (operator): end it that
+/// many seconds from now.
+pub(crate) async fn lock_extend(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<ExtendBody>,
+) -> Response {
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    let expires = sb_store::now_millis() + (body.ttl_secs.clamp(1, MAX_LOCK_SECS) as i64) * 1000;
+    match state.engine.optimize().extend_lock(&id, expires) {
+        Some(lock) => Json(json!(lock)).into_response(),
+        None => refuse(
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+            format!("no tuning lock {id}"),
+        ),
+    }
+}
+
+/// `DELETE /v1/optimize/locks/{id}` (operator): end it.
+pub(crate) async fn lock_delete(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    match state.engine.optimize().release_lock(&id) {
+        Some(lock) => {
+            tracing::info!(lane = %lock.lane, id = %lock.id, "tuning lock released");
+            Json(json!({"id": lock.id, "deleted": true})).into_response()
+        }
+        None => refuse(
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+            format!("no tuning lock {id}"),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ExperimentsQuery {
+    model: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `POST /v1/optimize/experiments` (operator): append one row of the
+/// tuning ledger. The row is metadata (lever, value, metrics, verdict), at
+/// most 16 KiB, and must name its `target` and `run_id`.
+pub(crate) async fn experiment_append(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(row): Json<Value>,
+) -> Response {
+    use axum::http::StatusCode;
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    let target = row["target"].as_str().unwrap_or("").to_string();
+    let run_id = row["run_id"].as_str().unwrap_or("").to_string();
+    if target.is_empty() || run_id.is_empty() || !row.is_object() {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "an experiment row is an object with `target` and `run_id`".to_string(),
+        );
+    }
+    let text = row.to_string();
+    if text.len() > 16 * 1024 {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "an experiment row is at most 16 KiB".to_string(),
+        );
+    }
+    let record = sb_store::ExperimentRecord {
+        id: 0,
+        target,
+        run_id,
+        at_ms: sb_store::now_millis(),
+        row: text,
+    };
+    let (id, durable) = match state.engine.store() {
+        Some(store) => match store.optimize_experiment_append(&record) {
+            Ok(id) => (id, true),
+            Err(e) => {
+                return refuse(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "store_error",
+                    format!("state store: {}", e.0),
+                )
+            }
+        },
+        None => (state.engine.optimize().remember_experiment(record), false),
+    };
+    (
+        StatusCode::CREATED,
+        Json(json!({"id": id, "durable": durable})),
+    )
+        .into_response()
+}
+
+/// `GET /v1/optimize/experiments?model=TARGET&limit=N` (operator): the
+/// tuning ledger, newest first.
+pub(crate) async fn experiment_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<ExperimentsQuery>,
+) -> Response {
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    let limit = query.limit.unwrap_or(200).clamp(1, 10_000);
+    let target = query.model.as_deref();
+    let (records, durable) = match state.engine.store() {
+        Some(store) => (
+            store
+                .optimize_experiment_list(target, limit)
+                .unwrap_or_default(),
+            true,
+        ),
+        None => (
+            state
+                .engine
+                .optimize()
+                .remembered_experiments(target, limit),
+            false,
+        ),
+    };
+    let data: Vec<Value> = records
+        .into_iter()
+        .map(|record| {
+            let mut row: Value = serde_json::from_str(&record.row).unwrap_or(json!({}));
+            row["id"] = json!(record.id);
+            row["at_ms"] = json!(record.at_ms);
+            row
+        })
+        .collect();
+    Json(json!({"object": "list", "durable": durable, "data": data})).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

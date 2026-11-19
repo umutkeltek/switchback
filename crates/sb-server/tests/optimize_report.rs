@@ -1,5 +1,8 @@
-//! The speed report end to end: it never wakes a machine or calls an
-//! engine, it names findings, and a client key gets its own view.
+//! The speed report and the tuning plumbing end to end: the report never
+//! wakes a machine or calls an engine, a client key gets its own view,
+//! a tuning lock keeps other requests off its lane (and refuses a busy lane,
+//! a quiet window and a second run), the experiment ledger round-trips, and
+//! a settings write keeps its note in the history.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -230,7 +233,6 @@ async fn chat_with(gw: &str, body: Value, lock: Option<&str>) -> (u16, Value, St
     )
 }
 
-#[allow(dead_code)]
 fn ask(model: &str) -> Value {
     json!({"model": model, "max_tokens": 50,
            "chat_template_kwargs": {"enable_thinking": false},
@@ -281,4 +283,189 @@ async fn the_report_never_wakes_or_calls_an_engine_and_names_findings() {
     assert_eq!(status, 200, "{client}");
     assert_eq!(client["view"], "client");
     assert!(client["findings"].as_array().unwrap().is_empty());
+    // A client key may not take a tuning lock.
+    let (status, _) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        CLIENT,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test]
+async fn a_tuning_lock_keeps_other_requests_off_its_lane() {
+    let fx = fixture(true, "    stickiness: false").await;
+    let (status, lock) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a", "ttl_secs": 600, "reason": "test"})),
+    )
+    .await;
+    assert_eq!(status, 201, "{lock}");
+    let id = lock["id"].as_str().unwrap().to_string();
+    // Another request goes elsewhere, and says why.
+    let (status, body, route) = chat_with(&fx.gw, ask("pair"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "ok from small-host"
+    );
+    assert!(route.contains("selected=small-host/m"), "{route}");
+    // Only the gpu box: a 503 to retry.
+    let (status, body, _) = chat_with(&fx.gw, ask("gpu-box/a"), None).await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.to_string().contains("tuning run"), "{body}");
+    // The run's own requests use the lane.
+    let (status, body, _) = chat_with(&fx.gw, ask("pair"), Some(&id)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["choices"][0]["message"]["content"], "ok from gpu-box");
+    // A second run is refused.
+    let (status, body) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (409, Some("locked"))
+    );
+    let (status, _) = call(
+        &fx.gw,
+        "DELETE",
+        &format!("/v1/optimize/locks/{id}"),
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (_, body, _) = chat_with(&fx.gw, ask("pair"), None).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "ok from gpu-box");
+}
+
+#[tokio::test]
+async fn a_lock_is_refused_on_a_busy_lane() {
+    let fx = fixture(true, "    stickiness: false").await;
+    let gw = fx.gw.clone();
+    let slow = tokio::spawn(async move {
+        chat_with(
+            &gw,
+            json!({"model": "gpu-box/a", "max_tokens": 50,
+                   "chat_template_kwargs": {"enable_thinking": false},
+                   "messages": [{"role": "user", "content": "slow please"}]}),
+            None,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let (status, body) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (409, Some("lane_busy")),
+        "{body}"
+    );
+    slow.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lock_is_refused_inside_a_quiet_window() {
+    let fx = fixture(
+        true,
+        "    quiet_windows: [\"00:00-23:59\", \"23:59-00:00\"]",
+    )
+    .await;
+    let (status, body) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (409, Some("quiet_window")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_experiment_ledger_and_settings_notes_round_trip() {
+    let fx = fixture(true, "    stickiness: false").await;
+    for (run, lever) in [("tune_1", "flash_attn"), ("tune_2", "draft_max")] {
+        let (status, body) = call(
+            &fx.gw,
+            "POST",
+            "/v1/optimize/experiments",
+            ADMIN,
+            Some(json!({"target": "gpu-box/a", "run_id": run, "lever": lever,
+                        "verdict": "rejected", "engine_build": "b1"})),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+    }
+    let (status, list) = call(
+        &fx.gw,
+        "GET",
+        "/v1/optimize/experiments?model=gpu-box/a",
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let levers: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["lever"].as_str().unwrap())
+        .collect();
+    assert_eq!(levers, ["draft_max", "flash_attn"]);
+    // A row without its run id is refused.
+    let (status, _) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/experiments",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(status, 400);
+    // A settings write keeps its note in the history.
+    let (status, body) = call(
+        &fx.gw,
+        "PUT",
+        "/v1/models/gpu-box/a/settings",
+        ADMIN,
+        Some(json!({"revision": 0, "load": {"flash_attn": "on"}, "note": "tune tune_2"})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, history) = call(
+        &fx.gw,
+        "GET",
+        "/v1/models/gpu-box/a/settings/history",
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(
+        history["history"][0]["action"], "put: tune tune_2",
+        "{history}"
+    );
+    // The state is the gateway's: nothing else holds it.
+    let _ = fx.state.engine.optimize().locks();
 }
