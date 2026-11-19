@@ -1073,7 +1073,15 @@ pub fn apply_layered(
             }
             _ => {}
         }
-        if request_has(req, path) {
+        // vLLM reads `repetition_penalty`: a `repeat_penalty` the settings
+        // set goes out under that name, and a request's own
+        // `repetition_penalty` counts as its value for the key (a lock
+        // replaces it). Nothing is renamed that the settings did not set.
+        let vllm_name = (engine == SettingsEngine::Vllm && path == "repeat_penalty")
+            .then_some("repetition_penalty");
+        let request_owns = request_has(req, path)
+            || vllm_name.is_some_and(|name| req.passthrough.contains_key(name));
+        if request_owns {
             if is_locked {
                 clear_request_value(req, path);
                 applied.locked.push(path.clone());
@@ -1082,8 +1090,16 @@ pub fn apply_layered(
             } else {
                 clear_request_value(req, path);
             }
+            if let Some(name) = vllm_name {
+                req.passthrough.remove(name);
+            }
         }
-        set_value(req, path, value);
+        match vllm_name {
+            Some(name) => {
+                req.passthrough.insert(name.to_string(), value.clone());
+            }
+            None => set_value(req, path, value),
+        }
         applied.applied.push(path.clone());
     }
 

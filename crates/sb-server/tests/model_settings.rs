@@ -138,40 +138,181 @@ fn hi(model: &str) -> Value {
     json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
 }
 
+/// What main (a1ade2d, before model settings) sent upstream for these
+/// requests, byte for byte: a target without settings must still get
+/// exactly this.
+const GOLDEN: &[(&str, &str)] = &[
+    (
+        "llama_plain",
+        r#"{"messages":[{"content":"s","role":"system"},{"content":"hi","role":"user"}],"model":"m","stream":false}"#,
+    ),
+    (
+        "llama_sampled",
+        r#"{"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64,"messages":[{"content":"s","role":"system"},{"content":"hi","role":"user"}],"min_p":0.05,"model":"m","repeat_penalty":1.1,"seed":7,"stop":["x"],"stream":false,"temperature":0.699999988079071,"top_k":20,"top_p":0.9}"#,
+    ),
+    (
+        "llama_both",
+        r#"{"messages":[{"content":"hi","role":"user"}],"model":"m","repeat_penalty":1.1,"repetition_penalty":1.3,"stream":false}"#,
+    ),
+    (
+        "vllm_plain",
+        r#"{"messages":[{"content":"s","role":"system"},{"content":"hi","role":"user"}],"model":"m","stream":false}"#,
+    ),
+    (
+        "vllm_sampled",
+        r#"{"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64,"messages":[{"content":"s","role":"system"},{"content":"hi","role":"user"}],"min_p":0.05,"model":"m","repeat_penalty":1.1,"seed":7,"stop":["x"],"stream":false,"temperature":0.699999988079071,"top_k":20,"top_p":0.9}"#,
+    ),
+    (
+        "vllm_both",
+        r#"{"messages":[{"content":"hi","role":"user"}],"model":"m","repeat_penalty":1.1,"repetition_penalty":1.3,"stream":false}"#,
+    ),
+];
+
+fn golden(name: &str) -> &'static str {
+    GOLDEN.iter().find(|(n, _)| *n == name).unwrap().1
+}
+
+fn golden_config(upstream: &str) -> String {
+    format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: text
+    type: openai_compatible
+    engine: llama_cpp
+    base_url: "{upstream}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: vtext
+    type: openai_compatible
+    engine: vllm
+    base_url: "{upstream}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: other
+    type: openai_compatible
+    base_url: "{upstream}"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+"#
+    )
+}
+
 #[tokio::test]
 async fn no_settings_means_byte_identical_upstream_request() {
     let (upstream, seen) = spawn_upstream().await;
     // Gateway A: no settings anywhere. Gateway B: settings on another
-    // target only. A request to text/m must reach the engine byte for byte
-    // the same through both.
-    let (a, _) = spawn_gateway(&config(&upstream, ""), None).await;
-    let (b, _) = spawn_gateway(&config(&upstream, ""), None).await;
+    // target only. Both must send main's bytes for targets without settings.
+    let (a, _) = spawn_gateway(&golden_config(&upstream), None).await;
+    let (b, _) = spawn_gateway(&golden_config(&upstream), None).await;
     assert_eq!(
-        put_settings(&b, "other/x", 0, json!({"defaults": {"temperature": 0.1}}))
-            .await
-            .status(),
+        put_settings(
+            &b,
+            "other/x",
+            0,
+            json!({"defaults": {"temperature": 0.1, "repeat_penalty": 1.2}})
+        )
+        .await
+        .status(),
         200
     );
-    let body = json!({
-        "model": "text/m",
-        "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "chat_template_kwargs": {"enable_thinking": true},
-        "stop": ["x"]
-    });
-    let ra = chat(&a, None, body.clone(), None).await;
-    assert_eq!(ra.status(), 200);
-    assert!(ra.headers().get("x-switchback-settings").is_none());
-    let from_a = seen.lock().unwrap().last().unwrap().clone();
-    let rb = chat(&b, None, body, None).await;
-    assert_eq!(rb.status(), 200);
-    assert!(rb.headers().get("x-switchback-settings").is_none());
-    let from_b = seen.lock().unwrap().last().unwrap().clone();
+    let plain = |model: &str| json!({"model": model, "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]});
+    let sampled = |model: &str| {
+        json!({"model": model,
+            "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
+            "temperature": 0.7, "top_p": 0.9, "top_k": 20, "min_p": 0.05, "repeat_penalty": 1.1,
+            "seed": 7, "max_tokens": 64, "stop": ["x"], "chat_template_kwargs": {"enable_thinking": true}})
+    };
+    let both = |model: &str| {
+        json!({"model": model, "messages": [{"role": "user", "content": "hi"}],
+            "repeat_penalty": 1.1, "repetition_penalty": 1.3})
+    };
+    let cases = [
+        ("llama_plain", plain("text/m")),
+        ("llama_sampled", sampled("text/m")),
+        ("llama_both", both("text/m")),
+        ("vllm_plain", plain("vtext/m")),
+        ("vllm_sampled", sampled("vtext/m")),
+        ("vllm_both", both("vtext/m")),
+    ];
+    for gateway in [&a, &b] {
+        for (name, body) in &cases {
+            let r = chat(gateway, None, body.clone(), None).await;
+            assert_eq!(r.status(), 200);
+            assert!(r.headers().get("x-switchback-settings").is_none());
+            let sent = seen.lock().unwrap().last().unwrap().clone();
+            assert_eq!(
+                std::str::from_utf8(&sent).unwrap(),
+                golden(name),
+                "{name}: a target without settings changed its request"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn vllm_gets_repetition_penalty_only_when_settings_set_it_and_a_lock_wins() {
+    let (upstream, seen) = spawn_upstream().await;
+    let (gw, _) = spawn_gateway(&golden_config(&upstream), None).await;
     assert_eq!(
-        from_a, from_b,
-        "a target without settings changed its request"
+        put_settings(
+            &gw,
+            "vtext/m",
+            0,
+            json!({"defaults": {"repeat_penalty": 1.2}, "locked": ["repeat_penalty"]})
+        )
+        .await
+        .status(),
+        200
     );
+    // The settings' value goes out under vLLM's name; the client's own
+    // vLLM-spelled value loses to the lock.
+    let r = chat(
+        &gw,
+        None,
+        json!({"model": "vtext/m", "messages": [{"role": "user", "content": "hi"}],
+               "repetition_penalty": 1.9}),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let header = r.headers()["x-switchback-settings"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(header.contains("locked=repeat_penalty"), "{header}");
+    let body = last_body(&seen);
+    assert_eq!(body["repetition_penalty"], json!(1.2), "{body}");
+    assert!(body.get("repeat_penalty").is_none(), "{body}");
+    // Unlocked: the client's own value (either spelling) wins and is sent
+    // as the client sent it.
+    assert_eq!(
+        put_settings(
+            &gw,
+            "vtext/m",
+            1,
+            json!({"defaults": {"repeat_penalty": 1.2}})
+        )
+        .await
+        .status(),
+        200
+    );
+    let r = chat(
+        &gw,
+        None,
+        json!({"model": "vtext/m", "messages": [{"role": "user", "content": "hi"}],
+               "repetition_penalty": 1.9}),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let body = last_body(&seen);
+    assert_eq!(body["repetition_penalty"], json!(1.9), "{body}");
+    assert!(body.get("repeat_penalty").is_none(), "{body}");
 }
 
 #[tokio::test]

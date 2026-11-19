@@ -286,21 +286,6 @@ pub fn apply_engine_thinking_on(engine: sb_core::OpenAiEngine, body: &mut Value)
     }
 }
 
-/// Sampling keys an engine spells differently from the model-settings
-/// names (which follow llama.cpp): vLLM reads `repetition_penalty`. A
-/// request that already sent vLLM's own name keeps it.
-pub fn apply_engine_sampling(engine: sb_core::OpenAiEngine, body: &mut Value) {
-    if engine != sb_core::OpenAiEngine::Vllm {
-        return;
-    }
-    let Some(obj) = body.as_object_mut() else {
-        return;
-    };
-    if let Some(value) = obj.remove("repeat_penalty") {
-        obj.entry("repetition_penalty").or_insert(value);
-    }
-}
-
 impl WireCodec for EngineChatCodec {
     fn id(&self) -> &'static str {
         OpenAiCodec.id()
@@ -317,7 +302,6 @@ impl WireCodec for EngineChatCodec {
         {
             apply_engine_thinking_on(self.engine, &mut body);
         }
-        apply_engine_sampling(self.engine, &mut body);
         Ok(body)
     }
     fn parse_response(&self, body: &Value) -> Result<AiResponse, String> {
