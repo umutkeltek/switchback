@@ -101,7 +101,7 @@ type ResolvedRoute = (
     Vec<String>,
     Option<ResolvedCombo>,
     bool,
-    Option<PreferAwakeConfig>,
+    Option<sb_core::PreferAwakeOverride>,
 );
 
 #[derive(Debug, Clone)]
@@ -441,10 +441,11 @@ pub(crate) fn resolve_candidates(
             );
         }
     }
-    // Wake-aware ordering (`prefer_awake`): the route's own setting, else
-    // the server default. Only then is a target's wake need stamped, so a
+    // Wake-aware ordering (`prefer_awake`): the route's own fields over the
+    // server default. Only when on is a target's wake need stamped, so a
     // route without it plans exactly as before.
-    let effective = route_prefer_awake.unwrap_or(snap.config.server.prefer_awake);
+    let server_default = snap.config.server.prefer_awake;
+    let effective = route_prefer_awake.map_or(server_default, |route| route.over(&server_default));
     let prefer_awake = effective.enabled.then_some(effective);
     if let (Some(_), Some(lanes)) = (prefer_awake, lanes) {
         for candidate in candidates.iter_mut() {

@@ -2090,9 +2090,9 @@ pub struct ServerConfig {
     /// of observed upstream latency. `cost_aware` wins when both are on.
     #[serde(default)]
     pub latency_aware: bool,
-    /// Server default for wake-aware ordering ("prefer awake"); a route's
-    /// own `prefer_awake` replaces it. Off by default. See
-    /// [`PreferAwakeConfig`].
+    /// Server default for wake-aware ordering ("prefer awake"); each field
+    /// a route's own `prefer_awake` sets replaces this one's
+    /// ([`PreferAwakeOverride`]). Off by default. See [`PreferAwakeConfig`].
     #[serde(default)]
     pub prefer_awake: PreferAwakeConfig,
     /// Cost-routing policy gates (all default-allow). Set false to exclude that
@@ -3724,9 +3724,42 @@ pub struct RouteConfig {
     #[serde(default)]
     pub pin_order: bool,
     /// Wake-aware ordering for this route (see [`PreferAwakeConfig`]).
-    /// Absent = the server default (`server.prefer_awake`), which is off.
+    /// Each field set here replaces the server default's
+    /// (`server.prefer_awake`); a field left out keeps it. So a route that
+    /// sets only `wake_for_prompt_tokens` stays on when the server default
+    /// is on, and `enabled: false` turns one route off. Absent = the server
+    /// default, which is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefer_awake: Option<PreferAwakeConfig>,
+    pub prefer_awake: Option<PreferAwakeOverride>,
+}
+
+/// A route's `prefer_awake`: each field set replaces the server default's
+/// ([`PreferAwakeConfig`]); a field left out keeps the server's value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreferAwakeOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_for_prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_for_output_tokens: Option<u32>,
+}
+
+impl PreferAwakeOverride {
+    /// The settings in force on the route: this route's fields over the
+    /// server default.
+    pub fn over(&self, server: &PreferAwakeConfig) -> PreferAwakeConfig {
+        PreferAwakeConfig {
+            enabled: self.enabled.unwrap_or(server.enabled),
+            wake_for_prompt_tokens: self
+                .wake_for_prompt_tokens
+                .unwrap_or(server.wake_for_prompt_tokens),
+            wake_for_output_tokens: self
+                .wake_for_output_tokens
+                .unwrap_or(server.wake_for_output_tokens),
+        }
+    }
 }
 
 /// Wake-aware ordering ("prefer awake") for routes over managed local lanes
@@ -4005,6 +4038,63 @@ routes:
       - "openrouter/openai/gpt-4o"
       - "mock/echo"
 "#;
+
+    /// A route's `prefer_awake` merges field by field over the server
+    /// default: a route that sets only a threshold keeps the server's
+    /// `enabled`, and `enabled: false` turns one route off.
+    #[test]
+    fn route_prefer_awake_merges_over_the_server_default() {
+        let cfg = Config::from_yaml(
+            r#"
+server:
+  bind: "127.0.0.1:0"
+  prefer_awake: { enabled: true, wake_for_output_tokens: 900 }
+providers:
+  - id: mock
+    type: mock
+routes:
+  - name: threshold
+    match: { model: "threshold" }
+    prefer_awake: { wake_for_prompt_tokens: 50 }
+    targets: ["mock/echo"]
+  - name: off
+    match: { model: "off" }
+    prefer_awake: { enabled: false }
+    targets: ["mock/echo"]
+  - name: plain
+    match: { model: "plain" }
+    targets: ["mock/echo"]
+"#,
+        )
+        .expect("parse");
+        let server = cfg.server.prefer_awake;
+        let effective = |model: &str| {
+            let route = cfg.exact_route_for(model).expect("route");
+            route
+                .prefer_awake
+                .map_or(server, |route| route.over(&server))
+        };
+        assert_eq!(
+            effective("threshold"),
+            PreferAwakeConfig {
+                enabled: true,
+                wake_for_prompt_tokens: 50,
+                wake_for_output_tokens: 900,
+            }
+        );
+        assert_eq!(
+            effective("off"),
+            PreferAwakeConfig {
+                enabled: false,
+                ..server
+            }
+        );
+        assert_eq!(effective("plain"), server);
+        // A route-level setting round-trips without the fields it left out.
+        let route = cfg.exact_route_for("threshold").expect("route");
+        let yaml = serde_yaml::to_string(&route.prefer_awake).expect("serialize");
+        assert_eq!(yaml.trim(), "wake_for_prompt_tokens: 50");
+    }
 
     #[test]
     fn parses_sample_config() {
