@@ -657,6 +657,24 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(len(self.requests("POST", "/v1/hosts/two/holds")), 1)
 
+    def test_bare_hold_means_the_only_machine_that_sleeps(self):
+        # An always-on machine (no wake, no power-off) beside the one that sleeps:
+        # a bare hold, release and bench of a route name mean the sleeping one.
+        self.fake.holds = []
+        self.fake.lanes = [lane("lane-text", "healthy", host="box"),
+                           lane("mac", "healthy", host="desk", wake_configured=False,
+                                poweroff_configured=False)]
+        run = self.sb("hold", "10m", "--wake")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(self.requests("POST", "/v1/hosts/box/holds")), 1)
+        self.assertEqual(self.requests("POST", "/v1/hosts/desk/holds"), [])
+        # Two sleeping machines stay ambiguous.
+        self.fake.lanes = [lane("lane-a", host="one"), lane("lane-b", host="two"),
+                           lane("mac", host="desk", wake_configured=False, poweroff_configured=False)]
+        run = self.sb("hold", "10m")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("desk, one, two", run.stderr)
+
     def test_hold_on_a_lane_with_a_machine_of_its_own(self):
         # The full (operator) report leaves `host` out for a lane that has a
         # machine of its own; the holds API names that machine after the lane.

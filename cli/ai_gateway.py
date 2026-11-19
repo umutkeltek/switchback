@@ -888,11 +888,26 @@ def host_for(gw, args):
     # machine is then named after the lane (the holds API takes that name).
     lanes = (capacity(gw).get("data") or [])
     hosts = sorted({machine_of(lane) for lane in lanes})
-    if len(hosts) == 1:
-        return hosts[0]
     if not hosts:
         raise Fail(GATEWAY_ERROR, "the gateway manages no machine (no local lanes)")
+    host = only_host(lanes)
+    if host:
+        return host
     raise Fail(USAGE, f"the gateway manages several machines ({', '.join(hosts)}); choose one with --host")
+
+
+def only_host(lanes):
+    """The one machine a bare hold or model means, or None.
+
+    With several machines, the one the gateway powers on and off wins when it is
+    the only such machine: an always-on machine (no wake, no power-off) needs no
+    hold, so `sb ai hold 2h --wake` keeps meaning the machine that sleeps."""
+    hosts = sorted({machine_of(lane) for lane in lanes})
+    if len(hosts) == 1:
+        return hosts[0]
+    managed = sorted({machine_of(lane) for lane in lanes
+                      if lane.get("wake_configured") or lane.get("poweroff_configured")})
+    return managed[0] if len(managed) == 1 else None
 
 
 def holds_path(host, hold_id=None):
@@ -1019,10 +1034,11 @@ def model_host(model, lanes):
         for lane in lanes:
             if lane.get("name") == prefix:
                 return machine_of(lane)
-    if len(hosts) == 1:
-        return hosts[0]
     if not hosts:
         raise Fail(GATEWAY_ERROR, "the gateway manages no machine (no local lanes)")
+    host = only_host(lanes)
+    if host:
+        return host
     raise Fail(USAGE, f"the gateway manages several machines ({', '.join(hosts)}); name the "
                       "model with its lane (like lane/model)")
 
