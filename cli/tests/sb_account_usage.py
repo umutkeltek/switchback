@@ -268,6 +268,99 @@ class UsageTests(unittest.TestCase):
         self.assertTrue(row["windows"][0]["estimated"])
         self.assertEqual(row["windows"][0]["model"], "fixture-model")
 
+    def recorded(self, utilization):
+        """A cachedUsageUtilization block in the shape Claude Code records, with synthetic values."""
+        empty = {key: None for key in ("seven_day_oauth_apps", "seven_day_opus", "seven_day_sonnet",
+                                       "seven_day_cowork", "pace", "indicator")}
+        return {"cachedUsageUtilization": {"fetchedAtMs": self.now * 1000, "accountUuid": "account-one",
+            "utilization": {**empty, "extra_usage": {"is_enabled": False, "utilization": None},
+                            "seven_day_breakdown": {"rows": [{"key": "chat", "percent": 0}]}, **utilization}}}
+
+    def limit(self, kind, percent, reset, model=None):
+        scope = {"model": {"id": None, "display_name": model}, "surface": None} if model else None
+        return {"kind": kind, "group": "session" if kind == "session" else "weekly", "percent": percent,
+                "severity": "normal", "resets_at": usage.iso(self.now + reset), "scope": scope, "is_active": False}
+
+    def test_model_scoped_weekly_limit_becomes_its_own_named_window(self):
+        data = self.recorded({
+            "five_hour": {"utilization": 20, "resets_at": usage.iso(self.now + 3600)},
+            "seven_day": {"utilization": 59, "resets_at": usage.iso(self.now + 86400)},
+            "limits": [self.limit("session", 20, 3600), self.limit("weekly_all", 59, 86400),
+                       self.limit("weekly_scoped", 73, 86399, "Fable")],
+            "weekly_scoped_shares": [{"limit_index": 2, "used_percent_of_weekly": 37}]})
+        windows = usage.claude_windows(data, "account-one", self.now)
+        self.assertEqual([w["name"] for w in windows], ["five_hour", "seven_day", "seven_day_fable"])
+        fable = windows[2]
+        self.assertEqual((fable["model"], fable["limit_kind"]), ("Fable", "weekly_scoped"))
+        self.assertEqual((fable["used_percent"], fable["remaining_percent"]), (73, 27))
+        self.assertEqual((fable["window_minutes"], fable["state"]), (10080, "fresh"))
+        # Account-wide rows are not counted twice: the limits copies of 5-hour and weekly add nothing.
+        self.assertEqual(sum(1 for w in windows if w["name"] == "seven_day"), 1)
+        # Model and kind survive the aging pass that every published row goes through.
+        row = usage.age_rows([{"provider": "claude", "slot": "one", "observed_at": usage.iso(self.now),
+                               "windows": windows}], self.now)[0]
+        self.assertEqual((row["windows"][2]["model"], row["windows"][2]["limit_kind"]), ("Fable", "weekly_scoped"))
+
+    def test_used_up_model_limit_without_a_session_keeps_five_hour_unknown(self):
+        data = self.recorded({"five_hour": None,
+            "seven_day": {"utilization": 89, "resets_at": usage.iso(self.now + 86400)},
+            "limits": [self.limit("weekly_all", 89, 86400), self.limit("weekly_scoped", 100, 86400, "Fable")]})
+        windows = {w["name"]: w for w in usage.claude_windows(data, "account-one", self.now)}
+        self.assertIsNone(windows["five_hour"]["used_percent"])
+        self.assertEqual(windows["five_hour"]["state"], "unknown")
+        self.assertEqual(windows["seven_day_fable"]["remaining_percent"], 0)
+
+    def test_limits_fill_missing_named_windows_and_win_over_legacy_model_keys(self):
+        data = self.recorded({"five_hour": None, "seven_day": None,
+            "seven_day_opus": {"utilization": 10, "resets_at": usage.iso(self.now + 86400)},
+            "limits": [self.limit("session", 30, 3600), self.limit("weekly_all", 40, 86400),
+                       self.limit("weekly_scoped", 50, 86400, "Opus"),
+                       self.limit("weekly_scoped", 60, 86400, "Claude Next 2.1"),
+                       self.limit("weekly_scoped", 70, 86400, "")]})
+        windows = {w["name"]: w for w in usage.claude_windows(data, "account-one", self.now)}
+        self.assertEqual(set(windows), {"five_hour", "seven_day", "seven_day_opus", "seven_day_claude_next_2_1"})
+        self.assertEqual((windows["five_hour"]["used_percent"], windows["seven_day"]["used_percent"]), (30, 40))
+        self.assertEqual((windows["seven_day_opus"]["used_percent"], windows["seven_day_opus"]["model"]), (50, "Opus"))
+        self.assertEqual(windows["seven_day_claude_next_2_1"]["model"], "Claude Next 2.1")
+
+    def test_malformed_limits_never_invent_a_window(self):
+        for limits in ("nope", [None, 3, {"kind": "weekly_scoped", "percent": 120,
+                       "scope": {"model": {"display_name": "Fable"}}}]):
+            data = self.recorded({"five_hour": {"utilization": 5, "resets_at": usage.iso(self.now + 60)},
+                                  "seven_day": {"utilization": 6, "resets_at": usage.iso(self.now + 60)},
+                                  "limits": limits})
+            windows = usage.claude_windows(data, "account-one", self.now)
+            extra = [w for w in windows if w["name"] not in ("five_hour", "seven_day")]
+            self.assertTrue(all(w["used_percent"] is None and w["state"] == "unknown" for w in extra), extra)
+
+    def test_family_without_a_usage_source_is_reported_once_and_never_scheduled(self):
+        with tempfile.TemporaryDirectory(prefix="sb-usage-source-fixture-") as tmp:
+            root = Path(tmp).resolve()
+            (root / ".codexbar").mkdir()
+            native.write_json(root / ".codexbar/config.json", {"providers": [
+                {"id": "fixturebridge", "enabled": True}, {"id": "fixtureoff", "enabled": False}]})
+            fs = SimpleNamespace(read_json=native.read_json, write_json=native.write_json,
+                safe_dir=native.safe_dir, lock=native.lock, valid_name=lambda x: bool(native.NAME.fullmatch(x)))
+            args = SimpleNamespace(provider="all", slot=None, timeout=30, refresh=True)
+            bridged = []
+
+            def query(command, timeout):
+                if command[1:] == ["config", "providers"]:
+                    return {"providers": [{"id": "gatewayonly"}, {"id": "fixtureoff"}, {"id": "fixturebridge"}]}, None
+                self.assertEqual(command[0], "codexbar")
+                bridged.append(command[command.index("--provider") + 1])
+                return [{"provider": "fixturebridge", "usage": {"updatedAt": usage.iso(self.now),
+                         "primary": {"usedPercent": 10, "windowMinutes": 300,
+                                     "resetsAt": usage.iso(self.now + 300)}}}], None
+            with patch.object(usage, "query", side_effect=query), patch.object(Path, "home", return_value=root), \
+                 patch.object(usage.shutil, "which", return_value="/fixture/codexbar"), \
+                 patch.object(usage.time, "time", return_value=self.now):
+                result = usage.report(args, root, "fixture-sb", fs)
+            self.assertEqual(bridged, ["fixturebridge"])
+            coverage = {row["provider"]: row["reason"] for row in result["coverage"]}
+            self.assertEqual(coverage, {"fixtureoff": usage.NO_COLLECTOR, "gatewayonly": usage.NO_COLLECTOR})
+            self.assertEqual(set(usage.refresh_groups(result)), {"fixturebridge/*"})
+
 
 if __name__ == "__main__":
     unittest.main()

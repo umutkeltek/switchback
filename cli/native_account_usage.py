@@ -12,6 +12,8 @@ from native_account_process import Refusal, supervised_group
 
 SCHEMA = "switchback/account-usage@1"
 FRESH_SECONDS = 900
+# Coverage reason for a configured family that no collector can observe; it is never scheduled.
+NO_COLLECTOR = "no_usage_collector"
 ALIASES = {"zai-coding": "zai", "zai-coding-headroom": "zai",
            "minimax-coding": "minimax", "kimi-coding": "kimi",
            "neuralwatt-coding": "neuralwatt", "codex-relay": "codex",
@@ -96,15 +98,45 @@ def claude_windows(data, expected_account, now):
     if not number(fetched) or not isinstance(usage, dict):
         return []
     sampled = fetched / 1000
+    limits = usage.get("limits")
+    limits = [x for x in limits if isinstance(x, dict)] if isinstance(limits, list) else []
+
+    def account_wide(kind):
+        return next((x for x in limits if x.get("kind") == kind and x.get("scope") is None), None)
+
     result = []
-    for name, minutes in (("five_hour", 300), ("seven_day", 10080)):
+    # The named windows stay authoritative; the limits list fills them only when they are absent.
+    for name, minutes, kind in (("five_hour", 300, "session"), ("seven_day", 10080, "weekly_all")):
         raw = usage.get(name)
-        raw = raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            fallback = account_wide(kind)
+            raw = {"utilization": fallback.get("percent"), "resets_at": fallback.get("resets_at")} if fallback else {}
         result.append(window(name, raw.get("utilization"), raw.get("resets_at"), sampled, now, minutes))
+    names = {"five_hour", "seven_day"}
+    # A weekly limit scoped to one model (for example Fable) is its own window, named by the model.
+    # It never reuses five_hour/seven_day, so consumers that require exactly one of those are unchanged.
+    for limit in limits:
+        model = object_value(object_value(limit.get("scope")).get("model"))
+        display = label(model.get("display_name"))
+        slug = model_slug(display) if display else ""
+        name = "seven_day_" + slug
+        if limit.get("kind") != "weekly_scoped" or not slug or name in names:
+            continue
+        names.add(name)
+        result.append({**window(name, limit.get("percent"), limit.get("resets_at"), sampled, now, 10080),
+                       "model": display, "limit_kind": "weekly_scoped"})
     for name, raw in usage.items():
-        if name.startswith("seven_day_") and isinstance(raw, dict) and "utilization" in raw:
+        if (name.startswith("seven_day_") and name not in names and isinstance(raw, dict)
+                and "utilization" in raw):
+            names.add(name)
             result.append(window(name, raw.get("utilization"), raw.get("resets_at"), sampled, now, 10080))
     return result
+
+
+def model_slug(display):
+    """Stable lowercase window suffix for a model display name: "Fable" -> "fable"."""
+    words = ''.join(c if c.isascii() and c.isalnum() else ' ' for c in display.lower()).split()
+    return '_'.join(words)[:40]
 
 
 def summary(windows):
@@ -274,7 +306,8 @@ def codexbar_rows(payload, now):
 
 def age_rows(rows, now):
     for row in rows:
-        row["windows"] = [{**{k: w[k] for k in ("model", "scope", "reset_source", "estimated", "usage_kind") if k in w},
+        row["windows"] = [{**{k: w[k] for k in ("model", "scope", "limit_kind", "reset_source", "estimated", "usage_kind")
+                              if k in w},
                                   **window(w["name"], w.get("used_percent"), w.get("resets_at"),
                                            w.get("sampled_at"), now, w.get("window_minutes"))}
                           for w in row.get("windows", []) if isinstance(w, dict) and "name" in w]
@@ -456,14 +489,22 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
     collectors = collectors if isinstance(collectors, list) else []
     token_counts = {x["id"]: len(account_rows(x.get("tokenAccounts")))
                     for x in collectors if isinstance(x, dict) and fs.valid_name(x.get("id", ""))}
-    families.update(backing_provider(x["id"]) for x in collectors if isinstance(x, dict)
-                    and x.get("enabled") is True and fs.valid_name(x.get("id", "")))
+    bridged = {backing_provider(x["id"]) for x in collectors if isinstance(x, dict)
+               and x.get("enabled") is True and fs.valid_name(x.get("id", ""))}
+    families.update(bridged)
     families.discard("claude")
     if provider != "all":
         families &= {ALIASES.get(provider, provider)}
     # Direct provider collectors resolve only the existing configured env references.
     # The redacted config supplies references/account ids, never credential values.
     from provider_account_usage import discover, collect, UsageError, DIRECT_FAMILIES
+    # CodexBar honours its own provider switches and answers an unknown provider with every
+    # enabled one. When its settings exist, a gateway-only family it does not collect has no
+    # usage source: report that once instead of querying, failing and retrying it forever.
+    if collectors:
+        for family in sorted(families - bridged - DIRECT_FAMILIES - {"codex"}):
+            families.discard(family)
+            coverage.append({"provider": family, "state": "unknown", "reason": NO_COLLECTOR})
     definitions, definitions_error = (query([sb, "config", "get", "providers", "--json"], 15)
                                       if families & DIRECT_FAMILIES else ([], None))
     direct = discover(definitions, families)
@@ -661,7 +702,7 @@ def refresh_groups(snapshot):
         if row not in values:
             values.append(row)
     for row in snapshot["coverage"]:
-        if row["provider"] != "inventory":
+        if row["provider"] != "inventory" and row.get("reason") != NO_COLLECTOR:
             grouped.setdefault(backing_provider(row["provider"]) + "/*", [])
     return grouped
 
@@ -740,6 +781,10 @@ def report(args, runtime, sb, fs):
                 not 0 <= v["consecutive_failures"] <= 32 for v in schedules.values()):
             raise Refusal("invalid usage refresh checkpoint")
         groups = refresh_groups(snapshot)
+        # Retired collectors (for example a family with no usage source) drop out of the checkpoint.
+        # Only a whole-inventory pass knows which collectors still exist.
+        if (args.provider or "all") == "all" and not args.slot:
+            schedules = {key: value for key, value in schedules.items() if key in groups}
         plan = refresh_plan(groups, schedules, sb) if scheduled else None
         due = {r["key"] for r in plan["collectors"] if r["due"]} if plan else set(groups)
         if not due:
