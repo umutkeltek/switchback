@@ -26,6 +26,12 @@ import urllib.parse
 import urllib.request
 import uuid
 
+try:
+    import ai_fit
+except ImportError:  # the module sits next to this file
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ai_fit
+
 OK, GATEWAY_ERROR, USAGE, UNREACHABLE = 0, 1, 2, 3
 MACHINE_OFF = 3  # the same code as an unreachable gateway: the work cannot start
 
@@ -56,6 +62,9 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  speech to text; --speakers says who spoke when
   sb ai speak "TEXT" [--model ID] [--voice V] -o OUT
                                  text to speech, saved to OUT
+  sb ai fit REPO [--ctx N] [--machines FILE] [--vram GB] [--ram GB]
+                 [--bandwidth GBS] [--json]
+                                 where a model fits and which file to take
 
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
@@ -99,13 +108,44 @@ PATH, else sent as it is. speak saves the audio to OUT; the extension picks the
 format (.mp3, .wav, .opus or .ogg, .aac, .flac, .pcm). Its
 model is --model, else SWITCHBACK_AI_SPEECH_MODEL, else the gateway's one speech
 model. Both wait up to --timeout SECS (default 900).
+fit reads the model index, never the model itself, and says where a model
+fits and which file to take: the best quant that fits whole, the KV cache it
+needs at that context, what has to be offloaded, the disk it takes and a
+rough writing speed. REPO is owner/name or a huggingface.co link. --ctx is
+the context length of the KV cache (32768 by default, f16). --vram, --ram and
+--bandwidth describe one machine: a GPU box when --vram is given (--ram is
+then its host memory), a unified memory machine when only --ram is given.
+--machines FILE reads a list of them:
+{"machines": [{"name": "box", "kind": "gpu", "vram_gb": 24, "ram_gb": 62,
+"bandwidth_gbs": 1008}, {"name": "laptop", "kind": "unified",
+"usable_gb": 28, "bandwidth_gbs": 546}]}
+SB_AI_MACHINES names the same file. Without a machine only the file sizes
+and the KV cache are shown. The speed is an estimate: the bandwidth of the
+machine times 0.55 divided by the bytes a token reads.
+
+--json prints the same answer with stable keys: repo, kind (gguf,
+safetensors, diffusion), context_length, model {architecture, layers,
+kv_layers, kv_heads, kv_heads_per_layer, head_dim, value_dim, experts,
+experts_used, max_context_length, sliding_window, sliding_layers, source},
+kv_cache {bytes, known, element_bytes, note},
+options [{quant, files [{name, bytes}], bytes, quality_bits, bytes_per_token,
+bytes_per_token_source}], projector {files, chosen, bytes} (chosen: the one
+file a server loads), draft {files, bytes},
+components [{folder, name, bytes, role}], machines [{name, kind,
+budget_bytes, host_bytes, bandwidth_gbs, verdict (fits, partial, no-fit),
+quant, files, weights_bytes, kv_cache_bytes, projector_bytes, margin_bytes,
+needed_bytes, on_gpu_bytes, offloaded_bytes, offloaded_fraction,
+bytes_per_token, speed_estimate_tok_s, disk_bytes, faster_alternative,
+warnings}], notes. A diffusion repository answers with the model it takes
+and the parts around it instead: model {name, bytes}, on_gpu [], offload [].
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
 SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL, SWITCHBACK_AI_SEGMENT_MODEL,
 SWITCHBACK_AI_SPEECH_MODEL (defaults), SWITCHBACK_AI_OUT_DIR.
 Exit codes: 0 ok, 1 the gateway reported an error, 2 usage error, 3 the gateway does
-not answer, or the machine is off.
+not answer, or the machine is off. fit answers 3 when the model index cannot be
+reached and 1 when it answers with an error.
 """
 
 CONFIG_KEYS = ("SWITCHBACK_AI_URL", "SWITCHBACK_AI_KEY", "SWITCHBACK_AI_IMAGE_MODEL",
@@ -1697,6 +1737,8 @@ def parser():
     speak.add_argument("--voice", default="")
     speak.add_argument("-o", "--output", required=True)
     speak.add_argument("--timeout", type=float, default=900)
+    fit = sub.add_parser("fit", add_help=False, allow_abbrev=False)
+    ai_fit.add_arguments(fit)
     return top
 
 
@@ -1707,6 +1749,9 @@ def main(argv=None, environ=None):
         print(HELP, end="")
         return OK
     args = parser().parse_args(argv)
+    if args.command == "fit":
+        # fit reads the model index, not the gateway: it needs no key.
+        return ai_fit.run(args)
     gw = None
     try:
         config = load_config(environ)
