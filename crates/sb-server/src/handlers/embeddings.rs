@@ -15,9 +15,14 @@ pub(crate) async fn embeddings(
     State(state): State<AppState>,
     Extension(principal): Extension<tenancy::Principal>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Response {
     let started = Instant::now();
+    // Model settings do not apply to embeddings; the `switchback` object
+    // still never reaches an upstream.
+    if let Some(object) = body.as_object_mut() {
+        object.remove(sb_core::SWITCHBACK_BODY_KEY);
+    }
     let (_admit, queue_ms) = match admission::acquire(&state).await {
         Ok(slot) => slot,
         Err(resp) => return *resp,

@@ -27,10 +27,21 @@ async fn record(State(seen): State<Seen>, body: Bytes) -> Json<Value> {
     }))
 }
 
+async fn record_embeddings(State(seen): State<Seen>, body: Bytes) -> Json<Value> {
+    seen.lock().unwrap().push(body);
+    Json(json!({
+        "object": "list",
+        "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+        "model": "m",
+        "usage": {"prompt_tokens": 1, "total_tokens": 1}
+    }))
+}
+
 async fn spawn_upstream() -> (String, Seen) {
     let seen: Seen = Arc::default();
     let app = Router::new()
         .route("/chat/completions", post(record))
+        .route("/embeddings", post(record_embeddings))
         .with_state(seen.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -477,4 +488,19 @@ api_keys:
             .unwrap();
         assert_eq!(r.status(), 403);
     }
+}
+
+#[tokio::test]
+async fn the_switchback_object_never_reaches_an_embeddings_upstream() {
+    let (upstream, seen) = spawn_upstream().await;
+    let (gw, _) = spawn_gateway(&config(&upstream, ""), None).await;
+    let r = reqwest::Client::new()
+        .post(format!("{gw}/v1/embeddings"))
+        .json(&json!({"model": "text/m", "input": "hi", "switchback": {"profile": "x"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let raw = String::from_utf8(seen.lock().unwrap().last().unwrap().to_vec()).unwrap();
+    assert!(!raw.contains("switchback"), "{raw}");
 }
