@@ -28,6 +28,7 @@ sb-store.workspace = true
 sb-plugin.workspace = true
 tokio.workspace = true
 futures.workspace = true
+bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -1888,6 +1888,11 @@ fn default_max_request_bytes() -> Option<u64> {
     Some(64 * 1024 * 1024)
 }
 
+/// OpenAI's own upload limit for `/v1/audio/transcriptions`: 25 MB.
+fn default_audio_max_upload_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
 fn default_idempotency_inflight_ttl_ms() -> u64 {
     600_000
 }
@@ -1990,6 +1995,13 @@ pub struct ServerConfig {
     /// Codex/Claude Code relay. `null` disables the cap.
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: Option<u64>,
+    /// Largest multipart body `/v1/audio/transcriptions` and
+    /// `/v1/audio/translations` accept (the audio file plus its fields).
+    /// A larger upload is refused with 413 `audio_too_large` before any
+    /// target is chosen. Default 25 MiB, as OpenAI. This route ignores
+    /// `max_request_bytes`.
+    #[serde(default = "default_audio_max_upload_bytes")]
+    pub audio_max_upload_bytes: u64,
     /// Telemetry privacy mode (Oracle #8). `metadata_only` (the default, and the
     /// only one enforced today: logs/traces are route+attempt metadata, never
     /// prompt/response content) — the richer modes are reserved seams.
@@ -2610,6 +2622,7 @@ impl Default for ServerConfig {
             tenant_concurrency_ttl_ms: default_tenant_concurrency_ttl_ms(),
             max_response_bytes: None,
             max_request_bytes: default_max_request_bytes(),
+            audio_max_upload_bytes: default_audio_max_upload_bytes(),
             privacy_mode: PrivacyMode::default(),
             execution_cache: ExecutionCacheConfig::default(),
             strict_schema_downlevel: false,
@@ -3578,6 +3591,9 @@ pub struct CapabilityOverrides {
     pub streaming: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_in: Option<bool>,
+    /// The deployment makes speech from text (`/v1/audio/speech`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_out: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_in: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3623,6 +3639,9 @@ impl CapabilityOverrides {
         if let Some(v) = self.audio_in {
             caps.audio_in = v;
         }
+        if let Some(v) = self.audio_out {
+            caps.audio_out = v;
+        }
         if let Some(v) = self.file_in {
             caps.file_in = v;
         }
@@ -3664,6 +3683,8 @@ pub struct RouteRequire {
     pub vision_sources: Vec<crate::ImageSourceKind>,
     #[serde(default)]
     pub audio_in: Option<bool>,
+    #[serde(default)]
+    pub audio_out: Option<bool>,
     #[serde(default)]
     pub file_in: Option<bool>,
     #[serde(default)]

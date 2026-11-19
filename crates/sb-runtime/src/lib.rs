@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use sb_core::Config;
 
+mod audio;
 mod audit;
 mod collect;
 mod denial;
@@ -42,8 +43,10 @@ mod usage;
 #[cfg(test)]
 mod tests;
 
+pub use audio::AudioInput;
 pub use audit::AuditContext;
-pub use outcome::{EmbeddingsOutcome, ExecError, ExecOutcome};
+pub use outcome::{AudioOutcome, EmbeddingsOutcome, ExecError, ExecOutcome};
+pub use sb_adapter::{AudioBody, AudioCall, FormPart};
 
 pub(crate) use denial::DenialTrace;
 #[cfg(test)]

@@ -15,6 +15,12 @@ pub enum WorkloadKind {
     ImageGeneration,
     VideoGeneration,
     WorkflowExecution,
+    /// `/v1/audio/transcriptions`: speech to text in its own language.
+    AudioTranscription,
+    /// `/v1/audio/translations`: speech to English text.
+    AudioTranslation,
+    /// `/v1/audio/speech`: text to speech.
+    AudioSpeech,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +58,8 @@ pub enum PricingUnit {
     PerMegapixel,
     PerSecond,
     PerVideo,
+    /// Characters of input text (text to speech).
+    PerCharacter,
     #[default]
     TokenMetered,
     Credits,

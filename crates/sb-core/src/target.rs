@@ -38,6 +38,9 @@ pub struct CapabilityProfile {
     pub server_tool_protocols: Vec<ServerToolProtocol>,
     #[serde(default)]
     pub audio_in: bool,
+    /// Makes speech from text (`/v1/audio/speech`).
+    #[serde(default)]
+    pub audio_out: bool,
     #[serde(default)]
     pub file_in: bool,
     #[serde(default)]
@@ -62,6 +65,7 @@ impl Default for CapabilityProfile {
             server_tools: false,
             server_tool_protocols: Vec::new(),
             audio_in: false,
+            audio_out: false,
             file_in: false,
             image_out: false,
             reasoning_summary: false,

@@ -74,6 +74,12 @@ pub trait WireCodec: Send + Sync {
         None
     }
 
+    /// Audio endpoint URL (`/audio/transcriptions`, `/audio/translations`,
+    /// `/audio/speech`), if this wire format has OpenAI's audio API.
+    fn audio_url(&self, _base_url: &str, _call: sb_adapter::AudioCall) -> Option<String> {
+        None
+    }
+
     /// Parse a model-list response into upstream model ids.
     fn parse_models_response(&self, _body: &Value) -> Result<Vec<String>, String> {
         Err("model listing not supported by this wire format".to_string())
@@ -170,6 +176,13 @@ impl WireCodec for OpenAiCodec {
     }
     fn embeddings_url(&self, base_url: &str) -> Option<String> {
         Some(format!("{}/embeddings", base_url.trim_end_matches('/')))
+    }
+    fn audio_url(&self, base_url: &str, call: sb_adapter::AudioCall) -> Option<String> {
+        Some(format!(
+            "{}/{}",
+            base_url.trim_end_matches('/'),
+            call.path()
+        ))
     }
     fn models_url(&self, base_url: &str) -> Option<String> {
         Some(format!("{}/models", base_url.trim_end_matches('/')))
@@ -280,6 +293,9 @@ impl WireCodec for EngineChatCodec {
     }
     fn embeddings_url(&self, base_url: &str) -> Option<String> {
         OpenAiCodec.embeddings_url(base_url)
+    }
+    fn audio_url(&self, base_url: &str, call: sb_adapter::AudioCall) -> Option<String> {
+        OpenAiCodec.audio_url(base_url, call)
     }
     fn models_url(&self, base_url: &str) -> Option<String> {
         OpenAiCodec.models_url(base_url)

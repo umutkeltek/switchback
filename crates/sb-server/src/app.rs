@@ -15,6 +15,15 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/models", get(handlers::meta::models))
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .route(
+            "/v1/audio/transcriptions",
+            post(handlers::audio::transcriptions),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(handlers::audio::translations),
+        )
+        .route("/v1/audio/speech", post(handlers::audio::speech))
+        .route(
             "/v1/images/generations",
             post(handlers::workloads::images_generations),
         )

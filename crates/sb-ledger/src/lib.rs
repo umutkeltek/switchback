@@ -1135,6 +1135,9 @@ fn workload_kind_name(kind: WorkloadKind) -> &'static str {
         WorkloadKind::ImageGeneration => "image_generation",
         WorkloadKind::VideoGeneration => "video_generation",
         WorkloadKind::WorkflowExecution => "workflow_execution",
+        WorkloadKind::AudioTranscription => "audio_transcription",
+        WorkloadKind::AudioTranslation => "audio_translation",
+        WorkloadKind::AudioSpeech => "audio_speech",
     }
 }
 
@@ -1144,6 +1147,7 @@ fn pricing_unit_name(unit: PricingUnit) -> &'static str {
         PricingUnit::PerMegapixel => "per_megapixel",
         PricingUnit::PerSecond => "per_second",
         PricingUnit::PerVideo => "per_video",
+        PricingUnit::PerCharacter => "per_character",
         PricingUnit::TokenMetered => "token_metered",
         PricingUnit::Credits => "credits",
         PricingUnit::Quota => "quota",
@@ -1199,6 +1203,9 @@ fn parse_workload_kind(value: &str) -> Option<WorkloadKind> {
         "image_generation" => Some(WorkloadKind::ImageGeneration),
         "video_generation" => Some(WorkloadKind::VideoGeneration),
         "workflow_execution" => Some(WorkloadKind::WorkflowExecution),
+        "audio_transcription" => Some(WorkloadKind::AudioTranscription),
+        "audio_translation" => Some(WorkloadKind::AudioTranslation),
+        "audio_speech" => Some(WorkloadKind::AudioSpeech),
         _ => None,
     }
 }
@@ -1209,6 +1216,7 @@ fn parse_pricing_unit(value: &str) -> Option<PricingUnit> {
         "per_megapixel" => Some(PricingUnit::PerMegapixel),
         "per_second" => Some(PricingUnit::PerSecond),
         "per_video" => Some(PricingUnit::PerVideo),
+        "per_character" => Some(PricingUnit::PerCharacter),
         "token_metered" => Some(PricingUnit::TokenMetered),
         "credits" => Some(PricingUnit::Credits),
         "quota" => Some(PricingUnit::Quota),

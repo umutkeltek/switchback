@@ -93,11 +93,58 @@ pub(crate) fn embeddings_usage(value: &serde_json::Value) -> Usage {
     }
 }
 
+/// Committed result of the audio runtime path (`/v1/audio/*`). The answer
+/// is the engine's own bytes and content type: a transcript as JSON, text,
+/// SRT or VTT, a server-sent event stream, or audio from text to speech.
+pub enum AudioOutcome {
+    Body {
+        status: u16,
+        content_type: Option<String>,
+        body: futures::stream::BoxStream<'static, Result<bytes::Bytes, AdapterError>>,
+        summary: String,
+        request_id: String,
+    },
+    Error {
+        error: ExecError,
+        request_id: String,
+    },
+}
+
+/// What an audio answer says it cost, in the engine's own units: seconds of
+/// audio from a `verbose_json`/`diarized_json` `duration` or a `usage`
+/// object of type `duration`. `None` when the answer says nothing.
+pub(crate) fn audio_seconds(value: &serde_json::Value) -> Option<f64> {
+    let usage = value.get("usage");
+    let from_usage = usage
+        .filter(|usage| usage.get("type").and_then(serde_json::Value::as_str) == Some("duration"))
+        .and_then(|usage| usage.get("seconds"))
+        .and_then(serde_json::Value::as_f64);
+    from_usage
+        .or_else(|| value.get("duration").and_then(serde_json::Value::as_f64))
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::ExecError;
+
+    #[test]
+    fn audio_seconds_reads_duration_or_a_duration_usage() {
+        use serde_json::json;
+        assert_eq!(super::audio_seconds(&json!({"duration": 12.5})), Some(12.5));
+        assert_eq!(
+            super::audio_seconds(&json!({"usage": {"type": "duration", "seconds": 3}})),
+            Some(3.0)
+        );
+        assert_eq!(
+            super::audio_seconds(&json!({"usage": {"type": "tokens", "input_tokens": 3}})),
+            None
+        );
+        assert_eq!(super::audio_seconds(&json!({"text": "hi"})), None);
+        assert_eq!(super::audio_seconds(&json!({"duration": -1})), None);
+    }
 
     #[test]
     fn exec_error_preserves_exact_retry_after_duration() {

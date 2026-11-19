@@ -6,7 +6,10 @@
 //! transport — no bespoke adapter, no complexity tax on the simple path.
 
 use futures::StreamExt;
-use sb_adapter::{AdapterError, EventStream, PreparedRequest, ProviderAdapter};
+use sb_adapter::{
+    AdapterError, AudioBody, AudioRequest, AudioResponse, EventStream, FormPart, PreparedRequest,
+    ProviderAdapter,
+};
 use sb_core::{AiStreamEvent, AuthScheme, CapabilityProfile, ErrorClass};
 
 use crate::codec::StreamDecoder;
@@ -431,6 +434,114 @@ impl ProviderAdapter for ComposedAdapter {
             .map_err(AdapterError::invalid)
     }
 
+    async fn audio(
+        &self,
+        request: AudioRequest,
+        _target: sb_core::ExecutionTarget,
+        lease: Option<sb_core::CredentialLease>,
+        egress_id: Option<String>,
+    ) -> Result<AudioResponse, AdapterError> {
+        let Some(url) = self.codec.audio_url(&self.base_url, request.call) else {
+            return Err(AdapterError::new(
+                ErrorClass::UnsupportedCapability,
+                "audio not supported by this wire format",
+            ));
+        };
+        self.guard_url(&url).await?;
+
+        let (content_type, length, body, signed_body) = match request.body {
+            AudioBody::Json(value) => {
+                let bytes =
+                    serde_json::to_vec(&value).map_err(|e| AdapterError::invalid(e.to_string()))?;
+                let length = bytes.len() as u64;
+                (
+                    "application/json".to_string(),
+                    length,
+                    reqwest::Body::from(bytes.clone()),
+                    bytes,
+                )
+            }
+            AudioBody::Form(parts) => {
+                let boundary = format!("switchback-{}", sb_core::new_id("form"));
+                let chunks = multipart_chunks(&parts, &boundary);
+                let length = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                let stream = futures::stream::iter(
+                    chunks
+                        .into_iter()
+                        .map(Ok::<bytes::Bytes, std::convert::Infallible>),
+                );
+                // Bearer/header/query auth never reads the body; a signer
+                // that would (SigV4) has no audio codec, so the file is not
+                // copied to be signed.
+                (
+                    format!("multipart/form-data; boundary={boundary}"),
+                    length,
+                    reqwest::Body::wrap_stream(stream),
+                    Vec::new(),
+                )
+            }
+        };
+
+        let (host, path, query) = crate::signer::split_url(&url);
+        let additions = self.signer.sign(
+            &SignTarget {
+                method: "POST",
+                host: &host,
+                path: &path,
+                query: &query,
+                body: &signed_body,
+            },
+            lease.as_ref(),
+        );
+
+        let epath = self.egress.path(egress_id.as_deref());
+        let mut builder = epath
+            .client()
+            .post(&url)
+            .header("content-type", content_type)
+            .header("content-length", length)
+            .body(body);
+        for (name, value) in self.codec.headers() {
+            builder = builder.header(name, value);
+        }
+        // Identity first (no auth headers allowed), auth last so the lease wins.
+        builder = epath.apply_identity(builder);
+        for (name, value) in &additions.headers {
+            builder = builder.header(name, value);
+        }
+        if !additions.query.is_empty() {
+            builder = builder.query(&additions.query);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| AdapterError::network(upstream_error_text(e)))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            let class = self.classify_error(Some(status.as_u16()), &body_text);
+            return Err(
+                AdapterError::new(class, format!("upstream {} error", status.as_u16()))
+                    .with_status(status.as_u16()),
+            );
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| AdapterError::network(upstream_error_text(e))))
+            .boxed();
+        Ok(AudioResponse {
+            status: status.as_u16(),
+            content_type,
+            body,
+        })
+    }
+
     fn classify_error(&self, status: Option<u16>, _body: &str) -> ErrorClass {
         match status {
             Some(401) => ErrorClass::Authentication,
@@ -445,10 +556,79 @@ impl ProviderAdapter for ComposedAdapter {
     }
 }
 
+/// A multipart/form-data body as a list of chunks. Each part's data is a
+/// reference to the caller's bytes, never a copy, so a large file is held
+/// in memory once however many targets it is sent to.
+fn multipart_chunks(parts: &[FormPart], boundary: &str) -> Vec<bytes::Bytes> {
+    let mut chunks = Vec::with_capacity(parts.len() * 3 + 1);
+    for part in parts {
+        let mut head = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"",
+            header_quoted(&part.name)
+        );
+        if let Some(filename) = &part.filename {
+            head.push_str(&format!("; filename=\"{}\"", header_quoted(filename)));
+        }
+        head.push_str("\r\n");
+        if let Some(content_type) = &part.content_type {
+            head.push_str(&format!("Content-Type: {}\r\n", header_line(content_type)));
+        }
+        head.push_str("\r\n");
+        chunks.push(bytes::Bytes::from(head));
+        chunks.push(part.data.clone());
+        chunks.push(bytes::Bytes::from_static(b"\r\n"));
+    }
+    chunks.push(bytes::Bytes::from(format!("--{boundary}--\r\n")));
+    chunks
+}
+
+/// A value for a quoted header parameter: no quote, no line break.
+fn header_quoted(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            '\r' | '\n' => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+/// A header value on one line.
+fn header_line(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sb_core::{AiStreamEvent, FinishReason};
+
+    #[test]
+    fn multipart_chunks_keep_fields_and_file_bytes_as_sent() {
+        let parts = vec![
+            FormPart {
+                name: "model".to_string(),
+                filename: None,
+                content_type: None,
+                data: bytes::Bytes::from_static(b"whisper"),
+            },
+            FormPart {
+                name: "file".to_string(),
+                filename: Some("a\"b.wav".to_string()),
+                content_type: Some("audio/wav".to_string()),
+                data: bytes::Bytes::from_static(b"RIFF\x00\x01"),
+            },
+        ];
+        let body: Vec<u8> = multipart_chunks(&parts, "B")
+            .iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect();
+        let expected = b"--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper\r\n\
+--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a'b.wav\"\r\n\
+Content-Type: audio/wav\r\n\r\nRIFF\x00\x01\r\n--B--\r\n";
+        assert_eq!(body, expected.to_vec());
+    }
 
     struct FinishOnlyDecoder;
 

@@ -117,6 +117,26 @@ pub trait ProviderAdapter: Send + Sync {
         ))
     }
 
+    /// Run one audio call (speech to text, translation, text to speech)
+    /// against the target. The request body is passed through unchanged
+    /// apart from `model`, which the runtime has already set to the target's
+    /// own model; the answer comes back as the engine sent it (status,
+    /// content type, bytes), so any response format the engine speaks
+    /// reaches the client. An error status is an `Err` (before any byte), so
+    /// the runtime can still fall over to the next target.
+    async fn audio(
+        &self,
+        _request: AudioRequest,
+        _target: sb_core::ExecutionTarget,
+        _lease: Option<sb_core::CredentialLease>,
+        _egress_id: Option<String>,
+    ) -> Result<AudioResponse, AdapterError> {
+        Err(AdapterError::new(
+            sb_core::ErrorClass::UnsupportedCapability,
+            "audio not supported by this adapter",
+        ))
+    }
+
     /// List upstream model ids visible to this provider/account. Adapters that
     /// have no supported model-list endpoint return `UnsupportedCapability`.
     async fn list_models(
@@ -179,4 +199,70 @@ pub fn response_to_events(resp: &AiResponse) -> Vec<AiStreamEvent> {
         finish_reason: resp.finish_reason,
     });
     events
+}
+
+/// Which audio endpoint a call goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCall {
+    /// `/audio/transcriptions`: speech to text in the speech's language.
+    Transcription,
+    /// `/audio/translations`: speech to English text.
+    Translation,
+    /// `/audio/speech`: text to speech.
+    Speech,
+}
+
+impl AudioCall {
+    /// The path under the provider's base URL.
+    pub fn path(self) -> &'static str {
+        match self {
+            AudioCall::Transcription => "audio/transcriptions",
+            AudioCall::Translation => "audio/translations",
+            AudioCall::Speech => "audio/speech",
+        }
+    }
+}
+
+/// One field of a multipart upload, kept as the client sent it. `data`
+/// is a cheap reference-counted view: forwarding the same file to a
+/// fallback target does not copy it.
+#[derive(Clone)]
+pub struct FormPart {
+    pub name: String,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub data: bytes::Bytes,
+}
+
+impl std::fmt::Debug for FormPart {
+    // Never prints the bytes: a part can be a whole audio file.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormPart")
+            .field("name", &self.name)
+            .field("filename", &self.filename)
+            .field("content_type", &self.content_type)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
+}
+
+/// The body of an audio call: a multipart form (transcription,
+/// translation) or a JSON object (speech).
+#[derive(Debug, Clone)]
+pub enum AudioBody {
+    Form(Vec<FormPart>),
+    Json(serde_json::Value),
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioRequest {
+    pub call: AudioCall,
+    pub body: AudioBody,
+}
+
+/// The engine's successful answer, streamed.
+pub struct AudioResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: BoxStream<'static, Result<bytes::Bytes, AdapterError>>,
 }

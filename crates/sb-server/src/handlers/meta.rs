@@ -1888,10 +1888,57 @@ pub(crate) async fn models(
 
     let data: Vec<serde_json::Value> = ids
         .into_iter()
-        .map(|id| serde_json::json!({"id": id, "object": "model", "owned_by": "switchback"}))
+        .map(|id| {
+            let mut row =
+                serde_json::json!({"id": id, "object": "model", "owned_by": "switchback"});
+            if let Some(kind) = audio_kind(&scoped, &snap.registry, &id) {
+                row["kind"] = serde_json::Value::from(kind);
+            }
+            row
+        })
         .collect();
 
     Json(serde_json::json!({"object": "list", "data": data, "models": []}))
+}
+
+/// `audio_transcription` for a model whose every target takes audio in
+/// (`/v1/audio/transcriptions` and `/translations`), `audio_speech` for one
+/// whose every target makes speech (`/v1/audio/speech`). Other models carry
+/// no `kind`, as before.
+fn audio_kind(
+    config: &Config,
+    registry: &sb_adapters::AdapterRegistry,
+    id: &str,
+) -> Option<&'static str> {
+    let capabilities: Vec<sb_core::CapabilityProfile> = if let Some(route) = config
+        .routes
+        .iter()
+        .find(|route| route.match_.model.as_deref() == Some(id))
+    {
+        route
+            .targets
+            .iter()
+            .filter_map(|target| registry.target_for(target))
+            .map(|target| target.capabilities)
+            .collect()
+    } else if let Some(target) = registry.target_for(id) {
+        vec![target.capabilities]
+    } else if let Some(provider) = config.providers.iter().find(|p| p.id == id) {
+        let mut caps = sb_core::CapabilityProfile::default();
+        provider.capabilities.apply_to(&mut caps);
+        vec![caps]
+    } else {
+        return None;
+    };
+    if capabilities.is_empty() {
+        None
+    } else if capabilities.iter().all(|caps| caps.audio_in) {
+        Some("audio_transcription")
+    } else if capabilities.iter().all(|caps| caps.audio_out) {
+        Some("audio_speech")
+    } else {
+        None
+    }
 }
 
 fn push_model_id(ids: &mut Vec<String>, seen: &mut HashSet<String>, id: impl Into<String>) {

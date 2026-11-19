@@ -2153,7 +2153,10 @@ fn media_units(price: Option<UnitPrice>, artifacts: &[ArtifactRecord]) -> Option
                 .filter(|artifact| artifact.kind == ArtifactKind::Video)
                 .count() as f64,
         ),
-        PricingUnit::TokenMetered | PricingUnit::Credits | PricingUnit::Quota => None,
+        PricingUnit::PerCharacter
+        | PricingUnit::TokenMetered
+        | PricingUnit::Credits
+        | PricingUnit::Quota => None,
     }
 }
 
@@ -2229,9 +2232,12 @@ fn image_fields_for(kind: WorkloadKind) -> Vec<WorkflowField> {
                 media_type: None,
             },
         ],
-        WorkloadKind::TextGeneration | WorkloadKind::Embedding | WorkloadKind::VideoGeneration => {
-            Vec::new()
-        }
+        WorkloadKind::TextGeneration
+        | WorkloadKind::Embedding
+        | WorkloadKind::VideoGeneration
+        | WorkloadKind::AudioTranscription
+        | WorkloadKind::AudioTranslation
+        | WorkloadKind::AudioSpeech => Vec::new(),
     }
 }
 
@@ -2246,7 +2252,11 @@ fn workflow_outputs_for(kind: WorkloadKind) -> Vec<WorkflowField> {
             required: true,
             media_type: None,
         }],
-        WorkloadKind::TextGeneration | WorkloadKind::Embedding => Vec::new(),
+        WorkloadKind::TextGeneration
+        | WorkloadKind::Embedding
+        | WorkloadKind::AudioTranscription
+        | WorkloadKind::AudioTranslation
+        | WorkloadKind::AudioSpeech => Vec::new(),
     }
 }
 

@@ -720,6 +720,7 @@ pub fn plan_route(
         || !require.vision_sources.is_empty()
         || req.requires_vision();
     let audio_required = require.audio_in == Some(true);
+    let audio_out_required = require.audio_out == Some(true);
     let file_required = require.file_in == Some(true);
     let image_out_required = require.image_out == Some(true);
     let reasoning_required = require.reasoning_summary == Some(true);
@@ -760,6 +761,12 @@ pub fn plan_route(
         }
     }
     decision.add_reason(format!("json_schema_required={json_schema_required}"));
+    if audio_required {
+        decision.add_reason("audio_in_required=true");
+    }
+    if audio_out_required {
+        decision.add_reason("audio_out_required=true");
+    }
 
     // Vision is the one capability whose absence does NOT make the request
     // unanswerable: a coding client that pastes a screenshot still asked a
@@ -843,6 +850,13 @@ pub fn plan_route(
                 decision.reject(
                     candidate.id.clone(),
                     "audio input required but target does not support it",
+                );
+                continue;
+            }
+            if audio_out_required && !candidate.capabilities.audio_out {
+                decision.reject(
+                    candidate.id.clone(),
+                    "audio output required but target does not support it",
                 );
                 continue;
             }
