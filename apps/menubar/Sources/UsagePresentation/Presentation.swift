@@ -40,6 +40,8 @@ public enum Presenter {
 
 
     public static let core = ["claude", "codex", "zai", "minimax", "opencodego", "opencodezen"]
+    /// Coverage reason for a configured provider that no collector observes; never shown as unknown capacity.
+    public static let noCollector = "no_usage_collector"
     public static func canonical(_ provider: String) -> String {
         switch provider.lowercased() {
         case "anthropic", "claude-code", "claude_code": "claude"
@@ -89,6 +91,7 @@ public enum Presenter {
         case "invalid_response", "parse_error", "invalid_usage": "Provider returned unreadable usage"
         case "not_configured", "no_accounts": "No account available"
         case "no_saved_usage": "No saved usage yet"
+        case noCollector: "No usage source"
         default: "Refresh unavailable"
         }
     }
@@ -215,7 +218,7 @@ public enum Presenter {
                 return AccountMenu(key: account.key, title: title, summary: summary, pinned: pinned, lines: lines,
                                    details: ["Account: " + name(account.provider) + " · " + clean(account.slot), "Source: " + clean(account.source), age(account.observedAt, now: now)])
             }
-            let gap = snapshot.coverage.first { canonical($0.provider) == provider }
+            let gap = snapshot.coverage.first { canonical($0.provider) == provider && $0.reason != noCollector }
             if rows.isEmpty, core.contains(provider), let gap, ["unknown", "unavailable"].contains(gap.state) {
                 summaries.append(name(provider) + ": ?")
                 compactSummaries.append(abbreviation(provider) + " ?")

@@ -72,7 +72,9 @@ enum Glance {
         if glance.status == .out, let backIn = glance.backInText { parts.append("Out of " + (glance.tighterTitle ?? "quota") + ". " + backIn) }
         if let note = account.ledger.note { parts.append(note) }
         parts += account.primary.map(\.accessibilityText)
+        parts += account.extras.filter { $0.generation && $0.qualifier != nil }.map(\.accessibilityText)
         parts += account.extras.filter { !$0.generation }.map(\.accessibilityText)
+        if let age = account.ageText { parts.append("Reading " + age + " old") }
         if let forecast = glance.forecast { parts.append(forecast.text) }
         if let cost = glance.cost { parts.append(cost.spoken) }
         return parts.joined(separator: ". ")

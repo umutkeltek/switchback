@@ -55,6 +55,8 @@ public struct AccountPanel: Codable, Sendable {
     public let summary: String
     public let notice: String?
     public let sampleText: String
+    /// Compact age of the account's reading, for example "12m", once it is at least 5 minutes old.
+    public let ageText: String?
     public let primary: [QuotaRow]
     public let extras: [QuotaRow]
     public let balances: [BalanceRow]
@@ -103,9 +105,31 @@ extension Presenter {
             if window.windowMinutes == 10080 { return "Weekly" }
             if window.windowMinutes == 43200 { return "Monthly" }
             return window.name.capitalized
+        case let name where name.hasPrefix("seven_day_") && !(window.model ?? "").isEmpty:
+            // A model's own weekly limit; the model name is the row's qualifier.
+            return "Weekly"
         default:
             return clean(window.name.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: "-", with: " ")).capitalized
         }
+    }
+    /// Age at which a reading shows its age in the compact row; it stays trusted for 15 minutes.
+    public static let ageShownAfter: TimeInterval = 300
+    /// "12m" or "2h 5m" once a sample is `ageShownAfter` old; nil when newer or the time is unknown.
+    public static func compactAge(_ value: String?, now: Date) -> String? {
+        guard let date = UsageTime.parse(value) else { return nil }
+        let seconds = now.timeIntervalSince(date)
+        return seconds >= ageShownAfter ? duration(seconds) : nil
+    }
+    /// "At limit", or "Fable at limit" when only a model's own limit is used up.
+    static func limitNotice(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> String {
+        let out = account.windows.filter { window in
+            guard isGeneration(window), valid(window, account: account, snapshotFresh: snapshotFresh, now: now),
+                  let left = window.remainingPercent ?? window.usedPercent.map({ 100 - $0 }) else { return false }
+            return percent(left) == "0%"
+        }
+        let models = Set(out.map { clean($0.model ?? "").trimmingCharacters(in: .whitespacesAndNewlines) })
+        guard models.count == 1, let model = models.first, !model.isEmpty else { return "At limit" }
+        return model + " at limit"
     }
     static func accountLabel(_ account: UsageAccount) -> String {
         let label = clean(account.label ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -122,7 +146,7 @@ extension Presenter {
         let selected = pins ?? defaults(snapshot)
         let providers = menu.groups.compactMap { group -> ProviderPanel? in
             let sourceRows = snapshot.accounts.filter { canonical($0.provider) == group.provider }
-            let coverage = snapshot.coverage.first { canonical($0.provider) == group.provider }
+            let coverage = snapshot.coverage.first { canonical($0.provider) == group.provider && $0.reason != noCollector }
             guard !sourceRows.isEmpty || coverage != nil else { return nil }
             let labelCounts = Dictionary(grouping: sourceRows, by: accountLabel).mapValues(\.count)
             let providerTitle = group.provider == "zai" ? "Z.ai" : group.title
@@ -178,7 +202,7 @@ extension Presenter {
                 else if account.refreshError != nil { notice = "Refresh unavailable" }
                 else if !validAccount(account, snapshotFresh: fresh, now: now) { notice = "Older reading" }
                 else if account.isEstimated { notice = "Estimated" }
-                else if summary == "0%" { notice = "At limit" }
+                else if summary == "0%" { notice = limitNotice(account, snapshotFresh: fresh, now: now) }
                 else if summary == "?" && !account.windows.isEmpty { notice = "Partial reading" }
                 else { notice = nil }
                 let label = accountLabel(account)
@@ -190,6 +214,7 @@ extension Presenter {
                     shortName: shortCounts[shortLabel, default: 0] > 1 ? clean(account.slot) : shortLabel,
                     email: account.email.map(clean), slot: clean(account.slot), pinned: selected.contains(key),
                     summary: summary, notice: notice, sampleText: age(account.observedAt, now: now),
+                    ageText: compactAge(account.observedAt, now: now),
                     primary: primaryIndices.map { quotas[$0] },
                     extras: quotas.enumerated().filter { !primarySet.contains($0.offset) }.map(\.element),
                     balances: balances, details: group.accounts.first { $0.key == key }?.lines ?? [],

@@ -78,7 +78,12 @@ extension AccountPanel {
         let session = primary.first { $0.lane == .session }
         let weekly = primary.first { $0.lane == .weekly }
         let used = Set([session?.id, weekly?.id].compactMap { $0 })
-        let outside = primary.filter { !used.contains($0.id) } + extras.filter { !$0.generation }
+        // When the columns are account-wide, a model's own limit (for example Fable) caps that model
+        // further and comes first. When the columns already belong to one model, other models are
+        // separate products and stay in details.
+        let accountWide = session?.qualifier == nil && weekly?.qualifier == nil
+        let modelLimits = accountWide ? extras.filter { $0.generation && $0.qualifier != nil } : []
+        let outside = primary.filter { !used.contains($0.id) } + modelLimits + extras.filter { !$0.generation }
         var lines = outside.prefix(Presenter.ledgerLineLimit).map(Presenter.ledgerLine)
         if outside.count > Presenter.ledgerLineLimit {
             lines.append("+\(outside.count - Presenter.ledgerLineLimit) more in details")

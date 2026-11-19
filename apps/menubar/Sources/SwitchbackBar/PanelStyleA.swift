@@ -33,6 +33,7 @@ struct LedgerList: View {
             var height = 16 + 6.0
             if provider.costTotal != nil { height += GlanceCostTotalLine.height + 6 }
             if provider.advice != nil && provider.advice?.key == nil { height += 22 }
+            height += Double(provider.advice?.models.count ?? 0) * 18
             for account in provider.accounts {
                 height += Metrics.row + Glance.extraLines(account)
                 if expanded.contains(account.key) { height += Glance.detailHeight(account) }
@@ -81,6 +82,19 @@ private struct LedgerSection: View {
                 .font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText)
                 .padding(.horizontal, 2).frame(height: 16)
                 .help(advice.detail)
+            }
+            ForEach(provider.advice?.models ?? [], id: \.model) { seat in
+                HStack(spacing: 5) {
+                    Image(systemName: seat.key == nil ? "questionmark.circle" : "arrow.right.circle")
+                        .foregroundStyle(seat.key == nil ? PanelColor.secondaryText : Color.accentColor)
+                        .accessibilityHidden(true)
+                    Text("Most room for " + seat.text).lineLimit(1).truncationMode(.tail)
+                }
+                .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                .padding(.horizontal, 2).frame(height: 12)
+                .help(seat.model + " has its own weekly limit; this seat has the most room under it and the 5-hour and weekly limits.")
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Most room for " + seat.text)
             }
             VStack(spacing: 0) {
                 ForEach(Array(provider.accounts.enumerated()), id: \.element.key) { index, account in
@@ -180,7 +194,12 @@ private struct LedgerRow: View {
                 Text((glance.tighterTitle ?? "Quota") + " used up").font(.system(size: 10)).foregroundStyle(Color.red.opacity(0.85))
             case .ready:
                 Text(glance.resetText ?? "—").font(.system(size: 12, weight: .medium)).monospacedDigit()
-                Text(glance.tighterTitle ?? "").font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                if let age = account.ageText {
+                    Text(age + " old").font(.system(size: 10)).monospacedDigit().foregroundStyle(Color.orange)
+                        .help("Reading taken " + age + " ago; it counts as current for 15 minutes.")
+                } else {
+                    Text(glance.tighterTitle ?? "").font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                }
             case .unavailable:
                 Text("—").font(.system(size: 12)).foregroundStyle(.tertiary)
                 Text(account.sampleText.replacingOccurrences(of: "Sampled ", with: ""))
