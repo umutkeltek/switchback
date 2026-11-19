@@ -22,6 +22,8 @@ struct Router_ {
     calls: Vec<String>,
     status: BTreeMap<String, String>,
     chats: Vec<Value>,
+    /// GPU memory the measurement reports (bytes).
+    total: u64,
 }
 
 #[derive(Clone)]
@@ -78,7 +80,7 @@ async fn models(
                 "memory": {
                     "status": "measured",
                     "min": {"n_ctx": 4096, "devices": [
-                        {"kind": "device", "name": "CUDA0", "model": 1000, "context": 100, "compute": 10},
+                        {"kind": "device", "name": "CUDA0", "total": inner.total, "model": 1000, "context": 100, "compute": 10},
                         {"kind": "host", "name": "Host", "model": 5, "context": 0, "compute": 1}]},
                     "max": {"n_ctx": 131072, "devices": []},
                     "effective": null
@@ -126,11 +128,18 @@ async fn chat(State(stub): State<Stub>, body: Bytes) -> Response {
 }
 
 fn temp(name: &str) -> PathBuf {
+    // Tests run in parallel and the clock may tick in microseconds: a
+    // counter keeps every name apart.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("sb-engine-{name}-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "sb-engine-{name}-{}-{nanos}-{n}",
+        std::process::id()
+    ))
 }
 
 async fn spawn_stub(up: bool) -> (String, Stub) {
@@ -144,6 +153,7 @@ async fn spawn_stub(up: bool) -> (String, Stub) {
     };
     stub.set("m", "loaded");
     stub.set("other", "unloaded");
+    stub.inner.lock().unwrap().total = 24u64 << 30;
     let app = Router::new()
         .route("/health", get(health))
         .route("/models", get(models))
@@ -513,4 +523,185 @@ async fn the_reference_overlay_script_writes_the_presets_the_router_reads() {
     );
     let engines = get_json(format!("{}/v1/engines", s.gw)).await;
     assert_eq!(engines["data"][0]["pending_apply"], json!(true));
+}
+
+// ---------------------------------------------------------------- variants
+
+const POLICY: &str = r#"{"allow": ["ctx_size"], "bounds": {"ctx_size": [4096, 131072]},
+                        "max_variants": 1, "variant_idle_ttl_secs": 3600}"#;
+
+async fn with_policy(s: &Setup, key: Option<&str>) {
+    let policy: Value = serde_json::from_str(POLICY).unwrap();
+    let mut request = reqwest::Client::new()
+        .put(format!("{}/v1/models/text/m/settings", s.gw))
+        .header("if-match", "0")
+        .json(&json!({"load": {"ctx_size": 8192}, "request_load": policy}));
+    if let Some(key) = key {
+        request = request.bearer_auth(key);
+    }
+    let r = request.send().await.unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+async fn chat_with_load(s: &Setup, key: Option<&str>, load: Value) -> (u16, Value, Option<String>) {
+    let mut request = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", s.gw))
+        .json(
+            &json!({"model": "text/m", "messages": [{"role": "user", "content": "hi"}],
+                      "switchback": {"load": load}}),
+        );
+    if let Some(key) = key {
+        request = request.bearer_auth(key);
+    }
+    let r = request.send().await.unwrap();
+    let status = r.status().as_u16();
+    let settings = r
+        .headers()
+        .get("x-switchback-settings")
+        .map(|v| v.to_str().unwrap().to_string());
+    (status, r.json().await.unwrap_or(Value::Null), settings)
+}
+
+fn reloads(stub: &Stub) -> usize {
+    stub.calls()
+        .iter()
+        .filter(|c| *c == "GET /models?reload=1")
+        .count()
+}
+
+#[tokio::test]
+async fn a_request_load_setting_makes_and_reuses_a_variant() {
+    let s = setup(true, "", None).await;
+    with_policy(&s, None).await;
+    let before = reloads(&s.stub);
+    let (status, body, settings) = chat_with_load(&s, None, json!({"ctx_size": 65536})).await;
+    assert_eq!(status, 200, "{body}");
+    let sent = s.stub.inner.lock().unwrap().chats.last().unwrap().clone();
+    let model = sent["model"].as_str().unwrap().to_string();
+    assert!(model.starts_with("m~") && model.len() == 10, "{model}");
+    assert!(sent.get("switchback").is_none());
+    assert!(settings.unwrap().contains(&format!("variant={model}")));
+    let overlay = overlay_of(&s);
+    assert_eq!(overlay["models"][&model]["base"], json!("m"));
+    assert_eq!(
+        overlay["models"][&model]["settings"]["ctx-size"],
+        json!("65536")
+    );
+    assert_eq!(
+        overlay["models"]["m"]["settings"]["ctx-size"],
+        json!("8192")
+    );
+    assert_eq!(reloads(&s.stub), before + 1);
+
+    // The same load settings again: the same variant, no new apply.
+    let (status, _, _) = chat_with_load(&s, None, json!({"ctx_size": 65536})).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        s.stub.inner.lock().unwrap().chats.last().unwrap()["model"],
+        json!(model)
+    );
+    assert_eq!(reloads(&s.stub), before + 1);
+
+    // Another one with max_variants 1: the idle old variant goes.
+    let (status, _, _) = chat_with_load(&s, None, json!({"ctx_size": 32768})).await;
+    assert_eq!(status, 200);
+    let newer = s.stub.inner.lock().unwrap().chats.last().unwrap()["model"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(newer, model);
+    let overlay = overlay_of(&s);
+    assert!(overlay["models"].get(&model).is_none(), "{overlay}");
+    assert!(overlay["models"].get(&newer).is_some(), "{overlay}");
+    let engines = get_json(format!("{}/v1/engines", s.gw)).await;
+    let variants = engines["data"][0]["variants"].as_array().unwrap();
+    assert_eq!(variants.len(), 1);
+    assert_eq!(variants[0]["name"], json!(newer));
+    assert_eq!(variants[0]["target"], json!("text/m"));
+}
+
+#[tokio::test]
+async fn request_load_settings_are_checked_against_the_policy() {
+    let extra = r#"
+tenants:
+  - id: acme
+  - id: ops
+api_keys:
+  - { key: "sk-admin", tenant: ops, role: admin }
+  - { key: "sk-client", tenant: acme, role: client }
+"#;
+    let s = setup(true, extra, None).await;
+    // No policy yet: refused, naming the policy.
+    let (status, body, _) = chat_with_load(&s, Some("sk-client"), json!({"ctx_size": 65536})).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("request_load"),
+        "{body}"
+    );
+
+    with_policy(&s, Some("sk-admin")).await;
+    let before = s.stub.engine_calls().len();
+    for (key, load, kind) in [
+        (
+            Some("sk-client"),
+            json!({"ctx_size": 999999}),
+            "out_of_bounds",
+        ),
+        (
+            Some("sk-client"),
+            json!({"cache_type_k": "q8_0"}),
+            "request_load_refused",
+        ),
+        (Some("sk-admin"), json!({"ctx_size": 2048}), "out_of_bounds"),
+        (
+            Some("sk-admin"),
+            json!({"mmproj": "/x.gguf"}),
+            "request_load_refused",
+        ),
+        (
+            Some("sk-client"),
+            json!({"ctx_size": "big"}),
+            "invalid_settings",
+        ),
+    ] {
+        let (status, body, _) = chat_with_load(&s, key, load.clone()).await;
+        assert_eq!(status, 400, "{load}: {body}");
+        assert_eq!(body["error"]["type"], json!(kind), "{load}: {body}");
+    }
+    assert_eq!(
+        s.stub.engine_calls().len(),
+        before,
+        "a refused load reached the engine"
+    );
+    assert!(s.stub.inner.lock().unwrap().chats.is_empty());
+
+    // An operator-class key may set any typed key within bounds.
+    let (status, body, _) =
+        chat_with_load(&s, Some("sk-admin"), json!({"cache_type_k": "q8_0"})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body, _) = chat_with_load(&s, Some("sk-client"), json!({"ctx_size": 16384})).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn a_variant_that_would_not_fit_is_refused_with_the_numbers() {
+    let s = setup(true, "", None).await;
+    with_policy(&s, None).await;
+    // 1010 bytes of weights and compute, 100 bytes of KV per 4096 tokens:
+    // 131072 tokens need 4210 bytes; the GPU has 2000.
+    s.stub.inner.lock().unwrap().total = 2000;
+    let (status, body, _) = chat_with_load(&s, None, json!({"ctx_size": 131072})).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["type"], json!("would_not_fit"));
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("4210 bytes") && message.contains("1900 bytes"),
+        "{message}"
+    );
+    let overlay = overlay_of(&s);
+    assert_eq!(overlay["models"].as_object().unwrap().len(), 1, "{overlay}");
+    assert!(s.stub.inner.lock().unwrap().chats.is_empty());
 }

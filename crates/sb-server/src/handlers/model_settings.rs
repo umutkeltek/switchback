@@ -320,7 +320,12 @@ pub(crate) fn target_view(
         view["document"] = doc
             .map(|doc| serde_json::to_value(doc).unwrap_or(Value::Null))
             .unwrap_or_else(|| json!({}));
-        crate::engine_control::add_load_view(state, named, doc, &mut view);
+        crate::engine_control::add_load_view(
+            &crate::engine_control::EngineCtx::from(state),
+            named,
+            doc,
+            &mut view,
+        );
     }
     view
 }
@@ -570,7 +575,11 @@ async fn write(
             )
         }
     };
-    if let Err(message) = crate::engine_control::validate_for_target(state, &named.target, &doc) {
+    if let Err(message) = crate::engine_control::validate_for_target(
+        &crate::engine_control::EngineCtx::from(state),
+        &named.target,
+        &doc,
+    ) {
         return error(StatusCode::BAD_REQUEST, "invalid_settings", message);
     }
     let actor = actor_for(principal, headers);
@@ -581,7 +590,7 @@ async fn write(
         Err(e) => return write_error(e),
     };
     let apply = crate::engine_control::after_settings_write(
-        state,
+        &crate::engine_control::EngineCtx::from(state),
         &named.target,
         before.as_deref(),
         &entry,

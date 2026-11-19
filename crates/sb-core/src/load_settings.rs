@@ -282,6 +282,22 @@ pub const LOAD_KEYS: &[LoadKey] = &[
     },
 ];
 
+/// Bytes per element of a KV cache type (f16 when unknown), as
+/// `sb ai fit` counts them.
+pub fn cache_type_bytes(cache_type: &str) -> f64 {
+    match cache_type {
+        "f32" => 4.0,
+        "f16" | "bf16" => 2.0,
+        "f8_e4m3" => 1.0,
+        "q8_0" => 34.0 / 32.0,
+        "q5_1" => 24.0 / 32.0,
+        "q5_0" => 22.0 / 32.0,
+        "q4_1" => 20.0 / 32.0,
+        "q4_0" | "iq4_nl" => 18.0 / 32.0,
+        _ => 2.0,
+    }
+}
+
 pub fn load_key(name: &str) -> Option<&'static LoadKey> {
     LOAD_KEYS.iter().find(|key| key.name == name)
 }
@@ -422,6 +438,11 @@ pub fn validate_request_load_policy(policy: &RequestLoadPolicy) -> Result<(), Se
     if policy.variant_idle_ttl_secs < 60 {
         return err("variant_idle_ttl_secs must be at least 60");
     }
+    if let Some(estimate) = &policy.estimate {
+        if estimate.budget_bytes == 0 || estimate.kv_layers == 0 || estimate.head_dim == 0 {
+            return err("estimate needs budget_bytes, kv_layers and head_dim above 0");
+        }
+    }
     Ok(())
 }
 
@@ -457,6 +478,25 @@ mod tests {
     }
 
     #[test]
+    fn kv_math_matches_sb_ai_fit() {
+        // 48 KV layers, 8 heads, 128 + 128 wide, 32768 tokens, f16:
+        // 48 * 32768 * 2 * 8 * 256 bytes = 6 GiB.
+        let estimate = crate::FitEstimate {
+            weights_bytes: 0,
+            budget_bytes: 1,
+            kv_layers: 48,
+            kv_heads: 8,
+            head_dim: 128,
+            value_dim: None,
+        };
+        assert_eq!(estimate.kv_bytes(32768, "f16", "f16"), 6 * (1 << 30));
+        assert_eq!(
+            estimate.kv_bytes(32768, "q8_0", "q8_0"),
+            6 * (1 << 30) * 17 / 32
+        );
+    }
+
+    #[test]
     fn engine_args_shape() {
         validate_engine_args(
             json!({"no-warmup": true, "n-cpu-moe": 4})
@@ -475,6 +515,7 @@ mod tests {
             bounds: [("ctx_size".to_string(), [4096.0, 131072.0])].into(),
             max_variants: 2,
             variant_idle_ttl_secs: 3600,
+            estimate: None,
         };
         validate_request_load_policy(&ok).unwrap();
         let mut bad = ok.clone();

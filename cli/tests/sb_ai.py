@@ -1592,6 +1592,10 @@ class SbAi(unittest.TestCase):
         self.assertIn("tokens: 1000 in, 256 out", run.stderr)
         self.assertIn("route: strategy=pinned_order selected=text/m", run.stderr)
         self.assertIn("settings: profile=nothink; applied=2", run.stderr)
+        run = self.sb("chat", "fast", "hi", "--load", "ctx_size=65536")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.requests("POST", "/v1/chat/completions")[-1]["json"]["switchback"],
+                         {"load": {"ctx_size": 65536}})
         run = self.sb("chat", "fast", "hi", "--json")
         result = json.loads(run.stdout)
         self.assertEqual(result["completion_tokens"], 256)

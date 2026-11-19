@@ -74,8 +74,8 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai revert MODEL REVISION    put back the settings of an earlier revision
   sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake]
                                  change load settings (ctx_size=65536 cache_type_k=q8_0)
-  sb ai chat MODEL "prompt" [--profile NAME] [--set key=value ...] [--json]
-                                 one quick request to try settings: answer, tokens, speed, route
+  sb ai chat MODEL "prompt" [--profile NAME] [--set key=value ...] [--load key=value ...]
+             [--json]            one quick request to try settings: answer, tokens, speed, route
   sb ai load MODEL [--wake]      load a model now (preload); never wakes without --wake
   sb ai unload MODEL             unload a model; refused while it serves a request
   sb ai engines [--json]         what each engine has loaded, with memory and pending settings
@@ -173,7 +173,9 @@ profile gets; --history lists the changes (who, when, which keys). A change
 made meanwhile by someone else stops set with exit 1; run it again.
 chat streams one answer to stdout and prints the tokens, the first token time,
 the speed and the route on stderr; --set key=value sends a setting for this
-request only.
+request only; --load key=value asks for load settings for this request (a
+variant of the model with them, when the model's request_load policy allows
+it; the route header names the variant).
 
 Load settings change how the engine loads the model: ctx_size, n_gpu_layers,
 cache_type_k, cache_type_v, flash_attn, batch_size, ubatch_size, parallel,
@@ -2066,12 +2068,18 @@ def cmd_chat(gw, args):
         set_key(settings, key, value)
     body = {"model": args.model, "messages": [{"role": "user", "content": args.prompt}],
             "stream": True, "stream_options": {"include_usage": True}}
-    if settings or args.profile:
+    load = {}
+    for text in args.load or []:
+        key, value = parse_assignment(text)
+        load[key] = value
+    if settings or args.profile or load:
         body["switchback"] = {}
         if settings:
             body["switchback"]["settings"] = settings
         if args.profile:
             body["switchback"]["profile"] = args.profile
+        if load:
+            body["switchback"]["load"] = load
     answer_headers, text, reasoning = {}, [], []
     started = time.monotonic()
     first, usage, timings = None, None, None
@@ -2231,6 +2239,7 @@ def parser():
     chat.add_argument("prompt")
     chat.add_argument("--profile")
     chat.add_argument("--set", action="append")
+    chat.add_argument("--load", action="append")
     chat.add_argument("--json", action="store_true")
     chat.add_argument("--timeout", type=float, default=900)
     return top

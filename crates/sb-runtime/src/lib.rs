@@ -276,6 +276,9 @@ pub struct Engine {
     /// settings). State, not config: survives a publish, durable in the
     /// state store when one is attached.
     model_settings: Arc<model_settings::ModelSettingsRegistry>,
+    /// Engine variants for per-request load settings (`sb-server`'s engine
+    /// control). Unset = such requests are refused.
+    model_variants: OnceLock<Arc<dyn model_settings::ModelVariants>>,
 }
 
 /// Outcome of an optimistic-concurrency publish ([`Engine::publish_with_audit`]).

@@ -406,6 +406,72 @@ impl Engine {
                 return ExecOutcome::Error(e);
             }
         };
+        // Per-request load settings: one variant of the first target, made
+        // (or found) by the engine control; other targets cannot honour
+        // them, so they leave the plan.
+        let mut settings_plan = settings_plan;
+        if let Some(load) = request_settings
+            .as_ref()
+            .map(|settings| &settings.load)
+            .filter(|load| !load.is_empty())
+        {
+            let role = req
+                .metadata
+                .get(sb_core::SETTINGS_ROLE_METADATA_KEY)
+                .map(String::as_str)
+                .unwrap_or("client");
+            let variant = match crate::model_settings::check_request_load(
+                &self.model_settings,
+                &req,
+                role,
+                load,
+                &plan.candidates,
+            ) {
+                Ok((target, policy)) => match self.model_variants.get() {
+                    Some(variants) => variants
+                        .ensure_variant(&target, load, &policy)
+                        .await
+                        .map(|name| (target, name)),
+                    None => Err(ExecError::new(
+                        400,
+                        "no_engine_control",
+                        format!("`{}` has no engine control for load settings", target.id),
+                        None,
+                    )),
+                },
+                Err(e) => Err(e),
+            };
+            match variant {
+                Ok((target, name)) => {
+                    for dropped in plan.candidates.iter().skip(1) {
+                        plan.decision.reject(
+                            dropped.id.clone(),
+                            "request load settings: served by the first target's variant only",
+                        );
+                    }
+                    plan.candidates.truncate(1);
+                    plan.decision.fallbacks.clear();
+                    plan.decision
+                        .add_reason(format!("settings variant {name} of {}", target.id));
+                    settings_plan.set_model(&target, &req, name);
+                }
+                Err(e) => {
+                    self.record_denial_trace(DenialTrace {
+                        request_id: &req.id,
+                        revision: snap.revision,
+                        tenant: req.tenant.as_deref(),
+                        project: req.project.as_deref(),
+                        inbound_model: &req.model,
+                        status: e.status,
+                        error_type: &e.error_type,
+                        message: &e.message,
+                        started,
+                        streamed: req.stream,
+                    });
+                    return ExecOutcome::Error(e);
+                }
+            }
+        }
         if !settings_plan.is_empty() {
             if let Some(summary) = plan
                 .candidates

@@ -73,7 +73,13 @@ impl Engine {
             reload_lock: Mutex::new(()),
             lanes: None,
             model_settings: Arc::new(crate::model_settings::ModelSettingsRegistry::new()),
+            model_variants: OnceLock::new(),
         })
+    }
+
+    /// Attach the engine variants seam (once; later calls are ignored).
+    pub fn set_model_variants(&self, variants: Arc<dyn crate::model_settings::ModelVariants>) {
+        let _ = self.model_variants.set(variants);
     }
 
     /// The per-model settings registry (shared; survives reloads).

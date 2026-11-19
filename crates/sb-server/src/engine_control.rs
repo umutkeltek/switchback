@@ -457,6 +457,34 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------- context
+
+/// What the engine control works with: the runtime (snapshot, settings
+/// registry), the lanes, and its own state. Cheap to clone. Held by the
+/// runtime's variant seam with the engine weakly, so no cycle.
+#[derive(Clone)]
+pub(crate) struct EngineCtx {
+    pub engine: Arc<sb_runtime::Engine>,
+    pub capacity: Arc<crate::activator::CapacityActivator>,
+    pub engines: Arc<EngineControls>,
+}
+
+impl EngineCtx {
+    fn snapshot(&self) -> Arc<sb_runtime::Snapshot> {
+        self.engine.snapshot()
+    }
+}
+
+impl From<&AppState> for EngineCtx {
+    fn from(state: &AppState) -> Self {
+        EngineCtx {
+            engine: state.engine.clone(),
+            capacity: state.capacity.clone(),
+            engines: state.engines.clone(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- seams
 
 /// Runs a lane's `settings_command` with the overlay on stdin.
@@ -808,7 +836,7 @@ impl EngineControls {
     /// Whether the lane's machine is up. Never wakes: a lane in the
     /// lifecycle answers from its state; one outside it gets one health GET
     /// (a sleeping machine does not answer it).
-    async fn awake(&self, state: &AppState, lane: &EngineLane) -> Awake {
+    async fn awake(&self, state: &EngineCtx, lane: &EngineLane) -> Awake {
         use crate::activator::LaneState;
         if let Some(executor) = state.capacity.executor(&lane.name) {
             match executor.report().state {
@@ -835,7 +863,7 @@ impl EngineControls {
     /// One call to the engine, with the lane provider's credential.
     async fn call(
         &self,
-        state: &AppState,
+        state: &EngineCtx,
         lane: &EngineLane,
         method: reqwest::Method,
         path: &str,
@@ -876,7 +904,7 @@ impl EngineControls {
     }
 
     /// The engine's model listing (cached for when the machine sleeps).
-    async fn models(&self, state: &AppState, lane: &EngineLane) -> Result<Vec<Value>, String> {
+    async fn models(&self, state: &EngineCtx, lane: &EngineLane) -> Result<Vec<Value>, String> {
         let listing = self
             .call(
                 state,
@@ -904,7 +932,7 @@ impl EngineControls {
 
     /// The managed overlay of a lane: every managed load-time setting of
     /// its models, and its variants (base section plus their keys).
-    pub(crate) fn overlay(&self, state: &AppState, lane: &EngineLane) -> Value {
+    pub(crate) fn overlay(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
         let ops = kind_ops(lane.engine.kind);
         let mut models = Map::new();
         let mut bases: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -945,8 +973,9 @@ impl EngineControls {
 
     /// Write the lane's overlay through its `settings_command`, then ask an
     /// awake engine to re-read its presets. Never wakes.
-    pub(crate) async fn apply_lane(&self, state: &AppState, lane: &EngineLane) -> Value {
+    pub(crate) async fn apply_lane(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
         let _guard = self.apply_lock.lock().await;
+        self.gc_variants(state, lane);
         let overlay = self.overlay(state, lane);
         let names: Vec<String> = overlay["models"]
             .as_object()
@@ -1048,7 +1077,7 @@ impl EngineControls {
     }
 
     /// Wait (bounded) until nothing is in flight on an engine model.
-    async fn wait_idle(&self, state: &AppState, key: &str, secs: u64) -> Result<(), usize> {
+    async fn wait_idle(&self, state: &EngineCtx, key: &str, secs: u64) -> Result<(), usize> {
         let registry = state.engine.model_settings();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         loop {
@@ -1067,7 +1096,7 @@ impl EngineControls {
     /// (held only while loading), then wait for the engine to say loaded.
     async fn load_model(
         &self,
-        state: &AppState,
+        state: &EngineCtx,
         lane: &EngineLane,
         model: &str,
     ) -> Result<Value, String> {
@@ -1120,7 +1149,7 @@ impl EngineControls {
     /// nothing is in flight on it.
     async fn reload_model(
         &self,
-        state: &AppState,
+        state: &EngineCtx,
         lane: &EngineLane,
         target: &str,
         model: &str,
@@ -1171,7 +1200,7 @@ impl EngineControls {
     /// timeout). The guard counts as lane activity while held.
     async fn wake(
         &self,
-        state: &AppState,
+        state: &EngineCtx,
         lane: &EngineLane,
     ) -> Result<crate::activator::LaneJobGuard, String> {
         let executor = state
@@ -1220,13 +1249,333 @@ fn memory_summary(memory: &Value) -> Value {
     out
 }
 
+// ---------------------------------------------------------------- variants
+
+/// A short stable hash (FNV-1a, 64 bit) of a load layer: the variant's
+/// name suffix.
+fn load_hash(load: &Map<String, Value>) -> String {
+    let canonical: BTreeMap<&String, &Value> = load.iter().collect();
+    let text = serde_json::to_string(&canonical).unwrap_or_default();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")[..8].to_string()
+}
+
+/// The numbers behind a fit verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Fit {
+    pub needed_bytes: u64,
+    pub budget_bytes: u64,
+    pub ctx: u64,
+    pub source: &'static str,
+}
+
+fn cache_type<'a>(
+    variant: &'a Map<String, Value>,
+    base: &'a Map<String, Value>,
+    key: &str,
+) -> &'a str {
+    variant
+        .get(key)
+        .or_else(|| base.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or("f16")
+}
+
+/// Whether a variant fits on its machine. From the engine's own memory
+/// measurement of the base model when there is one: weights and compute
+/// as measured, the KV cache scaled from the measured context to the
+/// variant's (and by the cache types), against 95% of the GPU memory the
+/// measurement saw. Else from the policy's estimate (the `sb ai fit` KV
+/// math). `None` = nothing to check it with (or no context change).
+pub(crate) fn variant_fit(
+    row: Option<&Value>,
+    base_load: &Map<String, Value>,
+    variant_load: &Map<String, Value>,
+    estimate: Option<&sb_core::FitEstimate>,
+) -> Option<Fit> {
+    let changes_size = ["ctx_size", "cache_type_k", "cache_type_v", "parallel"]
+        .iter()
+        .any(|key| variant_load.contains_key(*key));
+    if !changes_size {
+        return None;
+    }
+    let (k_new, v_new) = (
+        sb_core::cache_type_bytes(cache_type(variant_load, base_load, "cache_type_k")),
+        sb_core::cache_type_bytes(cache_type(variant_load, base_load, "cache_type_v")),
+    );
+    let (k_base, v_base) = (
+        sb_core::cache_type_bytes(cache_type(&Map::new(), base_load, "cache_type_k")),
+        sb_core::cache_type_bytes(cache_type(&Map::new(), base_load, "cache_type_v")),
+    );
+    let measured = row
+        .map(|row| &row["memory"])
+        .filter(|memory| memory["status"] == "measured")
+        .map(|memory| &memory["min"])
+        .filter(|min| min["n_ctx"].as_u64().is_some_and(|n| n > 0));
+    let ctx_of = |default: u64| {
+        variant_load
+            .get("ctx_size")
+            .or_else(|| base_load.get("ctx_size"))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .unwrap_or(default)
+    };
+    if let Some(min) = measured {
+        let n_ctx = min["n_ctx"].as_u64().unwrap_or(1);
+        let (mut fixed, mut context, mut total) = (0u64, 0u64, 0u64);
+        for device in min["devices"].as_array().into_iter().flatten() {
+            if device["kind"] == "host" {
+                continue;
+            }
+            fixed +=
+                device["model"].as_u64().unwrap_or(0) + device["compute"].as_u64().unwrap_or(0);
+            context += device["context"].as_u64().unwrap_or(0);
+            total += device["total"].as_u64().unwrap_or(0);
+        }
+        if total == 0 {
+            return None; // no GPU seen: host memory is not limited here
+        }
+        let ctx = ctx_of(n_ctx);
+        let scale = (k_new + v_new) / (k_base + v_base);
+        let kv = (context as f64 / n_ctx as f64 * ctx as f64 * scale) as u64;
+        return Some(Fit {
+            needed_bytes: fixed + kv,
+            budget_bytes: total / 100 * 95,
+            ctx,
+            source: "engine measurement",
+        });
+    }
+    let estimate = estimate?;
+    let ctx = ctx_of(4096);
+    let k = cache_type(variant_load, base_load, "cache_type_k");
+    let v = cache_type(variant_load, base_load, "cache_type_v");
+    Some(Fit {
+        needed_bytes: estimate.weights_bytes + estimate.kv_bytes(ctx, k, v),
+        budget_bytes: estimate.budget_bytes,
+        ctx,
+        source: "estimate",
+    })
+}
+
+/// A variant idle for its whole TTL: unused since it was made or last
+/// used (whichever is later).
+fn variant_expired(now_ms: i64, last_used_ms: Option<i64>, created_ms: i64, ttl_secs: u64) -> bool {
+    let last = last_used_ms.unwrap_or(created_ms).max(created_ms);
+    now_ms - last >= (ttl_secs as i64).saturating_mul(1000)
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+impl EngineControls {
+    /// Drop variants unused for their target's `variant_idle_ttl_secs`
+    /// (or whose target no longer allows variants). Never one serving a
+    /// request. They leave the overlay on this apply.
+    fn gc_variants(&self, state: &EngineCtx, lane: &EngineLane) {
+        let registry = state.engine.model_settings();
+        let now = now_ms();
+        let mut st = self.lock();
+        let Some(variants) = st.variants.get_mut(&lane.name) else {
+            return;
+        };
+        variants.retain(|name, variant| {
+            let key = format!("{}/{name}", lane.name);
+            if registry.in_flight(&key) > 0 {
+                return true;
+            }
+            let Some(policy) = registry
+                .get(&variant.target)
+                .and_then(|entry| entry.doc.request_load.clone())
+            else {
+                return false;
+            };
+            !variant_expired(
+                now,
+                registry.last_used_ms(&key),
+                variant.created_ms,
+                policy.variant_idle_ttl_secs,
+            )
+        });
+    }
+
+    /// Find or make the variant of `target` with `load`; `Ok` is its
+    /// engine model name.
+    pub(crate) async fn ensure_variant(
+        &self,
+        state: &EngineCtx,
+        target: &sb_core::ExecutionTarget,
+        load: &Map<String, Value>,
+        policy: &sb_core::RequestLoadPolicy,
+    ) -> Result<String, sb_runtime::ExecError> {
+        use sb_runtime::ExecError;
+        let snap = state.snapshot();
+        let Some(lane) = engine_lane(&snap.config, &target.provider_id) else {
+            return Err(ExecError::new(
+                400,
+                "no_engine_control",
+                format!("`{}` has no engine control for load settings", target.id),
+                None,
+            ));
+        };
+        let name = format!("{}~{}", target.model, load_hash(load));
+        let registry = state.engine.model_settings();
+        {
+            let mut st = self.lock();
+            let variants = st.variants.entry(lane.name.clone()).or_default();
+            if variants.contains_key(&name) {
+                return Ok(name);
+            }
+            // At the limit: drop the least recently used idle variant of
+            // this target, or refuse.
+            let mine: Vec<(String, i64)> = variants
+                .values()
+                .filter(|v| v.target == target.id)
+                .map(|v| {
+                    let key = format!("{}/{}", lane.name, v.name);
+                    (
+                        v.name.clone(),
+                        registry.last_used_ms(&key).unwrap_or(v.created_ms),
+                    )
+                })
+                .collect();
+            if mine.len() >= policy.max_variants as usize {
+                let idle = mine
+                    .iter()
+                    .filter(|(n, _)| registry.in_flight(&format!("{}/{n}", lane.name)) == 0)
+                    .min_by_key(|(_, last)| *last)
+                    .map(|(n, _)| n.clone());
+                match idle {
+                    Some(evict) => {
+                        variants.remove(&evict);
+                    }
+                    None => {
+                        return Err(ExecError::new(
+                            409,
+                            "too_many_variants",
+                            format!(
+                                "`{}` already has {} variant(s) serving requests (max_variants {})",
+                                target.id,
+                                mine.len(),
+                                policy.max_variants
+                            ),
+                            None,
+                        ))
+                    }
+                }
+            }
+        }
+        // Fit check before the variant exists anywhere.
+        let base_load = registry
+            .get(&target.id)
+            .map(|entry| entry.doc.load.clone())
+            .unwrap_or_default();
+        let listing = match self.awake(state, &lane).await {
+            Awake::Up => self.models(state, &lane).await.ok(),
+            Awake::Asleep(_) => self.cached_models(&lane.name).map(|(_, models)| models),
+        };
+        let row = listing
+            .as_ref()
+            .and_then(|models| models.iter().find(|row| row["id"] == target.model.as_str()));
+        if let Some(fit) = variant_fit(row, &base_load, load, policy.estimate.as_ref()) {
+            if fit.needed_bytes > fit.budget_bytes {
+                return Err(ExecError::new(
+                    409,
+                    "would_not_fit",
+                    format!(
+                        "variant of `{}` would not fit: needs {} ({} bytes) at ctx {}, the \
+                         machine has {} ({} bytes) for it ({})",
+                        target.id,
+                        gib(fit.needed_bytes),
+                        fit.needed_bytes,
+                        fit.ctx,
+                        gib(fit.budget_bytes),
+                        fit.budget_bytes,
+                        fit.source
+                    ),
+                    None,
+                ));
+            }
+        }
+        self.lock()
+            .variants
+            .entry(lane.name.clone())
+            .or_default()
+            .insert(
+                name.clone(),
+                Variant {
+                    name: name.clone(),
+                    target: target.id.clone(),
+                    base_model: target.model.clone(),
+                    load: load.clone(),
+                    created_ms: now_ms(),
+                },
+            );
+        let result = self.apply_lane(state, &lane).await;
+        if result["ok"] != json!(true) {
+            if let Some(variants) = self.lock().variants.get_mut(&lane.name) {
+                variants.remove(&name);
+            }
+            return Err(ExecError::new(
+                503,
+                "variant_apply_failed",
+                format!(
+                    "could not set up the variant of `{}`: {}",
+                    target.id,
+                    result["error"].as_str().unwrap_or("unknown error")
+                ),
+                None,
+            ));
+        }
+        Ok(name)
+    }
+}
+
+/// The runtime's variant seam over the engine control. Holds the engine
+/// weakly (the engine holds this).
+pub(crate) struct EngineVariants {
+    pub engine: std::sync::Weak<sb_runtime::Engine>,
+    pub capacity: Arc<crate::activator::CapacityActivator>,
+    pub engines: Arc<EngineControls>,
+}
+
+impl sb_runtime::model_settings::ModelVariants for EngineVariants {
+    fn ensure_variant<'a>(
+        &'a self,
+        target: &'a sb_core::ExecutionTarget,
+        load: &'a Map<String, Value>,
+        policy: &'a sb_core::RequestLoadPolicy,
+    ) -> sb_runtime::BoxFuture<'a, Result<String, sb_runtime::ExecError>> {
+        Box::pin(async move {
+            let Some(engine) = self.engine.upgrade() else {
+                return Err(sb_runtime::ExecError::new(
+                    503,
+                    "shutting_down",
+                    "the gateway is shutting down",
+                    None,
+                ));
+            };
+            let ctx = EngineCtx {
+                engine,
+                capacity: self.capacity.clone(),
+                engines: self.engines.clone(),
+            };
+            ctx.engines.ensure_variant(&ctx, target, load, policy).await
+        })
+    }
+}
+
 // ---------------------------------------------------------------- settings API hooks
 
 /// Engine checks of a settings document before it is written: load
 /// settings need an engine control with a `settings_command`; raw
 /// arguments must be the engine's; paths need `allow_model_path`.
 pub(crate) fn validate_for_target(
-    state: &AppState,
+    state: &EngineCtx,
     target: &str,
     doc: &ModelSettingsDoc,
 ) -> Result<(), String> {
@@ -1262,7 +1611,7 @@ pub(crate) fn validate_for_target(
 /// The load-time part of a target's view (operator keys only). Uses the
 /// last engine listing only: a settings read never calls a machine.
 pub(crate) fn add_load_view(
-    state: &AppState,
+    state: &EngineCtx,
     named: &NamedTarget,
     doc: Option<&ModelSettingsDoc>,
     view: &mut Value,
@@ -1316,7 +1665,7 @@ pub(crate) fn add_load_view(
 /// After a settings write: apply changed load settings (`next_load` or
 /// `now`). `None` = the load part did not change.
 pub(crate) async fn after_settings_write(
-    state: &AppState,
+    state: &EngineCtx,
     target: &str,
     before: Option<&ModelSettingsDoc>,
     entry: &SettingsEntry,
@@ -1402,11 +1751,12 @@ struct LoadBody {
 
 /// `POST /v1/models/{model}/load {"wake": false}`: preload a model.
 pub(crate) async fn load_endpoint(
-    state: &AppState,
+    app: &AppState,
     principal: &Principal,
     name: &str,
     body: Value,
 ) -> Response {
+    let state = &EngineCtx::from(app);
     let body: LoadBody = match serde_json::from_value(body) {
         Ok(body) => body,
         Err(e) => {
@@ -1417,7 +1767,7 @@ pub(crate) async fn load_endpoint(
             )
         }
     };
-    let named = match resolve_one(state, principal, name) {
+    let named = match resolve_one(app, principal, name) {
         Ok(named) => named,
         Err(response) => return response,
     };
@@ -1429,7 +1779,7 @@ pub(crate) async fn load_endpoint(
 
 /// Load a target's model (waking only when `wake`). `Err` is the response.
 pub(crate) async fn load_target(
-    state: &AppState,
+    state: &EngineCtx,
     target: &str,
     wake: bool,
 ) -> Result<Value, Response> {
@@ -1478,12 +1828,9 @@ pub(crate) async fn load_target(
 
 /// `POST /v1/models/{model}/unload`: refused while a request is in flight
 /// on the model; never wakes or powers anything off.
-pub(crate) async fn unload_endpoint(
-    state: &AppState,
-    principal: &Principal,
-    name: &str,
-) -> Response {
-    let named = match resolve_one(state, principal, name) {
+pub(crate) async fn unload_endpoint(app: &AppState, principal: &Principal, name: &str) -> Response {
+    let state = &EngineCtx::from(app);
+    let named = match resolve_one(app, principal, name) {
         Ok(named) => named,
         Err(response) => return response,
     };
@@ -1536,9 +1883,10 @@ pub(crate) async fn unload_endpoint(
 /// with status, arguments, memory, pending settings, variants and the last
 /// apply. Never wakes: a sleeping lane shows its last known listing.
 pub(crate) async fn engines_endpoint(
-    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::State(app): axum::extract::State<AppState>,
     axum::Extension(principal): axum::Extension<Principal>,
 ) -> Response {
+    let state = EngineCtx::from(&app);
     if !principal.is_operator_or_admin() {
         return crate::tenancy::forbidden();
     }
@@ -1624,12 +1972,111 @@ pub(crate) async fn engines_endpoint(
 }
 
 /// After a hold's wake: load the model the hold named (operator keys).
-pub(crate) fn preload_after_hold(state: &AppState, target: String, wake: bool) {
-    let state = state.clone();
+pub(crate) fn preload_after_hold(app: &AppState, target: String, wake: bool) {
+    let state = EngineCtx::from(app);
     tokio::spawn(async move {
         match load_target(&state, &target, wake).await {
             Ok(_) => tracing::info!(target_model = %target, "hold preload: loaded"),
             Err(_) => tracing::warn!(target_model = %target, "hold preload: not loaded"),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn measured(context: u64, total: u64) -> Value {
+        json!({"memory": {"status": "measured", "min": {"n_ctx": 4096, "devices": [
+            {"kind": "device", "name": "CUDA0", "total": total, "model": 10u64 << 30,
+             "context": context, "compute": 1u64 << 30},
+            {"kind": "host", "name": "Host", "model": 1u64 << 30, "context": 0, "compute": 0}]}}})
+    }
+
+    #[test]
+    fn fit_scales_the_measured_kv_cache() {
+        // 4096 tokens took 1 GiB of KV: 65536 take 16 GiB, plus 11 GiB.
+        let row = measured(1u64 << 30, 24u64 << 30);
+        let load = json!({"ctx_size": 65536}).as_object().unwrap().clone();
+        let fit = variant_fit(Some(&row), &Map::new(), &load, None).unwrap();
+        assert_eq!(fit.needed_bytes, 27 << 30);
+        assert_eq!(fit.budget_bytes, (24u64 << 30) / 100 * 95);
+        assert!(fit.needed_bytes > fit.budget_bytes);
+        // q8_0 K and V halve it (a bit more than half).
+        let load = json!({"ctx_size": 65536, "cache_type_k": "q8_0", "cache_type_v": "q8_0"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let fit = variant_fit(Some(&row), &Map::new(), &load, None).unwrap();
+        assert_eq!(
+            fit.needed_bytes,
+            (11u64 << 30) + ((16u64 << 30) as f64 * 17.0 / 32.0) as u64
+        );
+        // No size change: nothing to check.
+        let load = json!({"flash_attn": true}).as_object().unwrap().clone();
+        assert!(variant_fit(Some(&row), &Map::new(), &load, None).is_none());
+    }
+
+    #[test]
+    fn fit_uses_the_estimate_without_a_measurement() {
+        let estimate = sb_core::FitEstimate {
+            weights_bytes: 20 << 30,
+            budget_bytes: 24 << 30,
+            kv_layers: 48,
+            kv_heads: 8,
+            head_dim: 128,
+            value_dim: None,
+        };
+        let load = json!({"ctx_size": 32768}).as_object().unwrap().clone();
+        let fit = variant_fit(None, &Map::new(), &load, Some(&estimate)).unwrap();
+        assert_eq!(fit.needed_bytes, (20u64 << 30) + (6u64 << 30));
+        assert_eq!(fit.source, "estimate");
+        assert!(variant_fit(None, &Map::new(), &load, None).is_none());
+    }
+
+    #[test]
+    fn variants_expire_after_their_idle_ttl() {
+        let hour = 3_600_000;
+        assert!(!variant_expired(10 * hour, None, 10 * hour - 1000, 3600));
+        assert!(variant_expired(10 * hour, None, 9 * hour, 3600));
+        // Used recently: kept even though it was made long ago.
+        assert!(!variant_expired(
+            10 * hour,
+            Some(10 * hour - 5),
+            2 * hour,
+            3600
+        ));
+        assert!(variant_expired(10 * hour, Some(8 * hour), 2 * hour, 3600));
+    }
+
+    #[test]
+    fn variant_names_are_stable() {
+        let a = json!({"ctx_size": 65536, "cache_type_k": "q8_0"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let b = json!({"cache_type_k": "q8_0", "ctx_size": 65536})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(load_hash(&a), load_hash(&b));
+        assert_eq!(load_hash(&a).len(), 8);
+        assert_ne!(
+            load_hash(&a),
+            load_hash(&json!({"ctx_size": 1}).as_object().unwrap().clone())
+        );
+    }
+
+    #[test]
+    fn llama_preset_pairs_map_load_keys() {
+        let load = json!({"ctx_size": 8192, "flash_attn": false, "mmap": false, "mlock": true,
+                          "mmproj": "off", "draft_max": 8, "n_gpu_layers": "all"});
+        let pairs = LlamaCppRouter.preset_pairs(load.as_object().unwrap(), &Map::new());
+        assert_eq!(pairs["ctx-size"], "8192");
+        assert_eq!(pairs["flash-attn"], "off");
+        assert_eq!(pairs["load-mode"], "mlock");
+        assert_eq!(pairs["no-mmproj"], "true");
+        assert_eq!(pairs["spec-draft-n-max"], "8");
+        assert_eq!(pairs["n-gpu-layers"], "all");
+    }
 }

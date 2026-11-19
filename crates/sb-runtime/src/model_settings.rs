@@ -21,6 +21,18 @@ use sb_store::{ModelSettingsChange, ModelSettingsWrite, StateStore};
 
 use crate::{ExecError, Snapshot};
 
+/// Makes (or finds) the engine variant a request's load settings ask for:
+/// `sb-server`'s engine control. `Ok` is the upstream model name the
+/// attempt sends (`<model>~<hash8>`); `Err` is the answer to give.
+pub trait ModelVariants: Send + Sync {
+    fn ensure_variant<'a>(
+        &'a self,
+        target: &'a ExecutionTarget,
+        load: &'a Map<String, Json>,
+        policy: &'a sb_core::RequestLoadPolicy,
+    ) -> crate::BoxFuture<'a, Result<String, ExecError>>;
+}
+
 /// One target's current settings.
 #[derive(Debug, Clone)]
 pub struct SettingsEntry {
@@ -466,6 +478,24 @@ impl SettingsPlan {
         Some(registry.enter(&format!("{}/{model}", target.provider_id)))
     }
 
+    /// Send attempts on `target` to the engine model `model` (a variant).
+    pub(crate) fn set_model(&mut self, target: &ExecutionTarget, req: &AiRequest, model: String) {
+        let planned = self
+            .per_target
+            .entry(target.id.clone())
+            .or_insert_with(|| PlannedTarget {
+                request: req.clone(),
+                model: None,
+                summary: String::new(),
+            });
+        planned.summary = if planned.summary.is_empty() {
+            format!("variant={model}")
+        } else {
+            format!("{}; variant={model}", planned.summary)
+        };
+        planned.model = Some(model);
+    }
+
     /// The settings summary for a target, if any.
     pub(crate) fn summary_for(&self, target_id: &str) -> Option<&str> {
         self.per_target
@@ -491,18 +521,6 @@ pub(crate) fn plan_settings(
     };
     if request.is_none() && registry.is_empty() {
         return Ok(plan);
-    }
-    if request.is_some_and(|request| !request.load.is_empty()) {
-        return Err(ExecError::new(
-            400,
-            "request_load_disabled",
-            format!(
-                "`switchback.load` needs a `request_load` policy on the target of `{}`; \
-                 none allows per-request load settings",
-                req.model
-            ),
-            None,
-        ));
     }
     let route_profile = snap
         .config
@@ -570,6 +588,75 @@ pub(crate) fn plan_settings(
         );
     }
     Ok(plan)
+}
+
+/// Check a request's load settings against the first candidate's
+/// `request_load` policy. `Ok` is that target and its policy; `Err` a 400.
+/// Client keys may set only `allow`ed keys; every key stays within
+/// `bounds`; file paths never.
+pub(crate) fn check_request_load(
+    registry: &ModelSettingsRegistry,
+    req: &AiRequest,
+    role: &str,
+    load: &Map<String, Json>,
+    candidates: &[ExecutionTarget],
+) -> Result<(ExecutionTarget, sb_core::RequestLoadPolicy), ExecError> {
+    let bad = |kind: &str, message: String| ExecError::new(400, kind, message, None);
+    let Some(first) = candidates.first() else {
+        return Err(bad(
+            "request_load_disabled",
+            format!("no target for `{}`", req.model),
+        ));
+    };
+    let policy = registry
+        .get(&first.id)
+        .and_then(|entry| entry.doc.request_load.clone())
+        .ok_or_else(|| {
+            bad(
+                "request_load_disabled",
+                format!(
+                    "`switchback.load` needs a `request_load` policy on `{}`; it has none, so \
+                     per-request load settings are refused",
+                    first.id
+                ),
+            )
+        })?;
+    for (key, value) in load {
+        sb_core::validate_load_value(key, value)
+            .map_err(|e| bad("invalid_settings", format!("switchback.load: {e}")))?;
+        if sb_core::load_key(key).is_some_and(|k| k.kind == sb_core::LoadKind::Path) {
+            return Err(bad(
+                "request_load_refused",
+                format!("switchback.load: `{key}` names a file; a request may not set it"),
+            ));
+        }
+        if role == "client" && !policy.allow.iter().any(|allowed| allowed == key) {
+            return Err(bad(
+                "request_load_refused",
+                format!(
+                    "switchback.load: `{key}` is not allowed for this key on `{}`; allowed: {}",
+                    first.id,
+                    if policy.allow.is_empty() {
+                        "none".to_string()
+                    } else {
+                        policy.allow.join(", ")
+                    }
+                ),
+            ));
+        }
+        if let (Some([min, max]), Some(number)) = (policy.bounds.get(key), value.as_f64()) {
+            if number < *min || number > *max {
+                return Err(bad(
+                    "out_of_bounds",
+                    format!(
+                        "switchback.load: `{key}` = {number} is outside [{min}, {max}] on `{}`",
+                        first.id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok((first.clone(), policy))
 }
 
 /// A request's own settings layer, as a map for display.

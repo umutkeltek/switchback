@@ -60,6 +60,10 @@ pub(crate) async fn messages(
         }
     };
     req.tenant = principal.tenant.clone();
+    req.metadata.insert(
+        sb_core::SETTINGS_ROLE_METADATA_KEY.to_string(),
+        principal.role_name().to_string(),
+    );
     req.project = principal.project.clone();
     drop_chat_wire_thinking_unless_enabled(&state, &mut req);
     attach_session_metadata(&mut req, &headers);

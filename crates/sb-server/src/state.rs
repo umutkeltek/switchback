@@ -66,6 +66,14 @@ impl AppState {
         capacity.attach_credentials(Arc::new(crate::activator::EngineCredentials(
             Arc::downgrade(&engine),
         )));
+        // Per-request load settings make engine variants through the
+        // engine control, which the runtime reaches through this seam.
+        let engines = Arc::new(crate::engine_control::EngineControls::default());
+        engine.set_model_variants(Arc::new(crate::engine_control::EngineVariants {
+            engine: Arc::downgrade(&engine),
+            capacity: capacity.clone(),
+            engines: engines.clone(),
+        }));
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),
@@ -79,7 +87,7 @@ impl AppState {
             ),
             capacity,
             engine,
-            engines: Arc::new(crate::engine_control::EngineControls::default()),
+            engines,
         }
     }
 

@@ -397,6 +397,10 @@ async fn route_preview_inner(
         Err(msg) => return cp_error(StatusCode::BAD_REQUEST, msg),
     };
     req.tenant = principal.tenant.clone();
+    req.metadata.insert(
+        sb_core::SETTINGS_ROLE_METADATA_KEY.to_string(),
+        principal.role_name().to_string(),
+    );
     req.project = principal.project.clone();
     attach_session_metadata(&mut req, &headers);
     attach_wake_preference(&mut req, &headers);

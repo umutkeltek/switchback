@@ -38,6 +38,10 @@ pub const SETTINGS_PROFILE_METADATA_KEY: &str = "switchback_profile";
 pub const SETTINGS_RESPONSE_HEADER: &str = "x-switchback-settings";
 /// The request body object Switchback reads and strips before dispatch.
 pub const SWITCHBACK_BODY_KEY: &str = "switchback";
+/// Request-metadata key the gateway stores the caller's key role under
+/// (`client`, `operator`, `admin`): per-request load settings depend on it.
+/// Set by the gateway after parsing, never sent upstream.
+pub const SETTINGS_ROLE_METADATA_KEY: &str = "switchback_key_role";
 /// Request-metadata marker: settings asked for thinking on without an
 /// effort. Engines that switch thinking through a template argument read it
 /// in the adapter; never sent upstream.
@@ -524,6 +528,37 @@ pub struct RequestLoadPolicy {
     /// A variant unused this long is dropped on the next apply (default 1 h).
     #[serde(default = "default_variant_idle_ttl_secs")]
     pub variant_idle_ttl_secs: u64,
+    /// Numbers for the fit check when the engine has no memory measurement
+    /// of the model (the same KV math as `sb ai fit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<FitEstimate>,
+}
+
+/// What a model needs, for the fit check of a variant when the engine has
+/// not measured it: weights, the KV cache shape (`sb ai fit --json` gives
+/// `model.kv_layers`, `kv_heads`, `head_dim`, `value_dim`), and the bytes
+/// the machine has for it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FitEstimate {
+    pub weights_bytes: u64,
+    pub budget_bytes: u64,
+    pub kv_layers: u64,
+    pub kv_heads: u64,
+    pub head_dim: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_dim: Option<u64>,
+}
+
+impl FitEstimate {
+    /// KV cache bytes at `ctx` tokens with the given cache types:
+    /// layers × ctx × heads × (head_dim × K bytes + value_dim × V bytes).
+    pub fn kv_bytes(&self, ctx: u64, cache_k: &str, cache_v: &str) -> u64 {
+        let value_dim = self.value_dim.unwrap_or(self.head_dim) as f64;
+        let per_token_head = self.head_dim as f64 * crate::cache_type_bytes(cache_k)
+            + value_dim * crate::cache_type_bytes(cache_v);
+        (self.kv_layers as f64 * ctx as f64 * self.kv_heads as f64 * per_token_head) as u64
+    }
 }
 
 fn default_max_variants() -> u32 {
