@@ -248,7 +248,25 @@ def catalog(gw):
             media.add(model_id)
         else:
             result["text"].append(model_id)
+    result["text"] = plain_text_names(result["text"])
     return result
+
+
+def plain_text_names(ids):
+    """/v1/models lists each text route twice (`fast` and `<provider>/fast`) and
+    the providers themselves (`<provider>`). Keep one name per model: drop
+    `<provider>/x` when `x` is listed too, and a bare id that is only the prefix
+    of other ids (a provider, not a model)."""
+    listed = set(ids)
+    prefixes = {i.split("/", 1)[0] for i in ids if "/" in i}
+    keep = []
+    for model_id in ids:
+        if "/" in model_id and model_id.split("/", 1)[1] in listed:
+            continue
+        if "/" not in model_id and model_id in prefixes:
+            continue
+        keep.append(model_id)
+    return keep
 
 
 def resolve_model(name, group, cat, default=""):

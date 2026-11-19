@@ -381,6 +381,18 @@ class SbAi(unittest.TestCase):
                                                   "video": ["lane-img/clip", "video/clip2"]})
         self.assertEqual({r["method"] for r in self.fake.seen}, {"GET"})
 
+    def test_models_lists_each_text_model_once(self):
+        # A real gateway lists every route twice (`chat-a`, `lane-txt/chat-a`) and
+        # its providers as bare ids (`lane-txt`); a target with no plain twin stays.
+        self.fake.models.extend([{"id": "lane-txt/chat-a"}, {"id": "lane-txt/chat-b"},
+                                 {"id": "lane-txt"}, {"id": "lane-txt/only-direct"}])
+        run = self.sb("models", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)["text"], ["chat-a", "chat-b", "lane-txt/only-direct"])
+        run = self.sb("models")
+        self.assertNotIn("lane-txt/chat-a", run.stdout)
+        self.assertNotRegex(run.stdout, r"(?m)^  lane-txt$")
+
     # ------------------------------------------------------------ video
 
     def video_states(self):
