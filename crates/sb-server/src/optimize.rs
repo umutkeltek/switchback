@@ -665,9 +665,14 @@ pub(crate) async fn report(
     };
     let mut report = build_report(&input);
     if operator {
-        let minute = ((input.now_ms / 60_000) % (24 * 60)) as u32;
-        report["quiet_windows"] = json!(optimize.quiet_windows);
-        report["in_quiet_window"] = json!(optimize.quiet_window_at(minute));
+        report["quiet_windows"] = json!(optimize
+            .windows()
+            .map(|(window, tz)| window.label(tz))
+            .collect::<Vec<_>>());
+        report["in_quiet_window"] = json!(sb_runtime::optimize::quiet_window_now(
+            optimize,
+            input.now_ms
+        ));
     }
     Json(report).into_response()
 }
@@ -733,12 +738,13 @@ pub(crate) async fn lock_create(
     };
     let now = sb_store::now_millis();
     let optimize = &snap.config.server.optimize;
-    let minute = ((now / 60_000) % (24 * 60)) as u32;
-    if let Some(window) = optimize.quiet_window_at(minute) {
+    if let Some(window) = sb_runtime::optimize::quiet_window_now(optimize, now) {
         return refuse(
             StatusCode::CONFLICT,
             "quiet_window",
-            format!("inside the quiet window {window} (UTC, server.optimize.quiet_windows); try after it"),
+            format!(
+                "inside the quiet window {window} (server.optimize.quiet_windows); try after it"
+            ),
         );
     }
     let report = state
@@ -809,7 +815,9 @@ pub(crate) async fn lock_list(
 }
 
 /// `PATCH /v1/optimize/locks/{id} {"ttl_secs"}` (operator): end it that
-/// many seconds from now.
+/// many seconds from now. The answer adds `quiet_window` (the window in
+/// force, or null). A 404 means the lock is gone (expired, released, or
+/// the gateway restarted): the run stops.
 pub(crate) async fn lock_extend(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -821,7 +829,17 @@ pub(crate) async fn lock_extend(
     }
     let expires = sb_store::now_millis() + (body.ttl_secs.clamp(1, MAX_LOCK_SECS) as i64) * 1000;
     match state.engine.optimize().extend_lock(&id, expires) {
-        Some(lock) => Json(json!(lock)).into_response(),
+        // The tuner's heartbeat: it also learns whether a quiet window
+        // began, so it stops at its next safe point.
+        Some(lock) => {
+            let snap = state.snapshot();
+            let mut view = json!(lock);
+            view["quiet_window"] = json!(sb_runtime::optimize::quiet_window_now(
+                &snap.config.server.optimize,
+                sb_store::now_millis()
+            ));
+            Json(view).into_response()
+        }
         None => refuse(
             axum::http::StatusCode::NOT_FOUND,
             "not_found",

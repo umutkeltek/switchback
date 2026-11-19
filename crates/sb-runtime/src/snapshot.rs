@@ -470,7 +470,12 @@ impl Engine {
     /// construction publishes the already-validated snapshot.
     pub fn validate_config(config: &Config) -> Result<(), String> {
         let mut problems = config.semantic_problems();
-        if let Err(e) = config.server.optimize.validate() {
+        if let Err(e) = config
+            .server
+            .optimize
+            .validate()
+            .and_then(|()| crate::optimize::validate_time_zones(&config.server.optimize))
+        {
             problems.push(e);
         }
         if let Some(catalog) = &config.catalog {

@@ -85,6 +85,9 @@ zeroize = "1"
 hmac = "0.12"
 base64 = "0.22"
 time = "0.3"
+# IANA time zones (quiet windows); the bundled database covers machines
+# without a system one.
+jiff = { version = "1", features = ["tzdb-bundle-always"] }
 crc32fast = "1"
 zstd = "0.13"
 

@@ -49,9 +49,14 @@ pub struct OptimizeConfig {
     /// Measured or published numbers per machine (the lane's `host`, or
     /// the lane name): memory bandwidth and peak compute, for ceilings.
     pub hosts: BTreeMap<String, HostSpec>,
-    /// `HH:MM-HH:MM` windows (UTC) in which `sb ai tune` refuses to start
-    /// (for example while a nightly job runs). A window may wrap midnight.
-    pub quiet_windows: Vec<String>,
+    /// Windows in which `sb ai tune` refuses to start and a running tune
+    /// stops at its next safe point (for example while a nightly job runs).
+    /// Each is `"HH:MM-HH:MM"` (in `timezone`) or `{start, end, tz}` with
+    /// its own IANA time zone. A window may wrap midnight.
+    pub quiet_windows: Vec<QuietWindow>,
+    /// The IANA time zone (`Asia/Tokyo`) of windows that name none.
+    /// Absent = UTC.
+    pub timezone: Option<String>,
     /// Thresholds of the speed report's findings.
     pub report: ReportThresholds,
 }
@@ -66,6 +71,7 @@ impl Default for OptimizeConfig {
             big_prompt_tokens: None,
             hosts: BTreeMap::new(),
             quiet_windows: Vec::new(),
+            timezone: None,
             report: ReportThresholds::default(),
         }
     }
@@ -75,7 +81,7 @@ impl OptimizeConfig {
     /// Check the windows and numbers; a bad one names itself.
     pub fn validate(&self) -> Result<(), String> {
         for window in &self.quiet_windows {
-            parse_window(window)?;
+            window.minutes()?;
         }
         for (host, spec) in &self.hosts {
             for (name, value) in [
@@ -95,22 +101,85 @@ impl OptimizeConfig {
         Ok(())
     }
 
-    /// The window `now_minute` (minutes since midnight UTC) falls in.
-    pub fn quiet_window_at(&self, now_minute: u32) -> Option<&str> {
+    /// Every window with the time zone it is read in (`None` = UTC).
+    pub fn windows(&self) -> impl Iterator<Item = (&QuietWindow, Option<&str>)> {
         self.quiet_windows
             .iter()
-            .find(|window| {
-                parse_window(window)
-                    .map(|(start, end)| minute_in_window(now_minute, start, end))
-                    .unwrap_or(false)
-            })
-            .map(String::as_str)
+            .map(|window| (window, window.tz().or(self.timezone.as_deref())))
+    }
+
+    /// The window that holds the moment, given `local_minute`: minutes
+    /// since local midnight in a time zone (`None` = UTC), or `None` when
+    /// the zone is unknown (then the window is taken to hold, so a bad
+    /// zone never lets a tune run into a nightly job). Its label names
+    /// the zone.
+    pub fn quiet_window_at(
+        &self,
+        mut local_minute: impl FnMut(Option<&str>) -> Option<u32>,
+    ) -> Option<String> {
+        self.windows().find_map(|(window, tz)| {
+            let (start, end) = window.minutes().ok()?;
+            let inside = local_minute(tz).is_none_or(|now| minute_in_window(now, start, end));
+            inside.then(|| window.label(tz))
+        })
+    }
+}
+
+/// One quiet window: `"HH:MM-HH:MM"`, or `{start, end, tz}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum QuietWindow {
+    Text(String),
+    Spec(QuietWindowSpec),
+}
+
+/// `{start: "00:30", end: "03:00", tz: "Asia/Tokyo"}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuietWindowSpec {
+    pub start: String,
+    pub end: String,
+    /// IANA time zone; absent = `server.optimize.timezone`, else UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
+}
+
+impl From<&str> for QuietWindow {
+    fn from(text: &str) -> Self {
+        QuietWindow::Text(text.to_string())
+    }
+}
+
+impl QuietWindow {
+    /// Start and end, minutes since midnight.
+    pub fn minutes(&self) -> Result<(u32, u32), String> {
+        match self {
+            QuietWindow::Text(text) => parse_window(text),
+            QuietWindow::Spec(spec) => parse_window(&format!("{}-{}", spec.start, spec.end)),
+        }
+    }
+
+    /// The window's own time zone, when it names one.
+    pub fn tz(&self) -> Option<&str> {
+        match self {
+            QuietWindow::Text(_) => None,
+            QuietWindow::Spec(spec) => spec.tz.as_deref(),
+        }
+    }
+
+    /// `00:30-03:00 Asia/Tokyo` (`UTC` when no zone applies).
+    pub fn label(&self, tz: Option<&str>) -> String {
+        let span = match self {
+            QuietWindow::Text(text) => text.trim().to_string(),
+            QuietWindow::Spec(spec) => format!("{}-{}", spec.start.trim(), spec.end.trim()),
+        };
+        format!("{span} {}", tz.unwrap_or("UTC"))
     }
 }
 
 /// `HH:MM-HH:MM` to minutes since midnight.
 pub fn parse_window(window: &str) -> Result<(u32, u32), String> {
-    let bad = || format!("quiet window `{window}` must be HH:MM-HH:MM (UTC)");
+    let bad = || format!("quiet window `{window}` must be HH:MM-HH:MM");
     let (start, end) = window.trim().split_once('-').ok_or_else(bad)?;
     let minute = |text: &str| -> Result<u32, String> {
         let (h, m) = text.trim().split_once(':').ok_or_else(bad)?;
@@ -397,8 +466,56 @@ mod tests {
             quiet_windows: vec!["00:30-03:00".into()],
             ..OptimizeConfig::default()
         };
-        assert_eq!(cfg.quiet_window_at(45), Some("00:30-03:00"));
-        assert_eq!(cfg.quiet_window_at(200), None);
+        assert_eq!(
+            cfg.quiet_window_at(|_| Some(45)).as_deref(),
+            Some("00:30-03:00 UTC")
+        );
+        assert_eq!(cfg.quiet_window_at(|_| Some(200)), None);
+    }
+
+    #[test]
+    fn windows_name_their_zone_and_an_unknown_zone_holds() {
+        let cfg: OptimizeConfig = serde_json::from_value(json!({
+            "timezone": "Asia/Tokyo",
+            "quiet_windows": [
+                "01:00-02:00",
+                {"start": "10:00", "end": "11:00", "tz": "America/New_York"},
+                {"start": "20:00", "end": "21:00"}
+            ]
+        }))
+        .unwrap();
+        cfg.validate().unwrap();
+        let zones: Vec<_> = cfg.windows().map(|(_, tz)| tz).collect();
+        assert_eq!(
+            zones,
+            [
+                Some("Asia/Tokyo"),
+                Some("America/New_York"),
+                Some("Asia/Tokyo")
+            ]
+        );
+        // Each window is read in its own zone's local minute.
+        let at = |istanbul: u32, new_york: u32| {
+            cfg.quiet_window_at(|tz| match tz {
+                Some("America/New_York") => Some(new_york),
+                _ => Some(istanbul),
+            })
+        };
+        assert_eq!(at(90, 0).as_deref(), Some("01:00-02:00 Asia/Tokyo"));
+        assert_eq!(
+            at(0, 10 * 60 + 5).as_deref(),
+            Some("10:00-11:00 America/New_York")
+        );
+        assert_eq!(at(10 * 60 + 5, 0), None);
+        // A zone that cannot be read holds (fail closed).
+        assert!(cfg.quiet_window_at(|_| None).is_some());
+        let bad: Result<OptimizeConfig, _> =
+            serde_json::from_value(json!({"quiet_windows": [{"start": "1:00"}]}));
+        assert!(bad.is_err());
+        let typo: Result<OptimizeConfig, _> = serde_json::from_value(
+            json!({"quiet_windows": [{"start": "01:00", "end": "02:00", "zone": "UTC"}]}),
+        );
+        assert!(typo.is_err());
     }
 
     #[test]

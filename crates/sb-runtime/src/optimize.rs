@@ -1097,9 +1097,84 @@ impl crate::Engine {
     }
 }
 
+/// Minutes since local midnight at `now_ms` in IANA zone `tz` (`None` =
+/// UTC). `None` when the zone is unknown.
+pub fn local_minute(now_ms: i64, tz: Option<&str>) -> Option<u32> {
+    let instant = jiff::Timestamp::from_millisecond(now_ms).ok()?;
+    let zone = match tz {
+        None => jiff::tz::TimeZone::UTC,
+        Some(name) => jiff::tz::TimeZone::get(name).ok()?,
+    };
+    let local = zone.to_datetime(instant);
+    Some(local.hour() as u32 * 60 + local.minute() as u32)
+}
+
+/// The quiet window (`server.optimize.quiet_windows`) holding `now_ms`, as
+/// its label (`00:30-03:00 Asia/Tokyo`), each window read in its own
+/// time zone.
+pub fn quiet_window_now(config: &sb_core::OptimizeConfig, now_ms: i64) -> Option<String> {
+    config.quiet_window_at(|tz| local_minute(now_ms, tz))
+}
+
+/// Every time zone the quiet windows name must be a known IANA name.
+pub fn validate_time_zones(config: &sb_core::OptimizeConfig) -> Result<(), String> {
+    for (_, tz) in config.windows() {
+        if let Some(name) = tz {
+            jiff::tz::TimeZone::get(name).map_err(|_| {
+                format!(
+                    "server.optimize: time zone `{name}` is not a known IANA name \
+                     (for example Asia/Tokyo or UTC)"
+                )
+            })?;
+        }
+    }
+    if let Some(name) = &config.timezone {
+        jiff::tz::TimeZone::get(name)
+            .map_err(|_| format!("server.optimize.timezone `{name}` is not a known IANA name"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_windows_are_read_in_their_own_time_zone() {
+        // 2026-01-15 16:15 UTC = 2026-01-16 01:15 in Tokyo (UTC+9).
+        let now = jiff::Timestamp::from_second(1_768_493_700)
+            .unwrap()
+            .as_millisecond();
+        assert_eq!(local_minute(now, None), Some(16 * 60 + 15));
+        assert_eq!(local_minute(now, Some("Asia/Tokyo")), Some(75));
+        assert_eq!(local_minute(now, Some("Mars/Base")), None);
+        let cfg: sb_core::OptimizeConfig = serde_json::from_value(serde_json::json!({
+            "quiet_windows": [{"start": "00:30", "end": "03:00", "tz": "Asia/Tokyo"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            quiet_window_now(&cfg, now).as_deref(),
+            Some("00:30-03:00 Asia/Tokyo")
+        );
+        // The same span in UTC (a plain string) does not hold at 16:15 UTC.
+        let utc: sb_core::OptimizeConfig = serde_json::from_value(serde_json::json!({
+            "quiet_windows": ["00:30-03:00"]
+        }))
+        .unwrap();
+        assert_eq!(quiet_window_now(&utc, now), None);
+        // A server zone applies to plain strings.
+        let zoned: sb_core::OptimizeConfig = serde_json::from_value(serde_json::json!({
+            "timezone": "Asia/Tokyo", "quiet_windows": ["00:30-03:00"]
+        }))
+        .unwrap();
+        assert!(quiet_window_now(&zoned, now).is_some());
+        validate_time_zones(&zoned).unwrap();
+        let bad: sb_core::OptimizeConfig = serde_json::from_value(serde_json::json!({
+            "quiet_windows": [{"start": "00:30", "end": "03:00", "tz": "Mars/Base"}]
+        }))
+        .unwrap();
+        assert!(validate_time_zones(&bad).unwrap_err().contains("Mars/Base"));
+    }
     use sb_core::{EngineTimings, ExecutionTarget, ExecutionTargetKind};
 
     fn target(provider: &str, model: &str) -> ExecutionTarget {

@@ -404,6 +404,89 @@ async fn a_lock_is_refused_inside_a_quiet_window() {
 }
 
 #[tokio::test]
+async fn quiet_windows_name_their_time_zone_and_reach_a_running_lock() {
+    // A whole-day window in an IANA zone: refused, and the zone is named.
+    let fx = fixture(
+        true,
+        "    timezone: Asia/Tokyo\n    quiet_windows: [\"00:00-23:59\", {start: \"23:59\", end: \"00:00\", tz: UTC}]",
+    )
+    .await;
+    let (status, body) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("Asia/Tokyo") || message.contains("UTC"),
+        "{message}"
+    );
+    // A lock taken before a window begins: its heartbeat (PATCH) says the
+    // window is in force, so the run stops at its next safe point.
+    let fx = fixture(true, "    stickiness: false").await;
+    let (status, lock) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a", "ttl_secs": 60})),
+    )
+    .await;
+    assert_eq!(status, 201, "{lock}");
+    let id = lock["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/optimize/locks/{id}");
+    let (status, beat) = call(&fx.gw, "PATCH", &path, ADMIN, Some(json!({"ttl_secs": 60}))).await;
+    assert_eq!(status, 200, "{beat}");
+    assert_eq!(beat["quiet_window"], Value::Null);
+    let mut cfg = (*fx.state.engine.snapshot().config).clone();
+    cfg.server.optimize.quiet_windows = vec![
+        sb_core::QuietWindow::Spec(sb_core::QuietWindowSpec {
+            start: "00:00".into(),
+            end: "23:59".into(),
+            tz: Some("Asia/Tokyo".into()),
+        }),
+        sb_core::QuietWindow::Spec(sb_core::QuietWindowSpec {
+            start: "23:59".into(),
+            end: "00:00".into(),
+            tz: Some("Asia/Tokyo".into()),
+        }),
+    ];
+    fx.state.engine.reload(cfg).unwrap();
+    let (status, beat) = call(&fx.gw, "PATCH", &path, ADMIN, Some(json!({"ttl_secs": 60}))).await;
+    assert_eq!(status, 200, "{beat}");
+    assert!(
+        beat["quiet_window"]
+            .as_str()
+            .is_some_and(|w| w.ends_with("Asia/Tokyo")),
+        "{beat}"
+    );
+    // A lock the gateway no longer has (a restart): 404 on the heartbeat.
+    let (status, _) = call(&fx.gw, "DELETE", &path, ADMIN, None).await;
+    assert_eq!(status, 200);
+    let (status, _) = call(&fx.gw, "PATCH", &path, ADMIN, Some(json!({"ttl_secs": 60}))).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn an_unknown_time_zone_is_a_config_error() {
+    let cfg = sb_core::Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+  optimize:
+    quiet_windows: [{start: "00:30", end: "03:00", tz: "Mars/Base"}]
+"#,
+    )
+    .unwrap();
+    let e = sb_runtime::Engine::validate_config(&cfg).unwrap_err();
+    assert!(e.contains("Mars/Base"), "{e}");
+}
+
+#[tokio::test]
 async fn the_experiment_ledger_and_settings_notes_round_trip() {
     let fx = fixture(true, "    stickiness: false").await;
     for (run, lever) in [("tune_1", "flash_attn"), ("tune_2", "draft_max")] {
