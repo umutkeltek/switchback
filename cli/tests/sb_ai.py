@@ -407,6 +407,14 @@ class SbAi(unittest.TestCase):
         self.assertIn("lane-img/flux", run.stderr)
         self.assertEqual(self.requests("POST"), [])
 
+    def test_an_unlisted_full_id_goes_to_the_gateway(self):
+        """An old name kept as an alias resolves at the gateway but is never
+        listed; the CLI sends a full id of the right group and lets the
+        gateway decide."""
+        run = self.sb("image", "a dog", "--model", "image/old-name")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.posted("/v1/images/generations")["json"]["model"], "image/old-name")
+
     def test_ambiguous_model_lists_the_matches(self):
         self.fake.workflows.append({"id": "lane-two/flux", "kind": "image_generation", "provider": "lane-two"})
         run = self.sb("image", "x", "--model", "flux")

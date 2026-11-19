@@ -478,6 +478,10 @@ def resolve_model(name, group, cat, default=""):
     if not cat["listed"]:
         raise Fail(USAGE, f"this key cannot list the gateway's {group} models; give the full id "
                           f"(like <lane>/{name})")
+    if name.startswith(f"{group}/"):
+        # A full id the list does not show, such as an old name kept as an alias:
+        # aliases resolve at the gateway but are never listed. The gateway decides.
+        return name
     listed = ", ".join(choices) or "none"
     raise Fail(USAGE, f"unknown {group} model {name}; the gateway offers: {listed}")
 
