@@ -27,6 +27,11 @@ struct EngineState {
     /// First user messages seen (a repeat is a prefix-cache hit).
     seen: Vec<String>,
     loads: usize,
+    /// `GET /models` calls (the listing poller must never reach a
+    /// sleeping machine).
+    listings: usize,
+    /// A loaded instance's command line, per model (`status.args`).
+    args: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -85,8 +90,11 @@ async fn health(State(m): State<Machine>) -> StatusCode {
     }
 }
 
+/// Shaped like a real llama.cpp router (build b12359): a preset model's
+/// row has no `sidecars` field, and a loaded one carries `status.args`.
 async fn models(State(m): State<Machine>) -> Json<Value> {
-    let st = m.state.lock().unwrap();
+    let mut st = m.state.lock().unwrap();
+    st.listings += 1;
     let data: Vec<Value> = st
         .models
         .iter()
@@ -96,7 +104,12 @@ async fn models(State(m): State<Machine>) -> Json<Value> {
             } else {
                 "unloaded"
             };
-            json!({"id": id, "status": {"value": status}})
+            let mut row = json!({"id": id, "path": format!("/models/{id}.gguf"),
+                                 "status": {"value": status}});
+            if let Some(args) = st.args.get(id).filter(|_| status == "loaded") {
+                row["status"]["args"] = json!(args);
+            }
+            row
         })
         .collect();
     Json(json!({"data": data}))
@@ -185,6 +198,10 @@ async fn chat(State(m): State<Machine>, Json(body): Json<Value>) -> Response {
     .into_response()
 }
 
+async fn props(State(_): State<Machine>) -> Json<Value> {
+    Json(json!({"build_info": "b12359-b1b770d90", "model_path": "", "n_ctx": 0}))
+}
+
 async fn noop(State(_): State<Machine>, Json(_): Json<Value>) -> Json<Value> {
     Json(json!({"success": true}))
 }
@@ -201,6 +218,7 @@ async fn serve(machine: &Machine) -> String {
         Router::new()
             .route("/health", get(health))
             .route("/models", get(models))
+            .route("/props", get(props))
             .route("/models/load", post(noop))
             .route("/models/unload", post(noop))
             .route("/v1/chat/completions", post(chat))
@@ -637,4 +655,149 @@ async fn streamed_empty_answer_after_thinking_is_counted() {
             .get("small-host/m")
             .map(|o| o.empty_after_thinking)
     );
+}
+
+fn listings(machine: &Machine) -> usize {
+    machine.state.lock().unwrap().listings
+}
+
+async fn lane_state(gw: &str, lane: &str) -> String {
+    let capacity: Value = reqwest::get(format!("{gw}/v1/workloads/capacity"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    capacity["data"]
+        .as_array()
+        .and_then(|lanes| lanes.iter().find(|l| l["name"] == lane))
+        .map(|l| l["state"].as_str().unwrap_or("").to_string())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn the_listing_poller_never_calls_a_sleeping_lane() {
+    let fx = fixture("    loaded_aware: true").await;
+    // Asleep from the start: never polled, never woken.
+    fx.gpu.sleep();
+    fx.state.capacity.observe_all().await;
+    let before = listings(&fx.gpu);
+    fx.state.poll_engine_listings().await;
+    assert_eq!(listings(&fx.gpu), before, "a sleeping lane was polled");
+    assert!(!fx.wakes.exists(), "the poller woke the machine");
+    // Up again (the lifecycle adopts a machine woken outside it): polled
+    // only once the lifecycle says it is up.
+    std::fs::write(&fx.gpu.up, b"up").unwrap();
+    fx.state.capacity.observe_all().await;
+    let state = lane_state(&fx.gw, "gpu-box").await;
+    fx.state.poll_engine_listings().await;
+    if state != "healthy" && state != "idle_countdown" {
+        assert_eq!(listings(&fx.gpu), before, "a {state} lane was polled");
+    }
+    let answer = send(&fx.gw, convo("gpu-box/a", "hello", 1)).await;
+    assert_eq!(answer.status, 200, "{:?}", answer.body);
+    let state = lane_state(&fx.gw, "gpu-box").await;
+    assert!(
+        state == "healthy" || state == "idle_countdown",
+        "lane state {state}"
+    );
+    let before = listings(&fx.gpu);
+    fx.state.poll_engine_listings().await;
+    assert_eq!(listings(&fx.gpu), before + 1);
+    // The loaded-model view follows the listing (a is loaded now).
+    let view: Value = reqwest::get(format!("{}/v1/engines", fx.gw))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let gpu = &view["data"][0];
+    assert_eq!(gpu["lane"], "gpu-box");
+    // The machine sleeps: the lifecycle may still say healthy, but its
+    // probe saw it down, so it is not polled again.
+    fx.gpu.sleep();
+    fx.state.capacity.observe_all().await;
+    let before = listings(&fx.gpu);
+    fx.state.poll_engine_listings().await;
+    assert_eq!(listings(&fx.gpu), before, "a sleeping lane was polled");
+    // The small host has no engine control: never polled.
+    assert_eq!(listings(&fx.small), 0);
+    assert!(!fx.wakes.exists(), "the poller woke the machine");
+}
+
+#[tokio::test]
+async fn the_spawned_poller_refreshes_up_lanes_only() {
+    let fx = fixture("    loaded_aware: true").await;
+    send(&fx.gw, convo("gpu-box/a", "hello", 1)).await;
+    let before = listings(&fx.gpu);
+    fx.state
+        .spawn_engine_listing_poller(Duration::from_millis(20));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(listings(&fx.gpu) > before, "an up lane was not polled");
+    fx.gpu.sleep();
+    fx.state.capacity.observe_all().await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let asleep = listings(&fx.gpu);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(listings(&fx.gpu), asleep, "a sleeping lane was polled");
+    assert!(!fx.wakes.exists());
+}
+
+#[tokio::test]
+async fn the_engine_view_reads_build_and_speculation_from_a_real_shaped_router() {
+    let fx = fixture("    loaded_aware: true").await;
+    // A loaded instance whose command line turns on MTP (the preset has
+    // `spec-type = draft-mtp`); no `sidecars` anywhere, as on a real router.
+    fx.gpu.state.lock().unwrap().args.insert(
+        "b".into(),
+        vec![
+            "llama-server".into(),
+            "--port".into(),
+            "8081".into(),
+            "--spec-type".into(),
+            "draft-mtp".into(),
+        ],
+    );
+    // Settings the gateway writes into the overlay set the type; the loaded
+    // instance names a draft model on its command line.
+    fx.gpu.state.lock().unwrap().args.insert(
+        "a".into(),
+        vec!["llama-server".into(), "-md".into(), "/models/d.gguf".into()],
+    );
+    fx.gpu.state.lock().unwrap().loaded.push("a".into());
+    put_settings(
+        &fx.gw,
+        "gpu-box/a",
+        json!({"load": {"spec_type": "draft-simple"}}),
+    )
+    .await;
+    let view: Value = reqwest::get(format!("{}/v1/engines", fx.gw))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let gpu = &view["data"][0];
+    assert_eq!(gpu["build"], "b12359-b1b770d90", "{gpu}");
+    let row = |id: &str| {
+        gpu["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    let (a, b) = (row("a"), row("b"));
+    assert_eq!(a["sidecars"], json!([]));
+    assert_eq!(b["sidecars"], json!([]));
+    // A file identity, never the path.
+    assert_eq!(a["file"].as_str().unwrap().len(), 12);
+    assert_eq!(b["speculative"]["spec_type"], "draft-mtp", "{b}");
+    assert_eq!(b["speculative"]["mtp"], true);
+    assert_eq!(b["speculative"]["sources"], json!(["args"]));
+    assert_eq!(a["speculative"]["spec_type"], "draft-simple", "{a}");
+    assert_eq!(a["speculative"]["draft_model"], true);
+    assert_eq!(a["speculative"]["mtp"], false);
+    assert_eq!(a["speculative"]["sources"], json!(["settings", "args"]));
 }

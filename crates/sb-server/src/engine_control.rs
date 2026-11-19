@@ -1257,6 +1257,31 @@ impl EngineControls {
         Ok(models)
     }
 
+    /// Take the engine's model listing again after the gateway loaded,
+    /// unloaded or applied something on the lane (it just talked to the
+    /// engine, so the machine is up). A failure keeps the last listing.
+    async fn refresh_listing(&self, state: &EngineCtx, lane: &EngineLane) {
+        if let Err(e) = self.models_within(state, lane, LISTING_TIMEOUT).await {
+            tracing::debug!(lane = %lane.name, error = %e, "engine listing not refreshed");
+        }
+    }
+
+    /// One pass of the listing poller: `GET /models` (short timeout) on
+    /// every engine lane whose machine is up and not busy
+    /// ([`listing_pollable`]). Never wakes, and never calls a lane that is
+    /// off, waking, powering off or draining.
+    pub(crate) async fn poll_listings(&self, state: &EngineCtx) {
+        let snap = state.snapshot();
+        let lanes: Vec<EngineLane> = snap
+            .config
+            .local_executors
+            .iter()
+            .filter_map(|lane| engine_lane(&snap.config, &lane.name))
+            .filter(|lane| listing_pollable(state, &lane.name))
+            .collect();
+        futures::future::join_all(lanes.iter().map(|lane| self.refresh_listing(state, lane))).await;
+    }
+
     /// The engine's build (`GET /props` `build_info`, e.g. `b12359-b1b770d90`),
     /// kept for the tuning ledger. Best effort: a failure keeps the last one.
     async fn refresh_build(&self, state: &EngineCtx, lane: &EngineLane) {
@@ -1341,6 +1366,11 @@ impl EngineControls {
     /// caller holds the lane's apply lock.
     async fn apply_locked(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
         let result = self.apply_locked_once(state, lane).await;
+        // The engine re-read its presets (and unloaded models whose preset
+        // changed): the loaded-model view follows at once.
+        if result["reloaded"] == json!(true) {
+            self.refresh_listing(state, lane).await;
+        }
         // A held-back model whose last request ended while this apply ran
         // found nothing held back yet (its idle hook came too early): retry
         // it now, after this apply lets go of the lock.
@@ -1880,6 +1910,7 @@ impl EngineControls {
             Err(e) => {
                 value["ok"] = json!(false);
                 value["error"] = json!(e);
+                self.refresh_listing(state, lane).await;
             }
         }
         drop(gate);
@@ -1935,6 +1966,82 @@ fn sidecar_names(sidecars: &Value) -> Value {
         .map(|path| json!(path.rsplit(['/', '\\']).next().unwrap_or(path)))
         .collect();
     Value::Array(names)
+}
+
+/// Speculative decoding on one model, for `sb ai tune`: the type in force
+/// (`spec_type`) and whether an MTP head (`mtp`) or a draft model
+/// (`draft_model`) is known, with the sources that said so. First the
+/// settings the gateway writes into the preset overlay (`load.spec_type`,
+/// `load.spec_draft_model`, `engine_args` `spec-type` / `spec-draft-model`),
+/// then a loaded instance's `status.args`, then the engine's `sidecars`
+/// (a real router lists them only for cached Hugging Face models, never
+/// for preset models).
+fn speculative_view(doc: Option<&ModelSettingsDoc>, row: &Value) -> Value {
+    let mut spec_type: Option<String> = None;
+    let (mut mtp, mut draft) = (false, false);
+    let mut sources: Vec<&str> = Vec::new();
+    let mut found = |source: &'static str, ty: Option<String>, has_draft: bool| {
+        let ty = ty.filter(|ty| !ty.trim().is_empty());
+        if ty.is_none() && !has_draft {
+            return;
+        }
+        sources.push(source);
+        mtp |= ty.as_deref().is_some_and(|ty| ty.contains("mtp"));
+        draft |= has_draft;
+        if spec_type.is_none() {
+            spec_type = ty;
+        }
+    };
+    if let Some(doc) = doc {
+        let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_string);
+        found(
+            "settings",
+            text(doc.load.get("spec_type")).or_else(|| text(doc.engine_args.get("spec-type"))),
+            doc.load.contains_key("spec_draft_model")
+                || doc.engine_args.contains_key("spec-draft-model")
+                || doc.engine_args.contains_key("model-draft"),
+        );
+    }
+    let args: Vec<&str> = row["status"]["args"]
+        .as_array()
+        .map(|args| args.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let flag = |names: &[&str]| -> Option<String> {
+        args.iter().enumerate().find_map(|(i, arg)| {
+            names.iter().find_map(|name| {
+                if arg == name {
+                    Some(args.get(i + 1).copied().unwrap_or_default().to_string())
+                } else {
+                    arg.strip_prefix(&format!("{name}=")).map(str::to_string)
+                }
+            })
+        })
+    };
+    found(
+        "args",
+        flag(&["--spec-type"]),
+        flag(&["--spec-draft-model", "--model-draft", "-md"]).is_some(),
+    );
+    let names: Vec<String> = sidecar_names(&row["sidecars"])
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_lowercase)
+        .collect();
+    let side_mtp = names.iter().any(|name| name.contains("mtp"));
+    let side_draft = names.iter().any(|name| name.contains("draft"));
+    if side_mtp || side_draft {
+        sources.push("sidecars");
+        mtp |= side_mtp;
+        draft |= side_draft;
+    }
+    json!({
+        "spec_type": spec_type,
+        "mtp": mtp,
+        "draft_model": draft,
+        "sources": sources,
+    })
 }
 
 /// `memory` of a model row, summed per measurement: bytes on GPU devices
@@ -2508,6 +2615,47 @@ impl sb_runtime::model_settings::ModelVariants for EngineVariants {
     }
 }
 
+/// How often the listing poller asks an up engine for its loaded models.
+pub(crate) const LISTING_POLL: Duration = Duration::from_secs(30);
+/// How long one listing call may take (poller and refresh after an op).
+const LISTING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whether the lifecycle says the lane's machine is up and quiet enough to
+/// be asked for its listing: healthy or idle-counting, and its last probe
+/// did not see it down. Off, waking, powering off, draining, degraded and
+/// unmanaged lanes are never polled.
+fn listing_pollable(state: &EngineCtx, lane: &str) -> bool {
+    use crate::activator::LaneState;
+    state.capacity.executor(lane).is_some_and(|executor| {
+        let report = executor.report();
+        matches!(report.state, LaneState::Healthy | LaneState::IdleCountdown)
+            && report.observed_healthy != Some(false)
+    })
+}
+
+/// Keep the loaded-model view fresh: every `every`, one
+/// [`EngineControls::poll_listings`] pass. Stops when the engine is gone.
+pub(crate) fn spawn_listing_poller(app: &AppState, every: Duration) {
+    let weak = Arc::downgrade(&app.engine);
+    let (capacity, engines) = (app.capacity.clone(), app.engines.clone());
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(every);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(engine) = weak.upgrade() else {
+                return;
+            };
+            let ctx = EngineCtx {
+                engine,
+                capacity: capacity.clone(),
+                engines: engines.clone(),
+            };
+            engines.poll_listings(&ctx).await;
+        }
+    });
+}
+
 /// Wire the engine control's retries: when a lane comes up, and when the
 /// last request dispatched on a held-back model ends.
 pub(crate) fn install_hooks(
@@ -2909,8 +3057,11 @@ pub(crate) async fn unload_endpoint(app: &AppState, principal: &Principal, name:
         .await;
     drop(gate);
     match outcome {
-        Ok(_) => Json(json!({"target": named.target, "model": model, "status": "unloaded"}))
-            .into_response(),
+        Ok(_) => {
+            controls.refresh_listing(state, &lane).await;
+            Json(json!({"target": named.target, "model": model, "status": "unloaded"}))
+                .into_response()
+        }
         Err(e) => error(StatusCode::BAD_GATEWAY, "engine_error", e),
     }
 }
@@ -2947,11 +3098,13 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
             let file = row["path"]
                 .as_str()
                 .map(|path| sb_core::fnv_hex(&[path])[..12].to_string());
+            let doc = registry.get(&target).map(|entry| entry.doc);
             json!({
                 "id": id,
                 "target": target,
                 "file": file,
                 "sidecars": sidecar_names(&row["sidecars"]),
+                "speculative": speculative_view(doc.as_deref(), row),
                 "status": status,
                 "failed": row["status"]["failed"],
                 "args": row["status"]["args"],

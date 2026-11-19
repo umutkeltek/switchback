@@ -116,6 +116,19 @@ impl AppState {
     /// directory (the gateway's start-up; a library caller without one keeps
     /// them in memory). Call before the state is shared.
     ///
+    /// Start the engine listing poller: every `every`, the loaded models of
+    /// each engine lane that is up (never one that is off, waking, powering
+    /// off or draining; never a wake). `serve` starts it every 30 s.
+    pub fn spawn_engine_listing_poller(&self, every: std::time::Duration) {
+        crate::engine_control::spawn_listing_poller(self, every);
+    }
+
+    /// One pass of the engine listing poller (tests and tools).
+    pub async fn poll_engine_listings(&self) {
+        let ctx = crate::engine_control::EngineCtx::from(self);
+        self.engines.poll_listings(&ctx).await;
+    }
+
     /// Host holds are kept in `<state_root>/holds.json` too (they survive a
     /// restart), unless `server.artifacts.storage` is `memory` (a deployment
     /// with no writable state directory).

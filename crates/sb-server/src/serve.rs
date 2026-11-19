@@ -141,6 +141,8 @@ pub(crate) async fn serve_gateway(
         .capacity
         .clone()
         .spawn_supervisor(std::time::Duration::from_secs(10));
+    // Loaded-model freshness for routing tricks: lanes that are up only.
+    state.spawn_engine_listing_poller(crate::engine_control::LISTING_POLL);
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");
