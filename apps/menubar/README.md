@@ -39,6 +39,10 @@ When a core provider has explicit unknown or unavailable coverage and no account
 
 The default status item is a 24-point vector icon. Options can show the existing pinned readings within a 96-point text budget using the actual menu-bar font. Crowded pin sets show as many readings as fit plus +N; all pin selections, account submenus and the full tooltip remain intact. macOS can hide status items: when the frontmost app's menus leave no room, or when the menu bar hides itself. A running PID alone is not a visibility check. The app publishes its rendered title, measured width, enabled state and PID through its own preferences for the owner status command, plus what macOS reports about the item: `item_on_screen` (its window has a size, lies on a screen and is reported visible), `item_frame`, `menu_bar_visible` and `visibility_changes`, the last twelve changes between shown and hidden with their times. `sb menubar status` reports `on_screen_visibility` from them.
 
+With the gauge look and readings shown (Options › Icon only in menu bar off), the item draws one mini bar per pinned Claude seat, coloured and filled by its room, then the number of the seat with the most room now. It stays inside the same 96-point budget; when the pinned seats do not fit, or no Claude seat is pinned, the item falls back to the icon. Preview it with synthetic input:
+
+    SwitchbackBar --render-status snapshot.json --output gauge-item.png --theme dark --style gauge
+
 When the item is hidden, the panel still opens, under the right side of the menu bar:
 
 - a global shortcut, ⌃⌥⌘L by default; Options › Open panel shortcut picks another or turns it off. It uses the system hot-key service, which needs no Accessibility permission and sees no other keys;
@@ -48,7 +52,7 @@ When the item is hidden, the panel still opens, under the right side of the menu
 
 ## Native account panel
 
-Click the Switchback symbol for the native panel. Provider filters and account search replace nested menus; the pin in each account's expanded row (beside each card in the card look) updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Search receives focus on every open. Tab reaches the provider filters and account controls. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.
+Click the Switchback symbol for the native panel. Its default look is the gauge, described below. In the ledger and card looks, Provider filters and account search replace nested menus; the pin in each account's expanded row (beside each card in the card look) updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Search receives focus on every open. Tab reaches the provider filters and account controls. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.
 
 The panel reuses the existing Presenter trust predicates. Stale, reset-passed, disabled, errored and estimated readings never draw measured capacity bars. Last readings retain their age and estimate provenance. Same-name model windows have distinct stable identities and complete accessibility descriptions. No collector, account-selection or admission policy changes.
 
@@ -57,6 +61,21 @@ Render the actual SwiftUI panel offscreen, with no window activation or desktop 
     SwitchbackBar --render-panel snapshot.json --output panel.png --theme light --provider claude
 
 The image includes supplied account labels and emails. Use synthetic input for shareable previews.
+
+## Gauge
+
+The default look. It answers one question first: which seat to use now.
+
+- **Use now.** A card at the top names the Claude seat with the most room now (see Most room now), with its number, its reset chip and, when the reading is at least 5 minutes old, its age. When another seat is best for a model with its own limit, such as Fable, that seat sits on the card's right. Click the card for the seat's details.
+- **One gauge per provider.** A provider with several accounts gets its own group; single-account plans and providers without a reading share `Other plans`, named by short provider names (Codex, Z.ai, MiniMax, DeepSeek, Neural, OpenR., Go, Zen) with the full name in the tooltip. A group wraps into rows of at most five segments, all the same width: eight plans are two rows of four. Numbers, balances and reset chips are never truncated.
+- **One segment per account.** The segment's fill is its room: the tighter of its 5-hour and weekly windows. Under it are the account's name with a state symbol, the number left and a reset chip such as `↻ 4d 19h`; an account at its limit says when it is back, for example `back 1h 31m`. A reading at least 5 minutes old gets a small clock mark on the bar's corner; the age is in the tooltip and the details. The tooltip shows both windows and any model limit.
+- **Partial seats.** When some windows have a fresh reading and others do not (for example no 5-hour reading), the segment shows the room of the windows that are known, lighter and inside a dashed outline, with a half-filled symbol. It never counts as the seat to use now. VoiceOver and the tooltip say which window is unknown.
+- **Model limits.** When accounts have a model's own limit, such as Fable, a thin purple bar under each segment shows what is left of it, and one legend line under the gauge says what both bars mean. No model limit, no thin bar and no legend.
+- **Details in place.** Click a segment, or press Return on a focused one, to open its details under the gauge: 5-hour, weekly and model limits with what is left, the reset time and the reading's age; other windows; prepaid balances; estimated spend; refresh errors and sign-in needs; and the menu bar pin. Escape, the close button or a second click closes them.
+- **Find and filter.** The magnifier (Command-F) opens account search; the filter button picks a provider or pinned accounts only, and the chosen provider is remembered. Command-R refreshes. Arrow keys move between segments; Tab reaches every control.
+- **Accessibility.** Every segment has one VoiceOver sentence, for example `Seat 2: 38 percent left, weekly; Fable 73 percent used; resets in 4 days 19 hours`. Colour never carries state alone: each state has its own symbol. Reduce Motion turns off the details transition, Reduce Transparency draws a solid background and increased contrast strengthens tracks and outlines.
+
+The panel keeps the 600-point height cap and scrolls beyond it. Render a seat's details offscreen with `--open-seat`, for example `--open-seat claude:seat2`. The rules live in `Presenter.directions`, `Presenter.seatDetail`, `GaugeLayout` and `StatusGauge` in `UsagePresentation`.
 
 ## Compact presentation
 
@@ -103,17 +122,13 @@ The bar never computes cost. It draws only the windows a row sent, so a row with
 
 A provider with an entry in the top-level `cost_summary` gets one total line under its section header, for example `Est. spend ~$2,267 today · ~$12.0k in 7 days`. The totals do not depend on the split by account, so they can show while rows carry no cost. The line follows the same trust rules; a sent amount that cannot be shown, or two entries for one provider, hides it. The tooltip and VoiceOver say `At API list prices, from local logs. Not a bill.` When more than 2% of a window's tokens are unattributed, that figure gets a dotted underline and the tooltip says the split by account is not known yet. No `cost_summary` means no line and no reserved space. The rule is `Presenter.costTotal`.
 
-The earlier account cards stay reachable while they remain tested code:
+Options › Look picks the panel's look: Gauge (the default), Ledger, Rings or Strip. The choice is saved under the existing `panelStyle` preference, so a look saved before the gauge became the default is kept. The earlier account cards stay reachable through the preference while they remain tested code:
 
+    defaults write dev.switchback.menubar panelStyle a       # the ledger
     defaults write dev.switchback.menubar panelStyle cards   # account cards
-    defaults delete dev.switchback.menubar panelStyle        # back to the ledger
+    defaults delete dev.switchback.menubar panelStyle        # back to the gauge
 
-The app reads the preference on every refresh. `--render-panel` draws the ledger; add `--style cards` for the cards.
-
-Three visual explorations sit behind the same hidden preference and are not the default: `rings` (one tile per account, weekly on the outer arc, 5-hour on the inner arc, a model's own limit as a tick), `gauge` (one segmented gauge per provider, one segment per account) and `strip` (one colour line per account under a strip of upcoming 5-hour resets). Each leads with the seat to use now; colour always comes with a symbol, and money stays out of the default view. Preview them and their menu bar item with synthetic input:
-
-    SwitchbackBar --render-panel snapshot.json --output rings.png --theme dark --style rings
-    SwitchbackBar --render-status snapshot.json --output rings-item.png --theme dark --style rings
+The app reads the preference on every refresh. `--render-panel` draws the gauge; add `--style a` for the ledger, `--style cards`, `--style rings` or `--style strip` for the others. `rings` draws one tile per account (weekly on the outer arc, 5-hour on the inner arc, a model's own limit as a tick) and `strip` one colour line per account under a strip of upcoming 5-hour resets. Each look leads with the seat to use now; colour always comes with a symbol, and money stays out of the main view.
 
 ## Limit notifications
 
