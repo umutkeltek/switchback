@@ -25,8 +25,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 - **Speed tricks, layer 3: `sb ai tune`**: the skill's hill-climbing loop on
   one local model through the gateway (baseline, ceiling, one change at a
   time, control/candidate/control with at least 6 samples each, keep only
-  what beats both controls with no other metric more than 3% worse, repeat
-  a win over 20% once (the repeat must clear the 5% noise), greedy/needle/soak gates, plateau after three flat
+  what beats both controls with no other metric more than 3% worse than the
+  controls' mean, repeat a win over 20% once (the repeat must clear the 5%
+  noise) and a run whose controls differ by more than 3% (noisy),
+  greedy/needle/soak gates, plateau after three flat
   levers). The lever catalogue for `llama_cpp_router` is data. Safety:
   refuses a sleeping machine without `--wake`, a busy lane, a quiet window
   (`server.optimize.quiet_windows`) and a locked load key (`locked:

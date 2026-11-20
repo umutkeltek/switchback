@@ -882,5 +882,68 @@ class RestoreUnitTests(unittest.TestCase):
         self.assertIn("sb ai revert", caught.exception.message)
 
 
+
+class VerdictUnitTests(unittest.TestCase):
+    """The keep rule: other metrics against the mean of the two controls;
+    controls that disagree by more than 3% make the run noisy (repeated)."""
+
+    def tuner(self):
+        ai_tune = load_tuner_module()
+        tuner = ai_tune.Tuner.__new__(ai_tune.Tuner)
+        tuner.records, tuner.logs = [], []
+        tuner.record = tuner.records.append
+        tuner.log = tuner.logs.append
+        tuner.restore_best = lambda why: None
+        tuner.samples = 6
+        tuner.last_control = None
+        return tuner
+
+    def test_other_metrics_are_held_to_the_mean_of_the_controls(self):
+        tuner = self.tuner()
+        c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 102.5}
+        cand = {"prefill": 1200.0, "decode": 98.0}
+        # 2% under the worse control but 3.2% under the mean: rejected.
+        accepted, _, reason, noisy = tuner.verdict("prefill", c1, cand, c2)
+        self.assertFalse(accepted, reason)
+        self.assertIn("mean", reason)
+        self.assertFalse(noisy)
+        cand["decode"] = 99.5
+        accepted, _, reason, noisy = tuner.verdict("prefill", c1, cand, c2)
+        self.assertTrue(accepted, reason)
+        self.assertFalse(noisy)
+
+    def test_controls_that_disagree_make_the_run_noisy(self):
+        tuner = self.tuner()
+        c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 110.0}
+        accepted, _, reason, noisy = tuner.verdict(
+            "prefill", c1, {"prefill": 1100.0, "decode": 106.0}, c2)
+        self.assertTrue(accepted and noisy, reason)
+        self.assertIn("differ by more than 3%", reason)
+
+    def run_experiment(self, tuner, controls, cand):
+        controls = list(controls)
+        tuner.control = lambda: controls.pop(0)
+        tuner.trial = lambda entry, change: (dict(cand), None)
+        return tuner.experiment({"lever": "ubatch_size", "metric": "prefill"}, {"ubatch_size": 1024})
+
+    def test_a_noisy_run_is_repeated_and_noisy_twice_changes_nothing(self):
+        noisy = [{"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 110.0}]
+        steady = [{"prefill": 1000.0, "decode": 105.0}, {"prefill": 1000.0, "decode": 105.5}]
+        cand = {"prefill": 1100.0, "decode": 105.0}
+        # Noisy, then steady: the repeat decides, kept.
+        tuner = self.tuner()
+        accepted, _, reason = self.run_experiment(tuner, noisy + steady, cand)
+        self.assertTrue(accepted, reason)
+        self.assertTrue(any("noisy controls" in line for line in tuner.logs), tuner.logs)
+        self.assertEqual(sum(1 for r in tuner.records if r["role"] == "candidate"), 2)
+        # Noisy twice: rejected.
+        tuner = self.tuner()
+        accepted, _, reason = self.run_experiment(tuner, noisy + noisy, cand)
+        self.assertFalse(accepted)
+        self.assertIn("noisy again", reason)
+        verdicts = [r for r in tuner.records if r["role"] == "verdict"]
+        self.assertEqual([v["verdict"] for v in verdicts], ["rejected"])
+
+
 if __name__ == "__main__":
     unittest.main()

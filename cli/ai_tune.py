@@ -8,8 +8,10 @@ live gateway: measure a baseline, read the ceiling, change one load setting
 at a time from the current best, and judge each change with
 control / candidate / control runs. A change is kept only when it beats both
 neighbouring controls on its own metric and no other measured metric is
-more than 3% worse than the worse control; a win of more than 20% is
-repeated once first and must win again by more than the noise.
+more than 3% worse than the mean of the two controls; a win of more than
+20%, or a run whose two controls differ by more than 3% on such a metric
+(noisy), is repeated once first and must win again (by more than the noise,
+for a surprising win).
 Changes that claim to be lossless must give the same greedy answer; changes
 to the KV cache or context must find needles at about half and all of the
 context; a change to the slot count must survive a concurrent soak at full
@@ -735,29 +737,38 @@ class Tuner:
         return self.elapsed() >= self.budget
 
     def verdict(self, metric, c1, cand, c2):
-        """(accepted, gain, reason) by the skill's rules."""
+        """(accepted, gain, reason, noisy) by the skill's rules. Every other
+        metric is held to the mean of the two controls; `noisy` when the two
+        controls differ by more than 3% on one of those metrics, so the run
+        says too little and is repeated (the repeat rule)."""
         higher = HIGHER_IS_BETTER[metric]
         a, b, x = c1[metric], c2[metric], cand[metric]
         base = (a + b) / 2
         gain = (x / base - 1) if higher else (base / x - 1 if x > 0 else 0)
         beats = x > max(a, b) if higher else x < min(a, b)
         if not beats:
-            return False, gain, (f"{metric} {x:.1f} did not beat both controls ({a:.1f}, {b:.1f})")
+            return False, gain, (f"{metric} {x:.1f} did not beat both controls ({a:.1f}, {b:.1f})"), False
+        noisy = []
         for other in ("decode", "ttft_ms", "prefill", "aggregate"):
             if other == metric or other not in cand or other not in c1 or other not in c2:
                 continue
-            # Against the worse of the two controls: a candidate inside the
-            # controls' own spread is noise, not a regression.
+            mean = (c1[other] + c2[other]) / 2
+            if mean <= 0:
+                continue
+            if abs(c1[other] - c2[other]) / mean > REGRESSION:
+                noisy.append(other)
             if HIGHER_IS_BETTER[other]:
-                floor = min(c1[other], c2[other])
-                worse = (floor - cand[other]) / floor if floor > 0 else 0
+                worse = (mean - cand[other]) / mean
             else:
-                ceiling = max(c1[other], c2[other])
-                worse = (cand[other] - ceiling) / ceiling if ceiling > 0 else 0
+                worse = (cand[other] - mean) / mean
             if worse > REGRESSION:
                 return False, gain, (f"{metric} gained {gain * 100:.0f}% but {other} got "
-                                     f"{worse * 100:.0f}% worse (more than 3%)")
-        return True, gain, f"{metric} {gain * 100:+.0f}% over both controls"
+                                     f"{worse * 100:.0f}% worse than the controls' mean "
+                                     "(more than 3%)"), bool(noisy)
+        if noisy:
+            return True, gain, (f"{metric} {gain * 100:+.0f}% over both controls, but the controls "
+                                f"differ by more than 3% on {', '.join(noisy)}"), True
+        return True, gain, f"{metric} {gain * 100:+.0f}% over both controls", False
 
     def control(self):
         if self.last_control is not None and self.current_metric in self.last_control:
@@ -821,17 +832,26 @@ class Tuner:
         self.record({"role": "candidate", "lever": lever, "value": change, "metrics": cand,
                      "samples": self.samples})
         c2 = self.control()
-        accepted, gain, reason = self.verdict(metric, c1, cand, c2)
-        if accepted and gain > SURPRISE and not repeat:
-            self.log(f"  {lever} {json.dumps(change)}: {gain * 100:+.0f}%, a surprising win; repeating it once")
+        accepted, gain, reason, noisy = self.verdict(metric, c1, cand, c2)
+        if noisy and repeat:
+            # Noisy twice: the run cannot tell, so nothing changes.
+            accepted, reason = False, f"noisy again: {reason}"
+        surprising = accepted and gain > SURPRISE
+        if (surprising or noisy) and not repeat:
+            why = "a surprising win" if surprising else "noisy controls"
+            self.log(f"  {lever} {json.dumps(change)}: {gain * 100:+.0f}%, {why}; repeating it once")
             again, gain2, reason2 = self.experiment(entry, change, repeat=True)
-            if again and gain2 < NOISE:
+            if again and surprising and gain2 < NOISE:
                 again, reason2 = False, f"the repeat gained only {gain2 * 100:+.0f}%, inside the noise"
             if not again:
-                reason = f"a {gain * 100:+.0f}% win did not repeat ({reason2})"
+                reason = (f"a {gain * 100:+.0f}% win did not repeat ({reason2})" if accepted
+                          else f"{reason}; repeated: {reason2}")
                 self.record({"role": "verdict", "lever": lever, "value": change, "verdict": "rejected",
                              "reason": reason, "metrics": cand, "samples": self.samples})
                 return False, 0.0, reason
+            # The repeat decides: a noisy run rejected the first time is
+            # kept when its repeat (with agreeing controls) wins.
+            accepted = True
             gain = min(gain, gain2)
             reason = f"{reason}; repeated: {reason2}"
         if not repeat:
