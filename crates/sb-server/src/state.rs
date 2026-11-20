@@ -112,10 +112,6 @@ impl AppState {
         Self::from_engine(Engine::new(config, registry, resolver, ledger))
     }
 
-    /// Keep artifacts under `state_root` when `server.artifacts` names no
-    /// directory (the gateway's start-up; a library caller without one keeps
-    /// them in memory). Call before the state is shared.
-    ///
     /// Start the engine listing poller: every `every`, the loaded models of
     /// each engine lane that is up (never one that is off, waking, powering
     /// off or draining; never a wake). `serve` starts it every 30 s.
@@ -129,6 +125,10 @@ impl AppState {
         self.engines.poll_listings(&ctx).await;
     }
 
+    /// Keep artifacts under `state_root` when `server.artifacts` names no
+    /// directory (the gateway's start-up; a library caller without one keeps
+    /// them in memory). Call before the state is shared.
+    ///
     /// Host holds are kept in `<state_root>/holds.json` too (they survive a
     /// restart), unless `server.artifacts.storage` is `memory` (a deployment
     /// with no writable state directory).

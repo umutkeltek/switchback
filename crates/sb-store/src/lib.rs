@@ -62,9 +62,6 @@ pub struct RevisionRecord {
     pub created_at_ms: i64,
 }
 
-/// One target model's settings document as stored (`provider/model`).
-/// `doc` is the document's JSON text; `revision` counts writes to this
-/// target from 1.
 /// One run of a tuning experiment (`sb ai tune`): which target and run,
 /// when, and the row itself as JSON (model, engine build, model file
 /// identity, settings revision, lever, value, metrics, samples, verdict and
@@ -78,6 +75,9 @@ pub struct ExperimentRecord {
     pub row: String,
 }
 
+/// One target model's settings document as stored (`provider/model`).
+/// `doc` is the document's JSON text; `revision` counts writes to this
+/// target from 1.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelSettingsRecord {
     pub target: String,
