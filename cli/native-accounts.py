@@ -131,6 +131,12 @@ def identity(home):
     return {"account_uuid": account, "organization_uuid": org}
 
 
+# Claude Code answers `/usage` from its own usage cache while that cache is younger than a
+# minute, and then leaves the cache unchanged. A seat in active use keeps its cache that
+# young, so a reading up to this much older than the refresh is the vendor's current answer.
+VENDOR_USAGE_SNAPSHOT_MS = 60_000
+
+
 def quota(home, account, require_complete=False):
     data = read_json(metadata_path(home))
     cached = data.get("cachedUsageUtilization") if isinstance(data, dict) else None
@@ -963,7 +969,8 @@ def main():
                         refresh_started_ms = int(time.time() * 1000)
                         ok = refresh_quota(home)
                         current = quota(home, observed["account_uuid"]) if ok else None
-                        if current is None or current["fetched_at_ms"] < refresh_started_ms:
+                        # A login recovery below still requires a reading written after this refresh.
+                        if current is None or current["fetched_at_ms"] < refresh_started_ms - VENDOR_USAGE_SNAPSHOT_MS:
                             result["quota_error"] = "refresh_failed_or_invalid_cache"
                             if data.get("last_good_quota"):
                                 result["previous_quota"] = data["last_good_quota"]

@@ -515,6 +515,52 @@ class NativeAccounts(unittest.TestCase):
         self.assertNotIn("cooldown", json.loads(slot.read_text()))
         self.assertEqual((self.home / "refresh.log").read_text().splitlines(), ["refresh"])
 
+    def test_claude_refresh_answered_from_recent_vendor_snapshot_is_fresh(self):
+        # Claude Code answers /usage from its own usage cache while that cache is under a minute
+        # old and leaves it unchanged. An idle 5-hour window there has no reset time.
+        self.setup_slot("one")
+        profile = self.runtime / "config/claude/one/.claude.json"
+        native = json.loads(profile.read_text())
+        weekly_reset = time.time() + 6 * 3600
+        native["cachedUsageUtilization"] = {"accountUuid": "one", "fetchedAtMs": int(time.time() * 1000) - 10000,
+            "utilization": {"five_hour": {"utilization": 0, "resets_at": None},
+                            "seven_day": {"utilization": 100, "resets_at": time.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(weekly_reset))}}}
+        profile.write_text(json.dumps(native))
+        env = dict(self.env, FAKE_QUOTA="unchanged")
+        # The optional cost step starts its own collector; it is not part of this reading.
+        env.pop("SB_USAGE_COSTS", None)
+        status = self.call("status", "--provider", "claude", "--slot", "one", "--quota-refresh", "--json", env=env)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        result = json.loads(status.stdout)
+        self.assertNotIn("quota_error", result)
+        self.assertTrue(result["quota"]["exhausted"])
+        cooldown = json.loads((self.runtime / "config/native-account-slots/claude/one/slot.json").read_text())["cooldown"]
+        self.assertEqual(cooldown["reason"], "rate_limit")
+        self.assertAlmostEqual(cooldown["reset"], int(weekly_reset), delta=1)
+        limits = self.call("usage", "--provider", "claude", "--slot", "one", "--refresh", "--json", env=env)
+        self.assertEqual(limits.returncode, 0, limits.stderr)
+        row = next(x for x in json.loads(limits.stdout)["accounts"] if x["slot"] == "one")
+        self.assertNotIn("refresh_error", row)
+        windows = {w["name"]: w for w in row["windows"]}
+        self.assertEqual(windows["five_hour"]["state"], "fresh")
+        self.assertEqual(windows["five_hour"]["remaining_percent"], 100)
+        self.assertIsNone(windows["five_hour"]["resets_at"])
+        self.assertEqual(windows["seven_day"]["remaining_percent"], 0)
+
+    def test_claude_refresh_older_than_vendor_snapshot_window_stays_unavailable(self):
+        self.setup_slot("one")
+        profile = self.runtime / "config/claude/one/.claude.json"
+        native = json.loads(profile.read_text())
+        native["cachedUsageUtilization"] = {"accountUuid": "one", "fetchedAtMs": int(time.time() * 1000) - 90000,
+            "utilization": {"five_hour": {"utilization": 0, "resets_at": None},
+                            "seven_day": {"utilization": 40, "resets_at": None}}}
+        profile.write_text(json.dumps(native))
+        status = self.call("status", "--provider", "claude", "--slot", "one", "--quota-refresh", "--json",
+                           env=dict(self.env, FAKE_QUOTA="unchanged"))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["quota_error"], "refresh_failed_or_invalid_cache")
+
     def test_claude_cooldown_unknown_is_retained_and_retried(self):
         self.setup_slot("one")
         slot = self.runtime / "config/native-account-slots/claude/one/slot.json"
