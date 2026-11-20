@@ -41,12 +41,13 @@ pub(crate) struct TargetInfo {
 }
 
 /// The settings side of one target: its document, revision and the time
-/// of its latest revision.
+/// of its latest revision and of the one before it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SettingsSide {
     pub doc: ModelSettingsDoc,
     pub revision: u64,
     pub revision_at_ms: Option<i64>,
+    pub previous_revision_at_ms: Option<i64>,
 }
 
 /// Everything the report reads, gathered first so the computation is pure.
@@ -63,6 +64,9 @@ pub(crate) struct ReportInput {
     /// Per lane: measured wakes and their EWMA.
     pub wakes: HashMap<String, (u64, Option<u64>)>,
     pub stickiness_on: bool,
+    /// Per lane: when it was under a tuning lock (from, to in epoch ms).
+    /// Requests served then were the tuner's own trials.
+    pub tuning_spans: HashMap<String, Vec<(i64, i64)>>,
     /// The client view: measurements from the key's own records only, no
     /// gateway-wide counters and no findings drawn from them.
     pub client: bool,
@@ -424,21 +428,39 @@ pub(crate) fn build_report(input: &ReportInput) -> Value {
                 );
             }
         }
-        // Regression after the latest settings revision.
+        // Regression after the latest settings revision: the latest
+        // revision against the one before it only, without the tuner's own
+        // trial requests (served while the lane was under a tuning lock).
         if let Some((revision, at_ms)) = side
             .filter(|s| s.revision > 1)
             .and_then(|s| s.revision_at_ms.map(|at| (s.revision, at)))
         {
-            let records = by_target
-                .get(&info.target)
+            let previous_at = side
+                .and_then(|s| s.previous_revision_at_ms)
+                .unwrap_or(i64::MIN);
+            let spans = input
+                .tuning_spans
+                .get(&info.lane)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let before = measured_of(
-                records
+            // A record's time has whole seconds: a second of slack each side.
+            let tuning = |at: i64| {
+                spans
                     .iter()
-                    .copied()
-                    .filter(|r| (r.timestamp_unix as i64) * 1000 < at_ms),
-            );
+                    .any(|(from, to)| at >= from - 1000 && at <= to.saturating_add(1000))
+            };
+            let records: Vec<&UsageRecord> = by_target
+                .get(&info.target)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|r| !tuning((r.timestamp_unix as i64) * 1000))
+                .collect();
+            let before = measured_of(records.iter().copied().filter(|r| {
+                let at = (r.timestamp_unix as i64) * 1000;
+                at >= previous_at && at < at_ms
+            }));
             let after = measured_of(
                 records
                     .iter()
@@ -624,16 +646,14 @@ pub(crate) async fn report(
     let mut settings = HashMap::new();
     for info in &targets {
         if let Some(entry) = registry.get(&info.target) {
-            let revision_at_ms = registry
-                .history(&info.target, 1)
-                .ok()
-                .and_then(|history| history.first().map(|change| change.at_ms));
+            let history = registry.history(&info.target, 2).unwrap_or_default();
             settings.insert(
                 info.target.clone(),
                 SettingsSide {
                     doc: (*entry.doc).clone(),
                     revision: entry.revision,
-                    revision_at_ms,
+                    revision_at_ms: history.first().map(|change| change.at_ms),
+                    previous_revision_at_ms: history.get(1).map(|change| change.at_ms),
                 },
             );
         }
@@ -658,6 +678,13 @@ pub(crate) async fn report(
         thresholds: optimize.report.clone(),
         queue_waits: state.engine.optimize().queue_waits(),
         wakes,
+        tuning_spans: {
+            let mut spans: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+            for (lane, from, to) in state.engine.optimize().tuning_spans() {
+                spans.entry(lane).or_default().push((from, to));
+            }
+            spans
+        },
         stickiness_on: optimize.stickiness
             || snap
                 .config
@@ -1073,6 +1100,7 @@ mod tests {
             },
             revision: 1,
             revision_at_ms: None,
+            previous_revision_at_ms: None,
         }
     }
 
@@ -1243,6 +1271,7 @@ mod tests {
                 },
                 revision: 1,
                 revision_at_ms: None,
+                previous_revision_at_ms: None,
             },
         );
         assert!(kinds(&build_report(&inp)).is_empty());
@@ -1289,6 +1318,7 @@ mod tests {
                 doc: ModelSettingsDoc::default(),
                 revision: 4,
                 revision_at_ms: Some(at),
+                previous_revision_at_ms: Some(at - 7 * 60_000),
             },
         );
         let report = build_report(&inp);
@@ -1334,6 +1364,75 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("ttft 200 -> 300 ms"));
+    }
+
+    // The latest revision is compared with the one before it only: older
+    // records (under an earlier revision) do not count.
+    #[test]
+    fn a_regression_compares_only_the_revision_before() {
+        let mut inp = input(&[("box/a", "box")]);
+        let at = NOW - 3_600_000;
+        let previous = at - 7 * 60_000;
+        // Under the previous revision: 100 tok/s. Before it: 85.
+        let mut records: Vec<UsageRecord> = (0..6)
+            .map(|i| record("box/a", at - (i + 1) * 60_000, 100.0, 200))
+            .collect();
+        records.extend((0..6).map(|i| record("box/a", previous - (i + 1) * 60_000, 85.0, 200)));
+        // After the latest: 85, a regression against 100.
+        records.extend((0..6).map(|i| record("box/a", at + (i + 1) * 60_000, 85.0, 200)));
+        inp.records = records;
+        inp.settings.insert(
+            "box/a".into(),
+            SettingsSide {
+                doc: ModelSettingsDoc::default(),
+                revision: 4,
+                revision_at_ms: Some(at),
+                previous_revision_at_ms: Some(previous),
+            },
+        );
+        let report = build_report(&inp);
+        assert_eq!(kinds(&report), ["regression"], "{report}");
+        assert!(report["findings"][0]["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("decode 100.0 -> 85.0"));
+        // The previous revision's time unknown (history gone): everything
+        // before the latest counts, so the older records hide it again.
+        inp.settings
+            .get_mut("box/a")
+            .unwrap()
+            .previous_revision_at_ms = None;
+        assert!(kinds(&build_report(&inp)).is_empty());
+    }
+
+    // The tuner's own trial requests (served while the lane was under its
+    // tuning lock) are left out on both sides.
+    #[test]
+    fn a_regression_leaves_out_the_tuners_trials() {
+        let mut inp = input(&[("box/a", "box")]);
+        let at = NOW - 3_600_000;
+        let mut records: Vec<UsageRecord> = (0..6)
+            .map(|i| record("box/a", at - (i + 1) * 60_000, 100.0, 200))
+            .collect();
+        records.extend((0..6).map(|i| record("box/a", at + (i + 1) * 60_000, 100.0, 200)));
+        // A tuning run after the revision: slow trial candidates.
+        let run_from = at + 20 * 60_000;
+        records.extend((0..6).map(|i| record("box/a", run_from + (i + 1) * 10_000, 40.0, 900)));
+        inp.records = records;
+        inp.settings.insert(
+            "box/a".into(),
+            SettingsSide {
+                doc: ModelSettingsDoc::default(),
+                revision: 4,
+                revision_at_ms: Some(at),
+                previous_revision_at_ms: Some(at - 10 * 60_000),
+            },
+        );
+        // Without the tuning span the trials look like a regression.
+        assert_eq!(kinds(&build_report(&inp)), ["regression"]);
+        inp.tuning_spans
+            .insert("box".into(), vec![(run_from, run_from + 120_000)]);
+        assert!(kinds(&build_report(&inp)).is_empty());
     }
 
     #[test]

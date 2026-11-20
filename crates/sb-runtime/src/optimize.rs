@@ -168,6 +168,10 @@ pub struct OptimizeState {
     view: OnceLock<Arc<dyn EngineView>>,
     /// Tuning locks by lane.
     locks: Mutex<BTreeMap<String, TuneLock>>,
+    /// Ended tuning locks (lane, from, to in epoch ms), newest last, for a
+    /// week and at most [`MAX_TUNING_SPANS`]: the requests served on a lane
+    /// inside one were the tuner's own.
+    tuning_spans: Mutex<VecDeque<(String, i64, i64)>>,
     /// The tuning ledger when there is no state store (process lifetime).
     experiments: Mutex<Vec<sb_store::ExperimentRecord>>,
 }
@@ -175,6 +179,10 @@ pub struct OptimizeState {
 fn now_ms() -> i64 {
     sb_store::now_millis()
 }
+
+/// How many ended tuning locks are remembered.
+const MAX_TUNING_SPANS: usize = 256;
+const WEEK_MS: i64 = 7 * 86_400_000;
 
 impl OptimizeState {
     pub fn new() -> Self {
@@ -439,27 +447,58 @@ impl OptimizeState {
             .collect()
     }
 
+    /// Drop expired locks, remembering when each ran.
+    fn live_locks(&self, now: i64) -> std::sync::MutexGuard<'_, BTreeMap<String, TuneLock>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        let expired: Vec<String> = locks
+            .iter()
+            .filter(|(_, lock)| lock.expires_at_ms <= now)
+            .map(|(lane, _)| lane.clone())
+            .collect();
+        for lane in expired {
+            if let Some(lock) = locks.remove(&lane) {
+                self.remember_span(&lock, lock.expires_at_ms, now);
+            }
+        }
+        locks
+    }
+
+    fn remember_span(&self, lock: &TuneLock, ended_ms: i64, now: i64) {
+        let mut spans = self.tuning_spans.lock().unwrap_or_else(|e| e.into_inner());
+        spans.push_back((lock.lane.clone(), lock.created_ms, ended_ms));
+        while spans.len() > MAX_TUNING_SPANS
+            || spans.front().is_some_and(|(_, _, to)| now - to > WEEK_MS)
+        {
+            spans.pop_front();
+        }
+    }
+
+    /// When each lane was under a tuning lock, ended or live (a live one
+    /// runs to `i64::MAX`), as (lane, from, to) in epoch ms.
+    pub fn tuning_spans(&self) -> Vec<(String, i64, i64)> {
+        let now = now_ms();
+        let live: Vec<(String, i64, i64)> = self
+            .live_locks(now)
+            .values()
+            .map(|lock| (lock.lane.clone(), lock.created_ms, i64::MAX))
+            .collect();
+        let spans = self.tuning_spans.lock().unwrap_or_else(|e| e.into_inner());
+        spans.iter().cloned().chain(live).collect()
+    }
+
     /// The live tuning lock of a lane, if any (an expired one is dropped).
     pub fn lock_for_lane(&self, lane: &str) -> Option<TuneLock> {
-        let now = now_ms();
-        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks.retain(|_, lock| lock.expires_at_ms > now);
-        locks.get(lane).cloned()
+        self.live_locks(now_ms()).get(lane).cloned()
     }
 
     /// Every live tuning lock.
     pub fn locks(&self) -> Vec<TuneLock> {
-        let now = now_ms();
-        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks.retain(|_, lock| lock.expires_at_ms > now);
-        locks.values().cloned().collect()
+        self.live_locks(now_ms()).values().cloned().collect()
     }
 
     /// Take a lane's tuning lock; `Err` is the lock that already holds it.
     pub fn take_lock(&self, lock: TuneLock) -> Result<TuneLock, Box<TuneLock>> {
-        let now = now_ms();
-        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks.retain(|_, held| held.expires_at_ms > now);
+        let mut locks = self.live_locks(now_ms());
         if let Some(held) = locks.get(&lock.lane) {
             return Err(Box::new(held.clone()));
         }
@@ -482,7 +521,10 @@ impl OptimizeState {
             .iter()
             .find(|(_, lock)| lock.id == id)
             .map(|(lane, _)| lane.clone())?;
-        locks.remove(&lane)
+        let lock = locks.remove(&lane)?;
+        let now = now_ms();
+        self.remember_span(&lock, now.min(lock.expires_at_ms), now);
+        Some(lock)
     }
 
     /// Keep an experiment row in memory (no state store); answers its id.
@@ -1268,6 +1310,36 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_time_zones(&bad).unwrap_err().contains("Mars/Base"));
+    }
+
+    #[test]
+    fn ended_and_live_tuning_locks_are_remembered_as_spans() {
+        let state = OptimizeState::new();
+        let now = now_ms();
+        let lock = |id: &str, lane: &str, expires_at_ms: i64| TuneLock {
+            id: id.into(),
+            target: format!("{lane}/m"),
+            lane: lane.into(),
+            host: lane.into(),
+            reason: String::new(),
+            created_ms: now - 60_000,
+            expires_at_ms,
+        };
+        state.take_lock(lock("t1", "box", now + 600_000)).unwrap();
+        state.take_lock(lock("t2", "mac", now - 1)).unwrap();
+        // `t2` expired: dropped and remembered to its expiry.
+        assert!(state.lock_for_lane("mac").is_none());
+        state.release_lock("t1").unwrap();
+        state.take_lock(lock("t3", "box", now + 600_000)).unwrap();
+        let spans = state.tuning_spans();
+        assert!(
+            spans.contains(&("mac".into(), now - 60_000, now - 1)),
+            "{spans:?}"
+        );
+        assert!(spans
+            .iter()
+            .any(|(lane, from, to)| lane == "box" && *from == now - 60_000 && *to < i64::MAX));
+        assert!(spans.contains(&("box".into(), now - 60_000, i64::MAX)));
     }
 
     #[test]

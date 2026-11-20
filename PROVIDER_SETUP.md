@@ -1292,7 +1292,7 @@ findings, each with its evidence and one suggested action:
 | `low_acceptance` | speculative acceptance under 50% over 10 requests or more | try a shorter draft (`draft_max`) or no MTP |
 | `empty_after_thinking` | empty answers after thinking and no reasoning guard | turn on the reasoning guard |
 | `unused` | not used for 14 days (or never, in a usage window older than that) | removal candidate; Switchback deletes nothing |
-| `regression` | decode or time to first token worse by more than 10% after the latest settings revision, with 6 samples or more on each side | `sb ai revert TARGET N-1` |
+| `regression` | decode or time to first token worse by more than 10% after the latest settings revision than under the revision before it, with 6 samples or more on each side; requests a tuning run sent (while its lock held the lane) do not count | `sb ai revert TARGET N-1` |
 
 ```bash
 sb ai doctor
