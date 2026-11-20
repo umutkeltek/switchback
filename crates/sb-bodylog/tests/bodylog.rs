@@ -14,7 +14,31 @@ use sb_bodylog::{
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-fn temp_root(tag: &str) -> PathBuf {
+/// A test folder under the temp dir, removed when the value goes out of scope (also when the
+/// test panics). Keep it for the whole test; a bare `PathBuf` left every run's folder behind.
+struct TempRoot(PathBuf);
+
+impl std::ops::Deref for TempRoot {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TempRoot {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_root(tag: &str) -> TempRoot {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
         "switchback-bodylog-{tag}-{}-{id}",
@@ -22,7 +46,20 @@ fn temp_root(tag: &str) -> PathBuf {
     ));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
-    root
+    TempRoot(root)
+}
+
+#[test]
+fn temp_root_is_removed_when_the_test_ends() {
+    let root = temp_root("self-clean");
+    fs::write(root.join("body"), vec![0u8; 4096]).unwrap();
+    let path = root.to_path_buf();
+    drop(root);
+    assert!(
+        !path.exists(),
+        "bodylog test folder left behind: {}",
+        path.display()
+    );
 }
 
 fn input(request_id: &str, body: &[u8]) -> BodyEventInput {
@@ -2292,7 +2329,7 @@ fn backup_receipt_must_cover_the_exact_pending_sealed_segment_set() {
     );
 }
 
-fn pending_backup_receipt_fixture(tag: &str) -> (BodyLogger, CaptureBackupReceipt) {
+fn pending_backup_receipt_fixture(tag: &str) -> (TempRoot, BodyLogger, CaptureBackupReceipt) {
     let root = temp_root(tag);
     let logger = BodyLogger::new(BodyLoggerConfig {
         state_dir: root.join("state"),
@@ -2320,12 +2357,13 @@ fn pending_backup_receipt_fixture(tag: &str) -> (BodyLogger, CaptureBackupReceip
             remote_checksum_verified: true,
         }],
     };
-    (logger, receipt)
+    (root, logger, receipt)
 }
 
 #[test]
 fn backup_receipt_rejects_remote_artifact_path_traversal() {
-    let (logger, mut receipt) = pending_backup_receipt_fixture("backup-remote-path-traversal");
+    let (_root, logger, mut receipt) =
+        pending_backup_receipt_fixture("backup-remote-path-traversal");
     receipt.segments[0].remote_path =
         "segments/2026/07/25/hash/../../../../escape.sbcap".to_string();
 
@@ -2338,7 +2376,8 @@ fn backup_receipt_rejects_remote_artifact_path_traversal() {
 
 #[test]
 fn backup_receipt_rejects_remote_root_traversal() {
-    let (logger, mut receipt) = pending_backup_receipt_fixture("backup-remote-root-traversal");
+    let (_root, logger, mut receipt) =
+        pending_backup_receipt_fixture("backup-remote-root-traversal");
     receipt.remote_root = "truenas:/mnt/tank/../../tmp/switchback-capture".to_string();
 
     let error = logger.accept_backup_receipt(receipt).unwrap_err();
@@ -2418,7 +2457,7 @@ fn sealed_projection_missing_its_manifest_fails_backup_planning_loudly() {
     );
 }
 
-fn backed_spool_fixture(tag: &str) -> (PathBuf, BodyLogger, PathBuf, PathBuf, PathBuf) {
+fn backed_spool_fixture(tag: &str) -> (TempRoot, BodyLogger, PathBuf, PathBuf, PathBuf) {
     let root = temp_root(tag);
     let mount = root.join("mount");
     fs::write(&mount, b"offline").unwrap();
@@ -2611,7 +2650,7 @@ fn backed_spool_reclaim_restores_under_the_available_spool_root() {
 }
 
 struct BackedReclaimFixture {
-    root: PathBuf,
+    root: TempRoot,
     logger: BodyLogger,
     segment: CaptureBackupPlanItem,
     segment_path: PathBuf,

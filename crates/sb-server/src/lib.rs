@@ -42,6 +42,8 @@ mod vault_cli;
 mod workloads;
 
 #[cfg(test)]
+mod test_temp;
+#[cfg(test)]
 mod tests;
 
 pub use app::build_app;

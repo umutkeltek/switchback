@@ -2969,18 +2969,29 @@ mod tests {
     use tokio_tungstenite::tungstenite::http::HeaderValue;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
-    fn temp_capture_root(tag: &str) -> PathBuf {
+    /// Removed when the returned value goes out of scope; keep it for the whole test.
+    fn temp_capture_root(tag: &str) -> crate::test_temp::TempRoot {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        crate::test_temp::TempRoot::new(format!(
             "switchback-tap-bodylog-{tag}-{}-{nanos}",
             std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        root
+        ))
+    }
+
+    #[test]
+    fn temp_capture_root_is_removed_when_the_test_ends() {
+        let root = temp_capture_root("self-clean");
+        fs::write(root.join("body"), vec![0u8; 4096]).unwrap();
+        let path = root.to_path_buf();
+        drop(root);
+        assert!(
+            !path.exists(),
+            "capture test folder left behind: {}",
+            path.display()
+        );
     }
     fn isolated_body_logger(
         legacy_jsonl: &std::path::Path,
@@ -3057,7 +3068,7 @@ mod tests {
         TapResponseStream,
         BodyLogger,
         Arc<TraceLog>,
-        PathBuf,
+        crate::test_temp::TempRoot,
         Arc<std::sync::atomic::AtomicBool>,
     ) {
         let root = temp_capture_root("terminal-drain");
@@ -3140,7 +3151,7 @@ mod tests {
 
     async fn remove_drain_fixture(
         logger: BodyLogger,
-        root: PathBuf,
+        root: crate::test_temp::TempRoot,
         finished: Arc<std::sync::atomic::AtomicBool>,
     ) {
         // Queue metrics can reach zero before the receiver handles disconnect
@@ -3154,7 +3165,7 @@ mod tests {
         .await
         .unwrap();
         drop(logger);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 
     const TEST_TERMINAL: &[u8] =

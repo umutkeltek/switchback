@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_temp::TempRoot;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderMap;
@@ -14,8 +15,22 @@ use tokio::net::TcpListener;
 const LARGE_BYTES: usize = 16_881_691;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn logger(tag: &str) -> BodyLogger {
-    let root = std::env::temp_dir().join(format!(
+/// A body logger whose state folder is removed when the value goes out of scope.
+struct TestLogger {
+    logger: BodyLogger,
+    _root: TempRoot,
+}
+
+impl std::ops::Deref for TestLogger {
+    type Target = BodyLogger;
+
+    fn deref(&self) -> &BodyLogger {
+        &self.logger
+    }
+}
+
+fn logger(tag: &str) -> TestLogger {
+    let root = TempRoot::new(format!(
         "sb-moded-{tag}-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
@@ -24,13 +39,30 @@ fn logger(tag: &str) -> BodyLogger {
             .as_nanos(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    BodyLogger::new(BodyLoggerConfig {
+    let logger = BodyLogger::new(BodyLoggerConfig {
         state_dir: root.join("state"),
         archive_root: root.join("archive"),
         legacy_jsonl: None,
         inline_threshold_bytes: 1,
     })
-    .unwrap()
+    .unwrap();
+    TestLogger {
+        logger,
+        _root: root,
+    }
+}
+
+#[test]
+fn moded_logger_folder_is_removed_when_the_test_ends() {
+    let logger = logger("self-clean");
+    let path = logger._root.to_path_buf();
+    assert!(path.is_dir());
+    drop(logger);
+    assert!(
+        !path.exists(),
+        "capture test folder left behind: {}",
+        path.display()
+    );
 }
 
 fn input() -> BodyEventInput {
@@ -182,10 +214,12 @@ async fn exhausted_spool_refuses_before_consuming_client_body() {
 }
 
 struct Fixture {
-    logger: BodyLogger,
+    logger: TestLogger,
     client: reqwest::Client,
     url: String,
     handles: Vec<tokio::task::AbortHandle>,
+    // the proxy reads its CA files from here; removed after the handles are aborted
+    _ca_root: TempRoot,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -255,12 +289,11 @@ async fn fixture(tls: bool, policies: bool) -> Fixture {
     let logger = logger("wire");
     let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = proxy.local_addr().unwrap();
-    let ca_root = std::env::temp_dir().join(format!(
+    let ca_root = TempRoot::new(format!(
         "sb-moded-ca-{}-{}",
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&ca_root).unwrap();
     let cfg: ForwardProxyConfig = serde_json::from_value(serde_json::json!({
         "id":"moded-spill-fixture", "bind":"127.0.0.1:0", "capture_bodies":true,
         "intercept_hosts":["upstream.invalid"], "tunnel_unknown_hosts":false,
@@ -315,6 +348,7 @@ async fn fixture(tls: bool, policies: bool) -> Fixture {
             format!("{origin}/v1/messages")
         },
         handles: vec![server.abort_handle(), handle.abort_handle()],
+        _ca_root: ca_root,
     }
 }
 async fn exchange(fixture: &Fixture, policy: Option<(&str, &str, &str)>) {
