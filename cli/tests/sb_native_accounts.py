@@ -561,6 +561,66 @@ class NativeAccounts(unittest.TestCase):
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertEqual(json.loads(status.stdout)["quota_error"], "refresh_failed_or_invalid_cache")
 
+    def test_review_rejection_cooldown_not_cleared_by_reading_from_before_rejection(self):
+        # A run was rejected with a rate limit just now (cooldown, reset unknown). The vendor cache
+        # still holds a reading taken 40 s ago, before the rejection, at 97% used.
+        self.setup_slot("one")
+        slot = self.runtime / "config/native-account-slots/claude/one/slot.json"
+        data = json.loads(slot.read_text())
+        data["cooldown"] = {"reason": "rate_limit", "reset": None}
+        slot.write_text(json.dumps(data))
+        profile = self.runtime / "config/claude/one/.claude.json"
+        native = json.loads(profile.read_text())
+        native["cachedUsageUtilization"] = {"accountUuid": "one", "fetchedAtMs": int(time.time() * 1000) - 40000,
+            "utilization": {"five_hour": {"utilization": 97, "resets_at": None},
+                            "seven_day": {"utilization": 50, "resets_at": None}}}
+        profile.write_text(json.dumps(native))
+        status = self.call("status", "--provider", "claude", "--slot", "one", "--quota-refresh", "--json",
+                           env=dict(self.env, FAKE_QUOTA="unchanged"))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("cooldown", json.loads(slot.read_text()), "reading older than the rejection cleared its cooldown")
+        result = json.loads(status.stdout)
+        # The reading still counts as current for display and for the scheduler.
+        self.assertNotIn("quota_error", result)
+        self.assertTrue(result["quota_current"])
+
+    def test_rejection_cooldown_set_time_is_stored_and_a_later_reading_clears_it(self):
+        # The cooldown records when it was set; a cached reading taken after that clears it even
+        # though the reading is older than the refresh.
+        self.setup_slot("one")
+        slot = self.runtime / "config/native-account-slots/claude/one/slot.json"
+        data = json.loads(slot.read_text())
+        now_ms = int(time.time() * 1000)
+        data["cooldown"] = {"reason": "rate_limit", "reset": None, "set_at_ms": now_ms - 50000}
+        slot.write_text(json.dumps(data))
+        profile = self.runtime / "config/claude/one/.claude.json"
+        native = json.loads(profile.read_text())
+        native["cachedUsageUtilization"] = {"accountUuid": "one", "fetchedAtMs": now_ms - 20000,
+            "utilization": {"five_hour": {"utilization": 30, "resets_at": None},
+                            "seven_day": {"utilization": 50, "resets_at": None}}}
+        profile.write_text(json.dumps(native))
+        status = self.call("status", "--provider", "claude", "--slot", "one", "--quota-refresh", "--json",
+                           env=dict(self.env, FAKE_QUOTA="unchanged"))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertNotIn("cooldown", json.loads(slot.read_text()))
+
+    def test_exhausted_reading_sets_cooldown_with_its_set_time(self):
+        self.setup_slot("one")
+        profile = self.runtime / "config/claude/one/.claude.json"
+        native = json.loads(profile.read_text())
+        reset = time.time() + 3600
+        native["cachedUsageUtilization"] = {"accountUuid": "one", "fetchedAtMs": int(time.time() * 1000) - 40000,
+            "utilization": {"five_hour": {"utilization": 100, "resets_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset))}}}
+        profile.write_text(json.dumps(native))
+        before = int(time.time() * 1000)
+        status = self.call("status", "--provider", "claude", "--slot", "one", "--quota-refresh", "--json",
+                           env=dict(self.env, FAKE_QUOTA="unchanged"))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        cooldown = json.loads((self.runtime / "config/native-account-slots/claude/one/slot.json").read_text())["cooldown"]
+        self.assertEqual(cooldown["reason"], "rate_limit")
+        self.assertGreaterEqual(cooldown["set_at_ms"], before)
+
     def test_claude_cooldown_unknown_is_retained_and_retried(self):
         self.setup_slot("one")
         slot = self.runtime / "config/native-account-slots/claude/one/slot.json"

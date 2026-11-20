@@ -190,6 +190,43 @@ class RefreshTests(unittest.TestCase):
         self.assertNotIn("refresh_error", self.run_report()["accounts"][0])
 
 
+    def claude_refresh_backoff(self, status):
+        # A Claude seat whose vendor reading is 45 s old: older than the 30 s batch allowance,
+        # inside the account command's one-minute vendor-cache allowance.
+        self.args.provider = "claude"
+        self.args.refresh = True
+        self.args.refresh_if_due = False
+        slot = self.root / "config/native-account-slots/claude/one"
+        slot.mkdir(parents=True)
+        home = self.root / "config/claude/one"
+        home.mkdir(parents=True)
+        identity = {"account_uuid": "fixture-account", "organization_uuid": "fixture-org"}
+        native.write_json(slot / "slot.json", {"provider": "claude", "slot": "one", "identity": identity, "enabled": True})
+        native.write_json(home / ".claude.json", {"oauthAccount": {"accountUuid": "fixture-account",
+            "organizationUuid": "fixture-org"}, "cachedUsageUtilization": {"accountUuid": "fixture-account",
+            "fetchedAtMs": int(time.time() * 1000) - 45_000, "utilization": {
+                "five_hour": {"utilization": 20}, "seven_day": {"utilization": 30}}}})
+        self.row = {"provider": "claude", "slot": "one", "source": "native/claude", "account_id": identity,
+                    "observed_at": usage.iso(self.now - 3600), "windows": []}
+        self.save()
+        def query(command, timeout):
+            if "--quota-refresh" in command:
+                return status, None
+            return None, "unavailable"
+        with patch.object(usage, "query", side_effect=query), \
+             patch.object(usage.shutil, "which", return_value=None), \
+             patch.object(Path, "home", return_value=self.root):
+            result = usage.report(self.args, self.root, "fixture-sb", self.fs)
+        self.assertNotIn("refresh_error", result["accounts"][0])
+        checkpoint = native.read_json(self.state / "account-usage-refresh.json")["collectors"]
+        return checkpoint["claude/one"]["consecutive_failures"]
+
+    def test_current_vendor_reading_between_30_and_60_seconds_old_resets_backoff(self):
+        self.assertEqual(self.claude_refresh_backoff({"quota_current": True, "quota": {"exhausted": False}}), 0)
+
+    def test_reading_the_account_command_did_not_call_current_still_backs_off(self):
+        self.assertEqual(self.claude_refresh_backoff({"quota": {"exhausted": False}}), 1)
+
     @unittest.skipUnless(os.environ.get("SB_TEST_ENGINE"),"requires actual Rust engine")
     def test_real_sb_limits_routes_pure_policy_without_profile_file_options(self):
         (self.root/"manifest.json").write_text("{}")

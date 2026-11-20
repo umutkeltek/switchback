@@ -137,6 +137,20 @@ def identity(home):
 VENDOR_USAGE_SNAPSHOT_MS = 60_000
 
 
+def clears_cooldown(cooldown, reading, refresh_started_ms):
+    """A reading may clear a cooldown only when it was written after the refresh started or after
+    the cooldown was set. The vendor-cache allowance above counts an older reading as current for
+    display and for setting a cooldown, but a reading taken before a rejection says nothing about it."""
+    if not cooldown:
+        return True
+    fetched = reading["fetched_at_ms"]
+    if fetched >= refresh_started_ms:
+        return True
+    set_at = cooldown.get("set_at_ms") if isinstance(cooldown, dict) else None
+    return (isinstance(set_at, (int, float)) and not isinstance(set_at, bool)
+            and math.isfinite(set_at) and fetched >= set_at)
+
+
 def quota(home, account, require_complete=False):
     data = read_json(metadata_path(home))
     cached = data.get("cachedUsageUtilization") if isinstance(data, dict) else None
@@ -484,7 +498,8 @@ def _run_pool(args, runtime, root, session_locks):
                         continue
                     data["last_good_quota"] = current_quota
                     if current_quota["exhausted"]:
-                        data["cooldown"] = {"reason": "rate_limit", "reset": current_quota["reset"]}
+                        data["cooldown"] = {"reason": "rate_limit", "reset": current_quota["reset"],
+                                            "set_at_ms": int(time.time() * 1000)}
                         write_json(slot / "slot.json", data)
                         if current_quota["reset"]:
                             earliest.append(current_quota["reset"])
@@ -605,7 +620,7 @@ def _run_pool(args, runtime, root, session_locks):
                     data["last_session"]["transcript"] = path
                 if rejection:
                     kind, reset = rejection
-                    data["cooldown"] = {"reason": kind, "reset": reset}
+                    data["cooldown"] = {"reason": kind, "reset": reset, "set_at_ms": int(time.time() * 1000)}
                     if reset:
                         earliest.append(reset)
                 write_json(slot / "slot.json", data)
@@ -987,10 +1002,13 @@ def main():
                                 verified_auth(home, observed))
                             if recovered:
                                 if current["exhausted"]:
-                                    data["cooldown"] = {"reason": "rate_limit", "reset": current["reset"]}
-                                else:
+                                    data["cooldown"] = {"reason": "rate_limit", "reset": current["reset"],
+                                                        "set_at_ms": int(time.time() * 1000)}
+                                elif clears_cooldown(data.get("cooldown"), current, refresh_started_ms):
                                     data.pop("cooldown", None)
                             result["quota"] = current
+                            # The reading is the vendor's current answer; the scheduler counts it as a success.
+                            result["quota_current"] = True
                             write_json(path, data)
                     result["relogin_required"] = data.get("cooldown", {}).get("reason") == "authentication_failed"
                 else:

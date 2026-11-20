@@ -397,6 +397,11 @@ def _report(args, runtime, sb, fs, *, persist=False, native_refresh=None):
                 meta = object_value(fs.read_json(slot / "slot.json"))
             if isinstance(refreshed, dict) and refreshed.get("quota_error"):
                 error = "native_usage_unavailable"
+            elif (isinstance(refreshed, dict) and refreshed.get("quota_current") is True
+                    and isinstance(getattr(args, "_current_rows", None), set)):
+                # The account command judged this reading the vendor's current answer, even when
+                # the vendor wrote it before this refresh. The scheduler counts it as a success.
+                args._current_rows.add((native, slot.name))
             row = {"provider": native, "slot": slot.name, "enabled": meta.get("enabled", False),
                    "account_id": meta.get("identity"), "source": "native/" + native,
                    "windows": [], "observed_at": None,
@@ -812,20 +817,29 @@ def report(args, runtime, sb, fs):
             run_args.provider = family
             run_args.slot = None if slot == "*" else slot
             run_args._refresh_keys = {key}
+            run_args._current_rows = set()
             partial = _report(run_args, runtime, sb, fs)
             schedules[key]["last_attempt_at_ms"] = int(time.time() * 1000)
             completed = refresh_groups(partial).get(key, [])
             schedules[key]["binding"] = refresh_binding(completed)
             # Source failures preserve their dated observation and retry state.
-            if completed and all(not row.get("refresh_error") and
-                    (timestamp(row.get("observed_at")) or 0) * 1000 >= started - 30_000
-                    for row in completed):
+            if completed and all(refresh_succeeded(row, started, run_args._current_rows) for row in completed):
                 schedules[key]["consecutive_failures"] = 0
             fs.write_json(path, {"schema": "switchback/usage-refresh-state@1", "collectors": schedules})
         result = _report(read_args, runtime, sb, fs)
         result["refresh"] = {"state": "completed", "requested_collectors": sorted(due),
                              "collectors": plan["collectors"] if plan else []}
         return result
+
+
+def refresh_succeeded(row, started_ms, current_rows):
+    """A collector succeeded when it reported no error and its reading is current: either the
+    account command said so (`quota_current`), or the reading was taken during this batch."""
+    if row.get("refresh_error"):
+        return False
+    if (row.get("provider"), row.get("slot")) in current_rows:
+        return True
+    return (timestamp(row.get("observed_at")) or 0) * 1000 >= started_ms - 30_000
 
 
 def should_refresh(args, provider, slot="*"):
