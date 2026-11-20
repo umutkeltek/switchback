@@ -539,6 +539,11 @@ pub(crate) struct Hints {
     /// The request's estimated prompt tokens when at or over the
     /// big-prompt threshold on a route where placement may run.
     pub big_prompt: Option<u64>,
+    /// Targets on a local engine behind a lane (`local_executors` plus a
+    /// named llama.cpp, vLLM or Ollama engine): the only ones big-prompt
+    /// placement may pick. A cloud target often measures the fastest
+    /// prefill, and costs money.
+    pub local_engine: HashSet<String>,
 }
 
 fn move_to(candidates: &mut Vec<sb_core::ExecutionTarget>, from: usize, to: usize) {
@@ -602,7 +607,9 @@ pub(crate) fn apply_hints(plan: &mut sb_router::RoutePlan, hints: &Hints, pin_or
                 .candidates
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| hints.up.contains(&t.id) && usable(t))
+                .filter(|(_, t)| {
+                    hints.up.contains(&t.id) && usable(t) && hints.local_engine.contains(&t.id)
+                })
                 .filter_map(|(i, t)| hints.prompt_tps.get(&t.id).map(|tps| (i, *tps)))
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             match best {
@@ -1044,6 +1051,12 @@ impl crate::Engine {
             if let Some(tps) = self.optimize.prompt_tps(&candidate.id) {
                 hints.prompt_tps.insert(candidate.id.clone(), tps);
             }
+            if lane.is_some()
+                && crate::model_settings::settings_engine(snap, &candidate.provider_id)
+                    != sb_core::SettingsEngine::Generic
+            {
+                hints.local_engine.insert(candidate.id.clone());
+            }
             hints.host.insert(candidate.id.clone(), host);
         }
         if let Some(threshold) = switches.big_prompt_tokens {
@@ -1452,8 +1465,10 @@ mod tests {
             big_prompt: Some(5000),
             ..Hints::default()
         };
-        hints.up.insert("mac/m".into());
-        hints.up.insert("box/m".into());
+        for id in ["mac/m", "box/m"] {
+            hints.up.insert(id.into());
+            hints.local_engine.insert(id.into());
+        }
         hints.prompt_tps.insert("mac/m".into(), 1380.0);
         hints.prompt_tps.insert("box/m".into(), 10_000.0);
         let mut p = plan(&[("mac", "m"), ("box", "m")]);
@@ -1474,6 +1489,19 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("already first"));
+        // A cloud target (no lane, no local engine) measures the fastest
+        // prefill: never picked, the fastest local target is.
+        hints.up.insert("cloud/m".into());
+        hints.prompt_tps.insert("cloud/m".into(), 50_000.0);
+        let mut p = plan(&[("mac", "m"), ("cloud", "m"), ("box", "m")]);
+        assert!(apply_hints(&mut p, &hints, false));
+        assert_eq!(order(&p), ["box/m", "mac/m", "cloud/m"]);
+        // Only a cloud target measured: nothing moves.
+        let mut only_cloud = hints.clone();
+        only_cloud.prompt_tps.retain(|id, _| id == "cloud/m");
+        let mut p = plan(&[("mac", "m"), ("cloud", "m")]);
+        assert!(!apply_hints(&mut p, &only_cloud, false));
+        assert_eq!(order(&p), ["mac/m", "cloud/m"]);
     }
 
     #[test]

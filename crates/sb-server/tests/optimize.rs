@@ -40,6 +40,8 @@ struct Machine {
     state: Arc<Mutex<EngineState>>,
     up: PathBuf,
     swap_ms: u64,
+    /// The prompt time the engine reports for 100 prompt tokens.
+    prompt_ms: f64,
 }
 
 impl Machine {
@@ -56,6 +58,7 @@ impl Machine {
             state: Arc::new(Mutex::new(state)),
             up,
             swap_ms: 150,
+            prompt_ms: 10.0,
         }
     }
     fn chats(&self) -> Vec<Value> {
@@ -169,7 +172,7 @@ async fn chat(State(m): State<Machine>, Json(body): Json<Value>) -> Response {
     } else {
         (format!("ok from {}", m.name), Some("thought"), "stop")
     };
-    let timings = json!({"prompt_n": 100 - cached, "prompt_ms": 10.0, "cache_n": cached,
+    let timings = json!({"prompt_n": 100 - cached, "prompt_ms": m.prompt_ms, "cache_n": cached,
                          "predicted_n": 20, "predicted_ms": 100.0,
                          "draft_n": 10, "draft_n_accepted": 7});
     if body["stream"] == json!(true) {
@@ -238,6 +241,8 @@ struct Fixture {
     state: sb_server::AppState,
     gpu: Machine,
     small: Machine,
+    /// A cloud provider: no lane, no local engine, the fastest prefill.
+    cloud: Machine,
     wakes: PathBuf,
 }
 
@@ -245,6 +250,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.gpu.up);
         let _ = std::fs::remove_file(&self.small.up);
+        let _ = std::fs::remove_file(&self.cloud.up);
         let _ = std::fs::remove_file(&self.wakes);
     }
 }
@@ -260,6 +266,9 @@ async fn fixture_with(optimize: &str, extra: &str) -> Fixture {
     let small = Machine::new("small-host", &["m"], &["m"]);
     let gpu_url = serve(&gpu).await;
     let small_url = serve(&small).await;
+    let mut cloud = Machine::new("cloud", &["m"], &["m"]);
+    cloud.prompt_ms = 1.0;
+    let cloud_url = serve(&cloud).await;
     let wakes = temp("wakes");
     let cfg = format!(
         r#"
@@ -280,6 +289,10 @@ providers:
     engine: llama_cpp
     base_url: "{small_url}/v1"
     accounts: [{{ id: a, auth: {{ kind: none }} }}]
+  - id: cloud
+    type: openai_compatible
+    base_url: "{cloud_url}/v1"
+    accounts: [{{ id: a, auth: {{ kind: none }} }}]
 combos:
   rr:
     strategy: round_robin
@@ -289,6 +302,10 @@ routes:
     match: {{ model: "pair" }}
     prefer_awake: {{ enabled: true, wake_for_prompt_tokens: 100000, wake_for_output_tokens: 100000 }}
     targets: ["gpu-box/a", "small-host/m"]
+  - name: mixed
+    match: {{ model: "mixed" }}
+    prefer_awake: {{ enabled: true, wake_for_prompt_tokens: 100000, wake_for_output_tokens: 100000 }}
+    targets: ["small-host/m", "cloud/m"]
   - name: same-box
     match: {{ model: "same-box" }}
     targets: ["gpu-box/a", "gpu-box/b", "small-host/m"]
@@ -338,6 +355,7 @@ local_executors:
         state,
         gpu,
         small,
+        cloud,
         wakes,
     }
 }
@@ -602,6 +620,31 @@ async fn a_sticky_slot_is_dropped_after_a_settings_change_and_beyond_parallel() 
     assert!(fx.gpu.last_chat().get("id_slot").is_none());
     let line = beyond.header("x-switchback-optimize");
     assert!(line.contains("slot 3 not pinned (parallel 2)"), "{line}");
+}
+
+// Big-prompt placement picks only local engines behind a lane: a cloud
+// target measured with the fastest prefill is never moved first (it costs
+// money), on a route that mixes the two.
+#[tokio::test]
+async fn a_big_prompt_never_goes_to_a_cloud_target() {
+    let fx = fixture("    big_prompt_tokens: 50").await;
+    // Measure both: the cloud reports a prefill ten times faster.
+    for model in ["small-host/m", "cloud/m"] {
+        let answer = send(&fx.gw, convo(model, "measure me", 1)).await;
+        assert_eq!(answer.status, 200, "{model}: {:?}", answer.body);
+    }
+    let speeds = fx.state.engine.optimize().observations();
+    assert!(
+        speeds["cloud/m"].prompt_tps_ewma > speeds["small-host/m"].prompt_tps_ewma,
+        "the cloud must measure faster for this test"
+    );
+    let big = "a long document line\n".repeat(100);
+    let answer = send(&fx.gw, convo("mixed", &big, 1)).await;
+    assert_eq!(answer.status, 200, "{:?}", answer.body);
+    assert_eq!(answer.served_by(), "small-host");
+    let line = answer.header("x-switchback-optimize");
+    assert!(!line.contains("cloud/m"), "{line}");
+    assert!(line.contains("big_prompt"), "{line}");
 }
 
 #[tokio::test]

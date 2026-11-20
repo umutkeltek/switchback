@@ -1214,7 +1214,10 @@ keeps its order. What they did rides the response header
 - **Big-prompt placement** (`big_prompt_tokens`). On a route with
   `latency_aware` or `prefer_awake`, a prompt of at least that many
   (estimated) tokens goes to the awake target with the best measured prompt
-  speed (`big_prompt ~9000 tok -> gpu-box/qwen (10000 prompt tok/s)`). The
+  speed (`big_prompt ~9000 tok -> gpu-box/qwen (10000 prompt tok/s)`). Only
+  local engines behind a lane (a `local_executors` entry and a provider with
+  `engine: llama_cpp`, `vllm` or `ollama`) can be picked: a cloud target
+  often measures the fastest prefill, and it costs money. The
   existing ordering does not do this (a long-output request ranks on decode
   speed, a streaming one on time to first token), so it is its own step.
   Stickiness wins over it: a conversation's cached prefix is cheaper than a
