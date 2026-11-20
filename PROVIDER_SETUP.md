@@ -1179,8 +1179,9 @@ keeps its order. What they did rides the response header
 `sticky=gpu-box/qwen; slot=1` or `loaded=gpu-box/b over gpu-box/a (no model swap)`.
 
 - **Conversation stickiness.** A conversation is the session the client
-  names (header `x-switchback-session`, or `x-switchback-session-id`,
-  `metadata.session_id`), else the OpenAI `user` field plus a hash of the
+  names (header `x-switchback-session`, read only while stickiness is on,
+  or `x-switchback-session-id`, `metadata.session_id`), each within its
+  tenant and project, else the OpenAI `user` field plus a hash of the
   system prompt and the first user message (both stay the same for every
   turn). While the target that served the conversation last is up, healthy
   and not full, the next turn goes there first, so the engine reuses its

@@ -66,7 +66,7 @@ pub(crate) async fn messages(
     );
     req.project = principal.project.clone();
     drop_chat_wire_thinking_unless_enabled(&state, &mut req);
-    attach_session_metadata(&mut req, &headers);
+    attach_session_metadata(&state, &mut req, &headers);
     attach_wake_preference(&mut req, &headers);
     attach_settings_profile(&mut req, &headers);
     attach_native_execution_metadata(&mut req, &headers, &body);

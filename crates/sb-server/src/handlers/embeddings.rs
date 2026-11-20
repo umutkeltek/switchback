@@ -38,7 +38,7 @@ pub(crate) async fn embeddings(
             body,
             principal.tenant,
             principal.project,
-            session_id_from_headers(&headers),
+            session_id_from_headers(&state, &headers),
             wake_preference(&headers),
             started,
         )

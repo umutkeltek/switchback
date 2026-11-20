@@ -402,7 +402,7 @@ async fn route_preview_inner(
         principal.role_name().to_string(),
     );
     req.project = principal.project.clone();
-    attach_session_metadata(&mut req, &headers);
+    attach_session_metadata(&state, &mut req, &headers);
     attach_wake_preference(&mut req, &headers);
     let preview_tenant = req.tenant.clone();
     let preview_project = req.project.clone();

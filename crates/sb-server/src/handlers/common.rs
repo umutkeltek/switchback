@@ -54,7 +54,14 @@ fn observed_effort(body: &serde_json::Value) -> Option<(String, String)> {
     })
 }
 
-pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+/// The session the request names in a header. `x-switchback-session` is
+/// the optimizer's own name for it and is read only while conversation
+/// stickiness is on, so the optimizer off leaves session affinity as it was.
+pub(crate) fn session_id_from_headers(
+    state: &crate::AppState,
+    headers: &HeaderMap,
+) -> Option<String> {
+    let optimizer = sb_runtime::optimize::stickiness_on(&state.engine.snapshot().config);
     [
         "x-switchback-session",
         "x-switchback-session-id",
@@ -62,6 +69,7 @@ pub(crate) fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
         "x-session-id",
     ]
     .iter()
+    .filter(|name| optimizer || **name != "x-switchback-session")
     .find_map(|name| {
         headers
             .get(*name)
@@ -125,11 +133,15 @@ pub(crate) fn wake_preference(headers: &HeaderMap) -> Option<String> {
         .map(|value| value.to_ascii_lowercase().chars().take(32).collect())
 }
 
-pub(crate) fn attach_session_metadata(req: &mut sb_core::AiRequest, headers: &HeaderMap) {
+pub(crate) fn attach_session_metadata(
+    state: &crate::AppState,
+    req: &mut sb_core::AiRequest,
+    headers: &HeaderMap,
+) {
     if req.metadata.contains_key("session_id") {
         return;
     }
-    if let Some(session_id) = session_id_from_headers(headers) {
+    if let Some(session_id) = session_id_from_headers(state, headers) {
         req.metadata.insert("session_id".to_string(), session_id);
     }
 }

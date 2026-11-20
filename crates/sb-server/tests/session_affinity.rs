@@ -26,7 +26,11 @@ routes:
 "#;
 
 async fn spawn() -> String {
-    let cfg = sb_core::Config::from_yaml(CFG).unwrap();
+    spawn_with(CFG).await
+}
+
+async fn spawn_with(yaml: &str) -> String {
+    let cfg = sb_core::Config::from_yaml(yaml).unwrap();
     let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
     let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
     let state = sb_server::AppState::new(
@@ -82,4 +86,65 @@ async fn session_header_sticks_to_the_same_account() {
         vec!["b", "a", "a"],
         "s1 stayed on account a, while s2 advanced to b"
     );
+}
+
+/// The accounts of the newest `n` traces, oldest first.
+async fn accounts(base: &str, n: usize) -> Vec<String> {
+    let traces: Value = reqwest::Client::new()
+        .get(format!("{base}/v1/traces"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut out: Vec<String> = traces["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(n)
+        .map(|trace| {
+            trace["attempts"][0]["account_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
+async fn chat_header(base: &str, header: &str, session: &str) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header(header, session)
+        .json(&json!({"model":"mock/echo","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+// `x-switchback-session` is the optimizer's own header: with every
+// optimizer switch off it is not read, so session affinity is what it was
+// before the optimizer (round robin moves on); with stickiness on it names
+// the session like `x-switchback-session-id`.
+#[tokio::test]
+async fn the_optimizer_session_header_is_read_only_with_stickiness_on() {
+    let base = spawn().await;
+    for _ in 0..3 {
+        chat_header(&base, "x-switchback-session", "s1").await;
+    }
+    assert_eq!(accounts(&base, 3).await, ["a", "b", "a"], "optimizer off");
+
+    let on = CFG.replace(
+        "  bind: \"127.0.0.1:0\"\n",
+        "  bind: \"127.0.0.1:0\"\n  optimize:\n    stickiness: true\n",
+    );
+    assert!(on.contains("stickiness: true"));
+    let base = spawn_with(&on).await;
+    for _ in 0..3 {
+        chat_header(&base, "x-switchback-session", "s1").await;
+    }
+    assert_eq!(accounts(&base, 3).await, ["a", "a", "a"], "stickiness on");
 }

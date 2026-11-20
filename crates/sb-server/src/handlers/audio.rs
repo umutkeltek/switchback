@@ -151,7 +151,7 @@ async fn run(
             input,
             principal.tenant,
             principal.project,
-            session_id_from_headers(&headers),
+            session_id_from_headers(&state, &headers),
             started,
         )
         .await;

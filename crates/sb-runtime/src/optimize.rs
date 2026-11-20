@@ -940,9 +940,14 @@ fn lane_of<'a>(
 }
 
 fn stickiness_configured(snap: &crate::Snapshot) -> bool {
-    snap.config.server.optimize.stickiness
-        || snap
-            .config
+    stickiness_on(&snap.config)
+}
+
+/// Whether conversation stickiness is on anywhere (`server.optimize` or a
+/// route). Off, nothing optimizer-only is read from a request.
+pub fn stickiness_on(config: &sb_core::Config) -> bool {
+    config.server.optimize.stickiness
+        || config
             .routes
             .iter()
             .any(|route| route.optimize.is_some_and(|o| o.stickiness == Some(true)))
