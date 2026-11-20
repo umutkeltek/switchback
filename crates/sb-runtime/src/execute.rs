@@ -316,7 +316,7 @@ impl Engine {
         // Speed tricks (`server.optimize`, `routes[].optimize`): what the
         // ordering pass needs, computed once so every plan of this request
         // agrees. Nothing configured = nothing computed.
-        let tune_rejected = match self.apply_tune_locks(&req, &mut resolved) {
+        let tune_rejected = match self.apply_tune_locks(snap, &req, &mut resolved) {
             Ok(rejected) => rejected,
             Err(e) => {
                 self.record_denial_trace(DenialTrace {

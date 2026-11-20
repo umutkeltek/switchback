@@ -230,6 +230,11 @@ impl Engine {
                 resolved.require.audio_in = Some(true)
             }
         }
+        // Tuning locks, as for chat (see `execute`).
+        let tune_rejected = match self.apply_tune_locks(snap, &req, &mut resolved) {
+            Ok(rejected) => rejected,
+            Err(error) => return self.audio_denied(snap, &req, error, started),
+        };
         let unknown = resolved.unknown.clone();
         // Lanes with an engine control: the request counts on its first
         // choice's engine model from here, as for chat (see `execute`).
@@ -256,10 +261,13 @@ impl Engine {
                 }
                 Ok((route_name, plan))
             });
-        let (route_name, plan) = match planned {
+        let (route_name, mut plan) = match planned {
             Ok(plan) => plan,
             Err(error) => return self.audio_denied(snap, &req, error, started),
         };
+        for (target_id, reason) in tune_rejected {
+            plan.decision.reject(target_id, reason);
+        }
         // Per-model admissions (engine control): the first choice's, kept
         // while the plan still has its target.
         let mut admissions = crate::model_settings::admissions_only(

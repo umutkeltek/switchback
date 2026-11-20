@@ -922,7 +922,7 @@ class Tuner:
         try:
             lock = self.call("POST", "/v1/optimize/locks",
                              body={"target": self.target, "ttl_secs": min(ttl, 14400),
-                                   "reason": self.run_id},
+                                   "reason": self.run_id, "hold_id": self.hold},
                              doing="taking the lane's tuning lock")
         except TuneError as error:
             raise TuneError(FAIL, error.message.replace("taking the lane's tuning lock: ", "")) from None

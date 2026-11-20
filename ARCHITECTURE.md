@@ -429,7 +429,10 @@ lock) and keeps its ledger in the store (`optimize_experiments`, migration
 22, through `StateStore::optimize_experiment_*`; in memory without a
 store). The tuning lock is runtime state on `OptimizeState`: after
 resolving, candidates on a locked lane leave a request that does not carry
-the lock's id (a typed 503 `lane_tuning` when none is left). The lock lives in memory; the tuner's
+the lock's id (a typed 503 `lane_tuning` when none is left), for chat,
+embeddings and audio alike; while a quiet window is in force, locks are set
+aside. A new lock and the run's hold end no later than the next quiet
+window's start. The lock lives in memory; the tuner's
 heartbeat (`PATCH`) learns from a 404 that it is gone (a restart) and from
 `quiet_window` that a quiet window began (zones evaluated with `jiff`), and
 stops at its next safe point.

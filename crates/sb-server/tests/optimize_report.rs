@@ -471,6 +471,122 @@ async fn quiet_windows_name_their_time_zone_and_reach_a_running_lock() {
     assert_eq!(status, 404);
 }
 
+/// Whole-day quiet windows (UTC), as a config reload sets them.
+fn all_day_quiet(fx: &Fixture) {
+    let mut cfg = (*fx.state.engine.snapshot().config).clone();
+    cfg.server.optimize.quiet_windows = vec!["00:00-23:59".into(), "23:59-00:00".into()];
+    fx.state.engine.reload(cfg).unwrap();
+}
+
+// A lock left by a tuner that died must not block the work a quiet window
+// protects: once the window is in force, the lane serves everyone again.
+#[tokio::test]
+async fn a_quiet_window_sets_a_dead_tuners_lock_aside() {
+    let fx = fixture(true, "    stickiness: false").await;
+    let (status, lock) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a", "ttl_secs": 3600})),
+    )
+    .await;
+    assert_eq!(status, 201, "{lock}");
+    let (status, body, _) = chat_with(&fx.gw, ask("gpu-box/a"), None).await;
+    assert_eq!(status, 503, "locked before the window: {body}");
+    // The tuner is gone; the window begins.
+    all_day_quiet(&fx);
+    let (status, body, route) = chat_with(&fx.gw, ask("gpu-box/a"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "ok from gpu-box");
+    assert!(!route.contains("tuning run"), "{route}");
+    let (_, body, _) = chat_with(&fx.gw, ask("pair"), None).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "ok from gpu-box");
+}
+
+// The lock, and the run's hold, end no later than the next quiet window's
+// start, even when the run asked for longer.
+#[tokio::test]
+async fn a_lock_and_its_hold_end_at_the_next_quiet_window() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    // A UTC window from 10 to 20 minutes from now.
+    let start_ms = now / 60_000 * 60_000 + 10 * 60_000;
+    let hhmm = |ms: i64| {
+        let minute = (ms / 60_000).rem_euclid(1440);
+        format!("{:02}:{:02}", minute / 60, minute % 60)
+    };
+    let window = format!(
+        "    quiet_windows: [\"{}-{}\"]",
+        hhmm(start_ms),
+        hhmm(start_ms + 10 * 60_000)
+    );
+    let fx = fixture(true, &window).await;
+    let (status, hold) = call(
+        &fx.gw,
+        "POST",
+        "/v1/hosts/gpu-box/holds",
+        ADMIN,
+        Some(json!({"ttl_secs": 3600, "reason": "tune"})),
+    )
+    .await;
+    assert_eq!(status, 201, "{hold}");
+    let hold_id = hold["id"].as_str().unwrap().to_string();
+    assert!(hold["expires_at_ms"].as_i64().unwrap() > start_ms);
+    let (status, lock) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a", "ttl_secs": 3600, "hold_id": hold_id})),
+    )
+    .await;
+    assert_eq!(status, 201, "{lock}");
+    let expires = lock["expires_at_ms"].as_i64().unwrap();
+    assert_eq!(expires, start_ms, "{lock}");
+    let hold_end = lock["hold"]["expires_at_ms"].as_i64().unwrap();
+    assert!(
+        hold_end <= start_ms + 1_000 && hold_end > now,
+        "hold {hold_end} vs window start {start_ms}: {lock}"
+    );
+    let (_, holds) = call(&fx.gw, "GET", "/v1/hosts/gpu-box/holds", ADMIN, None).await;
+    assert_eq!(holds["data"][0]["expires_at_ms"].as_i64(), Some(hold_end));
+}
+
+// Tuning locks keep embeddings and audio off the lane too.
+#[tokio::test]
+async fn a_tuning_lock_covers_embeddings_and_audio() {
+    let fx = fixture(true, "    stickiness: false").await;
+    let (status, lock) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a", "ttl_secs": 600})),
+    )
+    .await;
+    assert_eq!(status, 201, "{lock}");
+    for (path, body) in [
+        (
+            "/v1/embeddings",
+            json!({"model": "gpu-box/a", "input": "hi"}),
+        ),
+        (
+            "/v1/audio/speech",
+            json!({"model": "gpu-box/a", "input": "hi", "voice": "x"}),
+        ),
+    ] {
+        let (status, answer) = call(&fx.gw, "POST", path, ADMIN, Some(body)).await;
+        assert_eq!(status, 503, "{path}: {answer}");
+        assert!(
+            answer.to_string().contains("tuning run"),
+            "{path}: {answer}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_unknown_time_zone_is_a_config_error() {
     let cfg = sb_core::Config::from_yaml(

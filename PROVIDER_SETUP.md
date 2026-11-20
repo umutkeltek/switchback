@@ -1374,15 +1374,15 @@ in flight or queued, inside a quiet window (`server.optimize.quiet_windows`, see
 (`locked: ["load.ctx_size"]`, or `sb ai set MODEL ctx_size=65536 --load
 --lock`; without `--levers` such a lever is skipped and said). While it
 runs it holds the machine on (a host hold, so the idle timer cannot power it
-off) and takes the lane's **tuning lock**: other requests skip that lane (to
-another target, or a retryable 503 `lane_tuning` when nothing else can
-serve), and only the run's own requests (header `x-switchback-tune-lock`)
-reach it. Ctrl-C or the end of the budget never cuts a request off: the
+off) and takes the lane's **tuning lock**: other chat, embeddings and audio
+requests skip that lane (to another target, or a retryable 503
+`lane_tuning` when nothing else can serve), and only the run's own requests
+(header `x-switchback-tune-lock`) reach it. Ctrl-C or the end of the budget never cuts a request off: the
 requests in flight finish, the best known settings are applied again (the
 reload waits for the model to drain), and the lock and the hold are let go.
 
 ```
-POST   /v1/optimize/locks {"target", "ttl_secs", "reason"}   201 | 409 quiet_window | lane_busy | locked
+POST   /v1/optimize/locks {"target", "ttl_secs", "reason", "hold_id"}   201 {…, "hold"} | 409 quiet_window | lane_busy | locked
 GET    /v1/optimize/locks
 PATCH  /v1/optimize/locks/{id} {"ttl_secs"}                  200 {…, "quiet_window"} | 404 (lock gone)
 DELETE /v1/optimize/locks/{id}
@@ -1410,6 +1410,12 @@ that safe point, applies the best known settings again, and lets the lock
 and the hold go (exit 0, `stopped: the quiet window … began`). Tuning locks
 live in the gateway's memory: after a restart the heartbeat gets 404, and
 the run stops the same way (exit 1).
+
+A tuner that dies cannot reach into a window either. A new lock, and the
+run's hold (`hold_id`), end no later than the next window's start, whatever
+`ttl_secs` asked for; the answer's `hold` shows the hold after that cap. And
+while a window is in force every tuning lock is set aside, so the window's
+work reaches the lane even if a lock is still on record.
 
 **Busy and paused models.** The tuner writes each candidate with `apply:
 now` and the revision it edits in `If-Match` (a quoted ETag). When the

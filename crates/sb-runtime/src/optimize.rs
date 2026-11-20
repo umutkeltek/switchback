@@ -868,12 +868,25 @@ impl crate::Engine {
     /// request unless the request carries that run's lock id. Returns the
     /// rejections for the decision; `Err` (503 `lane_tuning`) when nothing
     /// is left to serve.
+    ///
+    /// A quiet window in force (`server.optimize.quiet_windows`) sets every
+    /// lock aside: a lock left by a tuner that died never blocks the work
+    /// the window protects.
     pub(crate) fn apply_tune_locks(
         &self,
+        snap: &crate::Snapshot,
         req: &sb_core::AiRequest,
         resolved: &mut crate::profiles::CandidateResolution,
     ) -> Result<Vec<(String, String)>, crate::ExecError> {
         if resolved.candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let locked = |candidate: &sb_core::ExecutionTarget| {
+            self.optimize.lock_for_lane(&candidate.provider_id)
+        };
+        if !resolved.candidates.iter().any(|c| locked(c).is_some())
+            || quiet_window_now(&snap.config.server.optimize, now_ms()).is_some()
+        {
             return Ok(Vec::new());
         }
         let carried = req
@@ -881,8 +894,9 @@ impl crate::Engine {
             .get(sb_core::TUNE_LOCK_METADATA_KEY)
             .map(String::as_str);
         let mut rejected = Vec::new();
-        resolved.candidates.retain(|candidate| {
-            match self.optimize.lock_for_lane(&candidate.provider_id) {
+        resolved
+            .candidates
+            .retain(|candidate| match locked(candidate) {
                 Some(lock) if Some(lock.id.as_str()) != carried => {
                     rejected.push((
                         candidate.id.clone(),
@@ -894,8 +908,7 @@ impl crate::Engine {
                     false
                 }
                 _ => true,
-            }
-        });
+            });
         if resolved.candidates.is_empty() {
             let lanes: Vec<&str> = rejected.iter().map(|(target, _)| target.as_str()).collect();
             return Err(crate::ExecError::new(
@@ -1116,6 +1129,24 @@ pub fn quiet_window_now(config: &sb_core::OptimizeConfig, now_ms: i64) -> Option
     config.quiet_window_at(|tz| local_minute(now_ms, tz))
 }
 
+/// When the next quiet window begins after `now_ms` (epoch ms, on a minute
+/// boundary), within two days; `None` with no quiet window. Each window is
+/// read in its own time zone, so a daylight-saving change is honored.
+pub fn next_quiet_window_start(config: &sb_core::OptimizeConfig, now_ms: i64) -> Option<i64> {
+    if config.quiet_windows.is_empty() {
+        return None;
+    }
+    const MINUTE: i64 = 60_000;
+    let first = now_ms.div_euclid(MINUTE) * MINUTE + MINUTE;
+    let mut was_quiet = quiet_window_now(config, now_ms).is_some();
+    (0..2 * 24 * 60).map(|m| first + m * MINUTE).find(|at| {
+        let quiet = quiet_window_now(config, *at).is_some();
+        let starts = quiet && !was_quiet;
+        was_quiet = quiet;
+        starts
+    })
+}
+
 /// Every time zone the quiet windows name must be a known IANA name.
 pub fn validate_time_zones(config: &sb_core::OptimizeConfig) -> Result<(), String> {
     for (_, tz) in config.windows() {
@@ -1174,6 +1205,37 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_time_zones(&bad).unwrap_err().contains("Mars/Base"));
+    }
+
+    #[test]
+    fn the_next_quiet_window_start_is_found_in_its_own_zone() {
+        // 2026-01-15 16:15 UTC = 2026-01-16 01:15 in Tokyo.
+        let now = jiff::Timestamp::from_second(1_768_493_700)
+            .unwrap()
+            .as_millisecond();
+        let at = |second: i64| second * 1000;
+        let cfg: sb_core::OptimizeConfig =
+            serde_json::from_value(serde_json::json!({"quiet_windows": ["01:30-03:00"]})).unwrap();
+        // 2026-01-16 01:30 UTC.
+        assert_eq!(next_quiet_window_start(&cfg, now), Some(at(1_768_527_000)));
+        // Tokyo 02:00 = 17:00 UTC, the same day.
+        let tokyo: sb_core::OptimizeConfig = serde_json::from_value(serde_json::json!({
+            "quiet_windows": [{"start": "02:00", "end": "03:00", "tz": "Asia/Tokyo"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            next_quiet_window_start(&tokyo, now),
+            Some(at(1_768_496_400))
+        );
+        // Inside a window: the next one, a day later.
+        let inside: sb_core::OptimizeConfig =
+            serde_json::from_value(serde_json::json!({"quiet_windows": ["16:00-17:00"]})).unwrap();
+        assert_eq!(
+            next_quiet_window_start(&inside, now),
+            Some(at(1_768_579_200))
+        );
+        let none = sb_core::OptimizeConfig::default();
+        assert_eq!(next_quiet_window_start(&none, now), None);
     }
     use sb_core::{EngineTimings, ExecutionTarget, ExecutionTargetKind};
 

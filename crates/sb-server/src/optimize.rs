@@ -696,6 +696,9 @@ pub(crate) struct LockBody {
     ttl_secs: Option<u64>,
     #[serde(default)]
     reason: Option<String>,
+    /// The run's hold on the lane's machine: it ends no later than the lock.
+    #[serde(default)]
+    hold_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -707,11 +710,16 @@ pub(crate) struct ExtendBody {
 /// The longest a tuning lock may last (it is extended while a run goes on).
 const MAX_LOCK_SECS: u64 = 4 * 3600;
 
-/// `POST /v1/optimize/locks {"target", "ttl_secs", "reason"}` (operator):
-/// take a lane's tuning lock for `sb ai tune`. Refused (409, typed
-/// `reason`) inside a quiet window (`quiet_window`), while the lane has a
-/// request in flight or queued (`lane_busy`), or while another run holds it
-/// (`locked`). Never wakes anything.
+/// `POST /v1/optimize/locks {"target", "ttl_secs", "reason", "hold_id"}`
+/// (operator): take a lane's tuning lock for `sb ai tune`. Refused (409,
+/// typed `reason`) inside a quiet window (`quiet_window`), while the lane
+/// has a request in flight or queued (`lane_busy`), or while another run
+/// holds it (`locked`). Never wakes anything.
+///
+/// The lock, and the run's hold named by `hold_id`, end no later than the
+/// next quiet window's start, so a tuner that dies leaves nothing that
+/// reaches into the window. The answer's `hold` is that hold after the
+/// cap (`null` when no such hold is on the lane's machine).
 pub(crate) async fn lock_create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -781,19 +789,29 @@ pub(crate) async fn lock_create(
         .and_then(|l| l.host.clone())
         .unwrap_or_else(|| lane.name.clone());
     let ttl = body.ttl_secs.unwrap_or(1800).clamp(1, MAX_LOCK_SECS);
+    let mut expires_at_ms = now + (ttl as i64) * 1000;
+    if let Some(start) = sb_runtime::optimize::next_quiet_window_start(optimize, now) {
+        expires_at_ms = expires_at_ms.min(start);
+    }
     let lock = sb_runtime::optimize::TuneLock {
         id: sb_core::new_id("tune"),
         target: body.target.clone(),
         lane: lane.name.clone(),
-        host,
+        host: host.clone(),
         reason: body.reason.unwrap_or_default().chars().take(200).collect(),
         created_ms: now,
-        expires_at_ms: now + (ttl as i64) * 1000,
+        expires_at_ms,
     };
     match state.engine.optimize().take_lock(lock) {
         Ok(lock) => {
             tracing::info!(lane = %lock.lane, target = %lock.target, id = %lock.id, "tuning lock taken");
-            (StatusCode::CREATED, Json(json!(lock))).into_response()
+            let mut answer = json!(lock);
+            if let Some(hold_id) = &body.hold_id {
+                answer["hold"] = cap_hold(&state, &host, hold_id, lock.expires_at_ms, now)
+                    .map(|hold| crate::handlers::hosts::hold_json(&hold))
+                    .unwrap_or(Value::Null);
+            }
+            (StatusCode::CREATED, Json(answer)).into_response()
         }
         Err(held) => refuse(
             StatusCode::CONFLICT,
@@ -804,6 +822,28 @@ pub(crate) async fn lock_create(
             ),
         ),
     }
+}
+
+/// End the hold `hold_id` on `host` no later than `until_ms` (epoch ms on
+/// the lock's clock, `now_ms` being that clock's now). `None` when no such
+/// hold is active.
+fn cap_hold(
+    state: &AppState,
+    host: &str,
+    hold_id: &str,
+    until_ms: i64,
+    now_ms: i64,
+) -> Option<crate::holds::Hold> {
+    let holds = state.capacity.holds();
+    let hold_now = state.capacity.now_ms();
+    let hold = holds.get(host, hold_id, hold_now)?;
+    let left_ms = u64::try_from(until_ms.saturating_sub(now_ms))
+        .unwrap_or(0)
+        .max(1_000);
+    if hold.expires_at_ms <= hold_now.saturating_add(left_ms) {
+        return Some(hold);
+    }
+    holds.extend(host, hold_id, left_ms, hold_now)
 }
 
 /// `GET /v1/optimize/locks` (operator): the live tuning locks.

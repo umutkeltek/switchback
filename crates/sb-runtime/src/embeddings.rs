@@ -221,6 +221,28 @@ impl Engine {
                     };
                 }
             };
+        // Tuning locks, as for chat (see `execute`).
+        let tune_rejected = match self.apply_tune_locks(snap, &req, &mut resolved) {
+            Ok(rejected) => rejected,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: false,
+                });
+                return EmbeddingsOutcome::Error {
+                    request_id: req.id,
+                    error: e,
+                };
+            }
+        };
         let unknown = resolved.unknown.clone();
         // Lanes with an engine control: the request counts on its first
         // choice's engine model from here, as for chat (see `execute`).
@@ -264,7 +286,7 @@ impl Engine {
                 }
                 Ok((route_name, plan))
             });
-        let (route_name, plan) = match planned {
+        let (route_name, mut plan) = match planned {
             Ok(plan) => plan,
             Err(e) => {
                 self.record_denial_trace(DenialTrace {
@@ -285,6 +307,9 @@ impl Engine {
                 };
             }
         };
+        for (target_id, reason) in tune_rejected {
+            plan.decision.reject(target_id, reason);
+        }
         // Per-model admissions (engine control): the first choice's, kept
         // while the plan still has its target.
         let mut admissions = crate::model_settings::admissions_only(
