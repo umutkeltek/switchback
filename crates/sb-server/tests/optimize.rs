@@ -152,7 +152,13 @@ async fn chat(State(m): State<Machine>, Json(body): Json<Value>) -> Response {
             0
         }
     };
-    let slot = body["id_slot"].as_u64().unwrap_or(1);
+    // The engine picks slot 1, or slot 3 for a conversation that says so.
+    let default_slot = if text(&body).contains("slot three") {
+        3
+    } else {
+        1
+    };
+    let slot = body["id_slot"].as_u64().unwrap_or(default_slot);
     let thinking_off = body["chat_template_kwargs"]["enable_thinking"] == json!(false);
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(4096);
     let (content, reasoning, finish) = if thinking_off {
@@ -563,6 +569,39 @@ async fn sticky_conversation_pins_its_slot_and_cached_tokens_are_recorded() {
     let box_a = &obs["gpu-box/a"];
     assert_eq!(box_a.cached_tokens, 64);
     assert_eq!((box_a.draft_tokens, box_a.draft_accepted), (20, 14));
+}
+
+// A sticky slot rides along only while it still exists: a settings write
+// (a reload, perhaps with fewer slots) drops it, and a slot at or above the
+// current `parallel` is never sent (llama.cpp may defer such a task forever).
+#[tokio::test]
+async fn a_sticky_slot_is_dropped_after_a_settings_change_and_beyond_parallel() {
+    let fx = fixture("    stickiness: true").await;
+    put_settings(&fx.gw, "gpu-box/a", json!({"load": {"parallel": 4}})).await;
+    send(&fx.gw, convo("pair", "shared context", 1)).await;
+    let pinned = send(&fx.gw, convo("pair", "shared context", 2)).await;
+    assert_eq!(fx.gpu.last_chat()["id_slot"], json!(1));
+    assert!(pinned.header("x-switchback-optimize").contains("slot=1"));
+    // The target reloads with other settings: the slot is dropped once.
+    put_settings(&fx.gw, "gpu-box/a", json!({"load": {"parallel": 2}})).await;
+    let after = send(&fx.gw, convo("pair", "shared context", 3)).await;
+    assert_eq!(after.served_by(), "gpu-box");
+    assert!(fx.gpu.last_chat().get("id_slot").is_none());
+    let line = after.header("x-switchback-optimize");
+    assert!(
+        line.contains("slot 1 not pinned (settings changed)"),
+        "{line}"
+    );
+    // Served under the new settings, the slot is known again.
+    send(&fx.gw, convo("pair", "shared context", 4)).await;
+    assert_eq!(fx.gpu.last_chat()["id_slot"], json!(1));
+    // The engine reports slot 3 under `parallel 2`: never sent.
+    send(&fx.gw, convo("pair", "slot three please", 1)).await;
+    let beyond = send(&fx.gw, convo("pair", "slot three please", 2)).await;
+    assert_eq!(beyond.status, 200);
+    assert!(fx.gpu.last_chat().get("id_slot").is_none());
+    let line = beyond.header("x-switchback-optimize");
+    assert!(line.contains("slot 3 not pinned (parallel 2)"), "{line}");
 }
 
 #[tokio::test]

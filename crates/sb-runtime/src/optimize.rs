@@ -50,6 +50,9 @@ pub struct Sticky {
     pub engine_model: String,
     /// The engine slot that served it, when the engine said.
     pub slot: Option<u32>,
+    /// The target's settings revision when it was served: a settings
+    /// write (a reload with other slots, perhaps) drops the slot.
+    pub settings_revision: u64,
     pub at_ms: i64,
 }
 
@@ -140,6 +143,8 @@ pub(crate) struct Served<'a> {
     pub engine_lane: Option<Option<u32>>,
     pub sticky_ttl_ms: i64,
     pub sticky_max: usize,
+    /// The target's settings revision when the attempt was planned.
+    pub settings_revision: u64,
 }
 
 /// A tuning run's exclusive hold on a lane (`sb ai tune`): while it lasts,
@@ -357,6 +362,7 @@ impl OptimizeState {
                 provider_id: served.provider_id.to_string(),
                 engine_model: served.engine_model.to_string(),
                 slot: timings.and_then(|t| t.slot),
+                settings_revision: served.settings_revision,
                 at_ms: now,
             };
             if inner
@@ -823,6 +829,7 @@ pub(crate) struct Observer {
     engine_lane: Option<Option<u32>>,
     ttl_ms: i64,
     max: usize,
+    settings_revision: u64,
 }
 
 impl Observer {
@@ -840,8 +847,37 @@ impl Observer {
             engine_lane: self.engine_lane,
             sticky_ttl_ms: self.ttl_ms,
             sticky_max: self.max,
+            settings_revision: self.settings_revision,
         });
     }
+}
+
+/// The sticky slot to pin on a request, or why not. The slot is pinned only
+/// on the engine model that served it (the target's own, not a variant
+/// whose slot count is unknown), under the same settings revision, and
+/// only when it exists under the current `parallel`: llama.cpp may defer a
+/// task naming a slot it does not have indefinitely.
+pub(crate) fn sticky_slot(
+    sticky: &Sticky,
+    engine_model: &str,
+    own_model: &str,
+    settings_revision: u64,
+    parallel: u64,
+) -> Result<u32, String> {
+    let slot = sticky.slot.ok_or_else(|| "no slot known".to_string())?;
+    if engine_model != sticky.engine_model {
+        return Err(format!("slot {slot} not pinned (another engine model)"));
+    }
+    if engine_model != own_model {
+        return Err(format!("slot {slot} not pinned (a load-settings variant)"));
+    }
+    if settings_revision != sticky.settings_revision {
+        return Err(format!("slot {slot} not pinned (settings changed)"));
+    }
+    if u64::from(slot) >= parallel {
+        return Err(format!("slot {slot} not pinned (parallel {parallel})"));
+    }
+    Ok(slot)
 }
 
 fn lane_of<'a>(
@@ -1035,9 +1071,9 @@ impl crate::Engine {
         let (Some(sticky), Some(first)) = (sticky, plan.candidates.first().cloned()) else {
             return;
         };
-        let Some(slot) = sticky.slot else {
+        if sticky.slot.is_none() {
             return;
-        };
+        }
         if first.id != sticky.target_id
             || !plan
                 .decision
@@ -1067,6 +1103,19 @@ impl crate::Engine {
         if parallel <= 1 {
             return;
         }
+        let slot = match sticky_slot(
+            sticky,
+            &settings_plan.engine_model(&first),
+            &first.model,
+            self.model_settings.revision(&first.id),
+            parallel,
+        ) {
+            Ok(slot) => slot,
+            Err(why) => {
+                plan.decision.add_optimize(why);
+                return;
+            }
+        };
         // Others on the model: every admitted request but this one's own
         // admission (taken before routing on a lane with an engine control).
         let key = format!("{}/{}", first.provider_id, sticky.engine_model);
@@ -1106,6 +1155,7 @@ impl crate::Engine {
                 .map(|engine| engine.models_max),
             ttl_ms: (optimize.sticky_ttl_secs as i64).saturating_mul(1000),
             max: optimize.sticky_max_conversations,
+            settings_revision: self.model_settings.revision(&target.id),
         }
     }
 }
@@ -1208,6 +1258,42 @@ mod tests {
     }
 
     #[test]
+    fn a_sticky_slot_is_pinned_only_where_it_still_exists() {
+        let sticky = Sticky {
+            target_id: "box/a".into(),
+            provider_id: "box".into(),
+            engine_model: "a".into(),
+            slot: Some(3),
+            settings_revision: 7,
+            at_ms: 0,
+        };
+        // Same model, same revision, a slot under `parallel`: pinned.
+        assert_eq!(sticky_slot(&sticky, "a", "a", 7, 4), Ok(3));
+        // Recorded under `parallel 4`, now 2 (same revision: the engine
+        // reported a slot the settings do not have): not pinned.
+        assert!(sticky_slot(&sticky, "a", "a", 7, 2)
+            .unwrap_err()
+            .contains("parallel 2"));
+        assert!(sticky_slot(&sticky, "a", "a", 7, 3).is_err());
+        // A settings write since: the slot is dropped.
+        assert!(sticky_slot(&sticky, "a", "a", 8, 4)
+            .unwrap_err()
+            .contains("settings changed"));
+        // Another engine model (a variant of the request's own load
+        // settings, or another model): not pinned.
+        assert!(sticky_slot(&sticky, "a~ctx8k", "a", 7, 4)
+            .unwrap_err()
+            .contains("another engine model"));
+        let on_variant = Sticky {
+            engine_model: "a~ctx8k".into(),
+            ..sticky.clone()
+        };
+        assert!(sticky_slot(&on_variant, "a~ctx8k", "a", 7, 4)
+            .unwrap_err()
+            .contains("variant"));
+    }
+
+    #[test]
     fn the_next_quiet_window_start_is_found_in_its_own_zone() {
         // 2026-01-15 16:15 UTC = 2026-01-16 01:15 in Tokyo.
         let now = jiff::Timestamp::from_second(1_768_493_700)
@@ -1283,6 +1369,7 @@ mod tests {
             engine_lane: Some(Some(1)),
             sticky_ttl_ms: 60_000,
             sticky_max: 100,
+            settings_revision: 0,
         }
     }
 
