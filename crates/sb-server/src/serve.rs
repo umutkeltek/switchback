@@ -142,7 +142,9 @@ pub(crate) async fn serve_gateway(
         .clone()
         .spawn_supervisor(std::time::Duration::from_secs(10));
     // Loaded-model freshness for routing tricks: lanes that are up only.
-    state.spawn_engine_listing_poller(crate::engine_control::LISTING_POLL);
+    if !state.spawn_engine_listing_poller(crate::engine_control::LISTING_POLL) {
+        tracing::debug!("no lane has an engine control: the engine listing poller is not started");
+    }
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");

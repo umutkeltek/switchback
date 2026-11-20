@@ -2635,7 +2635,17 @@ fn listing_pollable(state: &EngineCtx, lane: &str) -> bool {
 
 /// Keep the loaded-model view fresh: every `every`, one
 /// [`EngineControls::poll_listings`] pass. Stops when the engine is gone.
-pub(crate) fn spawn_listing_poller(app: &AppState, every: Duration) {
+pub(crate) fn spawn_listing_poller(app: &AppState, every: Duration) -> bool {
+    // No lane with an engine control: nothing to poll, so no task.
+    if !app
+        .snapshot()
+        .config
+        .local_executors
+        .iter()
+        .any(|lane| lane.engine.is_some())
+    {
+        return false;
+    }
     let weak = Arc::downgrade(&app.engine);
     let (capacity, engines) = (app.capacity.clone(), app.engines.clone());
     tokio::spawn(async move {
@@ -2654,6 +2664,7 @@ pub(crate) fn spawn_listing_poller(app: &AppState, every: Duration) {
             engines.poll_listings(&ctx).await;
         }
     });
+    true
 }
 
 /// Wire the engine control's retries: when a lane comes up, and when the

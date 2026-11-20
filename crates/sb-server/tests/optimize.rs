@@ -916,13 +916,42 @@ async fn the_listing_poller_never_calls_a_sleeping_lane() {
     assert!(!fx.wakes.exists(), "the poller woke the machine");
 }
 
+// With no lane that has an engine control, the poller is not spawned.
+#[tokio::test]
+async fn no_poller_without_an_engine_lane() {
+    let cfg = sb_core::Config::from_yaml(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: mock
+    type: mock
+local_executors:
+  - name: mock
+    base_url: "http://127.0.0.1:9"
+    health_endpoint: "http://127.0.0.1:9/health"
+"#,
+    )
+    .unwrap();
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let state = sb_server::AppState::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    );
+    assert!(!state.spawn_engine_listing_poller(Duration::from_millis(20)));
+}
+
 #[tokio::test]
 async fn the_spawned_poller_refreshes_up_lanes_only() {
     let fx = fixture("    loaded_aware: true").await;
     send(&fx.gw, convo("gpu-box/a", "hello", 1)).await;
     let before = listings(&fx.gpu);
-    fx.state
-        .spawn_engine_listing_poller(Duration::from_millis(20));
+    assert!(fx
+        .state
+        .spawn_engine_listing_poller(Duration::from_millis(20)));
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(listings(&fx.gpu) > before, "an up lane was not polled");
     fx.gpu.sleep();

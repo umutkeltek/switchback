@@ -115,8 +115,12 @@ impl AppState {
     /// Start the engine listing poller: every `every`, the loaded models of
     /// each engine lane that is up (never one that is off, waking, powering
     /// off or draining; never a wake). `serve` starts it every 30 s.
-    pub fn spawn_engine_listing_poller(&self, every: std::time::Duration) {
-        crate::engine_control::spawn_listing_poller(self, every);
+    /// Returns whether it started: with no lane that has an engine control
+    /// at start-up there is nothing to poll and no task is spawned (a
+    /// reload that adds the first such lane is polled after a restart; the
+    /// served requests keep its loaded-model view meanwhile).
+    pub fn spawn_engine_listing_poller(&self, every: std::time::Duration) -> bool {
+        crate::engine_control::spawn_listing_poller(self, every)
     }
 
     /// One pass of the engine listing poller (tests and tools).
