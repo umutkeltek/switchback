@@ -1439,7 +1439,8 @@ store (`GET /v1/optimize/experiments?model=TARGET`, `sb ai tune MODEL
 identity (a hash of its path, never the path), settings revision, lever,
 value, metrics, samples, verdict and reason. A rejected change is skipped
 next time unless the engine build or the model file changed, and the run
-says so either way. Without a state store the ledger lives as long as the
+says so either way. The ledger keeps 180 days and at most 20,000 rows
+(pruned at start-up and daily). Without a state store the ledger lives as long as the
 process. The accepted winner is written as one settings revision with the
 note `tune <run id>` (the history shows `put: tune tune_…`), so `sb ai
 revert MODEL REVISION` undoes the whole run; the summary prints that

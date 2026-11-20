@@ -873,6 +873,44 @@ fn cap_hold(
     holds.extend(host, hold_id, left_ms, hold_now)
 }
 
+/// How long experiment rows are kept, and how many at most.
+pub(crate) const EXPERIMENT_KEEP_DAYS: i64 = 180;
+pub(crate) const EXPERIMENT_KEEP_ROWS: usize = 20_000;
+
+/// Prune the experiment ledger (store and memory) to
+/// [`EXPERIMENT_KEEP_DAYS`] and [`EXPERIMENT_KEEP_ROWS`]; answers how many
+/// rows went.
+pub(crate) fn prune_experiments(state: &AppState, now_ms: i64) -> usize {
+    let before = now_ms - EXPERIMENT_KEEP_DAYS * 86_400_000;
+    let mut removed = state
+        .engine
+        .optimize()
+        .prune_experiments(before, EXPERIMENT_KEEP_ROWS);
+    if let Some(store) = state.engine.store() {
+        match store.optimize_experiment_prune(before, EXPERIMENT_KEEP_ROWS) {
+            Ok(count) => removed += count,
+            Err(e) => tracing::warn!(error = %e.0, "pruning the experiment ledger failed"),
+        }
+    }
+    removed
+}
+
+/// Prune the experiment ledger now and then once a day.
+pub(crate) fn spawn_experiment_pruner(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(86_400));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let removed = prune_experiments(&state, sb_store::now_millis());
+            if removed > 0 {
+                tracing::info!(removed, "experiment ledger pruned");
+            }
+        }
+    });
+}
+
 /// `GET /v1/optimize/locks` (operator): the live tuning locks.
 pub(crate) async fn lock_list(
     State(state): State<AppState>,
@@ -1046,6 +1084,70 @@ mod tests {
     use super::*;
     use sb_core::{Ceiling, ReasoningGuard, Usage};
     use sb_ledger::RequestSpeed;
+    use std::sync::Arc;
+
+    fn experiment(at_ms: i64) -> sb_store::ExperimentRecord {
+        sb_store::ExperimentRecord {
+            id: 0,
+            target: "box/a".into(),
+            run_id: "tune_x".into(),
+            at_ms,
+            row: "{}".into(),
+        }
+    }
+
+    // The ledger keeps 180 days and 20,000 rows, in the store and in memory.
+    #[test]
+    fn the_experiment_ledger_is_pruned_by_age_and_count() {
+        let cfg = sb_core::Config::from_yaml("server:\n  bind: \"127.0.0.1:0\"\n").unwrap();
+        let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+        let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+        let store: Arc<dyn sb_store::StateStore> =
+            Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+        let engine = sb_runtime::Engine::new(
+            Arc::new(cfg),
+            Arc::new(registry),
+            Arc::new(resolver),
+            Arc::new(sb_ledger::UsageLedger::in_memory()),
+        )
+        .with_store(store.clone());
+        let state = AppState::from_engine(engine);
+        let day = 86_400_000;
+        let old = NOW - (EXPERIMENT_KEEP_DAYS + 1) * day;
+        for at in [old, old + 1] {
+            store.optimize_experiment_append(&experiment(at)).unwrap();
+            state.engine.optimize().remember_experiment(experiment(at));
+        }
+        for i in 0..EXPERIMENT_KEEP_ROWS as i64 + 3 {
+            let at = NOW - day + i;
+            store.optimize_experiment_append(&experiment(at)).unwrap();
+            state.engine.optimize().remember_experiment(experiment(at));
+        }
+        // Store: 2 old + 3 over the cap; memory: the same.
+        assert_eq!(prune_experiments(&state, NOW), 10);
+        // The store lists at most 10,000: the newest is still there, and a
+        // second prune finds nothing more to drop.
+        let left = store.optimize_experiment_list(None, 10_000).unwrap();
+        assert_eq!(left[0].at_ms, NOW - day + EXPERIMENT_KEEP_ROWS as i64 + 2);
+        assert_eq!(
+            store
+                .optimize_experiment_prune(NOW - EXPERIMENT_KEEP_DAYS * day, EXPERIMENT_KEEP_ROWS)
+                .unwrap(),
+            0
+        );
+        let remembered = state
+            .engine
+            .optimize()
+            .remembered_experiments(None, usize::MAX);
+        assert_eq!(remembered.len(), EXPERIMENT_KEEP_ROWS);
+        assert_eq!(remembered.last().unwrap().at_ms, NOW - day + 3);
+        // A new row after pruning gets a fresh id.
+        let ids: std::collections::HashSet<u64> = remembered.iter().map(|r| r.id).collect();
+        let id = state.engine.optimize().remember_experiment(experiment(NOW));
+        assert!(!ids.contains(&id));
+        // Memory is one over the cap again; the store is not.
+        assert_eq!(prune_experiments(&state, NOW), 1);
+    }
 
     const NOW: i64 = 1_800_000_000_000;
 

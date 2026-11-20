@@ -427,7 +427,7 @@ library): it drives the gateway's own APIs (settings writes with `apply:
 now` and a `note`, load/unload, chat requests carrying the lane's tuning
 lock) and keeps its ledger in the store (`optimize_experiments`, migration
 22, through `StateStore::optimize_experiment_*`; in memory without a
-store). The tuning lock is runtime state on `OptimizeState`: after
+store; 180 days and 20,000 rows at most, pruned at start-up and daily). The tuning lock is runtime state on `OptimizeState`: after
 resolving, candidates on a locked lane leave a request that does not carry
 the lock's id (a typed 503 `lane_tuning` when none is left), for chat,
 embeddings and audio alike; while a quiet window is in force, locks are set

@@ -530,10 +530,21 @@ impl OptimizeState {
     /// Keep an experiment row in memory (no state store); answers its id.
     pub fn remember_experiment(&self, mut record: sb_store::ExperimentRecord) -> u64 {
         let mut rows = self.experiments.lock().unwrap_or_else(|e| e.into_inner());
-        record.id = rows.len() as u64 + 1;
+        record.id = rows.last().map_or(0, |last| last.id) + 1;
         let id = record.id;
         rows.push(record);
         id
+    }
+
+    /// Drop remembered experiment rows older than `before_ms`, then all but
+    /// the newest `keep`; answers how many went.
+    pub fn prune_experiments(&self, before_ms: i64, keep: usize) -> usize {
+        let mut rows = self.experiments.lock().unwrap_or_else(|e| e.into_inner());
+        let before = rows.len();
+        rows.retain(|row| row.at_ms >= before_ms);
+        let over = rows.len().saturating_sub(keep);
+        rows.drain(..over);
+        before - rows.len()
     }
 
     /// Remembered experiment rows, newest first.

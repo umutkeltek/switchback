@@ -142,6 +142,9 @@ pub(crate) async fn serve_gateway(
         .clone()
         .spawn_supervisor(std::time::Duration::from_secs(10));
     // Loaded-model freshness for routing tricks: lanes that are up only.
+    // The experiment ledger: 180 days and 20,000 rows at most, pruned at
+    // start-up and daily.
+    crate::optimize::spawn_experiment_pruner(&state);
     if !state.spawn_engine_listing_poller(crate::engine_control::LISTING_POLL) {
         tracing::debug!("no lane has an engine control: the engine listing poller is not started");
     }

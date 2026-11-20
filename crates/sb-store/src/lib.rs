@@ -798,6 +798,12 @@ pub trait StateStore: Send + Sync {
     ) -> Result<Vec<ExperimentRecord>> {
         Ok(Vec::new())
     }
+
+    /// Drop experiment rows older than `before_ms`, then all but the newest
+    /// `keep`; answers how many went.
+    fn optimize_experiment_prune(&self, _before_ms: i64, _keep: usize) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). One connection
@@ -3443,6 +3449,20 @@ impl StateStore for SqliteStore {
         };
         Ok(rows)
     }
+
+    fn optimize_experiment_prune(&self, before_ms: i64, keep: usize) -> Result<usize> {
+        let conn = self.conn()?;
+        let old = conn.execute(
+            "DELETE FROM optimize_experiments WHERE at_ms < ?1",
+            params![before_ms],
+        )?;
+        let over = conn.execute(
+            "DELETE FROM optimize_experiments WHERE id NOT IN
+               (SELECT id FROM optimize_experiments ORDER BY id DESC LIMIT ?1)",
+            params![keep.min(i64::MAX as usize) as i64],
+        )?;
+        Ok(old + over)
+    }
 }
 
 const QUALITY_JUDGMENT_SELECT: &str =
@@ -5628,5 +5648,29 @@ mod model_settings_tests {
             .optimize_experiment_list(Some("none"), 5)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn experiments_prune_by_age_then_by_count() {
+        let store = SqliteStore::in_memory().unwrap();
+        for at in 1..=10 {
+            store
+                .optimize_experiment_append(&ExperimentRecord {
+                    id: 0,
+                    target: "box/a".to_string(),
+                    run_id: format!("tune_{at}"),
+                    at_ms: at * 1000,
+                    row: "{}".to_string(),
+                })
+                .unwrap();
+        }
+        // Older than 3 s: two rows; then keep the newest five.
+        assert_eq!(store.optimize_experiment_prune(3000, 5).unwrap(), 5);
+        let left = store.optimize_experiment_list(None, 100).unwrap();
+        assert_eq!(
+            left.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+            [10_000, 9000, 8000, 7000, 6000]
+        );
+        assert_eq!(store.optimize_experiment_prune(0, 100).unwrap(), 0);
     }
 }
