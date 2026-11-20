@@ -109,6 +109,16 @@ pub(super) fn register_owner(segment: &Path, state_dir: &Path, created: bool) ->
     )
 }
 
+/// Custody verdict for one sealed spool segment under the drain's locks.
+/// `Held` is a custody-rule refusal: the drain sets that one segment aside,
+/// names it in its report and goes on. I/O and unreadable-record failures
+/// stay errors and still stop the drain.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DrainCustody {
+    Ready,
+    Held(String),
+}
+
 /// Caller holds the segment lock. A store's own spool has exactly one writer,
 /// so a sealed segment there with no custody record can only be that store's:
 /// the record is missing because its writer predates custody records. Write the
@@ -119,14 +129,13 @@ pub(super) fn adopt_legacy_spool(
     spool_segments: &Path,
     archive_root: &Path,
     state_dir: &Path,
-) -> Result<()> {
+) -> Result<DrainCustody> {
     if read(segment)?.is_some() {
-        return Ok(());
+        return Ok(DrainCustody::Ready);
     }
     let refuse = |reason: &str| {
-        Err(BodyLogError::new(format!(
-            "legacy spool adoption refused: {reason}: {}",
-            segment.display()
+        Ok(DrainCustody::Held(format!(
+            "legacy spool adoption refused: {reason}"
         )))
     };
     if !fs::symlink_metadata(segment)?.file_type().is_file() {
@@ -142,29 +151,45 @@ pub(super) fn adopt_legacy_spool(
     if !super::read_verified_segment_manifest(segment)?.is_some_and(|manifest| manifest.sealed) {
         return refuse("segment is not sealed");
     }
-    register_owner(segment, state_dir, true)
+    register_owner(segment, state_dir, true)?;
+    Ok(DrainCustody::Ready)
 }
 
 /// Drain holds both segment locks and preserves exclusive, complete source custody.
-pub(super) fn prepare_drain(source: &Path, destination: &Path, state_dir: &Path) -> Result<()> {
+/// A segment that fails the rule is `Held`; nothing is written for it.
+pub(super) fn prepare_drain(
+    source: &Path,
+    destination: &Path,
+    state_dir: &Path,
+) -> Result<DrainCustody> {
     let owner = fs::canonicalize(state_dir)?;
-    let source_custody = read(source)?
-        .ok_or_else(|| BodyLogError::new("spool drain lacks complete segment custody"))?;
+    let Some(source_custody) = read(source)? else {
+        return Ok(DrainCustody::Held(
+            "spool drain lacks complete segment custody".to_string(),
+        ));
+    };
     if !source_custody.complete || source_custody.owners != [owner.clone()] {
-        return Err(BodyLogError::new(
-            "spool drain requires complete exclusive custody",
+        return Ok(DrainCustody::Held(
+            "spool drain requires complete exclusive custody".to_string(),
         ));
     }
     match read(destination)? {
-        Some(custody) if custody.complete && custody.owners.contains(&owner) => Ok(()),
-        Some(_) => Err(BodyLogError::new("drain destination has ambiguous custody")),
-        None if destination.try_exists()? => Err(BodyLogError::new(
-            "existing drain destination lacks custody",
+        Some(custody) if custody.complete && custody.owners.contains(&owner) => {
+            Ok(DrainCustody::Ready)
+        }
+        Some(_) => Ok(DrainCustody::Held(
+            "drain destination has ambiguous custody".to_string(),
         )),
-        None => atomic_write_private(
-            &custody_path(destination),
-            &serde_json::to_vec_pretty(&source_custody)?,
-        ),
+        None if destination.try_exists()? => Ok(DrainCustody::Held(
+            "existing drain destination lacks custody".to_string(),
+        )),
+        None => {
+            atomic_write_private(
+                &custody_path(destination),
+                &serde_json::to_vec_pretty(&source_custody)?,
+            )?;
+            Ok(DrainCustody::Ready)
+        }
     }
 }
 
@@ -192,14 +217,19 @@ mod tests {
         )
         .unwrap();
 
-        let error = adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir)
-            .expect_err("an unsealed segment is never adopted");
-        assert!(error.to_string().contains("not sealed"), "{error}");
+        let verdict = adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir).unwrap();
+        assert!(
+            matches!(&verdict, DrainCustody::Held(reason) if reason.contains("not sealed")),
+            "{verdict:?}"
+        );
         assert!(read(&segment).unwrap().is_none());
 
         crate::write_segment_manifest(&segment, &crate::streaming::SegmentSummary::default(), true)
             .unwrap();
-        adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir).unwrap();
+        assert_eq!(
+            adopt_legacy_spool(&segment, &spool_segments, &archive, &state_dir).unwrap(),
+            DrainCustody::Ready
+        );
         let custody = read(&segment).unwrap().expect("sealed segment is adopted");
         assert!(custody.complete);
         assert_eq!(custody.owners, [fs::canonicalize(&state_dir).unwrap()]);

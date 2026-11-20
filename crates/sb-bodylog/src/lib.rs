@@ -347,6 +347,16 @@ pub struct GcReport {
     pub spool_blobs_drained: u64,
     pub spool_segments_drained: u64,
     pub spool_day_files_drained: u64,
+    /// Sealed spool segments the custody rule refused this run. Each stays in
+    /// place, untouched, and the drain went on to the next segment.
+    pub spool_segments_held: Vec<HeldSpoolSegment>,
+}
+
+/// One spool segment the drain set aside, with the custody rule it failed.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldSpoolSegment {
+    pub segment: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1402,6 +1412,7 @@ impl BodyLogger {
             spool_blobs_drained: 0,
             spool_segments_drained: 0,
             spool_day_files_drained: 0,
+            spool_segments_held: Vec::new(),
         };
         if !archive_available {
             report.refused = Some(format!(
@@ -1686,13 +1697,26 @@ impl BodyLogger {
             let Some(_destination_lock) = try_acquire_segment_lock(&dest)? else {
                 continue;
             };
-            custody::adopt_legacy_spool(
+            // A custody refusal holds only this segment: name it and go on, so one
+            // old segment can never stop every newer one from draining.
+            let verdict = match custody::adopt_legacy_spool(
                 &src,
                 &self.spool_dir.join("segments"),
                 &self.config.archive_root,
                 &self.config.state_dir,
-            )?;
-            custody::prepare_drain(&src, &dest, &self.config.state_dir)?;
+            )? {
+                custody::DrainCustody::Ready => {
+                    custody::prepare_drain(&src, &dest, &self.config.state_dir)?
+                }
+                held => held,
+            };
+            if let custody::DrainCustody::Held(reason) = verdict {
+                report.spool_segments_held.push(HeldSpoolSegment {
+                    segment: src.to_string_lossy().into_owned(),
+                    reason,
+                });
+                continue;
+            }
             copy_file_verified(&src, &dest, Some(&manifest.segment_sha256))?;
             copy_file_verified(&src_manifest, &dest_manifest, None)?;
 

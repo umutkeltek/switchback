@@ -1294,6 +1294,15 @@ fn print_gc_report(report: &sb_bodylog::GcReport) {
             report.spool_day_files_drained
         );
     }
+    if !report.spool_segments_held.is_empty() {
+        println!(
+            "  set aside: {} spool segments held by custody (left in place)",
+            report.spool_segments_held.len()
+        );
+        for held in &report.spool_segments_held {
+            println!("    {} — {}", held.segment, held.reason);
+        }
+    }
 }
 
 fn default_body_state_dir() -> PathBuf {

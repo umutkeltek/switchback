@@ -4625,6 +4625,18 @@ fn drain_only() -> GcOptions {
     }
 }
 
+/// A custody refusal sets exactly this one segment aside; returns its reason.
+fn held_reason(run: &sb_bodylog::GcReport, segment: &Path) -> String {
+    assert!(run.refused.is_none());
+    let held: Vec<_> = run
+        .spool_segments_held
+        .iter()
+        .filter(|held| Path::new(&held.segment) == segment)
+        .collect();
+    assert_eq!(held.len(), 1, "held: {:?}", run.spool_segments_held);
+    held[0].reason.clone()
+}
+
 fn custody_path_of(segment: &Path) -> PathBuf {
     PathBuf::from(format!("{}.custody.json", segment.display()))
 }
@@ -4783,6 +4795,60 @@ fn legacy_spool_without_custody_drains_with_this_store_as_its_only_complete_owne
 }
 
 #[test]
+fn one_refused_segment_is_set_aside_and_newer_segments_still_drain() {
+    // The real 11-17 case: a recovery sealed an old abandoned segment and, not
+    // being its writer, recorded custody complete=false. That oldest segment
+    // sorts first; it must not stop the newer sealed segments behind it.
+    let root = temp_root("drain-sets-aside-refused");
+    let archive = offline_shared_archive(&root);
+    let requests = ["refused-oldest", "good-newer-a", "good-newer-b"];
+    let store = legacy_spool_store(&root, "state", &archive, &requests);
+    bring_archive_online(&archive);
+    let owner = fs::canonicalize(&store.state_dir).unwrap();
+    let refused = &store.segments[0];
+    let custody_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": "switchback/segment-custody@1",
+        "segment_file": refused.file_name().unwrap().to_str().unwrap(),
+        "complete": false,
+        "owners": [owner],
+    }))
+    .unwrap();
+    fs::write(custody_path_of(refused), &custody_bytes).unwrap();
+    let segment_bytes = fs::read(refused).unwrap();
+    let manifest_bytes = fs::read(manifest_path_of(refused)).unwrap();
+
+    for pass in 0..2 {
+        let run = store
+            .logger
+            .gc(drain_only())
+            .expect("one refused segment must not fail the whole drain");
+        assert_eq!(
+            run.spool_segments_drained,
+            if pass == 0 { 2 } else { 0 },
+            "pass {pass}: the newer segments drain once"
+        );
+        let reason = held_reason(&run, refused);
+        assert!(
+            reason.contains("requires complete exclusive custody"),
+            "unexpected reason: {reason}"
+        );
+        assert_eq!(run.spool_segments_held.len(), 1, "named again on every run");
+    }
+    // The refused segment is untouched: bytes, manifest and custody record.
+    assert_eq!(fs::read(refused).unwrap(), segment_bytes);
+    assert_eq!(fs::read(manifest_path_of(refused)).unwrap(), manifest_bytes);
+    assert_eq!(fs::read(custody_path_of(refused)).unwrap(), custody_bytes);
+    let events = store.logger.events_for_request("refused-oldest").unwrap();
+    assert_eq!(events[0].storage, "spool_segment");
+    for (segment, request) in store.segments.iter().zip(requests).skip(1) {
+        assert!(!segment.exists(), "{request} left the spool");
+        let events = store.logger.events_for_request(request).unwrap();
+        assert_eq!(events[0].storage, "archive_segment");
+        assert!(Path::new(&events[0].archive_path).starts_with(&archive));
+    }
+}
+
+#[test]
 fn legacy_spool_adoption_never_rewrites_an_existing_custody_record() {
     let root = temp_root("legacy-spool-existing");
     let archive = offline_shared_archive(&root);
@@ -4804,15 +4870,12 @@ fn legacy_spool_adoption_never_rewrites_an_existing_custody_record() {
         }))
         .unwrap();
         fs::write(custody_path_of(segment), &bytes).unwrap();
-        let error = store
-            .logger
-            .gc(drain_only())
-            .expect_err("an existing record keeps today's drain rule");
+        // an existing record keeps today's drain rule: the drain holds this segment and goes on.
+        let run = store.logger.gc(drain_only()).unwrap();
+        let reason = held_reason(&run, segment.as_ref());
         assert!(
-            error
-                .to_string()
-                .contains("requires complete exclusive custody"),
-            "unexpected error: {error}"
+            reason.contains("requires complete exclusive custody"),
+            "unexpected reason: {reason}"
         );
         assert_eq!(
             fs::read(custody_path_of(segment)).unwrap(),
@@ -4839,13 +4902,12 @@ fn legacy_spool_adoption_refuses_a_symlinked_segment_and_a_segment_outside_the_s
     std::os::unix::fs::symlink(&target, segment).unwrap();
     let target_bytes = fs::read(&target).unwrap();
     let manifest_bytes = fs::read(manifest_path_of(segment)).unwrap();
-    let error = store
-        .logger
-        .gc(drain_only())
-        .expect_err("a symlinked segment is never adopted");
+    // a symlinked segment is never adopted: the drain holds this segment and goes on.
+    let run = store.logger.gc(drain_only()).unwrap();
+    let reason = held_reason(&run, segment.as_ref());
     assert!(
-        error.to_string().contains("legacy spool adoption refused"),
-        "unexpected error: {error}"
+        reason.contains("legacy spool adoption refused"),
+        "unexpected reason: {reason}"
     );
     assert_eq!(fs::read(&target).unwrap(), target_bytes);
     assert_eq!(fs::read(manifest_path_of(segment)).unwrap(), manifest_bytes);
@@ -4871,13 +4933,12 @@ fn legacy_spool_adoption_refuses_a_symlinked_segment_and_a_segment_outside_the_s
     let outside_segment = outside_day.join(segment.file_name().unwrap());
     let outside_bytes = fs::read(&outside_segment).unwrap();
     let outside_manifest_bytes = fs::read(manifest_path_of(&outside_segment)).unwrap();
-    let error = store
-        .logger
-        .gc(drain_only())
-        .expect_err("a segment outside this store's spool is never adopted");
+    // a segment outside this store's spool is never adopted: the drain holds this segment and goes on.
+    let run = store.logger.gc(drain_only()).unwrap();
+    let reason = held_reason(&run, segment.as_ref());
     assert!(
-        error.to_string().contains("legacy spool adoption refused"),
-        "unexpected error: {error}"
+        reason.contains("legacy spool adoption refused"),
+        "unexpected reason: {reason}"
     );
     assert!(custody_records_under(&root).is_empty());
     assert!(outside_day.join(segment.file_name().unwrap()).exists());
@@ -4958,15 +5019,12 @@ fn legacy_spool_adoption_never_writes_custody_into_an_archive_root() {
     fs::create_dir_all(destination.parent().unwrap()).unwrap();
     fs::copy(segment, &destination).unwrap();
     fs::copy(manifest_path_of(segment), manifest_path_of(&destination)).unwrap();
-    let error = store
-        .logger
-        .gc(drain_only())
-        .expect_err("a record-less archive copy is never adopted");
+    // a record-less archive copy is never adopted: the drain holds this segment and goes on.
+    let run = store.logger.gc(drain_only()).unwrap();
+    let reason = held_reason(&run, segment.as_ref());
     assert!(
-        error
-            .to_string()
-            .contains("existing drain destination lacks custody"),
-        "unexpected error: {error}"
+        reason.contains("existing drain destination lacks custody"),
+        "unexpected reason: {reason}"
     );
     assert!(custody_of(&destination).is_none());
     assert!(segment.exists());
@@ -4985,12 +5043,12 @@ fn legacy_spool_adoption_never_writes_custody_into_an_archive_root() {
     })
     .unwrap()
     .expect("store exists");
-    let error = nested
-        .gc(drain_only())
-        .expect_err("a spool inside an archive root is never adopted");
+    // a spool inside an archive root is never adopted: the drain holds this segment and goes on.
+    let run = nested.gc(drain_only()).unwrap();
+    let reason = held_reason(&run, segment.as_ref());
     assert!(
-        error.to_string().contains("legacy spool adoption refused"),
-        "unexpected error: {error}"
+        reason.contains("legacy spool adoption refused"),
+        "unexpected reason: {reason}"
     );
     assert!(custody_records_under(&store.state_dir).is_empty());
     assert!(segment.exists());
