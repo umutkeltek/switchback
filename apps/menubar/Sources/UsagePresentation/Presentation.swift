@@ -155,6 +155,28 @@ public enum Presenter {
         if let used = window.usedPercent, let left = window.remainingPercent, abs(used + left - 100) > 1 { return false }
         return true
     }
+    /// A 5-hour window the vendor sent without numbers, for example an idle seat's: it has no reading.
+    /// The seat's room is then its weekly room, marked as weekly only.
+    static func isNullFiveHour(_ window: UsageWindow) -> Bool {
+        lane(window) == .session && (window.model ?? "").isEmpty && isGeneration(window) &&
+            window.usedPercent == nil && window.remainingPercent == nil
+    }
+    /// A 5-hour window whose reset time has passed since a fresh, trusted sample: it has started again.
+    static func fiveHourResetPassed(_ window: UsageWindow, account: UsageAccount, snapshotFresh: Bool, now: Date) -> Bool {
+        guard lane(window) == .session, validAccount(account, snapshotFresh: snapshotFresh, now: now),
+              ["fresh", "reset_passed"].contains(window.state), UsageTime.fresh(window.sampledAt, now: now),
+              percent(window.usedPercent) != nil || percent(window.remainingPercent) != nil,
+              let reset = UsageTime.parse(window.resetsAt) else { return false }
+        return reset <= now
+    }
+    /// What is left of a window under the rules every view shares: the tile, the best seat and the
+    /// status item. A 5-hour window whose reset time has passed counts as 100 left. nil when untrusted.
+    static func effectiveLeft(_ window: UsageWindow, account: UsageAccount, snapshotFresh: Bool, now: Date) -> Double? {
+        if valid(window, account: account, snapshotFresh: snapshotFresh, now: now) {
+            return window.remainingPercent ?? window.usedPercent.map { 100 - $0 }
+        }
+        return fiveHourResetPassed(window, account: account, snapshotFresh: snapshotFresh, now: now) ? 100 : nil
+    }
     public static func defaults(_ snapshot: UsageSnapshot) -> Set<String> {
         Set(core.compactMap { provider in snapshot.accounts.first { canonical($0.provider) == provider && $0.enabled != false }?.key })
     }
@@ -182,25 +204,26 @@ public enum Presenter {
                 }
                 var remaining: [Double] = []
                 var hasUnknown = false
+                var nullFiveHour = false
                 // A limit scoped to one model (for example a weekly Fable limit) is not the account's limit:
                 // when the account has account-wide windows, the pin reads those; the model limit stays in the
                 // lines below and in the panel. A provider with only model-scoped windows still pins them.
                 let hasAccountWide = account.windows.contains { isGeneration($0) && ($0.model ?? "").isEmpty }
                 for window in account.windows {
-                    let good = valid(window, account: account, snapshotFresh: snapshotFresh, now: now)
+                    let effective = effectiveLeft(window, account: account, snapshotFresh: snapshotFresh, now: now)
                     let estimate = account.isEstimated || window.isEstimated
                     let generation = isGeneration(window) && (!hasAccountWide || (window.model ?? "").isEmpty)
                     let qualified = [window.name, window.model, window.scope].compactMap { $0 }.map(clean).joined(separator: " · ")
                     let prefix = estimate ? "Estimate · " : ""
                     let usage: String
-                    if good {
-                        let left = window.remainingPercent ?? window.usedPercent.map { 100 - $0 }
-                        let used = window.usedPercent ?? window.remainingPercent.map { 100 - $0 }
-                        usage = "\(percent(left) ?? "?") remaining · \(percent(used) ?? "?") used"
-                        if !estimate && generation, let left { remaining.append(left) }
+                    if let left = effective {
+                        usage = "\(percent(left) ?? "?") remaining · \(percent(100 - left) ?? "?") used"
+                        if !estimate && generation { remaining.append(left) }
                     } else {
                         usage = "? remaining · refresh needed"
-                        if !estimate && generation { hasUnknown = true }
+                        // A 5-hour window with no numbers leaves the weekly room standing: the seat is weekly only.
+                        if !estimate && generation && isNullFiveHour(window) { nullFiveHour = true }
+                        else if !estimate && generation { hasUnknown = true }
                     }
                     lines.append(prefix + qualified + ": " + usage)
                     lines.append("  " + reset(window, now: now) + " · " + age(window.sampledAt, now: now))
@@ -225,7 +248,7 @@ public enum Presenter {
                 }
                 lines.append(contentsOf: account.notes.map { clean($0) })
                 if account.windows.isEmpty && account.balances.isEmpty { lines.append("Usage unavailable") }
-                let quotaSummary = hasUnknown ? "?" : remaining.min().flatMap { percent($0) } ?? "?"
+                let quotaSummary = hasUnknown || (nullFiveHour && remaining.isEmpty) ? "?" : remaining.min().flatMap { percent($0) } ?? "?"
                 let summary = account.windows.isEmpty ? balanceSummary(account, snapshotFresh: snapshotFresh, now: now) ?? "?" : quotaSummary
                 let pinned = pins.contains(account.key)
                 if pinned {

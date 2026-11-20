@@ -44,8 +44,7 @@ enum PanelMotion {
     var openSeat: String?
     /// The visual looks draw only the providers and accounts the filter and search keep.
     var directionData: DirectionPresentation {
-        Presenter.directions(PanelPresentation(status: presentation.status, accountCount: presentation.accountCount,
-                                               pinnedCount: presentation.pinnedCount, providers: visibleProviders))
+        Presenter.directions(presentation.with(providers: visibleProviders))
     }
     private func account(_ key: String) -> AccountPanel? {
         presentation.providers.lazy.flatMap(\.accounts).first { $0.key == key }

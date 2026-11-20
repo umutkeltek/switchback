@@ -52,8 +52,11 @@ func validatesAllSampleClocks(offset: Double) throws {
     #expect(badWindow.groups[0].accounts[0].summary == "?")
 }
 @Test func resetErrorLoginAndInvalidPercentNeverBecomeCapacity() throws {
+    // A passed weekly reset never becomes capacity. (A passed 5-hour reset starts a new 5-hour window.)
+    var weeklyPassed = window("week", reset: -1)
+    weeklyPassed["window_minutes"] = 10_080
     let cases = [
-        account("passed", windows: [window(reset: -1)]),
+        account("passed", windows: [weeklyPassed]),
         account("reset-state", windows: [window(state: "reset_passed")]),
         account("error", error: "authentication_required"), account("login", login: true),
         account("negative", windows: [window(used: -1, remaining: 101)]),
@@ -154,11 +157,14 @@ func validatesAllSampleClocks(offset: Double) throws {
     #expect(menu.groups.first { $0.provider == "opencode" }?.accounts.first?.key == "opencode:platform")
     #expect(Presenter.defaults(data) == ["opencodego:go"])
 }
-@Test func failedClientReadDoesNotLeaveApparentlyFreshCapacity() throws {
+@Test func failedClientReadKeepsReadingsThatAreFreshByTheirOwnTime() throws {
     let data = try snapshot([account()])
     let menu = Presenter.make(data, now: instant, failure: "Switchback refresh timed out")
-    #expect(menu.groups[0].accounts[0].summary == "?")
+    #expect(menu.groups[0].accounts[0].summary == "80%")
     #expect(menu.status == "Switchback refresh timed out")
+    // Readings older than the trust window stay unknown, failure or not.
+    let old = Presenter.make(try snapshot([account(sample: -901)]), now: instant, failure: "Switchback refresh timed out")
+    #expect(old.groups[0].accounts[0].summary == "?")
 }
 
 @Test func nullTimestampsDoNotHideHealthyAccounts() throws {

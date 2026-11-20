@@ -88,16 +88,29 @@ import Testing
     #expect(Presenter.directions(Presenter.panel(data, now: instant)).best == nil)
 }
 
-@Test func aSeatWithoutAUsableReadingSaysNoReading() throws {
+@Test func aSeatWithoutAUsableReadingSaysWhatToDo() throws {
+    var changed = seat("seat4", fiveHour: 80, weekly: 80, sample: -600)
+    changed["identity_state"] = "changed"
+    var unknown = seat("seat5", fiveHour: 80, weekly: 80, sample: -600, error: "identity_mismatch")
+    unknown["identity_state"] = "unknown"
     let data = try snapshot([seat("seat1", fiveHour: 80, weekly: 80, sample: -600, error: "authentication_required"),
                              seat("seat2", fiveHour: 80, weekly: 80, sample: -600, login: true),
-                             seat("seat3", fiveHour: 50, weekly: 60)])
-    let seats = Presenter.directions(Presenter.panel(data, now: instant)).seats
-    for slot in ["seat1", "seat2"] {
+                             seat("seat3", fiveHour: 50, weekly: 60), changed, unknown])
+    let panel = Presenter.panel(data, now: instant)
+    let seats = Presenter.directions(panel).seats
+    // A seat that needs sign-in says so; another signed-in account says "account changed".
+    // An unknown identity is no reading, never "account changed".
+    for (slot, chip) in [("seat1", "sign in"), ("seat2", "sign in"), ("seat4", "account changed"), ("seat5", "no reading")] {
         let glyph = try #require(seats.first { $0.id == "claude:" + slot })
-        #expect(glyph.chip == "no reading", "\(slot)")
+        #expect(glyph.chip == chip, "\(slot)")
         #expect(glyph.roomText == "—", "\(slot)")
-        // The age of the last reading moves to the tooltip.
+        #expect(glyph.room == nil, "\(slot)")
+        // The age of the last reading stays in the tooltip.
         #expect(glyph.detail.contains("10m old"), "\(slot)")
     }
+    let unknownRow = try #require(panel.providers[0].accounts.first { $0.key == "claude:seat5" })
+    #expect(unknownRow.notice != "Account changed")
+    #expect(!(Presenter.seatDetail(unknownRow).issues.first ?? "").contains("Another account"))
+    #expect(seats.first { $0.id == "claude:seat1" }?.spoken.contains("sign in needed") == true)
+    #expect(Presenter.bestSeat(data, now: instant)?.key == "claude:seat3")
 }

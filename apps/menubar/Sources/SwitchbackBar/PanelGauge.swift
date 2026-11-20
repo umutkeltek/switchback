@@ -49,7 +49,8 @@ struct DirectionPanelView: View {
                                     .transition(.opacity)
                             }
                         }
-                        if data.sections.isEmpty { emptyState }
+                        if let line = data.noReading { NoReadingLineView(line: line) }
+                        if data.sections.isEmpty && data.noReading == nil { emptyState }
                     }
                     .padding(GaugeLayout.padding)
                 }
@@ -150,10 +151,12 @@ struct DirectionPanelView: View {
     private var footer: some View {
         HStack(spacing: 5) {
             if state.failure != nil {
+                // A failed refresh hides nothing: the numbers above are judged by their own sample times.
                 Image(systemName: "exclamationmark.circle").font(.system(size: 10)).foregroundStyle(Color.orange)
                     .accessibilityHidden(true)
-                Text(state.presentation.accountCount > 0 ? "Couldn’t update · saved readings" : "Couldn’t load readings")
-                    .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
+                Text(Presenter.failureFooter(readingsAgeSeconds: state.presentation.readingsAgeSeconds,
+                                             hasReadings: state.presentation.accountCount > 0, busy: state.busy))
+                    .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1).truncationMode(.middle)
                     .help(state.failure ?? "")
             } else {
                 Circle().fill(state.busy ? Color.orange : Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
@@ -239,7 +242,7 @@ private struct BestNowCard: View {
     @Environment(\.colorSchemeContrast) private var contrast
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 Group {
                     switch style {
                     case .rings: SeatRing(seat: best, size: 46, line: 5)
@@ -247,16 +250,19 @@ private struct BestNowCard: View {
                     default: VerticalFuel(seat: best).frame(width: 14, height: 44)
                     }
                 }
-                .frame(width: 48, height: 48)
+                .frame(width: style == .rings ? 48 : 30, height: 48)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Use now").font(.system(size: 10, weight: .medium)).foregroundStyle(PanelColor.secondaryText)
-                    Text(best.name).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                    // A long name gives way in the middle; the number never does.
+                    Text(best.name).font(.system(size: 15, weight: .semibold)).lineLimit(1).truncationMode(.middle)
                     HStack(spacing: 4) {
-                        if let chip = best.chip { Text(chip) }
+                        if let note = best.partialNote { Text(note).foregroundStyle(PanelColor.secondaryText).fixedSize() }
+                        if let chip = best.chip { Text((best.partialNote == nil ? "" : "· ") + chip) }
                         if let age = best.age { Text("· " + age).foregroundStyle(.tertiary) }
                     }
                     .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).monospacedDigit().lineLimit(1)
                 }
+                .layoutPriority(1)
                 Spacer(minLength: 4)
                 if let pick = picks.first {
                     VStack(alignment: .trailing, spacing: 1) {
@@ -264,15 +270,27 @@ private struct BestNowCard: View {
                         if let back = pick.backText {
                             // No seat has room for this model: say so, with when the first one is back.
                             Text("No room").font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                            Text(back).font(.system(size: 11, weight: .medium)).monospacedDigit().lineLimit(1)
-                                .foregroundStyle(Color.red)
+                            Group {
+                                if let seat = pick.backSeat, let backIn = pick.backIn {
+                                    // The seat name gives way in the middle; "back in 1d 5h" stays whole.
+                                    HStack(spacing: 3) {
+                                        Text(seat).lineLimit(1).truncationMode(.middle)
+                                        Text("back in " + backIn).fixedSize()
+                                    }
+                                } else {
+                                    Text(back).lineLimit(1)
+                                }
+                            }
+                            .font(.system(size: 11, weight: .medium)).monospacedDigit().foregroundStyle(Color.red)
                         } else {
                             Text(pick.seat?.name ?? "—").font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                                .truncationMode(.middle)
                             Text(pick.roomText + "%").font(.system(size: 12, weight: .medium, design: .rounded)).monospacedDigit()
                                 .foregroundStyle(PanelColor.secondaryText)
                         }
                     }
                     .padding(.trailing, 4)
+                    .frame(minWidth: 76, maxWidth: 116, alignment: .trailing)
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 1) {
                     Text(best.roomText).font(.system(size: 30, weight: .semibold, design: .rounded)).monospacedDigit()
@@ -286,7 +304,11 @@ private struct BestNowCard: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(PanelPressStyle()).focusable()
-        .help(best.detail)
+        // Names cut in the middle on the card are whole here.
+        .help(best.detail + picks.map { pick in
+            "\nFor " + pick.model + ": " + (pick.backText.map { "no room · " + $0 }
+                ?? (pick.seat?.detail.components(separatedBy: "\n").first ?? "no fresh reading"))
+        }.joined())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Use now: " + best.spoken + picks.map { pick in
             ". For " + pick.model + ": " + (pick.backText.map { "no seat has room, " + $0 }
@@ -379,8 +401,8 @@ private struct GaugeSegmentButton: View {
             VStack(spacing: 0) {
                 GaugeBar(seat: seat, selected: selected).frame(height: GaugeLayout.segmentBar)
                     .overlay(alignment: .topTrailing) {
-                        // A reading at least 5 minutes old: a small clock mark; the age is in the tooltip and details.
-                        if seat.age != nil {
+                        // A reading at least 20 minutes old: a small clock mark; the age is under the number and in the tooltip.
+                        if seat.clock {
                             Image(systemName: "clock.fill").font(.system(size: 7, weight: .bold))
                                 .foregroundStyle(PanelColor.secondaryText)
                                 .padding(1.5).background(PanelColor.canvas, in: Circle())
@@ -495,20 +517,34 @@ private struct ModelBar: View {
     }
 }
 
-/// One line under a gauge whose seats have a model limit: what the two bars mean.
+/// One line under a gauge whose seats have a model limit: what the thin bar means, for example "Room for Fable".
 private struct GaugeLegend: View {
     let model: String
     var body: some View {
         HStack(spacing: 5) {
-            RoundedRectangle(cornerRadius: 2).fill(Color.green).frame(width: 10, height: 6)
-            Text("Room: the tighter of 5-hour and weekly")
-            Capsule().fill(modelTint).frame(width: 10, height: 3).padding(.leading, 6)
-            Text(model + " left")
+            Capsule().fill(modelTint).frame(width: 10, height: 3)
+            Text(model)
         }
         .font(.system(size: 9)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
         .frame(height: GaugeLayout.legend, alignment: .bottomLeading)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Each segment shows room, the tighter of the 5-hour and weekly windows. The thin bar shows what is left of the " + model + ".")
+        .accessibilityLabel("The thin bar under each seat shows its " + model.lowercased() + ": the smaller of that model's own limit and the seat's room.")
+    }
+}
+
+/// Plans with no reading, named on one quiet line instead of empty tiles. The reasons are in the tooltip.
+private struct NoReadingLineView: View {
+    let line: DirectionPresentation.NoReadingLine
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: SeatTone.unknown.symbol).font(.system(size: 9)).accessibilityHidden(true)
+            Text(line.text).lineLimit(1).truncationMode(.tail)
+        }
+        .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+        .frame(maxWidth: .infinity, alignment: .leading).frame(height: GaugeLayout.noReadingLine, alignment: .leading)
+        .help(line.help)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(line.spoken)
     }
 }
 

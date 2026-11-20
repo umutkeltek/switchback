@@ -11,8 +11,9 @@ import Testing
     #expect(expired.remainingFraction == nil)
     #expect(expired.valueText == "—")
     #expect(expired.lastReading == "Last reading: 80% remaining")
+    // A failed client refresh hides nothing: the window is fresh by its own sample time.
     let failed = Presenter.panel(data, now: instant, failure: "Could not read").providers[0].accounts[0].primary[0]
-    #expect(failed.remainingFraction == nil)
+    #expect(failed.remainingFraction == 0.8)
 }
 @Test func panelKeepsZeroMeasuredAndEstimatesDistinct() throws {
     var estimate = account("estimated", windows: [window(estimated: true)])

@@ -66,11 +66,18 @@ public struct SeatGlyph: Codable, Sendable, Identifiable {
     public let spoken: String
     /// The tooltip: both windows, a model's own limit, the full name and the slot.
     public let detail: String
+    /// What was left at a reading too old to count, shown muted with its age; never room.
+    public var lastRoom: Double? = nil
+    /// The reading is at least `clockAfter` old: the segment carries a small clock mark.
+    public var clock = false
+    /// Why a partial seat is partial, for example "weekly only" when it has no 5-hour reading.
+    public var partialNote: String? = nil
 
     public var roomText: String {
         switch tone {
         case .balance: chip ?? "—"
-        case .out: "0"
+        case .stale: lastRoom.map { String(format: "%.0f", ($0 * 100).rounded()) } ?? "—"
+        // A used-up seat shows what is really left, for example 3, with its used-up symbol.
         default: room.map { String(format: "%.0f", ($0 * 100).rounded()) } ?? "—"
         }
     }
@@ -88,7 +95,7 @@ public struct DirectionSection: Codable, Sendable, Identifiable {
         for seat in seats where seat.modelLeft != nil {
             if let model = seat.modelName, !model.isEmpty, !models.contains(model) { models.append(model) }
         }
-        legend = models.isEmpty ? nil : models.joined(separator: " · ") + " limit"
+        legend = models.isEmpty ? nil : "Room for " + models.joined(separator: " · ")
     }
     /// True when at least one seat draws the thin model bar.
     public var hasModelBar: Bool { legend != nil }
@@ -102,12 +109,25 @@ public struct DirectionPresentation: Codable, Sendable {
     public let sections: [DirectionSection]
     /// Set when every Claude seat with a fresh reading is at its limit: the card says so instead of naming a seat.
     public var noRoom: NoRoom? = nil
+    /// Single plans with nothing to show (no windows, no balance, no error the owner can act on):
+    /// one quiet line under the grid instead of empty tiles.
+    public var noReading: NoReadingLine? = nil
+    /// "No reading: MiniMax, Go, Zen, OpenRouter", with the full names and reasons in `help`.
+    public struct NoReadingLine: Codable, Sendable {
+        public let ids: [String]
+        public let text: String
+        public let help: String
+        public let spoken: String
+    }
     public struct ModelPick: Codable, Sendable, Identifiable {
         public let model: String
         public let seat: SeatGlyph?
         public let roomText: String
         /// No seat has room for this model: "back 2d 1h", or "no room" when no reset time is known.
         public var backText: String? = nil
+        /// The seat back first and how soon, for example "Seat 2" and "1d 5h"; nil when unknown.
+        public var backSeat: String? = nil
+        public var backIn: String? = nil
         public var id: String { model }
     }
     /// "No seat has room", with the seat that is back first, for example "Seat 3 back in 8h 29m".
@@ -127,6 +147,9 @@ public struct DirectionPresentation: Codable, Sendable {
 }
 
 extension Presenter {
+    /// Age after which a segment carries the clock mark. Normal refreshes run every few minutes.
+    public static let clockAfter: TimeInterval = 1_200
+
     public static func tone(room: Double?) -> SeatTone {
         guard let room else { return .unknown }
         if room <= 0.05 { return .out }
@@ -201,6 +224,7 @@ extension Presenter {
         var bestSeat: SeatGlyph?
         var noRoom: DirectionPresentation.NoRoom?
         var picks: [DirectionPresentation.ModelPick] = []
+        var quiet: [(id: String, name: String, title: String, reason: String)] = []
         for provider in panel.providers {
             let bestKey = provider.advice?.key
             let title = displayTitle(key: provider.key, title: provider.title)
@@ -211,7 +235,11 @@ extension Presenter {
                 seatGlyph($0, provider: provider.key, best: bestKey != nil && $0.key == bestKey,
                           name: single ? shortTitle : nil, title: single ? title : nil)
             }
-            if let key = bestKey { bestSeat = bestSeat ?? seats.first { $0.id == key } }
+            if let key = bestKey, bestSeat == nil, var seat = seats.first(where: { $0.id == key }) {
+                // The best seat with no 5-hour reading is marked on the card too.
+                if provider.advice?.weeklyOnly == true { seat.partialNote = "weekly only" }
+                bestSeat = seat
+            }
             if let advice = provider.advice, advice.noSeatHasRoom, noRoom == nil {
                 let back = seats.first { $0.id == advice.backKey }
                 let backIn = advice.backInSeconds.map(duration)
@@ -225,22 +253,28 @@ extension Presenter {
                 var pick = DirectionPresentation.ModelPick(model: model.model, seat: seats.first { $0.id == model.key },
                                                            roomText: model.roomPercent.map { String(format: "%.0f", $0) } ?? "—")
                 if model.noSeatHasRoom {
-                    pick.backText = model.backInSeconds.map { "back " + duration($0) } ?? "no room"
+                    let name = seats.first { $0.id == model.backKey }?.name ?? model.backSlot
+                    pick.backText = model.backInSeconds.map { (name.map { $0 + " " } ?? "") + "back in " + duration($0) } ?? "no room"
+                    pick.backSeat = model.backInSeconds == nil ? nil : name
+                    pick.backIn = model.backInSeconds.map(duration)
                 }
                 picks.append(pick)
             }
             // Providers with several accounts keep their own group; single accounts and providers
             // without a reading share one "Other plans" group, named by provider.
+            // A single plan with nothing to show is named on one quiet line instead of drawing an empty tile.
+            let quietName = shortTitle.hasSuffix(".") ? title : shortTitle
             if seats.count > 1 {
                 sections.append(DirectionSection(id: provider.key, title: title, seats: seats))
             } else if let seat = seats.first {
-                others.append(seat)
+                if seat.room == nil && seat.lastRoom == nil && seat.tone == .unknown && seat.chip == "no reading" {
+                    let account = provider.accounts[0]
+                    quiet.append((seat.id, quietName, title, account.notice ?? "No usage reported"))
+                } else {
+                    others.append(seat)
+                }
             } else if let message = provider.emptyMessage {
-                others.append(SeatGlyph(id: provider.key, provider: provider.key, name: shortTitle, title: title, room: nil,
-                                        session: nil, weekly: nil, roomLane: nil, partial: false, modelName: nil, modelLeft: nil,
-                                        tone: .unknown, chip: "no reading", age: nil, resetSeconds: nil,
-                                        sessionResetSeconds: nil, balanceEmpty: false, best: false,
-                                        spoken: title + ": no reading, " + message, detail: title + "\n" + message))
+                quiet.append((provider.key, quietName, title, message))
             }
         }
         if !others.isEmpty {
@@ -248,7 +282,14 @@ extension Presenter {
             let title = sections.isEmpty && others.count == 1 ? others[0].title : "Other plans"
             sections.append(DirectionSection(id: "other", title: title, seats: others))
         }
-        return DirectionPresentation(best: bestSeat, modelBest: picks, sections: sections, noRoom: noRoom)
+        var result = DirectionPresentation(best: bestSeat, modelBest: picks, sections: sections, noRoom: noRoom)
+        if !quiet.isEmpty {
+            let names = quiet.map(\.name).joined(separator: ", ")
+            result.noReading = .init(ids: quiet.map(\.id), text: "No reading: " + names,
+                                     help: quiet.map { $0.title + ": " + $0.reason }.joined(separator: "\n"),
+                                     spoken: "No reading for " + quiet.map(\.title).joined(separator: ", "))
+        }
+        return result
     }
 
     static func seatGlyph(_ account: AccountPanel, provider: String, best: Bool,
@@ -268,6 +309,8 @@ extension Presenter {
         var resetSeconds: Double?
         var backIn: String?
         var balanceEmpty = false
+        var lastRoom: Double?
+        var partialNote: String?
         if let balance {
             tone = balance.state == .measured ? .balance : .stale
             chip = compactBalance(balance)
@@ -275,7 +318,8 @@ extension Presenter {
         } else {
             switch glance.status {
             case .out:
-                tone = .out; room = 0; roomLane = glance.tighterLane
+                // What is really left, for example 3; the tone and symbol say it is used up.
+                tone = .out; room = glance.roomPercent.map { max(0, $0) / 100 } ?? 0; roomLane = glance.tighterLane
                 backIn = glance.backInText?.replacingOccurrences(of: "Back in ", with: "")
                 chip = glance.backInText?.replacingOccurrences(of: "Back in ", with: "back ")
                 resetSeconds = seconds(backIn)
@@ -299,19 +343,32 @@ extension Presenter {
                 partial = room != nil
                 tone = room == nil ? .unknown : Presenter.tone(room: room)
                 age = account.ageText.map { $0 + " old" }
+                // No 5-hour numbers at all (an idle seat): its room is its weekly room.
+                let missing = account.primary.filter { $0.generation && $0.remainingFraction == nil }
+                if partial, roomLane == .weekly, !missing.isEmpty, missing.allSatisfy({ $0.lane == .session && $0.lastReading == nil }) {
+                    partialNote = "weekly only"
+                }
             case .unavailable:
-                tone = account.notice == "Older reading" ? .stale : .unknown
-                // An old reading shows its age ("25m old", or "old reading" when the sample time is unknown).
-                // A seat with no usable reading says so; the age of its last reading stays in the tooltip.
-                chip = tone == .stale ? account.ageText.map { $0 + " old" } ?? "old reading" : "no reading"
+                // A reading too old to count shows its last number, muted, with its age under it ("40m ago").
+                // It never counts as room. Sign-in and identity problems hide the number and say what to do.
+                let last = account.primary.filter(\.generation).compactMap(\.lastFraction).min()
+                if ["Older reading", "Refresh unavailable"].contains(account.notice), let last {
+                    tone = .stale; lastRoom = last
+                    chip = account.ageText.map { $0 + " ago" } ?? "old reading"
+                } else {
+                    tone = .unknown
+                    chip = actionChip(account.notice) ?? "no reading"
+                }
             case .empty:
                 tone = .unknown
-                chip = "no reading"
+                chip = actionChip(account.notice) ?? "no reading"
             }
         }
         let session = ledger.session?.remainingFraction
         let weekly = ledger.weekly?.remainingFraction
-        let modelLeft = modelRow?.remainingFraction
+        // The thin bar is the room usable for the model on this seat: the smaller of its own limit and the seat's room,
+        // the same number the card's "For Fable" uses.
+        let modelLeft = modelRow?.remainingFraction.map { limit in room.map { min(limit, $0) } ?? limit }
         let modelName = modelRow?.qualifier.map { String($0.prefix(1)).uppercased() + $0.dropFirst() }
 
         // VoiceOver: "Seat 2: 38 percent left, weekly; Fable 73 percent used; resets in 4 days 19 hours".
@@ -322,13 +379,20 @@ extension Presenter {
             said.append("prepaid balance " + (chip ?? "unknown"))
         case .out:
             said.append("used up" + (lane.map { ", " + $0 } ?? ""))
-        case .stale, .unknown:
-            said.append(tone == .stale ? "old reading" : "no reading")
+        case .stale:
+            said.append("old reading" + (lastRoom.map { String(format: ", %.0f percent left then", $0 * 100) } ?? ""))
+        case .unknown:
+            switch chip {
+            case "sign in": said.append("sign in needed")
+            case "account changed": said.append("another account is signed in, sign in again")
+            default: said.append("no reading")
+            }
         default:
             var first = String(format: "%.0f percent left", (room ?? 0) * 100)
             if partial {
                 let missing = account.primary.filter { $0.generation && $0.remainingFraction == nil }
-                    .map { (laneWord($0.lane) ?? $0.title.lowercased()) + " unknown" }.joined(separator: ", ")
+                    .map { (laneWord($0.lane) ?? $0.title.lowercased()) + " unknown" }
+                    .joined(separator: ", ")
                 first += (lane.map { ", " + $0 + " only" } ?? "") + (missing.isEmpty ? "" : ", " + missing)
             } else if let lane {
                 first += ", " + lane
@@ -336,8 +400,8 @@ extension Presenter {
             said.append(first)
         }
         if let modelName, let modelLeft {
-            let used = Int(((1 - modelLeft) * 100).rounded())
-            said.append(used >= 100 ? modelName + " limit used up" : modelName + " \(used) percent used")
+            let left = Int((modelLeft * 100).rounded())
+            said.append(left == 0 ? "no room for " + modelName : "room for \(modelName) \(left) percent")
         }
         if let resetSeconds {
             said.append((tone == .out ? "back in " : "resets in ") + spokenDuration(resetSeconds))
@@ -348,7 +412,8 @@ extension Presenter {
         if tone == .stale, let chip { said.append(chip) }
         let lastReading = tone == .unknown && balance == nil ? account.ageText.map { "last reading " + $0 + " old" } : nil
         if let lastReading { said.append(lastReading) }
-        if let notice = account.notice, notice != "Older reading", notice != "Partial reading", !notice.hasSuffix("at limit") {
+        if let notice = account.notice, !["Older reading", "Partial reading", noReadingNotice].contains(notice),
+           !notice.hasSuffix("at limit"), actionChip(notice) == nil || tone != .unknown {
             said.append(notice.lowercased())
         }
         if best { said.append("most room now") }
@@ -364,17 +429,36 @@ extension Presenter {
         var lines = [(title.map { $0 + " · " } ?? "") + account.label + " · account " + account.slot]
         if let balance { lines.append(balance.title + " " + balance.valueText) }
         if !windows.isEmpty { lines.append(windows.joined(separator: " · ")) }
-        if partial { lines.append("Partial: showing only the windows with a fresh reading") }
+        if partial {
+            lines.append(partialNote == "weekly only" ? "Weekly only: no 5-hour reading yet"
+                         : "Partial: showing only the windows with a fresh reading")
+        }
+        if let lastRoom {
+            lines.append(String(format: "Last reading: %.0f%% left, too old to count", lastRoom * 100))
+        }
         if let age { lines.append("Reading " + age) }
         if let lastReading { lines.append(String(lastReading.prefix(1)).uppercased() + lastReading.dropFirst()) }
         if let notice = account.notice { lines.append(notice) }
         if account.directCheckFailed { lines.append("Last direct check failed") }
-        return SeatGlyph(id: account.key, provider: provider, name: name, title: title ?? account.label, room: room,
-                         session: session, weekly: weekly, roomLane: roomLane, partial: partial,
-                         modelName: modelName, modelLeft: modelLeft, tone: tone, chip: chip, age: age,
-                         resetSeconds: resetSeconds,
-                         // A 5-hour reset gives room back only to an account that is not out for longer.
-                         sessionResetSeconds: glance.status == .ready ? seconds(ledger.session?.resetIn) : nil,
-                         balanceEmpty: balanceEmpty, best: best, spoken: spoken, detail: lines.joined(separator: "\n"))
+        var glyph = SeatGlyph(id: account.key, provider: provider, name: name, title: title ?? account.label, room: room,
+                              session: session, weekly: weekly, roomLane: roomLane, partial: partial,
+                              modelName: modelName, modelLeft: modelLeft, tone: tone, chip: chip, age: age,
+                              resetSeconds: resetSeconds,
+                              // A 5-hour reset gives room back only to an account that is not out for longer.
+                              sessionResetSeconds: glance.status == .ready ? seconds(ledger.session?.resetIn) : nil,
+                              balanceEmpty: balanceEmpty, best: best, spoken: spoken, detail: lines.joined(separator: "\n"))
+        glyph.lastRoom = lastRoom
+        glyph.partialNote = partialNote
+        glyph.clock = balance == nil && (account.ageSeconds ?? 0) >= clockAfter && (room != nil || lastRoom != nil)
+        return glyph
+    }
+
+    /// The tile chip for a seat the owner can fix: "sign in", or "account changed" when another account is signed in.
+    static func actionChip(_ notice: String?) -> String? {
+        switch notice {
+        case "Sign in needed": "sign in"
+        case "Account changed": "account changed"
+        default: nil
+        }
     }
 }

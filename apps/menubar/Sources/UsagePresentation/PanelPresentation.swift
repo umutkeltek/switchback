@@ -26,6 +26,9 @@ public struct QuotaRow: Codable, Sendable {
     public let resetIn: String?
     /// False for tool and other non-generation scopes.
     public let generation: Bool
+    /// What was left at the last reading when it no longer counts (for example too old); nil otherwise.
+    /// Shown muted, never used as room.
+    public var lastFraction: Double? = nil
     public var accessibilityText: String {
         [title, qualifier, state.spoken,
          state == .unavailable ? lastReading ?? "Usage unknown" : valueText + " remaining",
@@ -67,6 +70,8 @@ public struct AccountPanel: Codable, Sendable {
     public let glance: AccountGlance
     /// The last direct check failed, but the account's windows are still fresh and shown.
     public var directCheckFailed = false
+    /// Seconds since the account's reading; nil when the sample time is unknown.
+    public var ageSeconds: Double? = nil
 }
 public struct ProviderPanel: Codable, Sendable {
     public let key: String
@@ -87,6 +92,8 @@ public struct PanelPresentation: Codable, Sendable {
     public let accountCount: Int
     public let pinnedCount: Int
     public let providers: [ProviderPanel]
+    /// Seconds since the newest account reading in the snapshot; nil when none has a sample time.
+    public var readingsAgeSeconds: Double? = nil
     public init(status: String = "Reading account limits…", accountCount: Int = 0,
                 pinnedCount: Int = 0, providers: [ProviderPanel] = []) {
         self.status = status; self.accountCount = accountCount
@@ -100,8 +107,17 @@ extension Presenter {
         guard let checked else { return busy ? "Refreshing…" : "Waiting for a reading" }
         return busy ? checked + " · refreshing" : checked
     }
+    /// The footer after a failed refresh. The numbers above stay: each window is judged by its own sample time.
+    /// "Couldn’t update · showing readings from 3m ago".
+    public static func failureFooter(readingsAgeSeconds: Double?, hasReadings: Bool, busy: Bool = false) -> String {
+        guard hasReadings else { return busy ? "Couldn’t load readings · refreshing" : "Couldn’t load readings" }
+        let age = readingsAgeSeconds.map { $0 < 60 ? "showing the latest readings" : "showing readings from " + duration($0) + " ago" }
+        return "Couldn’t update · " + (age ?? "showing saved readings") + (busy ? " · refreshing" : "")
+    }
+    /// A failed client refresh hides nothing: every window is judged by its own sample time, and the
+    /// snapshot only by when it was written. `failure` is kept for the footer.
     static func snapshotIsFresh(_ snapshot: UsageSnapshot, failure: String?, now: Date) -> Bool {
-        failure == nil && UsageTime.fresh(snapshot.generatedAt, now: now)
+        UsageTime.fresh(snapshot.generatedAt, now: now)
     }
     static func isGeneration(_ window: UsageWindow) -> Bool {
         let scope = window.scope?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -189,13 +205,15 @@ extension Presenter {
                     let state: ReadingState = measured ? .measured : good && estimate ? .estimated : .unavailable
                     let value = good ? (estimate ? "~" : "") + (percent(left) ?? "—") : "—"
                     let qualifiers = [window.model, isGeneration(window) ? nil : window.scope].compactMap { $0 }.filter { !$0.isEmpty }
-                    return QuotaRow(id: base + "|\(occurrence)", title: windowTitle(window),
+                    var row = QuotaRow(id: base + "|\(occurrence)", title: windowTitle(window),
                         qualifier: qualifiers.isEmpty ? nil : qualifiers.map(clean).joined(separator: " · "),
                         state: state, isEstimate: estimate, valueText: value,
                         remainingFraction: measured ? left.map { $0 / 100 } : nil,
                         resetText: reset(window, now: now), sampleText: age(window.sampledAt, now: now),
                         lastReading: !good ? percent(left).map { (estimate ? "Last estimate: " : "Last reading: ") + $0 + " remaining" } : nil,
                         lane: lane(window), resetIn: resetIn(window, now: now), generation: isGeneration(window))
+                    if !good && !estimate && percent(left) != nil, let left { row.lastFraction = left / 100 }
+                    return row
                 }
                 let generation = account.windows.indices.filter { isGeneration(account.windows[$0]) }
                 let aggregates = generation.filter { account.windows[$0].model == nil }
@@ -220,9 +238,12 @@ extension Presenter {
                 let notice: String?
                 let trusted = validAccount(account, snapshotFresh: fresh, now: now)
                 if account.enabled == false { notice = "Disabled" }
-                else if account.reloginRequired == true || account.refreshError.map(signInErrors.contains) == true {
-                    notice = account.refreshError == "identity_mismatch" ? "Account changed" : "Sign in needed"
+                else if account.reloginRequired == true ||
+                        account.refreshError.map { signInErrors.contains($0) && $0 != "identity_mismatch" } == true {
+                    notice = "Sign in needed"
                 }
+                // Switchback could not tell which account is signed in: the reading is hidden, but nothing says it changed.
+                else if account.identityState == "unknown" { notice = noReadingNotice }
                 else if hidesReading(account) { notice = "Account changed" }
                 // A failed direct check hides nothing while the windows are fresh; details still say it failed.
                 else if account.refreshError != nil && !trusted { notice = "Refresh unavailable" }
@@ -248,6 +269,7 @@ extension Presenter {
                     balances: balances, details: group.accounts.first { $0.key == key }?.lines ?? [],
                     glance: accountGlance)
                 panel.directCheckFailed = account.refreshError != nil && trusted
+                panel.ageSeconds = UsageTime.parse(account.observedAt).map { now.timeIntervalSince($0) }
                 return panel
             }
             let message = accounts.isEmpty ? group.unavailable ?? "No usage reported yet" : nil
@@ -256,9 +278,14 @@ extension Presenter {
                                  advice: group.provider == "claude" ? bestSeat(snapshot, now: now, failure: failure) : nil,
                                  costTotal: costTotal(snapshot.costSummary, provider: group.provider, title: providerTitle, now: now))
         }
-        return PanelPresentation(status: menu.status, accountCount: providers.reduce(0) { $0 + $1.accounts.count },
-                                 pinnedCount: providers.flatMap(\.accounts).filter(\.pinned).count, providers: providers)
+        var result = PanelPresentation(status: menu.status, accountCount: providers.reduce(0) { $0 + $1.accounts.count },
+                                       pinnedCount: providers.flatMap(\.accounts).filter(\.pinned).count, providers: providers)
+        result.readingsAgeSeconds = snapshot.accounts.compactMap { UsageTime.parse($0.observedAt) }.max()
+            .map { max(0, now.timeIntervalSince($0)) }
+        return result
     }
+    /// The notice of an account whose signed-in identity is unknown.
+    public static let noReadingNotice = "No reading"
 }
 
 extension PanelPresentation {
@@ -277,5 +304,11 @@ extension PanelPresentation {
             return ProviderPanel(key: provider.key, title: provider.title, emptyMessage: provider.emptyMessage, accounts: rows,
                                  advice: provider.advice, costTotal: provider.costTotal)
         }
+    }
+    /// The same presentation with only the given providers, keeping the readings' age.
+    public func with(providers: [ProviderPanel]) -> PanelPresentation {
+        var copy = PanelPresentation(status: status, accountCount: accountCount, pinnedCount: pinnedCount, providers: providers)
+        copy.readingsAgeSeconds = readingsAgeSeconds
+        return copy
     }
 }

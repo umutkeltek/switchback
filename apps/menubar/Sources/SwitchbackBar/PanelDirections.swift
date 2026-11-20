@@ -23,6 +23,7 @@ enum DirectionLayout {
             default: content += Double(count) * stripRow
             }
         }
+        if data.noReading != nil { content += (data.sections.isEmpty ? 0 : sectionGap) + GaugeLayout.noReadingLine }
         return header + content + footer
     }
 }

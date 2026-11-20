@@ -77,7 +77,8 @@ private func notices(_ data: UsageSnapshot, after previous: [String: Int], enabl
     let stale = notices(try reading(99, sample: -901), after: [fiveHourID: 0, weeklyID: 0])
     #expect(stale.notices.isEmpty)
     #expect(stale.levels == [fiveHourID: 0, weeklyID: 0])
+    // A failed client refresh does not make a fresh reading untrusted.
     let failed = Presenter.limitNotices(try reading(99), now: instant, pins: ["claude:seat4"], enabled: true,
                                         previous: [fiveHourID: 0], failure: "Could not read")
-    #expect(failed.notices.isEmpty)
+    #expect(!failed.notices.isEmpty)
 }

@@ -17,6 +17,8 @@ public enum GaugeLayout {
     /// Name, number and reset chip under each segment.
     public static let labels = 46.0
     public static let legend = 16.0
+    /// The quiet line naming plans with no reading.
+    public static let noReadingLine = 16.0
     /// Point sizes of the number under a segment: room, or a prepaid balance.
     public static let numberFont = 15.0, balanceFont = 13.0
     public static let emptyState = 120.0
@@ -65,7 +67,8 @@ public enum GaugeLayout {
             if index > 0 { content += sectionGap }
             content += sectionHeight(section)
         }
-        if data.sections.isEmpty { content += emptyState }
+        if data.noReading != nil { content += (data.sections.isEmpty ? 0 : sectionGap) + noReadingLine }
+        if data.sections.isEmpty && data.noReading == nil { content += emptyState }
         if let detail { content += rowGap + detailHeight(detail) }
         return header + (searching ? searchBar : 0) + content + footer
     }
@@ -131,18 +134,20 @@ extension Presenter {
         var issues: [String] = []
         if let notice = account.notice {
             switch notice {
-            case "Sign in needed": issues.append("Sign in needed: run the provider's sign-in, then refresh.")
-            case "Refresh unavailable": issues.append("The last refresh failed. Showing the last reading.")
-            case "Older reading": issues.append("This reading is too old to count. Refresh to check again.")
+            // One short line each: the details card is one line per issue, with the text in its tooltip.
+            case "Sign in needed": issues.append("Sign in needed. Sign in, then refresh.")
+            case "Refresh unavailable": issues.append("Last refresh failed · showing the last reading")
+            case "Older reading": issues.append("Too old to count. Refresh to check again.")
             case "Partial reading": issues.append("Some limits have no fresh reading.")
             case "Disabled": issues.append("This account is disabled.")
             case "Estimated": issues.append("These readings are estimates.")
-            case "Account changed": issues.append("Account changed: the signed-in account is not this seat's. Sign in again.")
+            case "Account changed": issues.append("Another account is signed in. Sign in again.")
+            case Presenter.noReadingNotice: issues.append("Couldn’t tell which account is signed in.")
             default: issues.append(notice + ".")
             }
         }
         if account.directCheckFailed {
-            issues.append("Last direct check failed. These numbers are from the last fresh reading.")
+            issues.append("Direct check failed · numbers are still fresh")
         }
         let identity = (["Account " + account.slot] + [account.email].compactMap { $0 }.filter { !$0.isEmpty })
             .joined(separator: " · ")
@@ -170,6 +175,20 @@ public enum StatusGauge {
     /// otherwise the item falls back to the icon.
     public static func fits(bars: Int, numberWidth: Double, budget: Double = budget) -> Bool {
         bars > 0 && width(bars: bars, numberWidth: numberWidth) <= budget
+    }
+    /// The number beside the bars: the best seat's room, or "—" when no seat is recommended.
+    /// The live item and `--render-status` use the same rule.
+    public static func number(_ data: DirectionPresentation) -> String {
+        data.best?.roomText ?? "—"
+    }
+    /// The menu bar item's VoiceOver label: what its bars and number say.
+    public static func spoken(_ data: DirectionPresentation) -> String {
+        if let best = data.best {
+            return "Switchback limits. Use now: " + best.name + ", " + best.roomText + " percent left" +
+                (best.partialNote.map { ", " + $0 } ?? "") + "."
+        }
+        if let noRoom = data.noRoom { return "Switchback limits. " + noRoom.spoken + "." }
+        return "Switchback limits. No fresh Claude reading."
     }
     /// The pinned Claude seats, in panel order.
     public static func bars(_ panel: PanelPresentation, data: DirectionPresentation) -> [SeatGlyph] {

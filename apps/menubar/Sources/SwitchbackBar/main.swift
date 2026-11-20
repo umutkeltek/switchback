@@ -6,7 +6,7 @@ import UsagePresentation
     private var item: NSStatusItem?
     private var snapshot: UsageSnapshot?
     private var timer: Timer?
-    private var task: Task<Void, Never>?
+    private let refreshSlot = RefreshSlot()
     private var popover: NSPopover?
     /// Stands in for the status item when macOS is not showing it, so the panel still opens under the menu bar.
     private var anchor: NSPanel?
@@ -18,7 +18,7 @@ import UsagePresentation
         self.outsideDismissals += 1
         self.closePanel()
     }
-    private var busy = false
+    private var busy: Bool { refreshSlot.busy }
     private var failure: String?
     private var lastChecked: Date?
     private let defaults = UserDefaults.standard
@@ -93,23 +93,19 @@ import UsagePresentation
         NotificationCenter.default.addObserver(self, selector: #selector(statusItemMoved(_:)),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         rebuild()
-        task = Task {
-            await refresh(.saved)
-            await refresh(.scheduled)
-        }
+        startRefresh([.saved, .scheduled])
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.rebuild()
-                guard !self.busy else { return }
-                self.task = Task { await self.refresh(.scheduled) }
+                self.startRefresh([.scheduled])
             }
         }
     }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         dismissal.stop()
         timer?.invalidate()
-        guard let task else { return .terminateNow }
+        guard let task = refreshSlot.task else { return .terminateNow }
         task.cancel()
         Task {
             await task.value
@@ -120,7 +116,7 @@ import UsagePresentation
     func applicationWillTerminate(_ notification: Notification) {
         dismissal.stop()
         timer?.invalidate()
-        task?.cancel()
+        refreshSlot.task?.cancel()
     }
     private func rebuild() {
         panel.busy = busy
@@ -132,6 +128,7 @@ import UsagePresentation
         var fullTitle = "Switchback account limits"
         var title = ""
         var gaugeImage: NSImage?
+        var spoken = "Switchback account limits"
         if let snapshot {
             let now = Date()
             let presentation = Presenter.make(snapshot, now: now, pins: pins, refreshing: busy, failure: failure)
@@ -145,8 +142,13 @@ import UsagePresentation
                 // text budget; a crowded item falls back to the icon.
                 let full = Presenter.directions(panel.presentation)
                 let bars = StatusGauge.bars(panel.presentation, data: full)
-                gaugeImage = StatusGaugeImage.make(bars: StatusGaugeImage.bars(bars), number: full.best?.roomText ?? (full.noRoom == nil ? "—" : "0"),
+                gaugeImage = StatusGaugeImage.make(bars: StatusGaugeImage.bars(bars), number: StatusGauge.number(full),
                                                    font: item?.button?.font ?? NSFont.menuBarFont(ofSize: 0))
+                if let gaugeImage {
+                    // VoiceOver reads what the bars and the number show.
+                    spoken = StatusGauge.spoken(full)
+                    gaugeImage.accessibilityDescription = spoken
+                }
             } else if !panel.iconOnly {
                 let fitted = Presenter.statusTitle(presentation, maxWidth: PanelMetrics.statusTextWidth) { text in
                     (text as NSString).size(withAttributes: [.font: self.item?.button?.font ?? NSFont.menuBarFont(ofSize: 0)]).width
@@ -164,6 +166,7 @@ import UsagePresentation
         item?.button?.imagePosition = iconOnly || gaugeImage != nil ? .imageOnly : .imageLeading
         item?.button?.title = gaugeImage == nil ? title : ""
         item?.button?.toolTip = fullTitle
+        item?.button?.setAccessibilityLabel(spoken)
         recordStatusItem()
     }
     private func recordStatusItem() {
@@ -239,8 +242,8 @@ import UsagePresentation
     }
     /// Opening the panel reads again when the last read is older than 20 seconds; due collectors refresh.
     private func refreshIfStale() {
-        guard !busy, lastChecked.map({ Date().timeIntervalSince($0) >= 20 }) ?? true else { return }
-        task = Task { await refresh(.scheduled) }
+        guard lastChecked.map({ Date().timeIntervalSince($0) >= 20 }) ?? true else { return }
+        startRefresh([.scheduled])
     }
     @objc private func togglePanel(_ sender: Any?) {
         guard let button = item?.button else { return }
@@ -310,25 +313,37 @@ import UsagePresentation
         defaults.set(updated.sorted(), forKey: "pinnedAccountKeys")
         rebuild()
     }
+    /// Starts one refresh unless one is already running. `task` is always the running refresh, so quitting
+    /// cancels and waits for it; a timer tick or panel opening during a refresh starts nothing.
+    private func startRefresh(_ requests: [RefreshRequest]) {
+        let started = refreshSlot.start({ [weak self] in
+            for request in requests {
+                guard !Task.isCancelled, let self else { break }
+                await self.refresh(request)
+            }
+        }, done: { [weak self] in self?.rebuild() })
+        if started { rebuild() }
+    }
     private func refresh(_ request: RefreshRequest) async {
-        guard !busy else { return }
-        busy = true; rebuild()
-        defer { busy = false; rebuild() }
         guard let executable = OwnerRunner.executable() else {
             failure = OwnerError.missingExecutable.message
             return
         }
         do {
-            let data = try await OwnerRunner.run(request, executable: executable)
-            snapshot = try UsageSnapshot.decode(data)
-            lastChecked = Date()
+            try await read(request, executable: executable)
             failure = nil
-            notifyLimits()
-        } catch let error as OwnerError {
-            failure = error.message
         } catch {
-            failure = "Switchback usage response is unreadable"
+            failure = (error as? OwnerError)?.message ?? "Switchback usage response is unreadable"
+            // A failed refresh keeps the panel on the latest saved readings: the cheap saved read.
+            guard let fallback = request.afterFailure, (error as? OwnerError) != .cancelled, !Task.isCancelled else { return }
+            try? await read(fallback, executable: executable)
         }
+    }
+    private func read(_ request: RefreshRequest, executable: URL) async throws {
+        let data = try await OwnerRunner.run(request, executable: executable)
+        snapshot = try UsageSnapshot.decode(data)
+        lastChecked = Date()
+        notifyLimits()
     }
     /// Remembers the last notified level per account window so each crossing notifies once.
     private func notifyLimits() {
@@ -340,8 +355,7 @@ import UsagePresentation
         LimitNotifier.post(result.notices)
     }
     @objc private func forceRefresh() {
-        guard !busy else { return }
-        task = Task { await refresh(.forced) }
+        startRefresh([.forced])
     }
     @objc private func quit() { NSApp.terminate(nil) }
 }
@@ -426,7 +440,7 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         let directions = Presenter.directions(panel)
         let claude = directions.sections.first { $0.id == "claude" }?.seats ?? []
         let gauge = StatusGaugeImage.make(bars: StatusGaugeImage.bars(StatusGauge.bars(panel, data: directions)),
-                                          number: directions.best?.roomText ?? "—",
+                                          number: StatusGauge.number(directions),
                                           font: .monospacedDigitSystemFont(ofSize: 12, weight: .medium))
         let view = StatusItemMock(style: style, data: directions, claude: claude, gaugeImage: gauge)
             .environment(\.colorScheme, theme == "dark" ? .dark : .light)

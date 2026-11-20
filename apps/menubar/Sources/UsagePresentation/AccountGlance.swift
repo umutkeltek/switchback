@@ -89,9 +89,10 @@ extension Presenter {
         var trusted: [Reading] = []
         for window in generation {
             guard !account.isEstimated, !window.isEstimated,
-                  valid(window, account: account, snapshotFresh: snapshotFresh, now: now),
-                  let left = window.remainingPercent ?? window.usedPercent.map({ 100 - $0 }) else { continue }
-            trusted.append(Reading(window: window, used: 100 - left, left: left, reset: UsageTime.parse(window.resetsAt)))
+                  let left = effectiveLeft(window, account: account, snapshotFresh: snapshotFresh, now: now) else { continue }
+            // A 5-hour window that has started again has no known reset time yet.
+            let reset = UsageTime.parse(window.resetsAt).flatMap { $0 > now ? $0 : nil }
+            trusted.append(Reading(window: window, used: 100 - left, left: left, reset: reset))
         }
         func title(_ window: UsageWindow) -> String { laneTitle(lane(window), fallback: windowTitle(window)) }
 

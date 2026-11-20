@@ -80,7 +80,12 @@ func textWidth(_ text: String, size: Double, weight: NSFont.Weight, rounded: Boo
     let data = try snapshot(plans.accounts, coverage: plans.coverage)
     let directions = Presenter.directions(Presenter.panel(data, now: instant))
     let other = try #require(directions.sections.first { $0.id == "other" })
-    #expect(other.seats.map(\.name) == ["Codex", "Z.ai", "MiniMax", "Go", "Zen", "DeepSeek", "Neural", "OpenR."])
+    #expect(other.seats.map(\.name) == ["Codex", "Z.ai", "MiniMax", "DeepSeek", "Neural"])
+    // Plans with nothing to show are one quiet line, with their full names and reasons in the tooltip.
+    let quiet = try #require(directions.noReading)
+    #expect(quiet.text == "No reading: Go, Zen, OpenRouter")
+    #expect(quiet.help.contains("OpenCode Go"))
+    #expect(quiet.help.contains("OpenRouter"))
     let neural = try #require(other.seats.first { $0.provider == "neuralwatt" })
     #expect(neural.title == "Neuralwatt")
     #expect(neural.detail.hasPrefix("Neuralwatt"))
@@ -88,7 +93,7 @@ func textWidth(_ text: String, size: Double, weight: NSFont.Weight, rounded: Boo
     #expect(neural.balanceEmpty)
     let deepseek = try #require(other.seats.first { $0.provider == "deepseek" })
     #expect(deepseek.chip == "$1,100")
-    #expect(GaugeLayout.rows(other.seats).map(\.count) == [4, 4])
+    #expect(GaugeLayout.rows(other.seats).map(\.count) == [5])
 }
 
 @Test func gaugeNeverTruncatesNumbersBalancesOrShortNames() throws {
@@ -151,7 +156,7 @@ func textWidth(_ text: String, size: Double, weight: NSFont.Weight, rounded: Boo
     #expect(partial.roomLane == .weekly)
     #expect(partial.tone == .low)
     #expect(partial.chip == "↻ 4d 19h")
-    #expect(partial.spoken.hasPrefix("Spare: 11 percent left, weekly only, 5-hour unknown; Fable limit used up"))
+    #expect(partial.spoken.hasPrefix("Spare: 11 percent left, weekly only, 5-hour unknown; no room for Fable"))
     #expect(partial.detail.contains("5-hour unknown · Weekly 11% left"))
     // Partial room is shown, never counted: the best seat still needs both windows.
     #expect(!partial.best)
@@ -169,7 +174,7 @@ func textWidth(_ text: String, size: Double, weight: NSFont.Weight, rounded: Boo
     #expect(seat.modelName == "Fable")
     #expect(seat.modelLeft == 0.27)
     #expect(seat.detail.contains("5-hour 84% left · Weekly 38% left · Fable limit 27% left"))
-    #expect(seat.spoken == "Seat 2: 38 percent left, weekly; Fable 73 percent used; resets in 4 days 19 hours")
+    #expect(seat.spoken == "Seat 2: 38 percent left, weekly; room for Fable 27 percent; resets in 4 days 19 hours")
     let best = try #require(directions.seats.first { $0.id == "claude:seat4" })
     #expect(best.spoken == "Seat 4: 60 percent left, weekly; resets in 4 days 19 hours; most room now")
 }
@@ -177,7 +182,7 @@ func textWidth(_ text: String, size: Double, weight: NSFont.Weight, rounded: Boo
 @Test func legendAppearsOnlyWhenAModelHasItsOwnLimit() throws {
     let withModel = try snapshot([gaugeSeat("seat1", fiveHour: 80, weekly: 70, fable: 40), gaugeSeat("seat2", fiveHour: 80, weekly: 70)])
     let section = try #require(Presenter.directions(Presenter.panel(withModel, now: instant)).sections.first)
-    #expect(section.legend == "Fable limit")
+    #expect(section.legend == "Room for Fable")
     #expect(section.hasModelBar)
     let without = try snapshot([gaugeSeat("seat1", fiveHour: 80, weekly: 70), gaugeSeat("seat2", fiveHour: 80, weekly: 70)])
     let plain = try #require(Presenter.directions(Presenter.panel(without, now: instant)).sections.first)

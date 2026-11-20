@@ -9,6 +9,13 @@ public enum RefreshRequest: Sendable {
         case .scheduled, .forced: 600
         }
     }
+    /// What to read after this request fails: the cheap saved read, so the panel holds the latest saved data.
+    public var afterFailure: RefreshRequest? {
+        switch self {
+        case .saved: nil
+        case .scheduled, .forced: .saved
+        }
+    }
     public var arguments: [String] {
         switch self {
         case .saved: ["limits", "--json"]
@@ -89,5 +96,24 @@ public enum OwnerRunner {
         process.waitUntilExit()
         guard process.terminationStatus == 0 else { throw OwnerError.failed }
         return output
+    }
+}
+
+/// The one running refresh. A timer tick or a panel opening while it runs starts nothing and never replaces
+/// the handle, so quitting cancels, and can wait for, the refresh that is really running.
+@MainActor public final class RefreshSlot {
+    public private(set) var task: Task<Void, Never>?
+    public init() {}
+    public var busy: Bool { task != nil }
+    /// Runs `work` unless a refresh is running; returns false when one is. `done` runs when the work ends.
+    @discardableResult
+    public func start(_ work: @escaping @MainActor () async -> Void, done: @escaping @MainActor () -> Void = {}) -> Bool {
+        guard task == nil else { return false }
+        task = Task { @MainActor [weak self] in
+            await work()
+            self?.task = nil
+            done()
+        }
+        return true
     }
 }

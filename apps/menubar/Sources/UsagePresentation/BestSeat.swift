@@ -36,6 +36,8 @@ public struct SeatAdvice: Codable, Sendable, Equatable {
     public let backKey: String?
     public let backSlot: String?
     public let backInSeconds: Double?
+    /// The recommended seat has no 5-hour reading (the vendor sent none): its room is its weekly room.
+    public var weeklyOnly = false
     public init(key: String?, slot: String?, roomPercent: Double?, text: String, detail: String, models: [ModelSeat] = [],
                 noSeatHasRoom: Bool = false, backKey: String? = nil, backSlot: String? = nil, backInSeconds: Double? = nil) {
         self.key = key; self.slot = slot; self.roomPercent = roomPercent
@@ -62,7 +64,7 @@ extension Presenter {
         let rows = snapshot.accounts.filter { canonical($0.provider) == "claude" }
         guard !rows.isEmpty else { return nil }
         let fresh = snapshotIsFresh(snapshot, failure: failure, now: now)
-        typealias Reading = (account: UsageAccount, room: Double, fiveHour: Double, weekly: Double, back: Date?)
+        typealias Reading = (account: UsageAccount, room: Double, fiveHour: Double?, weekly: Double, back: Date?)
         func best(_ readings: [Reading]) -> Reading? {
             readings.filter { $0.room > noRoomPercent }.reduce(nil) { current, reading in
                 guard let current else { return reading }
@@ -130,29 +132,37 @@ extension Presenter {
                                     roomPercent: pick.room, text: model + ": " + clean(pick.account.slot) + " · " + pickLeft + " left"))
         }
         let slot = clean(winner.account.slot)
-        return SeatAdvice(key: winner.account.key, slot: slot, roomPercent: winner.room,
-                          text: "Most room now: \(slot) · \(left) left",
-                          detail: "Lower of 5-hour (\(percent(winner.fiveHour) ?? "?") left) and weekly (\(percent(winner.weekly) ?? "?") left). " +
-                                  "Stale, sign-in-needed, disabled and used-up accounts are skipped.",
-                          models: models)
+        let basis = winner.fiveHour.map { "Lower of 5-hour (\(percent($0) ?? "?") left) and weekly (\(percent(winner.weekly) ?? "?") left). " }
+            ?? "Weekly only (\(percent(winner.weekly) ?? "?") left): no 5-hour reading. "
+        var advice = SeatAdvice(key: winner.account.key, slot: slot, roomPercent: winner.room,
+                                text: "Most room now: \(slot) · \(left) left" + (winner.fiveHour == nil ? " (weekly only)" : ""),
+                                detail: basis + "Stale, sign-in-needed, disabled and used-up accounts are skipped.",
+                                models: models)
+        advice.weeklyOnly = winner.fiveHour == nil
+        return advice
     }
 
-    /// Both 5-hour and weekly aggregate windows must be present and trusted.
-    static func room(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> (room: Double, fiveHour: Double, weekly: Double)? {
+    /// Both 5-hour and weekly aggregate windows must be trusted, with two exceptions every view shares:
+    /// a 5-hour window whose reset time has passed counts as 100 left, and a seat whose 5-hour window has
+    /// no reading at all (absent, or sent without numbers) has its weekly room, marked weekly only
+    /// (`fiveHour` nil). Any other untrusted window takes the seat out.
+    static func room(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> (room: Double, fiveHour: Double?, weekly: Double)? {
         guard !account.isEstimated else { return nil }
         let aggregate = account.windows.filter { isGeneration($0) && ($0.model ?? "").isEmpty }
-        func remaining(_ title: String) -> Double? {
-            let windows = aggregate.filter { windowTitle($0) == title }
+        func remaining(_ windows: [UsageWindow]) -> Double? {
             guard !windows.isEmpty else { return nil }
             var values: [Double] = []
             for window in windows {
-                guard !window.isEstimated, valid(window, account: account, snapshotFresh: snapshotFresh, now: now),
-                      let left = window.remainingPercent ?? window.usedPercent.map({ 100 - $0 }) else { return nil }
+                guard !window.isEstimated,
+                      let left = effectiveLeft(window, account: account, snapshotFresh: snapshotFresh, now: now) else { return nil }
                 values.append(left)
             }
             return values.min()
         }
-        guard let fiveHour = remaining("5-hour window"), let weekly = remaining("Weekly") else { return nil }
+        let fiveHours = aggregate.filter { windowTitle($0) == "5-hour window" }
+        guard let weekly = remaining(aggregate.filter { windowTitle($0) == "Weekly" }) else { return nil }
+        if fiveHours.allSatisfy(isNullFiveHour) { return (weekly, nil, weekly) }
+        guard let fiveHour = remaining(fiveHours) else { return nil }
         return (min(fiveHour, weekly), fiveHour, weekly)
     }
 

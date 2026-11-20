@@ -59,19 +59,19 @@ func seat(_ slot: String, fiveHour: Double, weekly: Double, sample: TimeInterval
     #expect(advice.text == "Most room now: seat2 · 30% left")
 }
 @Test func bestSeatSaysSoWhenNothingQualifies() throws {
-    var unknownFiveHour = account("max", windows: [window("five_hour", used: NSNull(), remaining: NSNull(), state: "unknown"),
-                                                   window("seven_day", used: 12, remaining: 88)])
-    unknownFiveHour["state"] = "fresh"
-    let weeklyOnly = account("seat3", windows: [window("seven_day", used: 10, remaining: 90)])
-    let data = try snapshot([unknownFiveHour, weeklyOnly, seat("seat1", fiveHour: 90, weekly: 90, sample: -901),
+    // A 5-hour window that is present with numbers but untrusted takes the seat out.
+    let staleFiveHour = account("max", windows: [window("five_hour", used: 10, remaining: 90, sample: -901),
+                                                 window("seven_day", used: 12, remaining: 88)])
+    let data = try snapshot([staleFiveHour, seat("seat1", fiveHour: 90, weekly: 90, sample: -901),
                              seat("seat2", fiveHour: 90, weekly: 90, login: true)])
     let advice = try #require(Presenter.bestSeat(data, now: instant))
     #expect(advice.key == nil)
     #expect(advice.roomPercent == nil)
     #expect(advice.text == "Most room now: no fresh Claude reading")
     #expect(Presenter.make(data, now: instant).groups.first { $0.provider == "claude" }?.headline == advice.text)
+    // A failed client refresh hides nothing: the readings are judged by their own sample times.
     let failed = Presenter.bestSeat(try snapshot([seat("seat2", fiveHour: 90, weekly: 90)]), now: instant, failure: "Could not read")
-    #expect(failed?.key == nil)
+    #expect(failed?.key == "claude:seat2")
     let noClaude = try snapshot([account("work", provider: "codex")])
     #expect(Presenter.bestSeat(noClaude, now: instant) == nil)
     #expect(Presenter.make(noClaude, now: instant).groups.allSatisfy { $0.headline == nil })

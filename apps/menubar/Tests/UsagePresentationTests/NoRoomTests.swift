@@ -46,7 +46,8 @@ import Testing
                                         backKey: "claude:seat1", backSlot: "seat1", backInSeconds: 86_400)])
     let pick = try #require(Presenter.directions(Presenter.panel(data, now: instant)).modelBest.first)
     #expect(pick.seat == nil)
-    #expect(pick.backText == "back 1d 0h")
+    // "No room · Seat 1 back in 1d 0h": the card names the seat that is back first.
+    #expect(pick.backText == "Seat 1 back in 1d 0h")
     // With Fable room on one seat, that seat is the Fable pick as before.
     let some = try snapshot([gaugeSeat("seat1", fiveHour: 80, weekly: 70, fable: 0),
                              gaugeSeat("seat2", fiveHour: 60, weekly: 60, fable: 40)])
@@ -62,14 +63,14 @@ import Testing
     let failed = try #require(panel.providers.first?.accounts.first { $0.key == "claude:seat1" })
     #expect(failed.directCheckFailed)
     #expect(failed.notice == nil)
-    #expect(Presenter.seatDetail(failed).issues == ["Last direct check failed. These numbers are from the last fresh reading."])
+    #expect(Presenter.seatDetail(failed).issues == ["Direct check failed · numbers are still fresh"])
     let glyph = try #require(Presenter.directions(panel).seats.first { $0.id == "claude:seat1" })
     #expect(glyph.roomText == "40")
     #expect(glyph.detail.contains("Last direct check failed"))
     let changed = try #require(panel.providers.first?.accounts.first { $0.key == "claude:seat2" })
     #expect(!changed.directCheckFailed)
     #expect(changed.notice == "Account changed")
-    #expect(Presenter.seatDetail(changed).issues.first?.hasPrefix("Account changed") == true)
+    #expect(Presenter.seatDetail(changed).issues.first == "Another account is signed in. Sign in again.")
 }
 
 @Test func footerKeepsTheAgeOfShownDataWhileRefreshing() {

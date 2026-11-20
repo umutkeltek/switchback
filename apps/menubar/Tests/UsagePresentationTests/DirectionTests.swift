@@ -19,16 +19,16 @@ import Testing
     // Used up: zero with its own tone and symbol, and no 5-hour reset promise.
     #expect(seats["claude:bravo"]?.tone == .out)
     #expect(seats["claude:bravo"]?.sessionResetSeconds == nil)
-    // Older than the trust window: no number, an age chip, never a coloured room.
+    // Older than the trust window: the last number, muted, with its age; never a coloured room.
     let stale = try #require(seats["claude:charlie"])
     #expect(stale.room == nil)
     #expect(stale.tone == .stale)
-    #expect(stale.roomText == "—")
-    #expect(stale.chip?.hasSuffix(" old") == true)
-    // Single accounts and providers without a reading share one group, named by provider.
+    #expect(stale.roomText == "90")
+    #expect(stale.chip == "20m ago")
+    // Single accounts share one group, named by provider; a provider without a reading is one quiet line.
     let other = try #require(directions.sections.first { $0.id == "other" })
-    #expect(other.seats.map(\.name) == ["Codex", "Go"])
-    #expect(other.seats.last?.tone == .unknown)
+    #expect(other.seats.map(\.name) == ["Codex"])
+    #expect(directions.noReading?.text == "No reading: Go")
     // Colour never carries state alone.
     #expect(Set([SeatTone.good, .low, .critical, .out, .stale, .unknown, .balance].map(\.symbol)).count == 7)
 }
