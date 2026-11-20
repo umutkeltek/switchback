@@ -930,15 +930,19 @@ fn parse_usage(value: Option<&Value>, energy_value: Option<&Value>) -> Usage {
             ..Usage::default()
         };
     };
+    // `input_tokens` counts the cached tokens too; the canonical
+    // `input_tokens` excludes them so they are not charged twice.
+    let cached = value
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
     Usage {
         input_tokens: value
             .get("input_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or_default(),
-        cached_input_tokens: value
-            .pointer("/input_tokens_details/cached_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .saturating_sub(cached),
+        cached_input_tokens: cached,
         output_tokens: value
             .get("output_tokens")
             .and_then(Value::as_u64)
@@ -954,9 +958,9 @@ fn parse_usage(value: Option<&Value>, energy_value: Option<&Value>) -> Usage {
 
 fn usage_json(usage: &Usage) -> Value {
     let mut value = json!({
-        "input_tokens": usage.input_tokens,
+        "input_tokens": usage.prompt_tokens(),
         "output_tokens": usage.output_tokens,
-        "total_tokens": usage.total(),
+        "total_tokens": usage.prompt_tokens().saturating_add(usage.output_tokens),
     });
     if let Some(energy) = &usage.energy {
         value["energy"] = energy_usage_json(energy);
@@ -1450,7 +1454,9 @@ mod tests {
         assert_eq!(parsed.id, "resp_fake");
         assert_eq!(parsed.model, "gpt-5.5");
         assert_eq!(parsed.message.text(), "pong");
-        assert_eq!(parsed.usage.input_tokens, 10);
+        // `input_tokens` counts the cached tokens; the canonical one
+        // excludes them so the cost code charges them once.
+        assert_eq!(parsed.usage.input_tokens, 8);
         assert_eq!(parsed.usage.cached_input_tokens, 2);
         assert_eq!(parsed.usage.output_tokens, 3);
         assert_eq!(parsed.usage.reasoning_tokens, 1);
@@ -1459,6 +1465,9 @@ mod tests {
         assert_eq!(energy.attribution_method.as_deref(), Some("time_weighted"));
 
         let emitted = response_to_openai_responses(&parsed);
+        // The client sees the upstream's own count again.
+        assert_eq!(emitted["usage"]["input_tokens"], 10);
+        assert_eq!(emitted["usage"]["total_tokens"], 13);
         assert_eq!(emitted["energy"]["energy_kwh"], 0.00000145);
         assert_eq!(emitted["usage"]["energy"]["energy_joules"], 5.23);
     }

@@ -84,15 +84,27 @@ fn openai_cached_tokens(usage: Option<&serde_json::Map<String, Value>>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Uncached and cached prompt tokens from an OpenAI `usage` object.
+/// OpenAI counts cached tokens inside `prompt_tokens`; the canonical
+/// `input_tokens` excludes them, so they are not charged twice.
+fn openai_prompt_split(usage: Option<&serde_json::Map<String, Value>>) -> (u64, u64) {
+    let prompt = usage
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = openai_cached_tokens(usage);
+    (prompt.saturating_sub(cached), cached)
+}
+
 fn energy_usage_json(energy: &EnergyUsage) -> Value {
     serde_json::to_value(energy).unwrap_or(Value::Null)
 }
 
 fn openai_usage_json(usage: &Usage) -> Value {
     let mut value = json!({
-        "prompt_tokens": usage.input_tokens,
+        "prompt_tokens": usage.prompt_tokens(),
         "completion_tokens": usage.output_tokens,
-        "total_tokens": usage.total(),
+        "total_tokens": usage.prompt_tokens().saturating_add(usage.output_tokens),
     });
     if let Some(energy) = &usage.energy {
         value["energy"] = energy_usage_json(energy);
@@ -947,11 +959,9 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
     }
 
     let usage = body.get("usage").and_then(Value::as_object);
+    let (input_tokens, cached_input_tokens) = openai_prompt_split(usage);
     let usage = Usage {
-        input_tokens: usage
-            .and_then(|usage| usage.get("prompt_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
         output_tokens: usage
             .and_then(|usage| usage.get("completion_tokens"))
             .and_then(Value::as_u64)
@@ -959,7 +969,7 @@ pub fn parse_openai_chat_response(body: &Value) -> Result<AiResponse, String> {
         energy: parse_energy_usage(body.get("energy"))
             .or_else(|| parse_energy_usage(usage.and_then(|usage| usage.get("energy")))),
         engine_timings: parse_engine_timings(body),
-        cached_input_tokens: openai_cached_tokens(usage),
+        cached_input_tokens,
         ..Usage::default()
     };
 
@@ -1023,18 +1033,16 @@ impl OpenAiStreamDecoder {
         let energy = parse_energy_usage(chunk_json.get("energy"))
             .or_else(|| parse_energy_usage(usage.and_then(|usage| usage.get("energy"))));
         if usage.is_some() || energy.is_some() {
+            let (input_tokens, cached_input_tokens) = openai_prompt_split(usage);
             events.push(AiStreamEvent::UsageDelta {
                 usage: Usage {
-                    input_tokens: usage
-                        .and_then(|usage| usage.get("prompt_tokens"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
+                    input_tokens,
                     output_tokens: usage
                         .and_then(|usage| usage.get("completion_tokens"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0),
                     energy,
-                    cached_input_tokens: openai_cached_tokens(usage),
+                    cached_input_tokens,
                     ..Usage::default()
                 },
             });

@@ -729,12 +729,26 @@ impl Usage {
         self.input_tokens + self.output_tokens
     }
 
+    /// Every prompt token, cached or not. `input_tokens` excludes the
+    /// cached ones (the Anthropic convention the cost code assumes), so a
+    /// wire format whose prompt count includes them (OpenAI, Responses,
+    /// Gemini) renders this sum.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.cached_input_tokens)
+    }
+
     /// Fill `cached_input_tokens` from the engine's own count of prompt
     /// tokens reused from its prefix cache (llama.cpp `cache_n` /
-    /// `tokens_cached`) when the usage report did not say.
+    /// `tokens_cached`) when the usage report did not say. The tokens it
+    /// adds move out of `input_tokens`, so the prompt total stays the same
+    /// and no token is charged twice.
     pub fn fill_cached_from_timings(&mut self) {
         if let Some(cached) = self.engine_timings.as_ref().and_then(|t| t.cache_tokens) {
-            self.cached_input_tokens = self.cached_input_tokens.max(cached);
+            let added = cached
+                .saturating_sub(self.cached_input_tokens)
+                .min(self.input_tokens);
+            self.cached_input_tokens += added;
+            self.input_tokens -= added;
         }
     }
 }
@@ -820,6 +834,36 @@ pub enum AiStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // llama.cpp's `prompt_tokens` includes the cache it reused; the
+    // tokens taken from `cache_n` move out of `input_tokens` so the prompt
+    // total stays the same and none is charged twice.
+    #[test]
+    fn cached_tokens_from_timings_move_out_of_input() {
+        let timings = |cache| EngineTimings {
+            cache_tokens: Some(cache),
+            ..EngineTimings::default()
+        };
+        let mut usage = Usage {
+            input_tokens: 1000,
+            engine_timings: Some(timings(800)),
+            ..Usage::default()
+        };
+        usage.fill_cached_from_timings();
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (200, 800));
+        assert_eq!(usage.prompt_tokens(), 1000);
+        // Already split by the usage report: nothing moves.
+        usage.fill_cached_from_timings();
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (200, 800));
+        // A cache count larger than the prompt never underflows.
+        let mut usage = Usage {
+            input_tokens: 10,
+            engine_timings: Some(timings(64)),
+            ..Usage::default()
+        };
+        usage.fill_cached_from_timings();
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (0, 10));
+    }
 
     #[test]
     fn message_text_concats_text_parts_only() {

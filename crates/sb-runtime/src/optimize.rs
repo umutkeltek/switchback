@@ -296,7 +296,7 @@ impl OptimizeState {
             .or_default();
         counters.requests += 1;
         counters.last_used_ms = now;
-        counters.prompt_tokens += served.usage.input_tokens.max(cached);
+        counters.prompt_tokens += served.usage.input_tokens.saturating_add(cached);
         counters.cached_tokens += cached;
         if cached > 0 {
             counters.cache_hit_requests += 1;

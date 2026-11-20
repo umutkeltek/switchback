@@ -340,19 +340,23 @@ pub fn request_to_gemini_wire_with_warnings(
 
 fn usage_from_gemini(meta: Option<&Value>) -> Usage {
     let meta = meta.and_then(Value::as_object);
+    // `promptTokenCount` includes the cached content; the canonical
+    // `input_tokens` excludes it so it is not charged twice.
+    let cached = meta
+        .and_then(|m| m.get("cachedContentTokenCount"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Usage {
         input_tokens: meta
             .and_then(|m| m.get("promptTokenCount"))
             .and_then(Value::as_u64)
-            .unwrap_or(0),
+            .unwrap_or(0)
+            .saturating_sub(cached),
         output_tokens: meta
             .and_then(|m| m.get("candidatesTokenCount"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        cached_input_tokens: meta
-            .and_then(|m| m.get("cachedContentTokenCount"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        cached_input_tokens: cached,
         ..Usage::default()
     }
 }
@@ -451,7 +455,7 @@ pub fn response_to_gemini(resp: &AiResponse) -> Value {
             "finishReason": finish_reason_to_gemini(resp.finish_reason),
         }],
         "usageMetadata": {
-            "promptTokenCount": resp.usage.input_tokens,
+            "promptTokenCount": resp.usage.prompt_tokens(),
             "candidatesTokenCount": resp.usage.output_tokens,
         }
     })
@@ -575,6 +579,29 @@ impl GeminiStreamDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `promptTokenCount` includes the cached content: the canonical
+    // `input_tokens` excludes it so it is charged once, and a Gemini client
+    // still sees the upstream's own count.
+    #[test]
+    fn cached_content_is_not_counted_twice() {
+        let body = json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]},
+                            "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 1000, "cachedContentTokenCount": 800,
+                              "candidatesTokenCount": 40}
+        });
+        let response = parse_gemini_response(&body).unwrap();
+        assert_eq!(
+            (
+                response.usage.input_tokens,
+                response.usage.cached_input_tokens
+            ),
+            (200, 800)
+        );
+        let emitted = response_to_gemini(&response);
+        assert_eq!(emitted["usageMetadata"]["promptTokenCount"], 1000);
+    }
 
     #[test]
     fn request_maps_system_model_role_and_tool_result_by_name() {
