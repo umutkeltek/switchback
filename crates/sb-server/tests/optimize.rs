@@ -714,6 +714,59 @@ async fn reasoning_guard_turns_thinking_off_for_small_budgets() {
         .contains("reasoning_guard"));
 }
 
+// Anthropic `thinking: {type: "enabled"}` and Responses `reasoning:
+// {effort}` are the request's own ask for thinking: the guard keeps it and
+// never forwards a field that turns thinking off.
+#[tokio::test]
+async fn the_reasoning_guard_keeps_thinking_asked_in_messages_and_responses_form() {
+    let fx = fixture("    stickiness: false").await;
+    put_settings(
+        &fx.gw,
+        "small-host/m",
+        json!({"reasoning": true, "reasoning_guard": {"min_tokens": 1024}}),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for (path, body) in [
+        (
+            "/v1/messages",
+            json!({"model": "small-host/m", "max_tokens": 100,
+                   "thinking": {"type": "enabled", "budget_tokens": 64},
+                   "messages": [{"role": "user", "content": "what is 2+2"}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": "small-host/m", "max_output_tokens": 100,
+                   "reasoning": {"effort": "high"}, "input": "what is 2+2"}),
+        ),
+    ] {
+        let r = client
+            .post(format!("{}{path}", fx.gw))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "{path}");
+        let settings = r
+            .headers()
+            .get("x-switchback-settings")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            settings.contains("reasoning_guard=kept"),
+            "{path}: {settings}"
+        );
+        let sent = fx.small.last_chat();
+        assert_ne!(
+            sent["chat_template_kwargs"]["enable_thinking"],
+            json!(false),
+            "{path}: {sent}"
+        );
+        assert_ne!(sent["reasoning_effort"], json!("none"), "{path}: {sent}");
+    }
+}
+
 #[tokio::test]
 async fn streamed_empty_answer_after_thinking_is_counted() {
     let fx = fixture("    stickiness: false").await;

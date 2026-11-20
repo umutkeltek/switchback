@@ -411,8 +411,10 @@ pub fn conversation_key(req: &AiRequest, session: Option<&str>) -> Option<String
 
 /// Whether the request itself asked for thinking (not a profile or the
 /// target's defaults): `reasoning_effort` other than `none`,
-/// `chat_template_kwargs.enable_thinking: true`, or a `reasoning` key in its
-/// own `switchback.settings`.
+/// `chat_template_kwargs.enable_thinking: true`, Anthropic `thinking:
+/// {type: "enabled"}` (or `adaptive`), a `reasoning` object with an
+/// `effort` other than `none` (the Responses form) or `enabled: true`, or a
+/// `reasoning` key in its own `switchback.settings`.
 pub fn request_asks_reasoning(
     req: &AiRequest,
     own_settings: Option<&serde_json::Map<String, Json>>,
@@ -422,6 +424,23 @@ pub fn request_asks_reasoning(
         .get("reasoning_effort")
         .and_then(Json::as_str)
         .is_some_and(|effort| effort != "none");
+    // Anthropic ingress keeps `thinking` for an Anthropic upstream
+    // (`protocol_passthrough.anthropic`); other ingresses leave it plain.
+    let anthropic_on = req
+        .protocol_passthrough
+        .get("anthropic")
+        .and_then(|anthropic| anthropic.get("thinking"))
+        .or_else(|| req.passthrough.get("thinking"))
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Json::as_str)
+        .is_some_and(|kind| matches!(kind, "enabled" | "adaptive"));
+    let reasoning_on = req.passthrough.get("reasoning").is_some_and(|reasoning| {
+        reasoning
+            .get("effort")
+            .and_then(Json::as_str)
+            .is_some_and(|effort| effort != "none")
+            || reasoning.get("enabled").and_then(Json::as_bool) == Some(true)
+    });
     let kwargs_on = req
         .passthrough
         .get("chat_template_kwargs")
@@ -434,7 +453,7 @@ pub fn request_asks_reasoning(
             reasoning.get("enabled").and_then(Json::as_bool) != Some(false)
                 && reasoning.get("effort").and_then(Json::as_str) != Some("none")
         });
-    effort_on || kwargs_on || own
+    effort_on || kwargs_on || anthropic_on || reasoning_on || own
 }
 
 /// Turn thinking off on a prepared request (the reasoning guard): the
@@ -566,6 +585,54 @@ mod tests {
             .unwrap()
             .starts_with("session:"));
         assert!(conversation_key(&AiRequest::new("m", vec![]), None).is_none());
+    }
+
+    #[test]
+    fn thinking_asked_in_any_wire_form_counts() {
+        let with = |key: &str, value: Json| {
+            let mut req = AiRequest::new("m", vec![Message::user("hi")]);
+            req.passthrough.insert(key.into(), value);
+            req
+        };
+        assert!(!request_asks_reasoning(
+            &AiRequest::new("m", vec![Message::user("hi")]),
+            None
+        ));
+        // Anthropic, as its ingress keeps it, and plain.
+        let mut anthropic = AiRequest::new("m", vec![Message::user("hi")]);
+        anthropic.protocol_passthrough.insert(
+            "anthropic".into(),
+            serde_json::Map::from_iter([(
+                "thinking".to_string(),
+                json!({"type": "enabled", "budget_tokens": 64}),
+            )]),
+        );
+        assert!(request_asks_reasoning(&anthropic, None));
+        assert!(request_asks_reasoning(
+            &with("thinking", json!({"type": "enabled"})),
+            None
+        ));
+        assert!(request_asks_reasoning(
+            &with("thinking", json!({"type": "adaptive"})),
+            None
+        ));
+        assert!(!request_asks_reasoning(
+            &with("thinking", json!({"type": "disabled"})),
+            None
+        ));
+        // Responses.
+        assert!(request_asks_reasoning(
+            &with("reasoning", json!({"effort": "high"})),
+            None
+        ));
+        assert!(!request_asks_reasoning(
+            &with("reasoning", json!({"effort": "none"})),
+            None
+        ));
+        assert!(request_asks_reasoning(
+            &with("reasoning", json!({"enabled": true})),
+            None
+        ));
     }
 
     #[test]
