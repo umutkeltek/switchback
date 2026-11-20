@@ -145,7 +145,7 @@ import UsagePresentation
                 // text budget; a crowded item falls back to the icon.
                 let full = Presenter.directions(panel.presentation)
                 let bars = StatusGauge.bars(panel.presentation, data: full)
-                gaugeImage = StatusGaugeImage.make(bars: StatusGaugeImage.bars(bars), number: full.best?.roomText ?? "—",
+                gaugeImage = StatusGaugeImage.make(bars: StatusGaugeImage.bars(bars), number: full.best?.roomText ?? (full.noRoom == nil ? "—" : "0"),
                                                    font: item?.button?.font ?? NSFont.menuBarFont(ofSize: 0))
             } else if !panel.iconOnly {
                 let fitted = Presenter.statusTitle(presentation, maxWidth: PanelMetrics.statusTextWidth) { text in

@@ -10,7 +10,7 @@ enum DirectionLayout {
     static let ringTile = 118.0, ringGap = 8.0, stripHeat = 64.0, stripRow = 30.0
 
     static func height(_ data: DirectionPresentation, style: PanelStyle) -> Double {
-        var content = padding * 2 + (data.best == nil ? 0 : hero + sectionGap)
+        var content = padding * 2 + (data.best == nil && data.noRoom == nil ? 0 : hero + sectionGap)
         if style == .strip && data.sections.contains(where: { $0.id == "claude" }) { content += stripHeat + sectionGap }
         for (index, section) in data.sections.enumerated() {
             if index > 0 { content += sectionGap }

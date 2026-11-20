@@ -65,6 +65,8 @@ public struct AccountPanel: Codable, Sendable {
     public let balances: [BalanceRow]
     public let details: [String]
     public let glance: AccountGlance
+    /// The last direct check failed, but the account's windows are still fresh and shown.
+    public var directCheckFailed = false
 }
 public struct ProviderPanel: Codable, Sendable {
     public let key: String
@@ -92,6 +94,12 @@ public struct PanelPresentation: Codable, Sendable {
     }
 }
 extension Presenter {
+    /// The footer line. While a refresh runs it keeps saying how old the shown data is:
+    /// "Checked 5m ago · refreshing". `checked` is nil before the first reading.
+    public static func footerStatus(checked: String?, busy: Bool) -> String {
+        guard let checked else { return busy ? "Refreshing…" : "Waiting for a reading" }
+        return busy ? checked + " · refreshing" : checked
+    }
     static func snapshotIsFresh(_ snapshot: UsageSnapshot, failure: String?, now: Date) -> Bool {
         failure == nil && UsageTime.fresh(snapshot.generatedAt, now: now)
     }
@@ -210,10 +218,15 @@ extension Presenter {
                                       amount: value, currency: currency.isEmpty ? nil : currency)
                 }
                 let notice: String?
+                let trusted = validAccount(account, snapshotFresh: fresh, now: now)
                 if account.enabled == false { notice = "Disabled" }
-                else if account.reloginRequired == true { notice = "Sign in needed" }
-                else if account.refreshError != nil { notice = "Refresh unavailable" }
-                else if !validAccount(account, snapshotFresh: fresh, now: now) { notice = "Older reading" }
+                else if account.reloginRequired == true || account.refreshError.map(signInErrors.contains) == true {
+                    notice = account.refreshError == "identity_mismatch" ? "Account changed" : "Sign in needed"
+                }
+                else if hidesReading(account) { notice = "Account changed" }
+                // A failed direct check hides nothing while the windows are fresh; details still say it failed.
+                else if account.refreshError != nil && !trusted { notice = "Refresh unavailable" }
+                else if !trusted { notice = "Older reading" }
                 else if account.isEstimated { notice = "Estimated" }
                 else if summary == "0%" || modelLimitUsedUp(account, snapshotFresh: fresh, now: now) {
                     notice = limitNotice(account, snapshotFresh: fresh, now: now)
@@ -225,7 +238,7 @@ extension Presenter {
                 let accountGlance: AccountGlance = glance(account, primary: primaryWindows, snapshotFresh: fresh, now: now)
                 let fullLabel = labelCounts[label, default: 0] > 1 ? label + " · " + clean(account.slot) : label
                 let shortLabel = short(account)
-                return AccountPanel(key: key, label: fullLabel,
+                var panel = AccountPanel(key: key, label: fullLabel,
                     shortName: shortCounts[shortLabel, default: 0] > 1 ? clean(account.slot) : shortLabel,
                     email: account.email.map(clean), slot: clean(account.slot), pinned: selected.contains(key),
                     summary: summary, notice: notice, sampleText: age(account.observedAt, now: now),
@@ -234,6 +247,8 @@ extension Presenter {
                     extras: quotas.enumerated().filter { !primarySet.contains($0.offset) }.map(\.element),
                     balances: balances, details: group.accounts.first { $0.key == key }?.lines ?? [],
                     glance: accountGlance)
+                panel.directCheckFailed = account.refreshError != nil && trusted
+                return panel
             }
             let message = accounts.isEmpty ? group.unavailable ?? "No usage reported yet" : nil
             return ProviderPanel(key: group.provider, title: group.provider == "zai" ? "Z.ai" : group.title,

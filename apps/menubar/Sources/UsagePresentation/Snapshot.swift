@@ -53,6 +53,8 @@ public struct UsageAccount: Decodable, Sendable {
     public let estimated: Bool?
     public let refreshError: String?
     public let reloginRequired: Bool?
+    /// Claude only: "matched" or "unbound" when the signed-in account is the seat's own; nil when not sent.
+    public let identityState: String?
     public let windows: [UsageWindow]
     public let balances: [UsageBalance]
     public let notes: [String]
@@ -74,6 +76,7 @@ public struct UsageAccount: Decodable, Sendable {
         estimated = try c.decodeIfPresent(Bool.self, forKey: .estimated)
         refreshError = try c.decodeIfPresent(String.self, forKey: .refreshError)
         reloginRequired = try c.decodeIfPresent(Bool.self, forKey: .reloginRequired)
+        identityState = try? c.decodeIfPresent(String.self, forKey: .identityState)
         windows = try c.decodeIfPresent([UsageWindow].self, forKey: .windows) ?? []
         balances = try c.decodeIfPresent([UsageBalance].self, forKey: .balances) ?? []
         notes = try c.decodeIfPresent([String].self, forKey: .notes) ?? []
@@ -84,6 +87,7 @@ public struct UsageAccount: Decodable, Sendable {
         case accountLabel = "account_label"
         case usageKind = "usage_kind"
         case observedAt = "observed_at", refreshError = "refresh_error", reloginRequired = "relogin_required"
+        case identityState = "identity_state"
     }
 }
 public struct UsageWindow: Decodable, Sendable {

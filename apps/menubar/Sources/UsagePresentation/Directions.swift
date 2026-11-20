@@ -100,11 +100,27 @@ public struct DirectionPresentation: Codable, Sendable {
     /// For example ("Fable", seat glyph) when a model's best seat differs.
     public let modelBest: [ModelPick]
     public let sections: [DirectionSection]
+    /// Set when every Claude seat with a fresh reading is at its limit: the card says so instead of naming a seat.
+    public var noRoom: NoRoom? = nil
     public struct ModelPick: Codable, Sendable, Identifiable {
         public let model: String
         public let seat: SeatGlyph?
         public let roomText: String
+        /// No seat has room for this model: "back 2d 1h", or "no room" when no reset time is known.
+        public var backText: String? = nil
         public var id: String { model }
+    }
+    /// "No seat has room", with the seat that is back first, for example "Seat 3 back in 8h 29m".
+    public struct NoRoom: Codable, Sendable {
+        public let title: String
+        public let detail: String
+        /// The seat back first; nil when no seat has a known reset time.
+        public let seat: SeatGlyph?
+        /// For example "8h 29m".
+        public let backIn: String?
+        /// The full sentence for the tooltip.
+        public let help: String
+        public let spoken: String
     }
     /// Every seat, in drawing order: keyboard navigation follows it.
     public var seats: [SeatGlyph] { sections.flatMap(\.seats) }
@@ -183,6 +199,7 @@ extension Presenter {
         var sections: [DirectionSection] = []
         var others: [SeatGlyph] = []
         var bestSeat: SeatGlyph?
+        var noRoom: DirectionPresentation.NoRoom?
         var picks: [DirectionPresentation.ModelPick] = []
         for provider in panel.providers {
             let bestKey = provider.advice?.key
@@ -195,9 +212,22 @@ extension Presenter {
                           name: single ? shortTitle : nil, title: single ? title : nil)
             }
             if let key = bestKey { bestSeat = bestSeat ?? seats.first { $0.id == key } }
+            if let advice = provider.advice, advice.noSeatHasRoom, noRoom == nil {
+                let back = seats.first { $0.id == advice.backKey }
+                let backIn = advice.backInSeconds.map(duration)
+                let name = back?.name ?? advice.backSlot
+                let detail = name.flatMap { name in backIn.map { name + " back in " + $0 } } ?? "Return time unknown"
+                noRoom = .init(title: "No seat has room", detail: detail, seat: back, backIn: backIn, help: advice.detail,
+                               spoken: "No seat has room. " + (name.flatMap { name in
+                                   advice.backInSeconds.map { name + " is back in " + spokenDuration($0) } } ?? "Return time unknown"))
+            }
             for model in provider.advice?.models ?? [] {
-                picks.append(.init(model: model.model, seat: seats.first { $0.id == model.key },
-                                   roomText: model.roomPercent.map { String(format: "%.0f", $0) } ?? "—"))
+                var pick = DirectionPresentation.ModelPick(model: model.model, seat: seats.first { $0.id == model.key },
+                                                           roomText: model.roomPercent.map { String(format: "%.0f", $0) } ?? "—")
+                if model.noSeatHasRoom {
+                    pick.backText = model.backInSeconds.map { "back " + duration($0) } ?? "no room"
+                }
+                picks.append(pick)
             }
             // Providers with several accounts keep their own group; single accounts and providers
             // without a reading share one "Other plans" group, named by provider.
@@ -218,7 +248,7 @@ extension Presenter {
             let title = sections.isEmpty && others.count == 1 ? others[0].title : "Other plans"
             sections.append(DirectionSection(id: "other", title: title, seats: others))
         }
-        return DirectionPresentation(best: bestSeat, modelBest: picks, sections: sections)
+        return DirectionPresentation(best: bestSeat, modelBest: picks, sections: sections, noRoom: noRoom)
     }
 
     static func seatGlyph(_ account: AccountPanel, provider: String, best: Bool,
@@ -271,8 +301,9 @@ extension Presenter {
                 age = account.ageText.map { $0 + " old" }
             case .unavailable:
                 tone = account.notice == "Older reading" ? .stale : .unknown
-                // Short enough for a segment: "25m old", or "old reading" when the sample time is unknown.
-                chip = account.ageText.map { $0 + " old" } ?? (tone == .stale ? "old reading" : nil)
+                // An old reading shows its age ("25m old", or "old reading" when the sample time is unknown).
+                // A seat with no usable reading says so; the age of its last reading stays in the tooltip.
+                chip = tone == .stale ? account.ageText.map { $0 + " old" } ?? "old reading" : "no reading"
             case .empty:
                 tone = .unknown
                 chip = "no reading"
@@ -315,6 +346,8 @@ extension Presenter {
         }
         if let age { said.append("reading " + age) }
         if tone == .stale, let chip { said.append(chip) }
+        let lastReading = tone == .unknown && balance == nil ? account.ageText.map { "last reading " + $0 + " old" } : nil
+        if let lastReading { said.append(lastReading) }
         if let notice = account.notice, notice != "Older reading", notice != "Partial reading", !notice.hasSuffix("at limit") {
             said.append(notice.lowercased())
         }
@@ -333,7 +366,9 @@ extension Presenter {
         if !windows.isEmpty { lines.append(windows.joined(separator: " · ")) }
         if partial { lines.append("Partial: showing only the windows with a fresh reading") }
         if let age { lines.append("Reading " + age) }
+        if let lastReading { lines.append(String(lastReading.prefix(1)).uppercased() + lastReading.dropFirst()) }
         if let notice = account.notice { lines.append(notice) }
+        if account.directCheckFailed { lines.append("Last direct check failed") }
         return SeatGlyph(id: account.key, provider: provider, name: name, title: title ?? account.label, room: room,
                          session: session, weekly: weekly, roomLane: roomLane, partial: partial,
                          modelName: modelName, modelLeft: modelLeft, tone: tone, chip: chip, age: age,

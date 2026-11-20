@@ -44,7 +44,7 @@ func seat(_ slot: String, fiveHour: Double, weekly: Double, sample: TimeInterval
     staleWindow["windows"] = [window("five_hour", used: 1, remaining: 99, state: "stale"),
                               window("seven_day", used: 1, remaining: 99)]
     let data = try snapshot([seat("max", fiveHour: 99, weekly: 99, sample: -901), staleState, staleWindow,
-                             seat("seat2", fiveHour: 40, weekly: 60), seat("seat4", fiveHour: 99, weekly: 99, error: "timeout")])
+                             seat("seat2", fiveHour: 40, weekly: 60), seat("seat4", fiveHour: 99, weekly: 99, error: "authentication_required")])
     #expect(Presenter.bestSeat(data, now: instant)?.key == "claude:seat2")
     var disabled = seat("seat4", fiveHour: 99, weekly: 99)
     disabled["enabled"] = false

@@ -60,7 +60,7 @@ public enum GaugeLayout {
     /// The caller caps it (600 points) and scrolls the rest.
     public static func height(_ data: DirectionPresentation, searching: Bool, detail: SeatDetail?, showBest: Bool) -> Double {
         var content = padding * 2
-        if showBest && data.best != nil { content += hero + sectionGap }
+        if showBest && (data.best != nil || data.noRoom != nil) { content += hero + sectionGap }
         for (index, section) in data.sections.enumerated() {
             if index > 0 { content += sectionGap }
             content += sectionHeight(section)
@@ -137,8 +137,12 @@ extension Presenter {
             case "Partial reading": issues.append("Some limits have no fresh reading.")
             case "Disabled": issues.append("This account is disabled.")
             case "Estimated": issues.append("These readings are estimates.")
+            case "Account changed": issues.append("Account changed: the signed-in account is not this seat's. Sign in again.")
             default: issues.append(notice + ".")
             }
+        }
+        if account.directCheckFailed {
+            issues.append("Last direct check failed. These numbers are from the last fresh reading.")
         }
         let identity = (["Account " + account.slot] + [account.email].compactMap { $0 }.filter { !$0.isEmpty })
             .joined(separator: " · ")

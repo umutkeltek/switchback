@@ -55,7 +55,7 @@ func validatesAllSampleClocks(offset: Double) throws {
     let cases = [
         account("passed", windows: [window(reset: -1)]),
         account("reset-state", windows: [window(state: "reset_passed")]),
-        account("error", error: "timeout"), account("login", login: true),
+        account("error", error: "authentication_required"), account("login", login: true),
         account("negative", windows: [window(used: -1, remaining: 101)]),
         account("inconsistent", windows: [window(used: 20, remaining: 90)]),
         account("null", windows: [window(used: NSNull(), remaining: NSNull())])
@@ -63,7 +63,11 @@ func validatesAllSampleClocks(offset: Double) throws {
     let menus = Presenter.make(try snapshot(cases), now: instant).groups[0].accounts
     #expect(menus.allSatisfy { $0.summary == "?" })
     #expect(menus[0].lines.contains { $0.contains("Reset passed") })
-    #expect(menus[2].lines.contains("Refresh timed out"))
+    #expect(menus[2].lines.contains("Sign in again"))
+    // Any other failed direct check leaves fresh windows standing and says so in the lines.
+    let timedOut = Presenter.make(try snapshot([account("error", error: "timeout")]), now: instant).groups[0].accounts[0]
+    #expect(timedOut.summary == "80%")
+    #expect(timedOut.lines.contains("Refresh timed out"))
     #expect(menus[3].lines.contains("Sign in again"))
 }
 @Test func balanceIsNotQuotaAndEstimatesStaySeparate() throws {
@@ -254,7 +258,7 @@ func explicitZenBalancePinsCurrency(amount: Double) throws {
     func zen(_ slot: String) -> [String: Any] { account(slot, provider: "opencodezen", windows: [], balances: [balance]) }
     var old = zen("old"); old["observed_at"] = stamp(-901)
     var unknown = zen("unknown"); unknown["state"] = "unknown"
-    var failed = zen("failed"); failed["refresh_error"] = "timeout"
+    var failed = zen("failed"); failed["refresh_error"] = "authentication_required"
     var disabled = zen("disabled"); disabled["enabled"] = false
     var estimate = zen("estimate"); estimate["estimated"] = true
     var kindEstimate = zen("kind-estimate"); kindEstimate["usage_kind"] = "estimated"

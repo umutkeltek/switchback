@@ -82,7 +82,9 @@ public enum Presenter {
     }
     public static func issue(_ code: String) -> String {
         switch code {
-        case "login_required", "relogin_required", "authentication_failed", "unauthorized", "expired_credentials", "credentials_expired": "Sign in again"
+        case "login_required", "relogin_required", "authentication_failed", "authentication_required", "unauthorized",
+             "expired_credentials", "credentials_expired": "Sign in again"
+        case "identity_mismatch": "Signed-in account changed"
         case "rate_limited", "http_429": "Refresh paused by provider"
         case "timeout", "refresh_timeout", "request_timeout": "Refresh timed out"
         case "network_error", "network_unavailable", "connection_error": "Could not reach provider"
@@ -113,10 +115,23 @@ public enum Presenter {
         guard let date = UsageTime.parse(raw) else { return "Reset time invalid" }
         return date <= now ? "Reset passed · refresh needed" : "Resets in " + duration(date.timeIntervalSince(now))
     }
+    /// Refresh errors that mean the reading may not be this login's: they hide the account's numbers.
+    static let signInErrors: Set<String> = [
+        "authentication_required", "relogin_required", "login_required", "authentication_failed", "unauthorized",
+        "expired_credentials", "credentials_expired", "missing_credentials", "credentials_unavailable",
+        "identity_mismatch",
+    ]
+    /// A sign-in or identity problem: the numbers may belong to another login, so they are not shown.
+    /// Any other failed direct check leaves the account's fresh windows standing; each window still
+    /// needs its own fresh sample.
+    static func hidesReading(_ account: UsageAccount) -> Bool {
+        if account.reloginRequired == true { return true }
+        if let state = account.identityState, state != "matched", state != "unbound" { return true }
+        return account.refreshError.map(signInErrors.contains) ?? false
+    }
     static func validAccount(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> Bool {
         snapshotFresh && account.state == "fresh" && account.enabled != false &&
-        account.refreshError == nil && account.reloginRequired != true &&
-        UsageTime.fresh(account.observedAt, now: now)
+        !hidesReading(account) && UsageTime.fresh(account.observedAt, now: now)
     }
     static func balanceSummary(_ account: UsageAccount, snapshotFresh: Bool, now: Date) -> String? {
         guard account.windows.isEmpty, account.balances.count == 1, !account.isEstimated,

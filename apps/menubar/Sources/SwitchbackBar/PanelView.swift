@@ -29,7 +29,8 @@ enum PanelMotion {
     var pinnedOnly = false
     var busy = false
     var failure: String?
-    var checkedText = "Waiting for a reading"
+    /// "Checked 5m ago"; nil before the first reading.
+    var checkedText: String?
     var iconOnly = true
     var limitNotices = false
     /// The global open-panel shortcut id, or `ShortcutChoice.off`.
@@ -297,7 +298,7 @@ struct UsagePanelView: View {
         HStack {
             HStack(spacing: 5) {
                 Circle().fill(state.busy ? Color.orange : Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
-                Text(state.busy ? "Refreshing…" : state.checkedText)
+                Text(Presenter.footerStatus(checked: state.checkedText, busy: state.busy))
                     .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
             }
             Spacer()

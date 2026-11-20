@@ -24,6 +24,8 @@ struct DirectionPanelView: View {
                     VStack(alignment: .leading, spacing: GaugeLayout.sectionGap) {
                         if let best = data.best {
                             BestNowCard(best: best, picks: data.modelBest, style: state.style) { toggle(best.id) }
+                        } else if let noRoom = data.noRoom {
+                            NoRoomCard(notice: noRoom) { if let seat = noRoom.seat { toggle(seat.id) } }
                         }
                         if state.style == .strip, let claude = data.sections.first(where: { $0.id == "claude" }) {
                             ResetHeatStrip(seats: claude.seats)
@@ -156,7 +158,8 @@ struct DirectionPanelView: View {
             } else {
                 Circle().fill(state.busy ? Color.orange : Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
                     .accessibilityHidden(true)
-                Text(state.busy ? "Refreshing…" : state.checkedText).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                Text(Presenter.footerStatus(checked: state.checkedText, busy: state.busy))
+                    .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
             }
             Spacer()
             PanelOptionsMenu(state: state)
@@ -258,9 +261,16 @@ private struct BestNowCard: View {
                 if let pick = picks.first {
                     VStack(alignment: .trailing, spacing: 1) {
                         Text("For " + pick.model).font(.system(size: 10, weight: .semibold)).foregroundStyle(modelTint)
-                        Text(pick.seat?.name ?? "—").font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                        Text(pick.roomText + "%").font(.system(size: 12, weight: .medium, design: .rounded)).monospacedDigit()
-                            .foregroundStyle(PanelColor.secondaryText)
+                        if let back = pick.backText {
+                            // No seat has room for this model: say so, with when the first one is back.
+                            Text("No room").font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                            Text(back).font(.system(size: 11, weight: .medium)).monospacedDigit().lineLimit(1)
+                                .foregroundStyle(Color.red)
+                        } else {
+                            Text(pick.seat?.name ?? "—").font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                            Text(pick.roomText + "%").font(.system(size: 12, weight: .medium, design: .rounded)).monospacedDigit()
+                                .foregroundStyle(PanelColor.secondaryText)
+                        }
                     }
                     .padding(.trailing, 4)
                 }
@@ -279,7 +289,8 @@ private struct BestNowCard: View {
         .help(best.detail)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Use now: " + best.spoken + picks.map { pick in
-            ". For " + pick.model + ": " + (pick.seat?.name ?? "no fresh reading") + ", " + pick.roomText + " percent left"
+            ". For " + pick.model + ": " + (pick.backText.map { "no seat has room, " + $0 }
+                ?? (pick.seat?.name ?? "no fresh reading") + ", " + pick.roomText + " percent left")
         }.joined())
         .accessibilityHint("Shows this seat's details")
         .accessibilityAddTraits(.isButton)
@@ -287,6 +298,46 @@ private struct BestNowCard: View {
 }
 
 /// The gauge's hero: one vertical gauge for the seat to use now.
+/// Every seat with a reading is at its limit: no seat is recommended. The card says so plainly and
+/// names the seat that is back first; clicking it opens that seat's details.
+private struct NoRoomCard: View {
+    let notice: DirectionPresentation.NoRoom
+    let action: () -> Void
+    @Environment(\.colorSchemeContrast) private var contrast
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: SeatTone.out.symbol).font(.system(size: 26)).foregroundStyle(SeatTone.out.color)
+                    .frame(width: 48, height: 48)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Use now").font(.system(size: 10, weight: .medium)).foregroundStyle(PanelColor.secondaryText)
+                    Text(notice.title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                    Text(notice.detail).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                        .monospacedDigit().lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if let backIn = notice.backIn {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text("Back in").font(.system(size: 10, weight: .medium)).foregroundStyle(PanelColor.secondaryText)
+                        Text(backIn).font(.system(size: 20, weight: .semibold, design: .rounded)).monospacedDigit()
+                    }
+                    .fixedSize()
+                }
+            }
+            .padding(.horizontal, 12).frame(height: GaugeLayout.hero)
+            .background(Color.red.opacity(contrast == .increased ? 0.18 : 0.08), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(contrast == .increased ? Color.red : .clear, lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(PanelPressStyle()).focusable()
+        .help(notice.help)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(notice.spoken)
+        .accessibilityHint(notice.seat == nil ? "" : "Shows that seat's details")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
 struct VerticalFuel: View {
     let seat: SeatGlyph
     var body: some View {
