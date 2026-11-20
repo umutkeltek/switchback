@@ -163,6 +163,9 @@ class Fake:
             return 200, view
         if apply == "now":
             problem = self.engine.apply(body.get("load") or {})
+            if note and note.endswith(getattr(self, "slow_note", "\x00")):
+                self.slow_started = True
+                time.sleep(2.0)
             view["apply"] = ({"ok": False, "error": problem, "message": problem} if problem
                              else {"ok": True, "message": "reloaded with the new settings"})
         return 200, view
@@ -717,6 +720,25 @@ class TuneTests(Base):
                         "a request was cut off mid-answer")
         self.assert_released()
 
+    def test_rr_ctrl_c_during_a_trial_apply_restores_the_best_settings(self):
+        self.fake.doc = {"load": {"ctx_size": 4096}}
+        self.fake.slow_note = "trial flash_attn"
+        self.fake.slow_started = False
+        self.effect("flash_attn", "on", decode=1.2)
+        proc = subprocess.Popen(["zsh", str(SB), "ai", "tune", TARGET, "--levers", "flash_attn",
+                                 "--samples", "6"],
+                                env=self.env, cwd=self.root, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 60
+        while time.time() < deadline and not self.fake.slow_started:
+            time.sleep(0.02)
+        time.sleep(0.3)
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=60)
+        time.sleep(2.5)
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 4096},
+                         "Ctrl-C during the trial's apply left the candidate in place: " + err[-600:])
+
     def test_plateau_stops_after_three_flat_levers(self):
         self.fake.doc = {"load": {"spec_type": "draft-mtp"}}
         run = self.tune("--levers", "spec_type,flash_attn,ubatch_size,mmap")
@@ -805,6 +827,59 @@ class DoctorAndFitTests(Base):
         self.assertEqual(fake.doc["ceiling"]["bytes_per_token"], 2_000_000_000)
         self.assertEqual(fake.doc["ceiling"]["decode_tps"], 50.0)
         self.assertIn("decode up to 50 tok/s", run.stdout)
+
+
+def load_tuner_module():
+    import sys
+    if str(CLI) not in sys.path:
+        sys.path.insert(0, str(CLI))
+    import ai_tune
+    return ai_tune
+
+
+class RestoreUnitTests(unittest.TestCase):
+    """`restore_best` and its Ctrl-C handling, without a gateway."""
+
+    def tuner(self, ai_tune, interrupts):
+        tuner = ai_tune.Tuner.__new__(ai_tune.Tuner)
+        tuner.best = {"load": {"ctx_size": 4096}}
+        tuner.applied_doc = None
+        tuner.run_id, tuner.target = "tune_x", TARGET
+        tuner.err = open(os.devnull, "w")
+        self.addCleanup(tuner.err.close)
+        tuner.writes = []
+
+        def put_doc(doc, note):
+            tuner.applied_doc = None
+            if len(tuner.writes) < interrupts:
+                tuner.writes.append(("cut", note))
+                raise KeyboardInterrupt()
+            tuner.writes.append(("ok", note))
+            tuner.applied_doc = json.loads(json.dumps(doc))
+        tuner.put_doc = put_doc
+        return tuner
+
+    def test_unknown_applied_settings_always_restore(self):
+        ai_tune = load_tuner_module()
+        tuner = self.tuner(ai_tune, 0)
+        tuner.restore_best("control")
+        self.assertEqual(tuner.writes, [("ok", "tune tune_x control")])
+        # Known and equal: nothing to write.
+        tuner.restore_best("control")
+        self.assertEqual(len(tuner.writes), 1)
+
+    def test_ctrl_c_inside_the_final_restore_restores_again(self):
+        ai_tune = load_tuner_module()
+        tuner = self.tuner(ai_tune, 1)
+        tuner.restore_best_finally("restore")
+        self.assertEqual([kind for kind, _ in tuner.writes], ["cut", "ok"])
+        self.assertEqual(tuner.applied_doc, tuner.best)
+        # Interrupted twice: a TuneError that names the undo, never a bare
+        # KeyboardInterrupt that skips releasing the lock and hold.
+        tuner = self.tuner(ai_tune, 2)
+        with self.assertRaises(ai_tune.TuneError) as caught:
+            tuner.restore_best_finally("restore")
+        self.assertIn("sb ai revert", caught.exception.message)
 
 
 if __name__ == "__main__":

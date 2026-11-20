@@ -405,6 +405,10 @@ class Tuner:
         path = f"/v1/models/{urllib.parse.quote(self.target, safe='/')}/settings"
         body = dict(doc)
         body.update({"apply": "now", "note": note})
+        # From here until the gateway answers, what the engine runs is
+        # unknown: a Ctrl-C or a client timeout can stop us while the
+        # gateway still applies `doc`. Unknown makes `restore_best` write.
+        self.applied_doc = None
         try:
             answer = self.gw.call("PUT", path, body=body, timeout=900,
                                   headers={"If-Match": f'"{self.revision}"'})
@@ -780,8 +784,27 @@ class Tuner:
         return metrics, problem
 
     def restore_best(self, why):
-        if json.dumps(self.applied_doc, sort_keys=True) != json.dumps(self.best, sort_keys=True):
+        """Put the best known settings back. Writes whenever what the engine
+        runs differs from them or is unknown (`applied_doc` is None while a
+        write is in flight or after one was cut off)."""
+        if self.applied_doc is None or \
+                json.dumps(self.applied_doc, sort_keys=True) != json.dumps(self.best, sort_keys=True):
             self.put_doc(self.best, f"tune {self.run_id} {why}")
+
+    def restore_best_finally(self, why):
+        """`restore_best` on the way out. A Ctrl-C during it does not leave
+        a trial's settings in place: the restore runs once more; a second
+        Ctrl-C there gives up and says how to undo."""
+        for attempt in range(2):
+            try:
+                self.restore_best(why)
+                return
+            except KeyboardInterrupt:
+                if attempt == 0:
+                    self.say("Ctrl-C while restoring the best settings: restoring them again "
+                             "(Ctrl-C once more to leave them as they are)")
+        raise TuneError(FAIL, "interrupted twice while restoring; run `sb ai revert "
+                              f"{self.target}` to undo the tuning writes")
 
     def experiment(self, entry, change, repeat=False):
         """Control, candidate, control. Returns (accepted, gain, reason)."""
@@ -1120,13 +1143,19 @@ class Tuner:
             try:
                 if self.lock_id or self.hold:
                     note = "restore" if code == INTERRUPTED else "best"
-                    self.restore_best(note)
+                    self.restore_best_finally(note)
                     if code != INTERRUPTED and self.gains:
                         # The winner as its own revision: `sb ai revert` undoes it.
                         self.put_doc(self.best, f"tune {self.run_id}")
             except (TuneError, Halt) as error:
                 self.say(f"restoring the best settings failed: {error.message}")
                 code = FAIL
+            except KeyboardInterrupt:
+                # Only the winner's own revision was cut off: the best
+                # settings were already back in place.
+                self.say("Ctrl-C while recording the winner as its own revision; "
+                         "the best settings are in place")
+                code = INTERRUPTED
             finally:
                 self.release()
         if stop is None:
