@@ -137,12 +137,11 @@ private func costField(today: Any = 4.12, week: Any = 61.4, sample: TimeInterval
     #expect(rows[0].primary.map(\.resetIn) == ["1h 15m", "2h 0m"])
     #expect(rows[1].primary.first?.resetIn == nil)
 }
-@Test func panelStyleDefaultsToTheLedger() {
-    #expect(PanelStyle(preference: nil) == .ledger)
-    #expect(PanelStyle(preference: "") == .ledger)
-    #expect(PanelStyle(preference: "unknown") == .ledger)
+@Test func savedLedgerPreferenceIsKeptAfterTheGaugeBecameTheDefault() {
+    // The gauge is the default now; anyone who saved the ledger or the cards keeps them.
+    #expect(PanelStyle(preference: nil) == .gauge)
     #expect(PanelStyle(preference: "a") == .ledger)
     #expect(PanelStyle(preference: "cards") == .cards)
-    // The three explorations are reachable only through the hidden flag.
-    #expect(PanelStyle.allCases == [.ledger, .cards, .rings, .gauge, .strip])
+    // The saved raw values do not change.
+    #expect(PanelStyle.allCases.map(\.rawValue) == ["a", "cards", "rings", "gauge", "strip"])
 }

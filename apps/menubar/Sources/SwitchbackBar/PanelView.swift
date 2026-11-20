@@ -35,13 +35,41 @@ enum PanelMotion {
     /// The global open-panel shortcut id, or `ShortcutChoice.off`.
     var shortcutID = ShortcutChoice.off
     var maximumHeight = PanelMetrics.maximumHeight
-    var style = PanelStyle.ledger
+    var style = PanelStyle.standard
     @ObservationIgnored var onResize: (Double) -> Void = { _ in }
     var expandedAccounts: Set<String> = []
+    /// The visual looks: the search bar is open, and the seat whose details are open in place.
+    var searchOpen = false
+    var openSeat: String?
+    /// The visual looks draw only the providers and accounts the filter and search keep.
+    var directionData: DirectionPresentation {
+        Presenter.directions(PanelPresentation(status: presentation.status, accountCount: presentation.accountCount,
+                                               pinnedCount: presentation.pinnedCount, providers: visibleProviders))
+    }
+    private func account(_ key: String) -> AccountPanel? {
+        presentation.providers.lazy.flatMap(\.accounts).first { $0.key == key }
+    }
+    /// Only accounts open; a provider without a reading has nothing more to show.
+    func canOpen(_ key: String) -> Bool { style == .gauge && account(key) != nil }
+    var openDetail: SeatDetail? { openSeat.flatMap(account).map(Presenter.seatDetail) }
+    /// "Claude" or "Pinned" beside the title while a filter is on.
+    var filterTitle: String? {
+        var parts: [String] = []
+        if selectedProvider != "all" {
+            parts.append(presentation.providers.first { $0.key == selectedProvider }
+                .map { Presenter.displayTitle(key: $0.key, title: $0.title) } ?? selectedProvider)
+        }
+        if pinnedOnly { parts.append("Pinned") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
     var preferredHeight: Double {
         let groups = visibleProviders
+        if style == .gauge {
+            let height = GaugeLayout.height(directionData, searching: searchOpen, detail: openDetail, showBest: true)
+            return min(maximumHeight, max(PanelMetrics.minimumHeight, height))
+        }
         if style.isDirection {
-            let height = DirectionLayout.height(Presenter.directions(presentation), style: style)
+            let height = DirectionLayout.height(directionData, style: style) + (searchOpen ? GaugeLayout.searchBar : 0)
             return min(maximumHeight, max(PanelMetrics.minimumHeight, height))
         }
         if style == .ledger {
@@ -79,6 +107,7 @@ enum PanelMotion {
     @ObservationIgnored var onIconOnly: (Bool) -> Void = { _ in }
     @ObservationIgnored var onLimitNotices: (Bool) -> Void = { _ in }
     @ObservationIgnored var onShortcut: (String) -> Void = { _ in }
+    @ObservationIgnored var onStyle: (PanelStyle) -> Void = { _ in }
 
     var visibleProviders: [ProviderPanel] {
         presentation.filtered(provider: selectedProvider, query: query, pinnedOnly: pinnedOnly)
@@ -100,7 +129,7 @@ struct UsagePanelView: View {
 
     var body: some View {
         if state.style.isDirection {
-            DirectionPanelView(state: state, solidBackground: solidBackground)
+            DirectionPanelView(state: state, interactive: interactive, solidBackground: solidBackground)
         } else {
             classic
         }
@@ -272,25 +301,36 @@ struct UsagePanelView: View {
                     .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
             }
             Spacer()
-            Menu {
-                Toggle("Icon only in menu bar", isOn: Binding(
-                    get: { state.iconOnly }, set: { state.onIconOnly($0) }))
-                Toggle("Limit notifications (80%, 95%, reset)", isOn: Binding(
-                    get: { state.limitNotices }, set: { state.onLimitNotices($0) }))
-                Picker("Open panel shortcut", selection: Binding(
-                    get: { state.shortcutID }, set: { state.onShortcut($0) })) {
-                    Text("Off").tag(ShortcutChoice.off)
-                    ForEach(ShortcutChoice.all) { choice in Text(choice.title).tag(choice.id) }
-                }
-                Divider()
-                Button("Quit Switchback", action: state.onQuit).keyboardShortcut("q", modifiers: .command)
-            } label: {
-                Image(systemName: "slider.horizontal.3").font(.system(size: 12))
-                    .foregroundStyle(PanelColor.secondaryText).frame(width: 24, height: 24)
-            }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Options").accessibilityLabel("Options").focusable()
+            PanelOptionsMenu(state: state)
         }
         .padding(.horizontal, 12).frame(height: 30)
+    }
+}
+/// Options: the panel's look, the menu bar mode, notifications, the open-panel shortcut and Quit.
+struct PanelOptionsMenu: View {
+    let state: UsagePanelState
+    var body: some View {
+        Menu {
+            Picker("Look", selection: Binding(get: { state.style }, set: { state.onStyle($0) })) {
+                ForEach(PanelStyle.looks, id: \.self) { style in Text(style.title).tag(style) }
+                if !PanelStyle.looks.contains(state.style) { Text(state.style.title).tag(state.style) }
+            }
+            Toggle("Icon only in menu bar", isOn: Binding(
+                get: { state.iconOnly }, set: { state.onIconOnly($0) }))
+            Toggle("Limit notifications (80%, 95%, reset)", isOn: Binding(
+                get: { state.limitNotices }, set: { state.onLimitNotices($0) }))
+            Picker("Open panel shortcut", selection: Binding(
+                get: { state.shortcutID }, set: { state.onShortcut($0) })) {
+                Text("Off").tag(ShortcutChoice.off)
+                ForEach(ShortcutChoice.all) { choice in Text(choice.title).tag(choice.id) }
+            }
+            Divider()
+            Button("Quit Switchback", action: state.onQuit).keyboardShortcut("q", modifiers: .command)
+        } label: {
+            Image(systemName: "slider.horizontal.3").font(.system(size: 12))
+                .foregroundStyle(PanelColor.secondaryText).frame(width: 24, height: 24)
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Options").accessibilityLabel("Options").focusable()
     }
 }
 private struct ProviderSection: View {

@@ -39,6 +39,9 @@ public struct BalanceRow: Codable, Sendable {
     public let isEstimate: Bool
     public let valueText: String
     public let sampleText: String
+    /// The finite amount and its currency code; nil currency when the reading sent none.
+    public let amount: Double
+    public let currency: String?
     public var accessibilityText: String {
         [title, valueText, state == .unavailable ? isEstimate ? "Last estimate" : "Last reading" : state.spoken,
          sampleText].joined(separator: ", ")
@@ -203,7 +206,8 @@ extension Presenter {
                     let state: ReadingState = good ? .measured : estimate && !currency.isEmpty && validAccount(account, snapshotFresh: fresh, now: now) ? .estimated : .unavailable
                     let valueText = currency.isEmpty ? "—" : currency + " " + String(format: "%.2f", value)
                     return BalanceRow(id: key + "|balance|\(index)", title: balance.kind == "prepaid" ? "Prepaid balance" : "Balance",
-                                      state: state, isEstimate: estimate, valueText: valueText, sampleText: age(account.observedAt, now: now))
+                                      state: state, isEstimate: estimate, valueText: valueText, sampleText: age(account.observedAt, now: now),
+                                      amount: value, currency: currency.isEmpty ? nil : currency)
                 }
                 let notice: String?
                 if account.enabled == false { notice = "Disabled" }

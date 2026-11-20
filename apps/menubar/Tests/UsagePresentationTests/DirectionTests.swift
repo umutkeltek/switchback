@@ -33,9 +33,10 @@ import Testing
     #expect(Set([SeatTone.good, .low, .critical, .out, .stale, .unknown, .balance].map(\.symbol)).count == 7)
 }
 
-@Test func hiddenStyleFlagSelectsExplorationsButNeverChangesTheDefault() {
-    #expect(PanelStyle(preference: nil) == .ledger)
-    #expect(PanelStyle(preference: "unknown") == .ledger)
+@Test func styleFlagSelectsTheVisualLooks() {
+    #expect(PanelStyle(preference: nil) == .gauge)
+    #expect(PanelStyle(preference: "unknown") == .gauge)
+    #expect(PanelStyle(preference: "a") == .ledger)
     #expect(PanelStyle(preference: "rings").isDirection)
     #expect(PanelStyle(preference: "gauge").isDirection)
     #expect(PanelStyle(preference: "strip").isDirection)

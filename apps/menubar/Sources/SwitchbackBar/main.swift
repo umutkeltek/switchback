@@ -23,6 +23,7 @@ import UsagePresentation
     private var lastChecked: Date?
     private let defaults = UserDefaults.standard
     private let panel = UsagePanelState()
+    private var statusIcon: NSImage?
     private var pins: Set<String>? {
         defaults.stringArray(forKey: "pinnedAccountKeys").map(Set.init)
     }
@@ -38,6 +39,7 @@ import UsagePresentation
                 .withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
             icon?.size = NSSize(width: 14, height: 14)
             icon?.isTemplate = true
+            statusIcon = icon
             button.image = icon
             button.imagePosition = .imageLeading
             button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
@@ -58,6 +60,11 @@ import UsagePresentation
         }
         panel.onIconOnly = { [weak self] value in
             self?.defaults.set(value, forKey: "menuBarIconOnly")
+            self?.rebuild()
+        }
+        panel.onStyle = { [weak self] style in
+            self?.defaults.set(style.rawValue, forKey: PanelStyle.preferenceKey)
+            self?.panel.openSeat = nil
             self?.rebuild()
         }
         panel.onShortcut = { [weak self] id in
@@ -124,6 +131,7 @@ import UsagePresentation
         panel.style = PanelStyle(preference: defaults.string(forKey: PanelStyle.preferenceKey))
         var fullTitle = "Switchback account limits"
         var title = ""
+        var gaugeImage: NSImage?
         if let snapshot {
             let now = Date()
             let presentation = Presenter.make(snapshot, now: now, pins: pins, refreshing: busy, failure: failure)
@@ -132,7 +140,14 @@ import UsagePresentation
             if let advice = Presenter.bestSeat(snapshot, now: now, failure: failure) {
                 fullTitle += "\n" + advice.tooltipLine
             }
-            if !panel.iconOnly {
+            if !panel.iconOnly && panel.style == .gauge {
+                // The gauge item: mini bars for the pinned Claude seats and the best seat's number, inside the
+                // text budget; a crowded item falls back to the icon.
+                let full = Presenter.directions(panel.presentation)
+                let bars = StatusGauge.bars(panel.presentation, data: full)
+                gaugeImage = StatusGaugeImage.make(bars: StatusGaugeImage.bars(bars), number: full.best?.roomText ?? "—",
+                                                   font: item?.button?.font ?? NSFont.menuBarFont(ofSize: 0))
+            } else if !panel.iconOnly {
                 let fitted = Presenter.statusTitle(presentation, maxWidth: PanelMetrics.statusTextWidth) { text in
                     (text as NSString).size(withAttributes: [.font: self.item?.button?.font ?? NSFont.menuBarFont(ofSize: 0)]).width
                 }
@@ -143,22 +158,28 @@ import UsagePresentation
             let minutes = max(0, Int(Date().timeIntervalSince(lastChecked) / 60))
             panel.checkedText = minutes == 0 ? "Checked just now" : "Checked \(minutes)m ago"
         }
-        item?.length = panel.iconOnly ? PanelMetrics.statusIconWidth : NSStatusItem.variableLength
-        item?.button?.imagePosition = panel.iconOnly ? .imageOnly : .imageLeading
-        item?.button?.title = title
+        let iconOnly = panel.iconOnly || (panel.style == .gauge && gaugeImage == nil)
+        item?.length = iconOnly ? PanelMetrics.statusIconWidth : NSStatusItem.variableLength
+        item?.button?.image = gaugeImage ?? statusIcon
+        item?.button?.imagePosition = iconOnly || gaugeImage != nil ? .imageOnly : .imageLeading
+        item?.button?.title = gaugeImage == nil ? title : ""
         item?.button?.toolTip = fullTitle
         recordStatusItem()
     }
     private func recordStatusItem() {
         guard let item, let button = item.button else { return }
-        let width = (button.title as NSString).size(withAttributes: [.font: button.font ?? NSFont.menuBarFont(ofSize: 0)]).width
+        let gauge = !panel.iconOnly && panel.style == .gauge && button.image !== statusIcon
+        let width = gauge ? Double(button.image?.size.width ?? 0)
+            : (button.title as NSString).size(withAttributes: [.font: button.font ?? NSFont.menuBarFont(ofSize: 0)]).width
         let onScreen = statusItemOnScreen()
         visibilityHistory = StatusItemVisibility.record(visibilityHistory, visible: onScreen, at: Date())
         defaults.set(["pid": Int(ProcessInfo.processInfo.processIdentifier),
                       "sampled_at": ISO8601DateFormatter().string(from: Date()),
                       "item_created": true, "item_enabled": item.isVisible,
                       "title": button.title, "title_width": width, "title_width_limit": PanelMetrics.statusTextWidth,
-                      "item_width": button.bounds.width, "menu_bar_mode": panel.iconOnly ? "icon" : "readings",
+                      "item_width": button.bounds.width,
+                      "menu_bar_mode": panel.iconOnly ? "icon" : gauge ? "gauge" : panel.style == .gauge ? "icon-crowded" : "readings",
+                      "panel_style": panel.style.rawValue,
                       "backing_scale": button.window?.backingScaleFactor ?? 1,
                       // What macOS actually shows: the item's window frame, whether it is reported visible,
                       // and the last changes between shown and hidden.
@@ -170,7 +191,7 @@ import UsagePresentation
                       "open_shortcut": GlobalShortcut.shared.registered?.title ?? ShortcutChoice.off,
                       "open_shortcut_registered": shortcutRegistered,
                       "panel_anchor": anchor?.isVisible == true ? "screen" : "status-item",
-                      "panel_width": PanelMetrics.width, "ui_revision": "compact-4-visibility",
+                      "panel_width": PanelMetrics.width, "ui_revision": "compact-5-gauge",
                       "panel_open": popover?.isShown ?? false,
                       "outside_click_monitor_active": dismissal.isMonitoring,
                       "outside_dismissals": outsideDismissals, "ui": "account-panel"],
@@ -245,6 +266,8 @@ import UsagePresentation
         guard let button = item?.button else { return }
         rebuild()
         panel.query = ""
+        panel.openSeat = nil
+        panel.searchOpen = false
         if popover == nil {
             let popup = NSPopover()
             popup.behavior = .transient
@@ -323,7 +346,8 @@ import UsagePresentation
     @objc private func quit() { NSApp.terminate(nil) }
 }
 
-@MainActor func renderPanel(_ snapshotPath: String, output: String, theme: String, provider: String, scale: Double = 2, reduceTransparency: Bool = false, style: PanelStyle = .ledger) throws {
+@MainActor func renderPanel(_ snapshotPath: String, output: String, theme: String, provider: String, scale: Double = 2, reduceTransparency: Bool = false, style: PanelStyle = .standard,
+                            openSeat: String? = nil) throws {
     let app = NSApplication.shared
     app.setActivationPolicy(.prohibited)
     guard scale == 1 || scale == 2 else { throw OwnerError.failed }
@@ -335,8 +359,10 @@ import UsagePresentation
     state.checkedText = "Checked just now"
     state.selectedProvider = provider
     state.style = style
-    // Explorations render their whole content so a preview shows every section; the live panel scrolls.
-    if style.isDirection { state.maximumHeight = 1_000 }
+    state.openSeat = openSeat
+    // Rings and strip render their whole content so a preview shows every section. The gauge renders
+    // at the live panel's height cap and scrolls beyond it, as the app does.
+    if style == .rings || style == .strip { state.maximumHeight = 1_000 }
     let view = UsagePanelView(state: state, interactive: false, solidBackground: reduceTransparency)
         .environment(\.colorScheme, theme == "dark" ? .dark : .light)
         .environment(\.controlActiveState, .active)
@@ -376,7 +402,8 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         try renderPanel(arguments[index + 1], output: output,
                         theme: value("--theme", fallback: "light"), provider: value("--provider", fallback: "all"),
                         scale: Double(value("--scale", fallback: "2")) ?? -1,
-                        reduceTransparency: arguments.contains("--reduce-transparency"), style: style)
+                        reduceTransparency: arguments.contains("--reduce-transparency"), style: style,
+                        openSeat: arguments.contains("--open-seat") ? value("--open-seat", fallback: "") : nil)
     } catch {
         FileHandle.standardError.write(Data("Could not render account panel\n".utf8)); exit(1)
     }
@@ -391,17 +418,25 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         let data = try Data(contentsOf: URL(fileURLWithPath: arguments[index + 1]))
         guard data.count <= 1_048_576 else { throw OwnerError.outputTooLarge }
         let snapshot = try UsageSnapshot.decode(data)
-        let style = PanelStyle(preference: value("--style", fallback: "rings"))
+        let style = PanelStyle(preference: value("--style", fallback: PanelStyle.standard.rawValue))
         let output = value("--output", fallback: "")
         guard style.isDirection, !output.isEmpty else { throw OwnerError.failed }
         let theme = value("--theme", fallback: "light")
-        let directions = Presenter.directions(Presenter.panel(snapshot, pins: Set(snapshot.accounts.map(\.key))))
+        let panel = Presenter.panel(snapshot, pins: Set(snapshot.accounts.map(\.key)))
+        let directions = Presenter.directions(panel)
         let claude = directions.sections.first { $0.id == "claude" }?.seats ?? []
-        let view = StatusItemMock(style: style, data: directions, claude: claude)
+        let gauge = StatusGaugeImage.make(bars: StatusGaugeImage.bars(StatusGauge.bars(panel, data: directions)),
+                                          number: directions.best?.roomText ?? "—",
+                                          font: .monospacedDigitSystemFont(ofSize: 12, weight: .medium))
+        let view = StatusItemMock(style: style, data: directions, claude: claude, gaugeImage: gauge)
             .environment(\.colorScheme, theme == "dark" ? .dark : .light)
         let renderer = ImageRenderer(content: view)
         renderer.scale = 2
-        guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+        var rendered: NSImage?
+        NSAppearance(named: theme == "dark" ? .darkAqua : .aqua)?.performAsCurrentDrawingAppearance {
+            rendered = renderer.nsImage
+        }
+        guard let image = rendered, let tiff = image.tiffRepresentation,
               let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { throw OwnerError.failed }
         try png.write(to: URL(fileURLWithPath: output), options: .atomic)
     } catch {
@@ -431,7 +466,7 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         exit(1)
     }
 } else if arguments.count != 1 {
-    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --open-panel | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style a|cards|rings|gauge|strip] | --render-status snapshot.json --output item.png [--theme light|dark] --style rings|gauge|strip]\n".utf8))
+    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --open-panel | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style gauge|a|cards|rings|strip] [--open-seat ACCOUNT_KEY] | --render-status snapshot.json --output item.png [--theme light|dark] [--style gauge|rings|strip]]\n".utf8))
     exit(2)
 } else {
     // One bar only: a second copy (for example started by `sb bar open` while launchd waits to relaunch
