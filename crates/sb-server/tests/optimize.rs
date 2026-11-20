@@ -245,6 +245,11 @@ impl Drop for Fixture {
 
 /// `optimize` = lines under `server.optimize:` (four-space indent).
 async fn fixture(optimize: &str) -> Fixture {
+    fixture_with(optimize, "").await
+}
+
+/// `fixture` plus top-level config lines (`extra`), e.g. tenants and keys.
+async fn fixture_with(optimize: &str, extra: &str) -> Fixture {
     let gpu = Machine::new("gpu-box", &["a", "b"], &["b"]);
     let small = Machine::new("small-host", &["m"], &["m"]);
     let gpu_url = serve(&gpu).await;
@@ -257,6 +262,7 @@ server:
   retry: {{ max_retries: 0 }}
   optimize:
 {optimize}
+{extra}
 providers:
   - id: gpu-box
     type: openai_compatible
@@ -420,6 +426,56 @@ async fn stickiness_keeps_a_conversation_on_its_machine() {
     let other = send(&fx.gw, convo("rr", "something else entirely", 1)).await;
     assert_eq!(other.status, 200);
     assert!(other.header("x-switchback-optimize").is_empty());
+}
+
+/// Send `body` with an API key and a session header.
+async fn send_as(gw: &str, key: &str, session: &str, body: Value) -> Answer {
+    let r = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .bearer_auth(key)
+        .header("x-switchback-session-id", session)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let headers = r.headers().clone();
+    Answer {
+        status,
+        headers,
+        body: r.json().await.unwrap_or(Value::Null),
+    }
+}
+
+#[tokio::test]
+async fn two_tenants_with_the_same_session_never_steer_each_other() {
+    let fx = fixture_with(
+        "    stickiness: true",
+        r#"tenants:
+  - id: team-a
+  - id: team-b
+api_keys:
+  - { key: "sk-team-a", tenant: team-a, role: admin }
+  - { key: "sk-team-b", tenant: team-b, role: admin }"#,
+    )
+    .await;
+    // Team A's conversation `s-1` settles on a machine.
+    let a1 = send_as(&fx.gw, "sk-team-a", "s-1", convo("rr", "team a work", 1)).await;
+    assert_eq!(a1.status, 200, "{:?}", a1.body);
+    let home = a1.served_by();
+    // Team B sends the same session id: its own conversation, so nothing
+    // sticky steers it and round robin moves on.
+    let b1 = send_as(&fx.gw, "sk-team-b", "s-1", convo("rr", "team b work", 1)).await;
+    assert_eq!(b1.status, 200, "{:?}", b1.body);
+    let line = b1.header("x-switchback-optimize");
+    assert!(!line.contains("sticky="), "team b was steered: {line}");
+    assert_ne!(b1.served_by(), home, "round robin moved on for team b");
+    // Team A stays where it was; team B's turn did not move it.
+    let a2 = send_as(&fx.gw, "sk-team-a", "s-1", convo("rr", "team a work", 2)).await;
+    assert_eq!(a2.served_by(), home);
+    assert!(a2
+        .header("x-switchback-optimize")
+        .contains(&format!("sticky={home}")));
 }
 
 #[tokio::test]

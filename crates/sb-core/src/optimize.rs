@@ -376,9 +376,15 @@ fn text_of(parts: &[ContentPart]) -> String {
 /// field plus a hash of the system prompt and the first user message (both
 /// stay the same for every turn of one conversation). `None` when the
 /// request has no user message. Never holds prompt text.
+///
+/// The request's tenant and project are part of the key, so two tenants
+/// that send the same session id (or the same prompt) are two
+/// conversations: one never steers the other or shares its engine slot.
 pub fn conversation_key(req: &AiRequest, session: Option<&str>) -> Option<String> {
+    let tenant = req.tenant.as_deref().unwrap_or("");
+    let project = req.project.as_deref().unwrap_or("");
     if let Some(session) = session.filter(|s| !s.is_empty()) {
-        return Some(format!("session:{}", fnv_hex(&[session])));
+        return Some(format!("session:{}", fnv_hex(&[tenant, project, session])));
     }
     let first_user = req
         .messages
@@ -397,7 +403,10 @@ pub fn conversation_key(req: &AiRequest, session: Option<&str>) -> Option<String
         .get("user")
         .and_then(Json::as_str)
         .unwrap_or("");
-    Some(format!("conv:{}", fnv_hex(&[user, &system, &first_user])))
+    Some(format!(
+        "conv:{}",
+        fnv_hex(&[tenant, project, user, &system, &first_user])
+    ))
 }
 
 /// Whether the request itself asked for thinking (not a profile or the
@@ -557,6 +566,29 @@ mod tests {
             .unwrap()
             .starts_with("session:"));
         assert!(conversation_key(&AiRequest::new("m", vec![]), None).is_none());
+    }
+
+    #[test]
+    fn two_tenants_with_the_same_session_are_two_conversations() {
+        let mut a = AiRequest::new("m", vec![Message::user("hello")]);
+        a.tenant = Some("team-a".into());
+        let mut b = a.clone();
+        b.tenant = Some("team-b".into());
+        assert_ne!(
+            conversation_key(&a, Some("s-1")),
+            conversation_key(&b, Some("s-1"))
+        );
+        assert_ne!(conversation_key(&a, None), conversation_key(&b, None));
+        let mut other_project = a.clone();
+        other_project.project = Some("p2".into());
+        assert_ne!(
+            conversation_key(&a, Some("s-1")),
+            conversation_key(&other_project, Some("s-1"))
+        );
+        assert_eq!(
+            conversation_key(&a, Some("s-1")),
+            conversation_key(&a.clone(), Some("s-1"))
+        );
     }
 
     #[test]
