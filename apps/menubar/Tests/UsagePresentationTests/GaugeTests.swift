@@ -95,7 +95,7 @@ func textWidth(_ text: String, size: Double, weight: NSFont.Weight, rounded: Boo
     let plans = eightOtherPlans()
     let data = try snapshot([gaugeSeat("seat1", fiveHour: 0, weekly: 28), gaugeSeat("seat2", fiveHour: 84, weekly: 38, fable: 27),
                              gaugeSeat("seat3", fiveHour: 100, weekly: 0), gaugeSeat("seat4", fiveHour: 72, weekly: 60),
-                             gaugeSeat("personal", fiveHour: nil, weekly: 11)] + plans.accounts, coverage: plans.coverage)
+                             gaugeSeat("spare", fiveHour: nil, weekly: 11)] + plans.accounts, coverage: plans.coverage)
     let directions = Presenter.directions(Presenter.panel(data, now: instant))
     for section in directions.sections {
         let width = GaugeLayout.segmentWidth(columns: GaugeLayout.columns(section.seats.count))
@@ -142,16 +142,16 @@ func textWidth(_ text: String, size: Double, weight: NSFont.Weight, rounded: Boo
 }
 
 @Test func seatWithoutAFiveHourReadingShowsItsWeeklyRoomAsPartial() throws {
-    let data = try snapshot([gaugeSeat("personal", fiveHour: nil, weekly: 11, fable: 0), gaugeSeat("seat2", fiveHour: 84, weekly: 38)])
+    let data = try snapshot([gaugeSeat("spare", fiveHour: nil, weekly: 11, fable: 0), gaugeSeat("seat2", fiveHour: 84, weekly: 38)])
     let seats = Presenter.directions(Presenter.panel(data, now: instant)).sections[0].seats
-    let partial = try #require(seats.first { $0.id == "claude:personal" })
+    let partial = try #require(seats.first { $0.id == "claude:spare" })
     #expect(partial.partial)
     #expect(partial.room == 0.11)
     #expect(partial.roomText == "11")
     #expect(partial.roomLane == .weekly)
     #expect(partial.tone == .low)
     #expect(partial.chip == "↻ 4d 19h")
-    #expect(partial.spoken.hasPrefix("Personal: 11 percent left, weekly only, 5-hour unknown; Fable limit used up"))
+    #expect(partial.spoken.hasPrefix("Spare: 11 percent left, weekly only, 5-hour unknown; Fable limit used up"))
     #expect(partial.detail.contains("5-hour unknown · Weekly 11% left"))
     // Partial room is shown, never counted: the best seat still needs both windows.
     #expect(!partial.best)
