@@ -304,6 +304,22 @@ async fn no_settings_means_byte_identical_upstream_request() {
                 "{name}: a target without settings changed its request"
             );
         }
+        // The optimizer's session header with every optimizer switch off:
+        // the same bytes, and nothing optimizer-only on the answer.
+        for (name, body) in cases.iter().chain(&stream_cases) {
+            let r = reqwest::Client::new()
+                .post(format!("{gateway}/v1/chat/completions"))
+                .header("x-switchback-session", "s1")
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            assert!(r.headers().get("x-switchback-optimize").is_none(), "{name}");
+            r.text().await.unwrap();
+            let sent = seen.lock().unwrap().last().unwrap().clone();
+            assert_eq!(std::str::from_utf8(&sent).unwrap(), golden(name), "{name}");
+        }
         for (name, body) in &embedding_cases {
             let r = reqwest::Client::new()
                 .post(format!("{gateway}/v1/embeddings"))
