@@ -3747,7 +3747,7 @@ providers:
         let userinfo = ["user", "pw4u"].join(":");
         let command = format!(
             "cat >/dev/null; \
-             echo 'curl -s http://127.0.0.1:8080/x -H \"Authorization: Bearer {file_key}\"' >&2; \
+             echo 'curl -s http://engine.example -H \"Authorization: Bearer {file_key}\"' >&2; \
              echo \"config key={file_key} env ${newline_env}\"; \
              echo 'engine at http://{userinfo}@engine.example/health refused'; exit 2"
         );
