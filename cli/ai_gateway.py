@@ -2437,7 +2437,9 @@ def parser():
 def main(argv=None, environ=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     environ = os.environ if environ is None else environ
-    if not argv or argv[0] == "help" or "-h" in argv or "--help" in argv:
+    # Words after "--" are arguments, not options: `sb ai chat --json -- MODEL "-h"` sends "-h" as the prompt.
+    options = argv[:argv.index("--")] if "--" in argv else argv
+    if not argv or argv[0] == "help" or "-h" in options or "--help" in options:
         print(HELP, end="")
         return OK
     args = parser().parse_args(argv)

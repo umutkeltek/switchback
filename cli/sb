@@ -7251,6 +7251,21 @@ case "$cmd" in
         if [[ "$menubar_action" == start ]]; then exec /usr/bin/open -g "$menubar_app"; fi
         if [[ "$menubar_action" == open || "$menubar_action" == window ]]; then
           menubar_exec="$menubar_app/Contents/MacOS/SwitchbackBar"
+          if [[ "$menubar_action" == window ]]; then
+            # Ask the app first. One older than the window answers --open-window with its usage and code 2:
+            # say so in one line. A running app has opened the window on this request.
+            menubar_probe="$("$menubar_exec" --open-window 2>&1 >/dev/null)"
+            menubar_status=$?
+            if (( menubar_status == 2 )) && [[ "$menubar_probe" == "Usage: SwitchbackBar"* ]]; then
+              print -u2 -r -- 'This Switchback app is older: run `sb menubar install`'
+              exit 1
+            fi
+            if (( menubar_status != 0 )); then
+              [[ -n "$menubar_probe" ]] && print -u2 -r -- "${menubar_probe%%$'\n'*}"
+              exit "$menubar_status"
+            fi
+            /usr/bin/pgrep -qxf "$menubar_exec" && exit 0
+          fi
           if ! /usr/bin/pgrep -qxf "$menubar_exec"; then
             /usr/bin/open -g "$menubar_app" || exit 1
             for _ in {1..20}; do /usr/bin/pgrep -qxf "$menubar_exec" && break; sleep 0.25; done

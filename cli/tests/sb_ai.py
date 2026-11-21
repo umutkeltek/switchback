@@ -1536,6 +1536,28 @@ class SbAi(unittest.TestCase):
             self.assertEqual(run.returncode, 2, args)
         self.assertEqual(self.requests("POST"), [])
 
+    # ------------------------------------------------------------ chat
+
+    def test_chat_after_double_dash_sends_an_option_like_prompt_as_text(self):
+        # The Switchback window runs `sb ai chat --json -- MODEL PROMPT`: a prompt such as "-h" or "--help" is
+        # the question, never a request for help.
+        for prompt in ("-h", "--help", "--", "- a list"):
+            with self.subTest(prompt=prompt):
+                run = self.sb("chat", "--json", "--", "chat-a", prompt)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                answer = json.loads(run.stdout)
+                self.assertEqual(answer["model"], "chat-a")
+                self.assertEqual(answer["answer"], "The gateway keeps the record.")
+                sent = self.requests("POST", "/v1/chat/completions")[-1]["json"]
+                self.assertEqual(sent["model"], "chat-a")
+                self.assertEqual(sent["messages"], [{"role": "user", "content": prompt}])
+
+    def test_help_before_double_dash_still_prints_help(self):
+        run = self.sb("chat", "-h")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("sb ai chat MODEL", run.stdout)
+        self.assertEqual(self.requests("POST", "/v1/chat/completions"), [])
+
     # ------------------------------------------------------------ model settings
 
     def test_set_writes_typed_values_into_a_profile_with_its_revision(self):
