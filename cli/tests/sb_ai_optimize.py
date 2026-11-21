@@ -40,7 +40,7 @@ class Engine:
         # Decode jitter. Under 3% between two controls' medians, so a run
         # judged on decode is noisy only when a test makes it so.
         self.spread = 0.02
-        self.base_decode = 800.0      # tok/s; a 64-token answer takes ~80 ms
+        self.base_decode = 400.0      # tok/s; a 64-token answer takes ~160 ms, so scheduling noise stays near 1%
         self.base_ttft_ms = 200.0     # long enough that scheduling noise stays under 1%
         self.base_prefill = 60000.0   # tok/s
         self.effects = {}             # (key, json value) -> {"decode": f, "ttft": f, "prefill": f}
@@ -673,7 +673,7 @@ class TuneTests(Base):
         run = self.tune("--levers", "flash_attn")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(self.fake.paused_chats, 0)
-        self.assertEqual(self.verdicts()[-1]["verdict"], "accepted")
+        self.assertEqual(self.verdicts()[-1]["verdict"], "accepted", self.verdicts()[-1].get("reason"))
 
     def test_a_quiet_window_that_begins_stops_the_run_safely(self):
         self.effect("flash_attn", "on", decode=1.6)
