@@ -14,6 +14,9 @@ public struct Confirmation: Sendable, Equatable {
     public let message: String
     public let confirm: String
     public let destructive: Bool
+    /// Cancel is the default button (Return): a second Return or a held key never says yes; only choosing
+    /// `confirm` on purpose does. True for every question the window asks, each of which wakes or powers off a machine.
+    public var cancelIsDefault = true
 }
 
 /// A button's whole meaning: its label, the exact command, whether it wakes the GPU box, and the question first.
@@ -47,11 +50,12 @@ public enum WakeWarning {
     }
     /// The one question asked before an action that may wake a machine: why the window cannot be sure, then
     /// how long a wake takes.
-    public static func mayWakeConfirmation(_ action: String, machine: String = "GPU box", reason: String,
-                                           wakeSeconds: Double?) -> Confirmation {
+    /// `named` is the whole phrase ("a machine") when the machine is not one known GPU box.
+    public static func mayWakeConfirmation(_ action: String, machine: String = "GPU box", named: String? = nil,
+                                           reason: String, wakeSeconds: Double?) -> Confirmation {
         let time = wakeSeconds.map { " Waking takes about \(Words.duration($0))." } ?? ""
         let verb = action.prefix(1).lowercased() + action.dropFirst()
-        return Confirmation(title: "This may wake the \(machine)",
+        return Confirmation(title: "This may wake \(named ?? "the " + machine)",
                             message: "\(reason) If it is asleep, \(verb) wakes it.\(time) It powers off again when it has been idle.",
                             confirm: action, destructive: false)
     }

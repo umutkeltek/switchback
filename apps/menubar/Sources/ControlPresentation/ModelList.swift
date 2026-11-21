@@ -16,6 +16,7 @@ public enum Location: Sendable, Equatable {
         switch self {
         case .machine(.gpuBox, _): "cpu"
         case .machine(.mac, _): "desktopcomputer"
+        case .machine(.unknown, _): "questionmark.square.dashed"
         case .cloud: "cloud"
         case .unknown: "questionmark.circle"
         }

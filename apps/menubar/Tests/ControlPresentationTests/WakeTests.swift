@@ -27,17 +27,18 @@ import Testing
     // A route whose first model is on the Mac and whose second is on the sleeping GPU box may wake it.
     let route = Inspector.tryIt("vision", targets: ["mac/vision-model", "text/model-a"], prompt: "hi", machines: sleeping)
     #expect(route.wakes)
-    #expect(route.title == "Send · may wake the GPU box")
+    // The button says only "Send · may wake", so it never cuts its label; the full words are in `spoken`.
+    #expect(route.title == "Send · may wake" && route.spoken == "Send · may wake the GPU box")
     #expect(route.confirmation?.title == "This may wake the GPU box")
     #expect(route.confirmation?.message.hasPrefix("vision can answer from a model on the GPU box, which is asleep.") == true)
     #expect(route.confirmation?.message.contains("Waking takes about 1 min.") == true)
     #expect(route.confirmation?.confirm == "Send")
     // Every model behind the name on the sleeping box: it surely wakes it.
     let sure = Inspector.tryIt("model-a", targets: ["text/model-a"], prompt: "hi", machines: sleeping)
-    #expect(sure.title == "Send · wakes the GPU box" && sure.confirmation?.title == "Wake the GPU box?")
+    #expect(sure.title == "Send · wakes" && sure.confirmation?.title == "Wake the GPU box?")
     // A name whose models are not known yet (a route before its settings are read) asks too, even with the box on.
     let unknown = Inspector.tryIt("default", targets: [], targetsKnown: false, prompt: "hi", machines: fixture.machines)
-    #expect(unknown.title == "Send · may wake the GPU box")
+    #expect(unknown.title == "Send · may wake" && unknown.confirmation?.title == "This may wake a machine")
     #expect(unknown.confirmation?.message.hasPrefix("The window does not know yet which models default uses.") == true)
     #expect(Inspector.tryIt("model-a", targets: ["text/model-a"], targetsKnown: false, prompt: "hi",
                             machines: fixture.machines).confirmation != nil)
@@ -76,6 +77,7 @@ import Testing
     let runner = try FakeRunner()
     let clock = TestClock(Fixture.now)
     let store = ControlStore(runner: runner, clock: { clock.now })
+    store.visible = true  // a shown window: the round also starts the settings sweep
     await store.tick()
     await store.sweepTask?.value
     let row = try #require(store.rows.first { $0.name == "model-a" })
@@ -89,7 +91,7 @@ import Testing
     #expect(box.powerDoubt == "it was last read 16 s ago")
     #expect(!box.knownOn)
     let stale = store.tryIt(row, prompt: "hi")
-    #expect(stale.title == "Send · may wake the GPU box")
+    #expect(stale.title == "Send · may wake" && stale.spoken == "Send · may wake the GPU box")
     #expect(stale.confirmation?.message.hasPrefix("The window can’t be sure the GPU box is on: it was last read 16 s ago.") == true)
     // Keep on can no longer trust "on": it asks, and keeps the box on with a wake in case it went to sleep.
     let keep = try #require(store.keepOn("gpu-box"))
@@ -106,6 +108,7 @@ import Testing
 @MainActor @Test func aFailedReadMakesThePowerUnknownUntilAReadSucceeds() async throws {
     let runner = try FakeRunner()
     let store = ControlStore(runner: runner, clock: { Fixture.now })
+    store.visible = true  // a shown window: the round also starts the settings sweep
     await store.tick()
     await store.sweepTask?.value
     let row = try #require(store.rows.first { $0.name == "model-a" })
@@ -123,10 +126,12 @@ import Testing
     let runner = try FakeRunner()
     let clock = TestClock(Fixture.now)
     let store = ControlStore(runner: runner, clock: { clock.now }, sleep: { _ in try await Task.sleep(for: .seconds(3600)) })
+    store.visible = true  // a shown window: the round also starts the settings sweep
     await store.tick()
     await store.sweepTask?.value
     let row = try #require(store.rows.first { $0.name == "model-a" })
     #expect(store.tryIt(row, prompt: "hi").confirmation == nil)
+    store.visible = false  // hidden by hand: no timed loop ran
     // Shown again three seconds later: the next read waits its turn, and until it lands the power is unknown.
     clock.advance(3)
     store.setVisible(true)
@@ -164,6 +169,7 @@ import Testing
     let runner = try GatedRunner(holding: [Commands.settings("fast")])
     let clock = TestClock(Fixture.now)
     let store = ControlStore(runner: runner, clock: { clock.now })
+    store.visible = true  // a shown window: the round also starts the settings sweep
     // The first round returns although the five-minute sweep is still waiting on one name.
     await store.tick()
     #expect(store.status != nil)

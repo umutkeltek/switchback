@@ -95,7 +95,7 @@ struct GPUBoxCard: View {
             HStack(alignment: .top, spacing: 2) {
                 // With a hold already in place, keeping it on longer is not the main thing to do here.
                 ActionButton(plan: keep, store: store, look: machine.holds.isEmpty ? .prominent : .plain, symbol: "lock.fill",
-                             current: { store.keepOn(machine.machine, duration: duration) })
+                             click: { await store.clickKeepOn(machine.machine, duration: duration) })
                 // How long: a small menu beside the button, so the duration shows once, on the button.
                 Menu {
                     Picker("Keep on for", selection: $duration) {
@@ -150,7 +150,8 @@ struct Stat: View {
     }
 }
 
-/// The Mac: its models, in memory or resting. Show-only: no power, holds or load settings.
+/// The Mac, or a machine whose kind the window cannot tell: its models, in memory or resting. Show-only: no
+/// power, holds or load settings.
 struct MacCard: View {
     let machine: MachineCard
     var body: some View {
@@ -159,16 +160,23 @@ struct MacCard: View {
                 PowerGlyph(power: machine.power, kind: machine.kind, size: 48)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(machine.title).font(.system(size: 17, weight: .semibold))
-                    Text(machine.power == .on ? "On · always on" : machine.powerWord)
+                    Text(machine.kind == .mac ? (machine.power == .on ? "On · always on" : machine.powerWord)
+                                              : Machines.statusLine(machine).text)
                         .font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText)
                 }
                 Spacer()
                 Label("Show only", systemImage: "eye")
                     .font(.system(size: 11, weight: .medium)).foregroundStyle(WindowColor.secondaryText)
                     .padding(.horizontal, 8).frame(height: 22).background(Color.primary.opacity(0.06), in: Capsule())
-                    .help("The Mac runs its models by itself; this window does not power it, hold it or change what it loads")
+                    .help(machine.capabilityNote
+                          ?? "The Mac runs its models by itself; this window does not power it, hold it or change what it loads")
             }
             .accessibilityElement(children: .combine)
+            if let note = machine.capabilityNote {
+                Label(note, systemImage: "questionmark.circle")
+                    .font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true).labelStyle(TightLabelStyle())
+            }
             if !machine.problems.isEmpty {
                 VStack(alignment: .leading, spacing: 6) { ForEach(machine.problems) { ProblemRow(problem: $0, short: true) } }
             }

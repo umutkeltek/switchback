@@ -119,9 +119,9 @@ struct ActionButton: View {
     var symbol: String?
     var showsReason = true
     var compact = false
-    /// The plan as it is at the moment of the click, for actions whose question depends on how fresh the power
-    /// reading is ("Keep on"); nil uses `plan`.
-    var current: (() -> ActionPlan?)? = nil
+    /// What a click does, for actions whose question depends on how fresh the power reading is ("Keep on"):
+    /// the store makes the plan again at the click. Nil clicks `plan` as drawn.
+    var click: (() async -> Click)? = nil
     /// The plan the owner is being asked about.
     @State private var asking: ActionPlan?
     @State private var hovered = false
@@ -156,7 +156,12 @@ struct ActionButton: View {
                             titleVisibility: .visible, presenting: asking) { question in
             if let words = question.confirmation {
                 Button(words.confirm, role: words.destructive ? .destructive : nil) { run(question, confirmed: true) }
-                Button("Cancel", role: .cancel) {}
+                // Cancel is the default (Return): a second Return or a key repeat cannot say yes.
+                if words.cancelIsDefault {
+                    Button("Cancel", role: .cancel) {}.keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Cancel", role: .cancel) {}
+                }
             }
         } message: { question in
             Text(question.confirmation?.message ?? "")
@@ -204,15 +209,11 @@ struct ActionButton: View {
         }
     }
     private func trigger() {
-        let now: ActionPlan
-        if let current {
-            guard let fresh = current() else { return }
-            now = fresh
-        } else {
-            now = plan
+        let click = self.click
+        Task {
+            let outcome = if let click { await click() } else { await store.click(plan) }
+            if case .ask(let question) = outcome { asking = question }
         }
-        guard now.gate.isAllowed else { return }
-        if now.confirmation != nil { asking = now } else { run(now, confirmed: false) }
     }
     private func run(_ plan: ActionPlan, confirmed: Bool) {
         Task { await store.perform(plan, confirmed: confirmed) }
@@ -326,8 +327,8 @@ struct PowerGlyph: View {
     }
     private var symbol: String {
         switch power {
-        case .on: kind == .gpuBox ? "cpu.fill" : "desktopcomputer"
-        case .asleep: kind == .gpuBox ? "moon.zzz.fill" : "exclamationmark.triangle.fill"
+        case .on: kind == .gpuBox ? "cpu.fill" : kind == .mac ? "desktopcomputer" : "questionmark.square.dashed"
+        case .asleep: kind == .gpuBox ? "moon.zzz.fill" : kind == .mac ? "exclamationmark.triangle.fill" : "power"
         case .waking: "sunrise.fill"
         case .poweringOff: "power"
         }
@@ -335,7 +336,7 @@ struct PowerGlyph: View {
     private var tint: Color {
         switch power {
         case .on: .green
-        case .asleep: kind == .gpuBox ? .indigo : .red
+        case .asleep: kind == .gpuBox ? .indigo : kind == .mac ? .red : .secondary
         case .waking: .orange
         case .poweringOff: .secondary
         }

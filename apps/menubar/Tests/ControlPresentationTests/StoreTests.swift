@@ -15,6 +15,7 @@ final class TestClock: @unchecked Sendable {
     let runner = try FakeRunner()
     let store = ControlStore(runner: runner, clock: { Fixture.now })
     store.selectedModel = "model-a"
+    store.visible = true  // a shown window: the round also starts the settings sweep
     await store.tick()
     await store.sweepTask?.value
     let calls = runner.calls

@@ -29,7 +29,8 @@ import Testing
     """#.utf8))
     let status = AIStatus(json)
     #expect(status.lanes.first?.wakeConfigured == nil)
-    #expect(Machines.cards(status: status, engines: nil, doctor: nil, now: Fixture.now).first?.kind == .mac)
+    // Missing wake fields mean the window cannot tell: never "Mac".
+    #expect(Machines.cards(status: status, engines: nil, doctor: nil, now: Fixture.now).first?.kind == .unknown)
 }
 
 @Test func modelsReadEveryJob() throws {

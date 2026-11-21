@@ -14,6 +14,27 @@ public enum ActionFeedback: Sendable, Equatable {
     }
 }
 
+/// What a click on a button did, decided at the click from the power as it is then, never from the plan the
+/// button was drawn with.
+public enum Click: Sendable, Equatable {
+    /// Ask this question first; nothing ran.
+    case ask(ActionPlan)
+    /// It ran, without a question.
+    case ran
+    /// Disabled at the click, or already running: nothing ran.
+    case refused
+}
+
+/// How fresh the window's reading is, for the footer dot: the same rule as the machine line.
+public enum ReadingFreshness: Sendable, Equatable {
+    /// Read in the last 15 s: green.
+    case fresh
+    /// Older than 15 s, not read yet, or not read again since the window came back from hidden: muted.
+    case old
+    /// The last read failed: amber.
+    case failed
+}
+
 public enum ChatState: Sendable, Equatable {
     case running
     case answered(ChatAnswer)
@@ -43,7 +64,9 @@ public enum ChatState: Sendable, Equatable {
     public private(set) var reading = false
     public private(set) var feedback: [String: ActionFeedback] = [:]
     public private(set) var chats: [String: ChatState] = [:]
-    public private(set) var visible = false
+    /// Whether the window can be seen. Only `setVisible` changes it; tests set it directly to run rounds by hand,
+    /// as for a shown window, without the timed loop.
+    public internal(set) var visible = false
     /// The model whose inspector is open. Picking another reads its settings and history once the pick has
     /// held for `debounce` seconds; a read still running for the earlier pick is stopped.
     public var selectedModel: String? {
@@ -88,6 +111,12 @@ public enum ChatState: Sendable, Equatable {
     public var powerEvidence: PowerEvidence {
         PowerEvidence(readAt: statusReadAt, failed: statusFailed, awaitingFresh: awaitingFresh)
     }
+    /// The footer dot: muted once the status is older than the 15 s the machine line trusts, amber after a failed read.
+    public var readingFreshness: ReadingFreshness {
+        if readError != nil || statusFailed { return .failed }
+        guard let at = statusReadAt, !awaitingFresh, now.timeIntervalSince(at) <= Machines.powerTrust else { return .old }
+        return .fresh
+    }
     public var machines: [MachineCard] {
         Machines.cards(status: status, engines: engines, doctor: doctor, now: now, evidence: powerEvidence)
     }
@@ -107,6 +136,31 @@ public enum ChatState: Sendable, Equatable {
     /// "Keep on" for a machine, from the power as it is now.
     public func keepOn(_ machine: String, duration: String = Machines.keepOnChoices[0]) -> ActionPlan? {
         machines.first { $0.machine == machine }.flatMap { Machines.keepOn($0, duration: duration) }
+    }
+
+    // MARK: Clicks
+
+    /// "Try it" clicked: the plan is made again now, so a power reading that went stale (or a box that went to
+    /// sleep) since the button was drawn asks first. Returns the question to ask, or sends at once.
+    public func clickSend(_ row: ModelRow, prompt: String) async -> Click {
+        let plan = tryIt(row, prompt: prompt)
+        guard plan.gate.isAllowed, chats[row.name] != .running else { return .refused }
+        if plan.confirmation != nil { return .ask(plan) }
+        await send(plan, model: row.name)
+        return .ran
+    }
+    /// "Keep on" clicked: the plan is made again now, so a power reading that went stale since the button was
+    /// drawn asks first and keeps the box on with a wake instead of a plain hold.
+    public func clickKeepOn(_ machine: String, duration: String = Machines.keepOnChoices[0]) async -> Click {
+        guard let plan = keepOn(machine, duration: duration) else { return .refused }
+        return await click(plan)
+    }
+    /// Any other button clicked: its plan does not depend on how fresh the power is.
+    public func click(_ plan: ActionPlan) async -> Click {
+        guard plan.gate.isAllowed, feedback[plan.id] != .running else { return .refused }
+        if plan.confirmation != nil { return .ask(plan) }
+        await perform(plan)
+        return .ran
     }
 
     // MARK: Refresh
@@ -185,6 +239,8 @@ public enum ChatState: Sendable, Equatable {
         if case .some(.success(let json)) = modelsJSON { catalog = ModelCatalog(json); lastModels = started }
         if let open, open == selectedModel, case .some(.success(let json)) = openJSON { settings[open] = SettingsView(json) }
         lastRead = started
+        // Hidden mid-round: what was read is kept, but nothing more starts.
+        guard !Task.isCancelled, visible else { return }
         startSweepIfDue(at: started)
     }
 
@@ -205,8 +261,10 @@ public enum ChatState: Sendable, Equatable {
         return !allAsleep || time.timeIntervalSince(last) >= ControlStore.enginesAsleepEvery
     }
 
+    /// The five-minute read of every name's settings: only while the window is visible, never from a round that
+    /// was stopped.
     private func startSweepIfDue(at time: Date) {
-        guard visible || loop == nil, sweepTask == nil,
+        guard !Task.isCancelled, visible, sweepTask == nil,
               lastSweep.map({ time.timeIntervalSince($0) >= ControlStore.sweepEvery }) ?? true else { return }
         lastSweep = time
         sweepTask = Task { [weak self] in
@@ -265,7 +323,8 @@ public enum ChatState: Sendable, Equatable {
             for _ in 0..<3 { next() }
             for await (name, json) in group {
                 if let json, !Task.isCancelled { settings[name] = SettingsView(json) }
-                next()
+                // Hidden meanwhile: no further name is read.
+                if visible { next() }
             }
         }
     }

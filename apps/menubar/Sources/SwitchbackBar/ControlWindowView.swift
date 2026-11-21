@@ -146,12 +146,20 @@ struct ControlWindowView: View {
             if store.reading {
                 ProgressView().controlSize(.mini).frame(width: 10, height: 10)
             } else {
-                Circle().fill(store.readError == nil ? Color.green.opacity(0.8) : Color.orange).frame(width: 6, height: 6)
+                // The same freshness as the machine line: muted past 15 s, amber after a failed read.
+                Circle().fill(freshnessColor).frame(width: 6, height: 6)
             }
             Text(freshnessText).font(.system(size: 10)).foregroundStyle(WindowColor.secondaryText).lineLimit(2)
         }
         .help(store.readError ?? "Reads about every 10 seconds while this window is open")
         .accessibilityElement(children: .combine)
+    }
+    private var freshnessColor: Color {
+        switch store.readingFreshness {
+        case .fresh: Color.green.opacity(0.8)
+        case .old: Color.secondary.opacity(0.6)
+        case .failed: Color.orange
+        }
     }
     private var freshnessText: String {
         if store.readError != nil { return "Can’t reach the gateway" }

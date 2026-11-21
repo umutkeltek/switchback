@@ -363,7 +363,8 @@ public enum Inspector {
             ?? model?.memory?.inUse?.context
         return [
             row("load.ctx_size", engine: context.map { .number(Double($0)) }),
-            row("load.cache_type_k", engine: .string(model?.argument(["--cache-type-k", "-ctk"]) ?? "f16")),
+            // The cache type only when the engine's start arguments name one; otherwise the engine decides.
+            row("load.cache_type_k", engine: model?.argument(["--cache-type-k", "-ctk"]).map(JSONValue.string)),
             row("load.parallel", engine: model?.argument(["--parallel", "-np"]).flatMap(Double.init).map(JSONValue.number)),
         ]
     }
@@ -498,7 +499,10 @@ public enum Inspector {
 
     /// "Try it": one request to the name, which the gateway always sends, waking a sleeping GPU box. A route
     /// picks any of its models, so every model behind the name counts: it asks first whenever any of them is on a
-    /// GPU box the window does not know to be on, and whenever it does not know the name's models yet.
+    /// GPU box the window does not know to be on, or on a machine whose kind the window cannot tell (the short
+    /// status a non-operator key reads), and whenever it does not know the name's models yet.
+    /// The button says only "Send · may wake" or "Send · wakes", so it never cuts its label; the full words are in
+    /// `spoken` (VoiceOver and the tooltip) and in the question.
     public static func tryIt(_ name: String, targets: [String], targetsKnown: Bool = true, prompt: String,
                              machines: [MachineCard]) -> ActionPlan {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -506,32 +510,37 @@ public enum Inspector {
         let gate: Gate = trimmed.isEmpty ? .disabled("Write a prompt first") : .allowed
         var boxes: [MachineCard] = []
         for target in targets {
-            if let card = Machines.machine(ofTarget: target, in: machines), card.kind == .gpuBox, !card.knownOn,
-               !boxes.contains(where: { $0.machine == card.machine }) { boxes.append(card) }
+            guard let card = Machines.machine(ofTarget: target, in: machines),
+                  !boxes.contains(where: { $0.machine == card.machine }) else { continue }
+            if card.kind == .unknown || (card.kind == .gpuBox && !card.knownOn) { boxes.append(card) }
         }
         let unknown = !targetsKnown || targets.isEmpty || machines.isEmpty
         guard unknown || !boxes.isEmpty else {
             return ActionPlan(id: "chat:\(name)", title: "Send", command: command, gate: gate)
         }
         let box = boxes.count == 1 ? boxes[0] : nil
-        let word = box?.kind.title ?? "GPU box"
-        let machine = box?.title ?? "GPU box"
+        // "the GPU box" for one GPU box; "a machine" whenever a machine of unknown kind (or no known one) is behind it.
+        let allBoxes = !unknown && boxes.allSatisfy { $0.kind == .gpuBox }
+        let who = box.map { $0.kind == .gpuBox ? "the " + $0.title : "a machine" } ?? (allBoxes ? "the GPU box" : "a machine")
         let wakeSeconds = boxes.compactMap(\.wakeSeconds).max()
         func asleep(_ card: MachineCard) -> Bool {
-            (card.power == .asleep || card.power == .poweringOff) && card.powerDoubt == nil
+            card.kind == .gpuBox && (card.power == .asleep || card.power == .poweringOff) && card.powerDoubt == nil
         }
-        // Every model behind the name sits on a box known to be asleep: the request surely wakes it.
+        // Every model behind the name sits on a GPU box known to be asleep: the request surely wakes it.
         let surely = !unknown && targets.allSatisfy { target in
             Machines.machine(ofTarget: target, in: machines).map { card in boxes.contains { $0.machine == card.machine } && asleep(card) } ?? false
         }
         if surely {
-            return ActionPlan(id: "chat:\(name)", title: WakeWarning.label("Send", wakes: true, machine: word), command: command,
-                              wakes: true, confirmation: WakeWarning.confirmation("Send", machine: machine, wakeSeconds: wakeSeconds),
-                              gate: gate)
+            let question = WakeWarning.confirmation("Send", machine: who.hasPrefix("the ") ? String(who.dropFirst(4)) : who,
+                                                    wakeSeconds: wakeSeconds)
+            return ActionPlan(id: "chat:\(name)", title: "Send · wakes", command: command, wakes: true, confirmation: question,
+                              gate: gate, spoken: "Send · wakes " + who)
         }
         let reason: String
         if unknown {
             reason = "The window does not know yet which models \(name) uses."
+        } else if let first = boxes.first(where: { $0.kind == .unknown }) {
+            reason = "The window can’t tell what the machine \(first.machine) can do: this key reads only the short status."
         } else if let first = boxes.first, asleep(first) {
             reason = "\(name) can answer from a model on the \(first.title), which is asleep."
         } else if let first = boxes.first {
@@ -539,10 +548,10 @@ public enum Inspector {
         } else {
             reason = "The window can’t be sure where \(name) runs."
         }
-        return ActionPlan(id: "chat:\(name)", title: WakeWarning.mayWakeLabel("Send", machine: word), command: command,
-                          wakes: true, confirmation: WakeWarning.mayWakeConfirmation("Send", machine: machine, reason: reason,
-                                                                                    wakeSeconds: wakeSeconds),
-                          gate: gate)
+        return ActionPlan(id: "chat:\(name)", title: "Send · may wake", command: command, wakes: true,
+                          confirmation: WakeWarning.mayWakeConfirmation("Send", named: who, reason: reason,
+                                                                        wakeSeconds: wakeSeconds),
+                          gate: gate, spoken: "Send · may wake " + who)
     }
 
     /// What "Try it" does on the Mac: its engine loads a resting model by itself to answer.
@@ -556,7 +565,7 @@ public enum Inspector {
     /// the window never changes what the Mac loads.
     public static func versions(_ history: SettingsHistory, now: Date, machines: [MachineCard]) -> [VersionRow] {
         let machine = Machines.machine(ofTarget: history.target, in: machines)
-        let showOnly = machines.isEmpty || machine?.kind == .mac
+        let showOnly = machines.isEmpty || machine?.kind == .mac || machine?.kind == .unknown
         return history.entries.map { entry in
             let current = entry.revision == history.revision
             let what: String

@@ -1,13 +1,23 @@
 import Foundation
 
 /// What a machine is to the gateway. The window names a machine the gateway wakes and powers off "GPU box",
-/// and an always-on machine "Mac"; the Mac is show-only.
+/// and an always-on machine "Mac"; the Mac is show-only. A key that may read only the gateway's short status
+/// does not see whether a machine can wake: that machine is "Machine", show-only, and anything sent to it asks
+/// first.
 public enum MachineKind: Sendable, Equatable {
     /// The gateway wakes it when work arrives and powers it off when it has been idle.
     case gpuBox
     /// Always on: the gateway never wakes it, powers it off or changes what its engine loads.
     case mac
-    public var title: String { self == .gpuBox ? "GPU box" : "Mac" }
+    /// The status does not say whether the gateway wakes it or powers it off: it may sleep, so a request may wake it.
+    case unknown
+    public var title: String {
+        switch self {
+        case .gpuBox: "GPU box"
+        case .mac: "Mac"
+        case .unknown: "Machine"
+        }
+    }
 }
 
 public enum Power: String, Sendable, Equatable {
@@ -129,6 +139,12 @@ public struct MachineCard: Sendable, Equatable, Identifiable {
     /// Why the status line cannot say a confident "On"; nil when the reading is fresh.
     public var powerCheck: PowerCheck? = nil
 
+    /// What the card says about a machine the window cannot tell apart; nil for a GPU box or the Mac.
+    public var capabilityNote: String? {
+        kind == .unknown ? "The window can’t tell what this machine can do: this key reads only the short status. "
+            + "It offers no power, hold or load actions here, and Try it asks first." : nil
+    }
+
     /// On, and the window's reading of it is fresh: nothing sent to it can wake it.
     public var knownOn: Bool { power == .on && powerDoubt == nil }
     /// Models in memory now; a resting model is listed but not in memory, a loading one not yet.
@@ -169,11 +185,11 @@ public enum Machines {
         let kinds = Dictionary(uniqueKeysWithValues: order.map { machine in
             (machine, kind(of: status.lanes.filter { $0.machine == machine }))
         })
-        // GPU boxes first, then the Mac; otherwise the gateway's order.
-        order = order.filter { kinds[$0] == .gpuBox } + order.filter { kinds[$0] != .gpuBox }
+        // GPU boxes first, then machines of unknown kind, then the Mac; otherwise the gateway's order.
+        order = order.filter { kinds[$0] == .gpuBox } + order.filter { kinds[$0] == .unknown } + order.filter { kinds[$0] == .mac }
         return order.map { machine in
             let lanes = status.lanes.filter { $0.machine == machine }
-            let kind = kinds[machine] ?? .mac
+            let kind = kinds[machine] ?? .unknown
             let sameKind = kinds.values.filter { $0 == kind }.count
             let title = sameKind > 1 ? kind.title + " · " + machine : kind.title
             let powerText = status.power.first { $0.machine == machine }?.power ?? "off"
@@ -182,9 +198,13 @@ public enum Machines {
         }
     }
 
-    /// A machine the gateway wakes or powers off is a GPU box; any other is always on.
+    /// A machine the gateway wakes or powers off is a GPU box. One whose every engine says it does neither is
+    /// always on. When an engine leaves both out (the short status a non-operator key reads), or the machine has
+    /// no engine, the kind is unknown: never a Mac, so nothing sent to it skips the question before a wake.
     static func kind(of lanes: [LaneReport]) -> MachineKind {
-        lanes.contains { $0.wakeConfigured == true || $0.poweroffConfigured == true } ? .gpuBox : .mac
+        if lanes.contains(where: { $0.wakeConfigured == true || $0.poweroffConfigured == true }) { return .gpuBox }
+        let known = !lanes.isEmpty && lanes.allSatisfy { $0.wakeConfigured != nil && $0.poweroffConfigured != nil }
+        return known ? .mac : .unknown
     }
 
     static func card(machine: String, title: String, kind: MachineKind, powerText: String, lanes: [LaneReport],
@@ -201,6 +221,7 @@ public enum Machines {
         case (.poweringOff, _): "Powering off"
         case (.asleep, .gpuBox): "Asleep"
         case (.asleep, .mac): "Not answering"
+        case (.asleep, .unknown): "Off"
         }
         var holds: [HoldReport] = []
         for lane in lanes { for hold in lane.holds where !holds.contains(where: { $0.id == hold.id }) { holds.append(hold) } }
@@ -238,7 +259,7 @@ public enum Machines {
             for model in loaded where model.state != .failed && !lastLoaded.contains(model.name) { lastLoaded.append(model.name) }
         }
         let current = power == .on ? loaded : []
-        let check = kind == .gpuBox ? powerCheck(power: power, countdown: countdown, evidence: evidence, now: now) : nil
+        let check = kind != .mac ? powerCheck(power: power, countdown: countdown, evidence: evidence, now: now) : nil
         let holdCards = holds.map { hold -> HoldCard in
             let left = hold.expiresAtMs.map { max(0, $0 - nowMs) / 1000 }
             var until = ""
@@ -377,6 +398,9 @@ public enum Machines {
             parts.append("\(boxes.count) GPU boxes")
             parts.append("\(boxes.filter { $0.power == .on }.count) on")
         }
+        let others = cards.filter { $0.kind == .unknown }
+        if others.count == 1 { parts.append(others[0].title + " " + shortStatus(others[0]).lowercased()) }
+        if others.count > 1 { parts.append("\(others.count) machines of unknown kind") }
         let macs = cards.filter { $0.kind == .mac }
         if macs.count == 1 { parts.append("Mac " + macs[0].powerWord.lowercased()) }
         if macs.count > 1 {

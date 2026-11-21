@@ -383,8 +383,10 @@ private struct LoadCard: View {
                 VStack(alignment: .leading, spacing: 6) {
                     SettingLabel(setting: cache, draft: $draft)
                     Picker("KV cache", selection: Binding(
-                        get: { shownValue(cache, draft: draft)?.string ?? "f16" },
-                        set: { draft.values[cache.key] = .set(.string($0)) })) {
+                        get: { shownValue(cache, draft: draft)?.string ?? "" },
+                        set: { draft.values[cache.key] = $0.isEmpty ? nil : .set(.string($0)) })) {
+                        // The engine's start arguments name no cache type: it decides, and the window does not guess.
+                        if shownValue(cache, draft: draft)?.string == nil { Text("Engine decides").tag("") }
                         ForEach(Inspector.cacheTypes, id: \.self) { type in Text(type).tag(type) }
                         if let current = shownValue(cache, draft: draft)?.string, !Inspector.cacheTypes.contains(current) {
                             Text(current).tag(current)
@@ -601,7 +603,8 @@ private struct TryItCard: View {
                     HStack(spacing: 5) {
                         if chat == .running { ProgressView().controlSize(.mini) }
                         else { Image(systemName: plan.wakes ? "sunrise.fill" : "paperplane.fill").font(.system(size: 11)) }
-                        Text(plan.title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                        // The label is short ("Send · may wake") and never cut: the field beside it gives way.
+                        Text(plan.title).font(.system(size: 12, weight: .semibold)).lineLimit(1).fixedSize()
                     }
                     .padding(.horizontal, 12).frame(height: 30)
                     .foregroundStyle(plan.wakes ? Color.black.opacity(0.85) : .white)
@@ -610,8 +613,8 @@ private struct TryItCard: View {
                 }
                 .buttonStyle(PanelPressStyle()).focusable().disabled(!plan.gate.isAllowed || chat == .running)
                 .keyboardShortcut(.return, modifiers: .command)
-                .help(plan.gate.reason ?? (plan.confirmation.map { $0.title + " · asks first (⌘Return)" } ?? "Send (⌘Return)"))
-                .accessibilityLabel(plan.title)
+                .help(plan.gate.reason ?? (plan.confirmation.map { plan.spoken + " · " + $0.title + " · asks first (⌘Return)" } ?? "Send (⌘Return)"))
+                .accessibilityLabel(plan.spoken)
                 .accessibilityHint(plan.confirmation == nil ? "" : "Asks first")
                 CommandCopyButton(command: plan.command)
             }
@@ -643,15 +646,19 @@ private struct TryItCard: View {
         .confirmationDialog(asking?.confirmation?.title ?? "", isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
                             titleVisibility: .visible, presenting: asking) { question in
             Button(question.confirmation?.confirm ?? "Send") { Task { await store.send(question, model: row.name, confirmed: true) } }
-            Button("Cancel", role: .cancel) {}
+            // Cancel is the default (Return): a second Return or a key repeat cannot send and wake a machine.
+            if question.confirmation?.cancelIsDefault != false {
+                Button("Cancel", role: .cancel) {}.keyboardShortcut(.defaultAction)
+            } else {
+                Button("Cancel", role: .cancel) {}
+            }
         } message: { question in Text(question.confirmation?.message ?? "") }
     }
-    /// Decides at the click, from the power as it is now: a reading that went stale since the button was drawn
-    /// asks first.
+    /// The store decides at the click, from the power as it is then: a reading that went stale since the button
+    /// was drawn asks first.
     private func send() {
-        let plan = store.tryIt(row, prompt: state.prompts[row.name] ?? "")
-        guard plan.gate.isAllowed else { return }
-        if plan.confirmation != nil { asking = plan } else { Task { await store.send(plan, model: row.name) } }
+        let prompt = state.prompts[row.name] ?? ""
+        Task { if case .ask(let question) = await store.clickSend(row, prompt: prompt) { asking = question } }
     }
 }
 

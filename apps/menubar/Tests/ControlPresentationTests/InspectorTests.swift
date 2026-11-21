@@ -95,7 +95,7 @@ import Testing
     #expect(sleeping.load?.confirmation != nil)
     // Trying a model on a sleeping box wakes it too, and says so.
     let send = Inspector.tryIt("model-b", targets: ["text/model-b"], prompt: "hi", machines: asleep)
-    #expect(send.wakes && send.title == "Send · wakes the GPU box")
+    #expect(send.wakes && send.title == "Send · wakes" && send.spoken == "Send · wakes the GPU box")
     #expect(send.command.arguments == ["ai", "chat", "--json", "--", "model-b", "hi"])
     #expect(Inspector.tryIt("model-b", targets: ["text/model-b"], prompt: "  ", machines: asleep).gate.isAllowed == false)
     // A loaded model offers Unload, never while it answers.
