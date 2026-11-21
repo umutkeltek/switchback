@@ -1339,6 +1339,11 @@ def ai_tune_win_sd():
     return load_tuner_module().WIN_SD
 
 
+def load_lever_tuner():
+    """A simulated tuner whose plan is the mmap lever (judged on load time)."""
+    return sim_tuner(7, levers=("mmap",))
+
+
 def load_lever_run(budget, noise_s=40.0, load_run_s=240.0, apply_s=70.0, seed=7):
     """The mmap lever (judged on load time) on a fake engine: a run of the
     noise runs takes `noise_s`, a load-time run (three unloads and loads)
@@ -1379,6 +1384,29 @@ class BudgetUnitTests(unittest.TestCase):
             print(f"\nbudget {budget} s: ended at {clock.now:.0f} s (overrun {overrun:+.0f} s)",
                   file=sys.stderr)
             self.assertLessEqual(overrun, 240, (budget, clock.now, tuner.notes, tuner.logs))
+
+    def test_a_load_time_run_not_measured_yet_costs_three_reloads(self):
+        """Before any load-time run, one is priced at three applies (each a
+        reload), never at one 40 s noise run; and a lever whose runs that
+        price does not fit is not started, not even its first control."""
+        ai_tune, tuner = load_lever_tuner()
+        tuner.run_secs = {ai_tune.run_kind(tuner.noise_metrics): [40.0]}
+        tuner.apply_secs = [70.0]
+        self.assertEqual(tuner.run_cost("load_s"), 210.0)
+        self.assertEqual(tuner.run_cost("decode"), 40.0)
+        tuner.run_secs["load_s"] = [240.0]
+        self.assertEqual(tuner.run_cost("load_s"), 240.0)
+        del tuner.run_secs["load_s"]
+        # Left: 500 s. At the noise run's price the change fits (a control
+        # and one round: 40 + 2 x (70 + 40) = 260 s); at three reloads it
+        # does not (210 + 2 x (70 + 210) = 770 s).
+        tuner.budget, tuner.started, tuner.clock = 1000, 0.0, lambda: 500.0
+        tuner.noise = {"decode": 0.02}
+        self.assertFalse(tuner.experiment_fits(tuner.plan[0]))
+        measured = []
+        tuner.measure = lambda *metrics: measured.append(metrics) or ({}, None)
+        self.assertFalse(tuner.starts_within_budget(tuner.plan[0]))
+        self.assertEqual(measured, [])
 
     def test_the_first_trials_gate_is_counted(self):
         """A greedy gate that takes 100 s: a change whose rounds fit only
