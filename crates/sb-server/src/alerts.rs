@@ -215,7 +215,7 @@ fn secret_key(key: &str) -> bool {
 /// key material of an account's `auth` block (`inline`, an OAuth `refresh`),
 /// and the current value of every env var such a key names (`*_env`, and
 /// `env` / `refresh_env` in an `auth` block). `in_auth`: inside an `auth`.
-fn collect_secrets(
+pub(crate) fn collect_secrets(
     value: &serde_json::Value,
     key: Option<&str>,
     in_auth: bool,

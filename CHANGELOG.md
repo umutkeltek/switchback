@@ -485,11 +485,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   --load` prints) now carries the command's stderr, then its stdout
   (joined by ` | `), within 300 bytes on one line with control characters
   removed; each keeps at least half the room, so an ssh warning cannot
-  hide the script's reason. Known secret values are replaced by
-  `[redacted]` before the cut: the value of every env var the gateway
-  config names (`api_key_env`, an account's `env` and every other `*_env`),
-  and any value over 20 characters of an env var whose name holds KEY,
-  TOKEN, SECRET or PASSWORD. The command's environment is not changed. A
+  hide the script's reason. Each stream goes through the alerts' own
+  redaction before the cut, so `<redacted>` replaces every secret of the
+  gateway config (`server.api_key`, `api_keys[].key`, a provider's
+  `api_key`, an account's `auth` key material, and the value of every env
+  var the config names, `api_key_env`, an account's `env` and every other
+  `*_env`), the `user:pass@` and query of a URL, token-shaped words
+  (`Bearer …`), and any value over 20 characters of an env var whose name
+  holds KEY, TOKEN, SECRET or PASSWORD; values are trimmed, so one with a
+  trailing newline still matches. The command's environment is not changed. A
   command that succeeds is read as before.
 
 - **Revert to revision 0 means "no saved settings"**: `sb ai revert MODEL 0`

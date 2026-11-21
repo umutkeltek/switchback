@@ -741,8 +741,9 @@ pub trait SettingsCommandRunner: Send + Sync {
     /// `Ok(short stdout)` on exit 0, `Err(why)` otherwise.
     async fn run(&self, command: &str, input: &[u8], timeout: Duration) -> Result<String, String>;
 
-    /// [`Self::run`] with every one of `secrets` replaced by `[redacted]`
-    /// in the failure it answers. The default scrubs `run`'s answer; the
+    /// [`Self::run`] with its failure redacted as an alert is (see
+    /// [`redact_output`]): every one of `secrets`, URL credentials and
+    /// token-shaped words become `<redacted>`. The default scrubs `run`'s answer; the
     /// shell runner scrubs before it cuts the excerpt, so no part of a
     /// secret is left at the cut.
     async fn run_scrubbed(
@@ -754,7 +755,7 @@ pub trait SettingsCommandRunner: Send + Sync {
     ) -> Result<String, String> {
         self.run(command, input, timeout)
             .await
-            .map_err(|why| scrub_secrets(&why, secrets))
+            .map_err(|why| redact_output(&why, secrets))
     }
 }
 
@@ -855,15 +856,15 @@ impl SettingsCommandRunner for ShellSettingsRunner {
 /// Why a settings command failed, for the error the API and the CLI show:
 /// its stderr, then its stdout (a control script that refuses a change
 /// prints the reason there), each on one line with control characters
-/// removed, joined by ` | `, with every one of `secrets` replaced by
-/// `[redacted]`, within 300 bytes. Each stream keeps at least half the room
+/// removed, joined by ` | `, each redacted (see [`redact_output`]) before
+/// the cut, within 300 bytes. Each stream keeps at least half the room
 /// and its last bytes, so a long ssh warning on stderr cannot push out the
 /// script's reason on stdout, and the reverse.
 fn refusal_reason(stderr: &[u8], stdout: &[u8], secrets: &[String]) -> String {
     const LIMIT: usize = 300;
     const JOIN: &str = " | ";
-    let err = scrub_secrets(&one_line(stderr), secrets);
-    let out = scrub_secrets(&one_line(stdout), secrets);
+    let err = redact_output(&one_line(stderr), secrets);
+    let out = redact_output(&one_line(stdout), secrets);
     if err.is_empty() || out.is_empty() {
         return last_bytes(if err.is_empty() { &out } else { &err }, LIMIT);
     }
@@ -903,35 +904,42 @@ fn last_bytes(text: &str, limit: usize) -> String {
     text[start..].trim_start().to_string()
 }
 
-/// Env var values a settings command's output must never show: the value
-/// of every env var `config` names as a credential source (any `*_env`
-/// field, an account's `env`), and of any env var whose name holds KEY,
-/// TOKEN, SECRET or PASSWORD and whose value is longer than 20 characters.
-/// A named value shorter than 6 characters is left out, so a test key such
-/// as `k` does not blank every `k` of the text. The command's own
-/// environment is not touched.
+/// Values a settings command's output must never show: every secret the
+/// alerts redact from `config` (see [`crate::alerts::collect_secrets`]:
+/// `server.api_key`, `api_keys[].key`, a provider's `api_key`, an account's
+/// `auth` key material, and the value of every env var such a field names),
+/// the value of every env var `config` names in any `*_env` field, and of
+/// any env var whose name holds KEY, TOKEN, SECRET or PASSWORD and whose
+/// value is longer than 20 characters. Values are trimmed (a key file read
+/// with its newline still matches the key printed on one line); one
+/// shorter than 6 characters is left out, so a test key such as `k` does
+/// not blank every `k` of the text. The command's own environment is not
+/// touched.
 fn secret_values(config: Option<&sb_core::Config>) -> Vec<String> {
+    let mut found = BTreeSet::new();
     let mut names = Vec::new();
     if let Some(config) = config {
         if let Ok(tree) = serde_json::to_value(config) {
+            crate::alerts::collect_secrets(&tree, None, false, &mut found);
             env_names(&tree, &mut names);
         }
     }
-    let mut values: Vec<String> = names
-        .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .filter(|value| value.trim().len() >= 6)
-        .collect();
+    found.extend(names.iter().filter_map(|name| std::env::var(name).ok()));
     for (name, value) in std::env::vars() {
         let name = name.to_ascii_uppercase();
-        if value.len() > 20
+        if value.trim().len() > 20
             && ["KEY", "TOKEN", "SECRET", "PASSWORD"]
                 .iter()
                 .any(|word| name.contains(word))
         {
-            values.push(value);
+            found.insert(value);
         }
     }
+    let mut values: Vec<String> = found
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.len() >= 6)
+        .collect();
     // Longest first, so a value that holds another is replaced whole.
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     values.dedup();
@@ -959,15 +967,12 @@ fn env_names(tree: &Value, names: &mut Vec<String>) {
     }
 }
 
-/// `text` with every one of `secrets` replaced by `[redacted]`.
-fn scrub_secrets(text: &str, secrets: &[String]) -> String {
-    let mut text = text.to_string();
-    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-        if text.contains(secret.as_str()) {
-            text = text.replace(secret.as_str(), "[redacted]");
-        }
-    }
-    text
+/// `text` redacted as an alert's detail is (the same
+/// [`crate::alerts::redact_text`]): every one of `secrets`, the userinfo
+/// and query of every URL, and token-shaped words (`Bearer …`, `sk-…`)
+/// become `<redacted>`.
+fn redact_output(text: &str, secrets: &[String]) -> String {
+    crate::alerts::redact_text(text, secrets, &[])
 }
 
 // ---------------------------------------------------------------- engine kinds
@@ -3646,7 +3651,7 @@ mod tests {
         assert!(reason.starts_with("fatal: no such model | "), "{reason}");
     }
 
-    // A command that prints a key: the excerpt shows `[redacted]` in its
+    // A command that prints a key: the excerpt shows `<redacted>` in its
     // place, and the command still sees its environment (it printed it).
     #[tokio::test]
     async fn a_refusal_excerpt_never_shows_a_known_secret() {
@@ -3684,7 +3689,7 @@ providers:
             .unwrap_err();
         assert_eq!(
             error,
-            "exit 2: warning: key [redacted] | refused: token [redacted] and plain-value-not-a-secret-at-all"
+            "exit 2: warning: key <redacted> | refused: token <redacted> and plain-value-not-a-secret-at-all"
         );
         // Without the config, a long value of a KEY/TOKEN variable is still
         // scrubbed.
@@ -3705,7 +3710,60 @@ providers:
             .run_scrubbed("x", b"{}", Duration::from_secs(1), &secrets)
             .await
             .unwrap_err();
-        assert_eq!(error, "exit 2: [redacted]");
+        assert_eq!(error, "exit 2: <redacted>");
+    }
+
+    // The redaction is the alerts' own: a key written in the config file
+    // (no env var holds it) never shows, not inside a `curl` command line
+    // nor on its own; a value read with its trailing newline still matches
+    // the key printed on one line; a URL loses its `user:pass@`.
+    #[tokio::test]
+    async fn a_refusal_excerpt_is_redacted_as_an_alert_is() {
+        let file_key = "fake-config-file-key-abcdef";
+        let newline_env = "SB_TEST_SCRUB_NEWLINE_ENV";
+        let newline_value = "fake-newline-value-qrstuv";
+        // A test-only variable no other test reads.
+        std::env::set_var(newline_env, format!("{newline_value}\n"));
+        let cfg = sb_core::Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: up
+    type: openai_compatible
+    base_url: "http://127.0.0.1:1/v1"
+    api_key: "{file_key}"
+  - id: other
+    type: openai_compatible
+    base_url: "http://127.0.0.1:2/v1"
+    api_key_env: {newline_env}
+"#
+        ))
+        .unwrap();
+        let secrets = secret_values(Some(&cfg));
+        assert!(secrets.iter().any(|value| value == file_key));
+        assert!(
+            secrets.iter().any(|value| value == newline_value),
+            "trimmed"
+        );
+        let userinfo = ["user", "pw4u"].join(":");
+        let command = format!(
+            "cat >/dev/null; \
+             echo 'curl -s http://127.0.0.1:8080/x -H \"Authorization: Bearer {file_key}\"' >&2; \
+             echo \"config key={file_key} env ${newline_env}\"; \
+             echo 'engine at http://{userinfo}@engine.example/health refused'; exit 2"
+        );
+        let error = ShellSettingsRunner
+            .run_scrubbed(&command, b"{}", Duration::from_secs(10), &secrets)
+            .await
+            .unwrap_err();
+        assert!(!error.contains(file_key), "{error}");
+        assert!(!error.contains(newline_value), "{error}");
+        assert!(!error.contains(&userinfo), "{error}");
+        assert!(!error.contains("pw4u"), "{error}");
+        assert!(error.contains("config key=<redacted>"), "{error}");
+        assert!(
+            error.contains("http://engine.example/health refused"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
