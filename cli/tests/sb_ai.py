@@ -154,6 +154,7 @@ class Fake:
         self.settings_conflict = False  # the next write loses to another writer
         self.settings_fallback = False  # text/m also reaches other/m (a route named like its target)
         self.revert_zero_unknown = False  # a gateway from before revision 0 was revertable
+        self.write_during_revert = False  # another writer lands while revert 0 is refused
         self.routes = {
             ("GET", "/health"): lambda r: (200, b"ok", "text/plain"),
             ("GET", "/v1/workloads/capacity"): lambda r: self.json({"object": "list", "data": self.lanes}),
@@ -224,6 +225,9 @@ class Fake:
         revision = (request["json"] or {}).get("revision")
         known = {change.get("revision") for change in self.settings_history}
         if revision not in known and (revision != 0 or self.revert_zero_unknown):
+            if self.write_during_revert:
+                self.settings_doc = {"defaults": {"top_k": 40}}
+                self.settings_revision += 1
             return self.json({"error": {"message": f"no settings revision {revision} in the history",
                                         "type": "not_found"}}, 404)
         if revision == 0:
@@ -1652,6 +1656,22 @@ class SbAi(unittest.TestCase):
         self.assertEqual(put["json"], {})
         self.assertEqual(put["headers"]["If-Match"], "3")
         self.assertIn("text/m: revision 4 (no saved settings", run.stdout)
+
+    def test_revert_to_zero_on_an_older_gateway_never_wipes_a_write_made_meanwhile(self):
+        # Another writer lands between the revert's read and its fallback
+        # write: the fallback edits the revision the revert read, so it is a
+        # conflict, and the other write stays.
+        self.fake.revert_zero_unknown = True
+        self.fake.write_during_revert = True
+        self.fake.settings_doc = {"defaults": {"top_k": 20}}
+        self.fake.settings_revision = 3
+        run = self.sb("revert", "text/m", "0")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("the settings changed meanwhile", run.stderr)
+        put = self.posted_with("PUT", "/v1/models/text/m/settings")
+        self.assertEqual(put["headers"]["If-Match"], "3")
+        self.assertEqual(self.fake.settings_doc, {"defaults": {"top_k": 40}})
+        self.assertEqual(self.fake.settings_revision, 4)
 
     def test_chat_sends_profile_and_settings_and_prints_stats(self):
         self.fake.chat_headers = {"x-switchback-route": "strategy=pinned_order selected=text/m",

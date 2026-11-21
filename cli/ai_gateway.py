@@ -2026,9 +2026,14 @@ def cmd_settings(gw, args):
     return OK
 
 
-def write_settings(gw, model, change, extra=None):
-    """Read the document, change it, and write it back with its revision."""
-    target = one_target(settings_view(gw, model, "reading the settings"), model)
+def write_settings(gw, model, change, extra=None, target=None):
+    """Read the document, change it, and write it back with its revision.
+
+    With `target` (a target as read before), that read is the one edited: a
+    write that landed since makes this one a conflict instead of being lost.
+    """
+    if target is None:
+        target = one_target(settings_view(gw, model, "reading the settings"), model)
     if "document" not in target:
         raise Fail(GATEWAY_ERROR, "this key may not change settings (an operator or admin key can)")
     doc = target.get("document") or {}
@@ -2153,8 +2158,10 @@ def cmd_revert(gw, args):
     except GatewayError as error:
         if error.status == 404 and error.error_type == "not_found" and args.revision == 0:
             # A gateway from before revision 0 was revertable: an empty
-            # document is the same write (what `unset` of every key sends).
-            answer = write_settings(gw, args.model, lambda doc: doc.clear())
+            # document is the same write (what `unset` of every key sends),
+            # of the revision read above, so a write that landed since is
+            # a conflict, not wiped.
+            answer = write_settings(gw, args.model, lambda doc: doc.clear(), target=target)
         elif error.status == 409:
             raise Fail(GATEWAY_ERROR, f"the settings changed meanwhile ({error.message}); "
                                       "run the command again") from None

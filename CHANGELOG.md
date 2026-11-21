@@ -498,7 +498,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   history stays; load settings are applied the same way an unset applies
   them, so a lane's `settings_command` puts the engine's config back to its
   base. Against an older gateway, `sb ai revert MODEL 0` writes the empty
-  document itself.
+  document itself, against the revision it read first: a write that landed
+  in between makes it a conflict ("the settings changed meanwhile"), never
+  wiped.
 
 - **A settings name shared with its first target writes that target**: a
   route named like one of its targets (`mac/x` -> `mac/x`, `box/y`) answered
