@@ -95,3 +95,30 @@ func standIn(_ body: String) throws -> (runner: ProcessCommandRunner, directory:
     }
     #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("ran").path))
 }
+
+/// The file descriptors open in this process now.
+func openFileCount() -> Int {
+    (0..<Int32(min(getdtablesize(), 65_536))).filter { fcntl($0, F_GETFD) != -1 }.count
+}
+
+@Test func stoppingARunWhileItWritesNeverCrashesOrLeaksFiles() async throws {
+    // The stand-in keeps writing 64 KB at a time, so a stop lands while a pipe is being read.
+    let (runner, directory) = try standIn("while :; do head -c 65536 /dev/zero; done")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let before = openFileCount()
+    for round in 0..<20 {
+        let task = Task { try await runner.run(Commands.status) }
+        try await Task.sleep(for: .milliseconds(2 + (round % 5) * 3))
+        task.cancel()
+        do {
+            _ = try await task.value
+            Issue.record("a stopped run finished")
+        } catch let failure as CommandFailure {
+            #expect(failure.cancelled)
+        }
+    }
+    // Each stopped stand-in closes its pipes when it is gone; then every pipe end the runs opened is closed.
+    // Two leaked ends a run would leave 40 open; other tests running beside this one hold a few at most.
+    for _ in 0..<400 where openFileCount() > before + 10 { try await Task.sleep(for: .milliseconds(10)) }
+    #expect(openFileCount() <= before + 10, "open files: \(before) before, \(openFileCount()) after")
+}

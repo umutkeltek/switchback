@@ -65,16 +65,21 @@ public struct ProcessCommandRunner: CommandRunning {
     }
 }
 
-/// One running `sb`. It ends when the process has exited and both pipes are closed, or at once when it is stopped
+/// One running `sb`. The wait ends when the process exited and both pipes closed, or at once when it is stopped
 /// (cancelled, too slow, too much output); a stopped process gets SIGTERM, then SIGKILL 0.3 s later.
+///
+/// Each pipe is read only by its own handler, and only that handler closes it, after it read the end: stopping
+/// never closes a pipe a handler may still be reading. A stopped process's pipes close when it is gone; until
+/// then what it still writes is read and dropped.
 final class RunningCommand: @unchecked Sendable {
     static let stdoutCeiling = 8_388_608
     static let stderrCeiling = 262_144
+    static let chunk = 65_536
     private let lock = NSLock()
     private let process: Process
     private let out = Pipe(), err = Pipe()
     private var stdout = Data(), stderr = Data()
-    private var outOpen = true, errOpen = true, exited = false, launched = false, closed = false
+    private var outOpen = true, errOpen = true, exited = false, launched = false
     private var failure: CommandFailure?
     private var continuation: CheckedContinuation<CommandResult, any Error>?
     private var deadline: DispatchWorkItem?
@@ -90,6 +95,7 @@ final class RunningCommand: @unchecked Sendable {
         if let failure {
             // Stopped before it started: it never runs.
             lock.unlock()
+            closeAll()
             continuation.resume(throwing: failure)
             return
         }
@@ -105,9 +111,11 @@ final class RunningCommand: @unchecked Sendable {
         do {
             try process.run()
         } catch {
+            // Nothing was written, so no handler is reading: the pipes can close here.
             out.fileHandleForReading.readabilityHandler = nil
             err.fileHandleForReading.readabilityHandler = nil
             process.terminationHandler = nil
+            closeAll()
             let waiting = lock.withLock { () -> CheckedContinuation<CommandResult, any Error>? in
                 defer { self.continuation = nil }
                 return self.continuation
@@ -128,8 +136,9 @@ final class RunningCommand: @unchecked Sendable {
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: item)
     }
 
-    /// Stops the process and ends the wait with `reason`. Before the process has started it only records the
-    /// reason, and `start` stops it (or never starts it).
+    /// Stops the process and ends the wait with `reason`. Before the process started it only records the
+    /// reason, and `start` stops it (or never starts it). The pipes stay with their handlers, which drain and
+    /// close them once the stopped process is gone.
     func stop(_ reason: CommandFailure) {
         lock.lock()
         if failure == nil { failure = reason }
@@ -139,28 +148,33 @@ final class RunningCommand: @unchecked Sendable {
         let item = deadline
         lock.unlock()
         item?.cancel()
-        out.fileHandleForReading.readabilityHandler = nil
-        err.fileHandleForReading.readabilityHandler = nil
         if process.isRunning { process.terminate() }
         let process = self.process
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
             if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
         }
-        closeReaders()
         waiting?.resume(throwing: reason)
     }
 
+    /// One read from a pipe, in its own handler. A read error counts as the end, never a trap.
     private func collect(_ handle: FileHandle, stdout isOut: Bool) {
-        let data = handle.availableData
-        if data.isEmpty { handle.readabilityHandler = nil }
+        // A late call after this pipe's end never touches the closed handle.
+        guard lock.withLock({ isOut ? outOpen : errOpen }) else { return }
+        var buffer = [UInt8](repeating: 0, count: Self.chunk)
+        let count = buffer.withUnsafeMutableBytes { Darwin.read(handle.fileDescriptor, $0.baseAddress, Self.chunk) }
+        if count < 0 && (errno == EAGAIN || errno == EINTR) { return }
+        guard count > 0 else {
+            // The end (or a read error): this handler is the pipe's only reader, so it closes it.
+            handle.readabilityHandler = nil
+            handle.closeFile()
+            lock.withLock { if isOut { outOpen = false } else { errOpen = false } }
+            finishIfDone()
+            return
+        }
         let tooMuch = lock.withLock { () -> Bool in
-            if data.isEmpty {
-                if isOut { outOpen = false } else { errOpen = false }
-            } else if isOut {
-                stdout.append(data)
-            } else {
-                stderr.append(data)
-            }
+            // Stopped: what the process still writes is dropped.
+            guard failure == nil else { return false }
+            if isOut { stdout.append(contentsOf: buffer[0..<count]) } else { stderr.append(contentsOf: buffer[0..<count]) }
             return stdout.count > Self.stdoutCeiling || stderr.count > Self.stderrCeiling
         }
         if tooMuch { stop(CommandFailure("sb answered with too much output")) } else { finishIfDone() }
@@ -175,18 +189,15 @@ final class RunningCommand: @unchecked Sendable {
                                    stderr: String(decoding: stderr, as: UTF8.self))
         lock.unlock()
         item?.cancel()
-        closeReaders()
         waiting.resume(returning: result)
     }
 
-    private func closeReaders() {
-        let first = lock.withLock { () -> Bool in
-            defer { closed = true }
-            return !closed
+    /// Closes every end of both pipes; only where no handler reads them.
+    private func closeAll() {
+        for pipe in [out, err] {
+            pipe.fileHandleForReading.closeFile()
+            pipe.fileHandleForWriting.closeFile()
         }
-        guard first else { return }
-        out.fileHandleForReading.closeFile()
-        err.fileHandleForReading.closeFile()
     }
 }
 
