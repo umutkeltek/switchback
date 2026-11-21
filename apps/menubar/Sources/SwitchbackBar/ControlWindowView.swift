@@ -123,9 +123,8 @@ struct ControlWindowView: View {
             let problems = store.problems
             return problems.isEmpty ? nil : .count(problems.count, problems.contains(where: \.serious) ? .red : .orange)
         case .models:
-            // Models in memory, each once: several names can reach one loaded model.
-            let loaded = ModelList.loadedCount(engines: store.engines)
-            return loaded == 0 ? nil : .text("\(loaded) loaded")
+            // Models in memory, in the machine cards' words; an asleep box adds none.
+            return ModelList.inMemoryText(store.machines).map { .text($0) }
         case .machines:
             guard let box = store.machines.first(where: { $0.kind == .gpuBox }) else { return nil }
             let color: Color = switch box.power {
@@ -134,7 +133,8 @@ struct ControlWindowView: View {
             case .asleep: .indigo
             case .poweringOff: .secondary
             }
-            return .dot(color, box.powerWord)
+            // A reading the window cannot vouch for draws grey, in the status line's words.
+            return .dot(box.powerCheck == nil ? color : .secondary, Machines.shortStatus(box))
         case .accounts:
             guard let best = accounts.directionData.best else { return nil }
             return .text(best.roomText + "%")
@@ -156,7 +156,9 @@ struct ControlWindowView: View {
     private var freshnessText: String {
         if store.readError != nil { return "Can’t reach the gateway" }
         guard let last = store.lastRead else { return store.reading ? "Reading…" : "Not read yet" }
-        return "Updated " + Words.ago(store.now.timeIntervalSince(last))
+        // Past the power's 15 s trust, the exact age, so it matches the machines' "Last seen … ago".
+        let age = store.now.timeIntervalSince(last)
+        return "Updated " + (age > Machines.powerTrust ? Words.duration(age) + " ago" : Words.ago(age))
     }
 
     // MARK: Header
@@ -181,7 +183,7 @@ struct ControlWindowView: View {
             let rows = store.rows
             let routes = rows.filter(\.isRoute).count
             return rows.isEmpty ? "No models listed" : "\(rows.count) names · \(routes) \(routes == 1 ? "route" : "routes")"
-        case .machines: return "Power, holds and what each machine has loaded"
+        case .machines: return "Power, holds and what each machine has in memory"
         case .accounts: return "Which account to use now, and how much room each has"
         }
     }

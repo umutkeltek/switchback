@@ -113,16 +113,18 @@ struct MachineTile: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
                 PowerGlyph(power: machine.power, kind: machine.kind, size: 40)
+                    // A reading the window cannot vouch for: the glyph dims with the status line.
+                    .opacity(machine.powerCheck == nil ? 1 : 0.45)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(machine.title).font(.system(size: 15, weight: .semibold)).lineLimit(1).truncationMode(.middle)
-                    Text(MachineWords.status(machine)).font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText).lineLimit(1)
+                    StatusText(machine: machine).lineLimit(1)
                 }
                 .layoutPriority(1)
                 Spacer(minLength: 6)
                 MachineWords.timer(machine)
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel(machine.title + ": " + MachineWords.status(machine))
+            .accessibilityLabel(machine.title + ": " + Machines.statusLine(machine).text)
             HStack(spacing: 6) {
                 if let gpu = machine.gpuUser { Pill(text: "GPU: " + gpu, symbol: "memorychip") }
                 if machine.busy > 0 { Pill(text: "\(machine.busy) working", symbol: "bolt.fill", tint: .orange) }
@@ -133,26 +135,31 @@ struct MachineTile: View {
                 }
             }
             Rectangle().fill(WindowColor.hairline).frame(height: 1).accessibilityHidden(true)
-            LoadedList(models: machine.loaded, budget: budget, limit: 4)
+            LoadedList(models: machine.loaded, budget: budget, lastLoaded: machine.lastLoaded, limit: 4)
         }
         .windowCard()
     }
 }
 
-/// Loaded models with their memory.
+/// A machine's models, each "In memory" (filled dot, with its memory) or "Resting" (hollow dot). A machine that
+/// is not on lists none; what it had before it powered off shows muted as "Last loaded".
 struct LoadedList: View {
     let models: [LoadedModel]
     let budget: Double?
+    var lastLoaded: [String] = []
     var limit = 99
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if models.isEmpty {
-                Text("Nothing loaded").font(.system(size: 12)).foregroundStyle(.tertiary)
+            if models.isEmpty && !lastLoaded.isEmpty {
+                Text("Last loaded: " + lastLoaded.joined(separator: ", ")).font(.system(size: 12)).foregroundStyle(.tertiary)
+                    .lineLimit(2).truncationMode(.tail)
+                    .help("What its engine listed before it powered off; nothing is in memory now")
+            } else if models.isEmpty {
+                Text("Nothing in memory").font(.system(size: 12)).foregroundStyle(.tertiary)
             }
             ForEach(models.prefix(limit)) { model in
                 HStack(spacing: 8) {
-                    LoadDot(state: model.state == .loaded ? .loaded : model.state == .resting ? .resting
-                                   : model.state == .loading ? .loading : .failed)
+                    LoadDot(state: model.loadState)
                     Text(model.name).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
                         .help(model.name)
                     if model.answering > 0 {
@@ -161,17 +168,19 @@ struct LoadedList: View {
                     }
                     Spacer(minLength: 6)
                     if model.state == .failed {
-                        Text("failed").font(.system(size: 11, weight: .medium)).foregroundStyle(.red)
-                    } else if model.state == .resting {
-                        // Listed but not in memory: its engine loads it again when work comes.
-                        Text("Resting").font(.system(size: 11)).foregroundStyle(WindowColor.secondaryText)
-                            .help("Listed, not in memory: it loads again when a request comes")
+                        Text(model.word).font(.system(size: 11, weight: .medium)).foregroundStyle(.red).fixedSize()
                     } else {
-                        MemoryBar(used: model.memoryBytes, budget: budget, width: 70)
+                        // Memory shows only when the engine measured it.
+                        if model.state == .loaded, model.memoryBytes != nil {
+                            MemoryBar(used: model.memoryBytes, budget: budget, width: 56)
+                        }
+                        Text(model.word).font(.system(size: 11)).foregroundStyle(WindowColor.secondaryText).fixedSize()
+                            .help(model.state == .resting ? "Listed, not in memory: it loads again when a request comes"
+                                  : model.state == .loading ? "Going into memory now" : "In memory now")
                     }
                 }
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("\(model.name), \(LoadState(rawValue: model.state.rawValue)?.word ?? model.state.rawValue)")
+                .accessibilityLabel("\(model.name), \(model.word)")
             }
             if models.count > limit {
                 Text("+\(models.count - limit) more").font(.system(size: 11)).foregroundStyle(.tertiary)
@@ -189,12 +198,21 @@ struct LoadedList: View {
     }
 }
 
+/// The line under a machine's name; muted when the window cannot vouch for the power it last read.
+struct StatusText: View {
+    let machine: MachineCard
+    var body: some View {
+        let line = Machines.statusLine(machine)
+        Text(line.text).font(.system(size: 12))
+            .foregroundStyle(line.muted ? AnyShapeStyle(.tertiary) : AnyShapeStyle(WindowColor.secondaryText))
+            .help(line.muted ? "The window can’t vouch for this right now: " + (machine.powerDoubt ?? "") : "")
+    }
+}
+
 enum MachineWords {
-    static func status(_ machine: MachineCard) -> String {
-        var parts = [machine.powerWord]
-        if let uptime = Machines.uptimeText(machine) { parts.append("up \(uptime)") }
-        if machine.kind == .gpuBox && machine.power == .asleep { parts.append("wakes when work arrives") }
-        return parts.joined(separator: " · ")
+    /// "1 in memory" beside a machine's models; nil when none is.
+    static func inMemory(_ machine: MachineCard) -> String? {
+        machine.inMemory == 0 ? nil : "\(machine.inMemory) in memory"
     }
     /// The idle countdown as a ring, "Kept on" while a hold runs, nothing otherwise.
     @ViewBuilder static func timer(_ machine: MachineCard) -> some View {

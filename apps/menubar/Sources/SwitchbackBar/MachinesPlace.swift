@@ -40,9 +40,11 @@ struct GPUBoxCard: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 14) {
                 PowerGlyph(power: machine.power, kind: machine.kind, size: 48)
+                    // A reading the window cannot vouch for: the glyph dims with the status line.
+                    .opacity(machine.powerCheck == nil ? 1 : 0.45)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(machine.title).font(.system(size: 17, weight: .semibold)).lineLimit(1).truncationMode(.middle)
-                    Text(MachineWords.status(machine)).font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText)
+                    StatusText(machine: machine)
                 }
                 .accessibilityElement(children: .combine)
                 Spacer(minLength: 12)
@@ -62,8 +64,8 @@ struct GPUBoxCard: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 VStack(alignment: .leading, spacing: 10) {
-                    CardTitle(title: "Loaded", symbol: "square.stack.3d.up", trailing: machine.inMemory == 0 ? nil : "\(machine.inMemory)")
-                    LoadedList(models: machine.loaded, budget: budget)
+                    CardTitle(title: "Models", symbol: "square.stack.3d.up", trailing: MachineWords.inMemory(machine))
+                    LoadedList(models: machine.loaded, budget: budget, lastLoaded: machine.lastLoaded)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -116,21 +118,11 @@ struct GPUBoxCard: View {
         }
     }
 
+    /// Only the tiles that mean something now: an asleep box has no uptime or countdown to show.
     private var stats: some View {
         HStack(spacing: 10) {
-            Stat(title: "Up", value: Machines.uptimeText(machine) ?? "—", symbol: "clock",
-                 help: machine.uptime == nil ? "Unknown: the gateway does not say when it came up"
-                     : machine.uptimeApproximate ? "About: from its newest wake, so it may have been up longer; it can power off after 4 min"
-                     : "Since it came up; it can power off after 4 min")
-            Stat(title: "GPU", value: machine.gpuUser ?? "free", symbol: "memorychip", help: "Who has the GPU now")
-            Stat(title: "Working", value: machine.busy == 0 ? "idle" : "\(machine.busy)", symbol: "bolt",
-                 help: "Requests running or waiting", tint: machine.busy > 0 ? .orange : nil)
-            Stat(title: "Powers off", value: machine.powerOffIn.map { "in " + Words.duration($0) } ?? (machine.holds.isEmpty ? "—" : "held"),
-                 symbol: "power", help: "The idle power-off countdown")
-            // How long a wake takes matters only while it sleeps.
-            if machine.power == .asleep || machine.power == .poweringOff, let wake = machine.wakeSeconds {
-                Stat(title: "Wake takes", value: "~" + Words.duration(wake), symbol: "sunrise",
-                     help: "How long a wake takes, on average")
+            ForEach(Machines.stats(machine)) { stat in
+                Stat(title: stat.title, value: stat.value, symbol: stat.symbol, help: stat.help, tint: stat.busy ? .orange : nil)
             }
         }
     }
@@ -158,7 +150,7 @@ struct Stat: View {
     }
 }
 
-/// The Mac: what it has loaded and its memory. Show-only: no power, holds or load settings.
+/// The Mac: its models, in memory or resting. Show-only: no power, holds or load settings.
 struct MacCard: View {
     let machine: MachineCard
     var body: some View {
@@ -180,8 +172,8 @@ struct MacCard: View {
             if !machine.problems.isEmpty {
                 VStack(alignment: .leading, spacing: 6) { ForEach(machine.problems) { ProblemRow(problem: $0, short: true) } }
             }
-            CardTitle(title: "Loaded", symbol: "square.stack.3d.up", trailing: machine.inMemory == 0 ? nil : "\(machine.inMemory)")
-            LoadedList(models: machine.loaded, budget: nil)
+            CardTitle(title: "Models", symbol: "square.stack.3d.up", trailing: MachineWords.inMemory(machine))
+            LoadedList(models: machine.loaded, budget: nil, lastLoaded: machine.lastLoaded)
         }
         .windowCard(padding: 20)
     }

@@ -37,6 +37,44 @@ public struct LoadedModel: Sendable, Equatable, Identifiable {
     public let memoryBytes: Double?
     public let context: Int?
     public let answering: Int
+    /// The same state every place shows: a filled dot "In memory", a hollow dot "Resting".
+    public var loadState: LoadState {
+        switch state {
+        case .loaded: .loaded
+        case .resting: .resting
+        case .loading: .loading
+        case .failed: .failed
+        }
+    }
+    /// "In memory", "Resting", "Loading", "Failed to load".
+    public var word: String { loadState.word }
+}
+
+/// Why the window cannot vouch for a GPU box's power right now; the status line says so instead of "On".
+public enum PowerCheck: Sendable, Equatable {
+    /// No reading to go by: the window just came back from hidden, or it has not read the power yet.
+    case checking
+    /// The newest good reading is this many seconds old: older than 15 s, or the read after it failed.
+    case lastSeen(age: Double)
+    /// The idle power-off is this many seconds away, under 30 s: it may be asleep by the time work arrives.
+    case poweringOffSoon(in: Double)
+}
+
+/// A machine's status line, and whether it is a guess the window cannot vouch for (drawn muted).
+public struct StatusLine: Sendable, Equatable {
+    public let text: String
+    public let muted: Bool
+}
+
+/// One small tile on a GPU box card: "Up", "GPU", "Working", "Powers off", "Wake takes".
+public struct MachineStat: Sendable, Equatable, Identifiable {
+    public var id: String { title }
+    public let title: String
+    public let value: String
+    public let symbol: String
+    public let help: String
+    /// Drawn orange: work is waiting.
+    public var busy = false
 }
 
 /// Something wrong, in one plain line.
@@ -85,11 +123,16 @@ public struct MachineCard: Sendable, Equatable, Identifiable {
     public var powerDoubt: String? = nil
     /// The uptime is an estimate from the newest wake: the gateway did not say when the machine came up.
     public var uptimeApproximate: Bool = false
+    /// What the engine listed in memory or resting before the machine powered off, by name. Only for a machine
+    /// that is not on, whose `loaded` is then empty: nothing is in memory on a machine that is asleep.
+    public var lastLoaded: [String] = []
+    /// Why the status line cannot say a confident "On"; nil when the reading is fresh.
+    public var powerCheck: PowerCheck? = nil
 
     /// On, and the window's reading of it is fresh: nothing sent to it can wake it.
     public var knownOn: Bool { power == .on && powerDoubt == nil }
-    /// Models in memory now; a resting model is listed but not in memory.
-    public var inMemory: Int { loaded.filter { $0.state == .loaded || $0.state == .loading }.count }
+    /// Models in memory now; a resting model is listed but not in memory, a loading one not yet.
+    public var inMemory: Int { loaded.filter { $0.state == .loaded }.count }
 }
 
 /// How far the window can trust the power it last read.
@@ -186,6 +229,16 @@ public enum Machines {
                                    answering: model.inFlight)
             }
         }
+        // A listing is read only while the machine is up. On a machine that is not on now, it is from before the
+        // machine powered off: nothing in it is in memory. It shows only as "Last loaded", and only when the
+        // gateway says when it read it; a listing of unknown age shows nothing.
+        let listings = (engines?.lanes ?? []).filter { machineLanes.contains($0.lane) }
+        var lastLoaded: [String] = []
+        if power != .on, !listings.isEmpty, listings.allSatisfy({ ($0.seenAtMs ?? .infinity) <= nowMs }) {
+            for model in loaded where model.state != .failed && !lastLoaded.contains(model.name) { lastLoaded.append(model.name) }
+        }
+        let current = power == .on ? loaded : []
+        let check = kind == .gpuBox ? powerCheck(power: power, countdown: countdown, evidence: evidence, now: now) : nil
         let holdCards = holds.map { hold -> HoldCard in
             let left = hold.expiresAtMs.map { max(0, $0 - nowMs) / 1000 }
             var until = ""
@@ -206,28 +259,97 @@ public enum Machines {
             uptime: uptime, gpuUser: gpuLane.map { jobWords(lane: $0.name, engines: engines, doctor: doctor) },
             busy: lanes.reduce(0) { $0 + $1.inFlight + $1.queueDepth }, guardBusy: lanes.contains(where: \.poweroffGuardBusy),
             // A Mac shows no holds: there is nothing to release on a machine that is always on.
-            holds: kind == .gpuBox ? holdCards : [], loaded: loaded,
+            holds: kind == .gpuBox ? holdCards : [], loaded: current,
             problems: problems(title: title, kind: kind, power: power, lanes: lanes, holds: holdCards,
                                engines: (engines?.lanes ?? []).filter { machineLanes.contains($0.lane) }),
             wakeSeconds: lanes.compactMap(\.wakeDurationAverageMs).max().map { $0 / 1000 },
             lanes: machineLanes,
-            powerDoubt: kind == .gpuBox ? powerDoubt(power: power, countdown: countdown, evidence: evidence, now: now) : nil,
-            uptimeApproximate: up?.approximate ?? false)
+            powerDoubt: check.map { doubtWords($0, evidence: evidence) },
+            uptimeApproximate: up?.approximate ?? false, lastLoaded: lastLoaded, powerCheck: check)
     }
 
-    /// Why the window cannot be sure of a GPU box's power now, in a few words; nil when it can. The power is
-    /// unknown when it was read more than 15 s ago, when the last read failed, when the window just came back
-    /// from hidden and has not read it again, and when the idle power-off is under 30 s away.
-    static func powerDoubt(power: Power, countdown: Double?, evidence: PowerEvidence?, now: Date) -> String? {
+    /// Whether the window can vouch for a GPU box's power now; nil when it can. The power is unknown when it was
+    /// read more than 15 s ago, when the last read failed, when the window just came back from hidden and has
+    /// not read it again, and when the idle power-off is under 30 s away.
+    static func powerCheck(power: Power, countdown: Double?, evidence: PowerEvidence?, now: Date) -> PowerCheck? {
         if let evidence {
-            if evidence.failed { return "the last reading failed" }
-            if evidence.awaitingFresh { return "the window is reading it again" }
-            guard let readAt = evidence.readAt else { return "it has not been read yet" }
-            let age = now.timeIntervalSince(readAt)
-            if age > powerTrust { return "it was last read \(Words.duration(age)) ago" }
+            let age = evidence.readAt.map { max(0, now.timeIntervalSince($0)) }
+            if evidence.failed { return age.map { .lastSeen(age: $0) } ?? .checking }
+            if evidence.awaitingFresh { return .checking }
+            guard let age else { return .checking }
+            if age > powerTrust { return .lastSeen(age: age) }
         }
-        if power == .on, let countdown, countdown < countdownTrust { return "it powers off in \(Words.duration(countdown))" }
+        if power == .on, let countdown, countdown < countdownTrust { return .poweringOffSoon(in: countdown) }
         return nil
+    }
+
+    /// The doubt in a few words, for the questions that ask before a wake.
+    static func doubtWords(_ check: PowerCheck, evidence: PowerEvidence?) -> String {
+        switch check {
+        case .checking:
+            if evidence?.awaitingFresh == true && evidence?.failed != true { return "the window is reading it again" }
+            return evidence?.failed == true ? "the last reading failed" : "it has not been read yet"
+        case .lastSeen(let age):
+            return evidence?.failed == true ? "the last reading failed" : "it was last read \(Words.duration(age)) ago"
+        case .poweringOffSoon(let seconds): return "it powers off in \(Words.duration(seconds))"
+        }
+    }
+
+    /// The line under a machine's name. A fresh reading: "On · up 12 min", "Asleep · wakes when work arrives".
+    /// A reading the window cannot vouch for says so, muted: "Checking…", "Last seen on 40 s ago",
+    /// "About to power off · in 20 s".
+    public static func statusLine(_ machine: MachineCard) -> StatusLine {
+        switch machine.powerCheck {
+        case .checking?:
+            return StatusLine(text: "Checking…", muted: true)
+        case .lastSeen(let age)?:
+            let when = age < 5 ? "just now" : Words.duration(age) + " ago"
+            return StatusLine(text: "Last seen \(machine.powerWord.lowercased()) \(when)", muted: true)
+        case .poweringOffSoon(let seconds)?:
+            return StatusLine(text: "About to power off · in \(Words.duration(seconds))", muted: true)
+        case nil:
+            var parts = [machine.powerWord]
+            if let uptime = uptimeText(machine) { parts.append("up \(uptime)") }
+            if machine.kind == .gpuBox && machine.power == .asleep { parts.append("wakes when work arrives") }
+            return StatusLine(text: parts.joined(separator: " · "), muted: false)
+        }
+    }
+
+    /// The machine's state in one or two words, for the sidebar and the header: "On", "Asleep", "Checking…",
+    /// "Last seen on", "About to power off".
+    public static func shortStatus(_ machine: MachineCard) -> String {
+        switch machine.powerCheck {
+        case .checking?: "Checking…"
+        case .lastSeen?: "Last seen " + machine.powerWord.lowercased()
+        case .poweringOffSoon?: "About to power off"
+        case nil: machine.powerWord
+        }
+    }
+
+    /// The tiles that mean something in the box's state. On: up, GPU, working, powers off. Asleep or powering
+    /// off: how long a wake takes and the GPU. Waking: also the requests waiting for it.
+    public static func stats(_ machine: MachineCard) -> [MachineStat] {
+        let gpu = MachineStat(title: "GPU", value: machine.gpuUser ?? "free", symbol: "memorychip", help: "Who has the GPU now")
+        let working = MachineStat(title: "Working", value: machine.busy == 0 ? "idle" : "\(machine.busy)", symbol: "bolt",
+                                  help: "Requests running or waiting", busy: machine.busy > 0)
+        let wake = machine.wakeSeconds.map {
+            MachineStat(title: "Wake takes", value: "~" + Words.duration($0), symbol: "sunrise", help: "How long a wake takes, on average")
+        }
+        switch machine.power {
+        case .on:
+            let up = MachineStat(title: "Up", value: uptimeText(machine) ?? "—", symbol: "clock",
+                                 help: machine.uptime == nil ? "Unknown: the gateway does not say when it came up"
+                                     : machine.uptimeApproximate ? "About: from its newest wake, so it may have been up longer; it can power off after 4 min"
+                                     : "Since it came up; it can power off after 4 min")
+            let off = MachineStat(title: "Powers off",
+                                  value: machine.powerOffIn.map { "in " + Words.duration($0) } ?? (machine.holds.isEmpty ? "—" : "held"),
+                                  symbol: "power", help: "The idle power-off countdown")
+            return [up, gpu, working, off]
+        case .asleep, .poweringOff:
+            return [wake, gpu].compactMap { $0 }
+        case .waking:
+            return [wake, gpu, working].compactMap { $0 }
+        }
     }
 
     /// When the machine came up: the gateway's own time when it gives one. Otherwise the newest successful
@@ -250,7 +372,7 @@ public enum Machines {
     public static func summary(_ cards: [MachineCard]) -> String {
         var parts: [String] = []
         let boxes = cards.filter { $0.kind == .gpuBox }
-        if boxes.count == 1 { parts.append("GPU box " + boxes[0].powerWord.lowercased()) }
+        if boxes.count == 1 { parts.append("GPU box " + shortStatus(boxes[0]).lowercased()) }
         if boxes.count > 1 {
             parts.append("\(boxes.count) GPU boxes")
             parts.append("\(boxes.filter { $0.power == .on }.count) on")
@@ -310,13 +432,12 @@ public enum Machines {
         return found
     }
 
-    /// "Power off": offered only for a GPU box, disabled with the reason while it must stay on.
+    /// "Power off": offered only for a GPU box that is on or waking, disabled with the reason while it must stay
+    /// on. A box that is asleep or already powering off gets no button at all.
     public static func powerOff(_ machine: MachineCard) -> ActionPlan? {
-        guard machine.kind == .gpuBox else { return nil }
+        guard machine.kind == .gpuBox, machine.power == .on || machine.power == .waking else { return nil }
         let gate: Gate
-        if machine.power == .asleep { gate = .disabled("Already asleep") }
-        else if machine.power == .waking { gate = .disabled("Waking up") }
-        else if machine.power == .poweringOff { gate = .disabled("Already powering off") }
+        if machine.power == .waking { gate = .disabled("Waking up") }
         else if !machine.holds.isEmpty {
             gate = .disabled(machine.holds.count == 1 ? "A hold keeps it on · release it first"
                                                       : "\(machine.holds.count) holds keep it on · release them first")

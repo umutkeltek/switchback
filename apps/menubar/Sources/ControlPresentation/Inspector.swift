@@ -47,6 +47,30 @@ public struct SettingState: Sendable, Equatable, Identifiable {
     public let gate: Gate
 }
 
+/// The undo beside one setting.
+public enum RowUndo: Sendable, Equatable {
+    /// Take back an edit waiting for Apply: the saved value shows again.
+    case undoChange
+    /// Take back a reset waiting for Apply: the saved value stays.
+    case undoReset
+    /// Nothing waiting: remove the saved value, so the engine's own value applies (after Apply).
+    case reset
+    public var help: String {
+        switch self {
+        case .undoChange: "Undo this change"
+        case .undoReset: "Undo the reset · keep the saved value"
+        case .reset: "Back to the engine’s own value"
+        }
+    }
+    public func spoken(_ title: String) -> String {
+        switch self {
+        case .undoChange: "Undo change to " + title
+        case .undoReset: "Undo reset of " + title
+        case .reset: "Reset " + title
+        }
+    }
+}
+
 /// A change waiting for "Apply".
 public enum DraftValue: Sendable, Equatable {
     case set(JSONValue)
@@ -234,6 +258,25 @@ public enum Inspector {
             if let value = setting.value { return SettingFace(value: value, source: .saved, text: words(value)) }
             if let shown = setting.shown { return SettingFace(value: shown, source: .engine, text: words(shown)) }
             return SettingFace(value: nil, source: .unknown, text: neutral)
+        }
+    }
+
+    /// The small undo beside a setting's title, if any: undo an edit or a reset waiting for Apply, or (with
+    /// nothing waiting) go back to the engine's own value. Nil while the setting may not change here.
+    public static func rowUndo(_ setting: SettingState, draft: SettingsDraft) -> RowUndo? {
+        guard setting.gate.isAllowed else { return nil }
+        switch draft.values[setting.key] {
+        case .reset?: return .undoReset
+        case .set?: return .undoChange
+        case nil: return setting.value == nil ? nil : .reset
+        }
+    }
+    /// What pressing that undo does to the draft. Undoing a waiting edit or reset leaves only that row's entry
+    /// out, so the other changes stay waiting.
+    public static func press(_ undo: RowUndo, for setting: SettingState, in draft: inout SettingsDraft) {
+        switch undo {
+        case .undoReset, .undoChange: draft.values[setting.key] = nil
+        case .reset: draft.values[setting.key] = .reset
         }
     }
 
@@ -428,13 +471,16 @@ public enum Inspector {
         return ChangePlan(lines: lines, actions: actions, notes: notes, reloads: loadChanged && loaded && apply == .now)
     }
 
-    /// Load and unload, for a GPU box model whose engine accepts them.
+    /// Load and unload, for a GPU box model whose engine accepts them. For a route, `target` is the model chosen
+    /// in its picker. "Unload" only for a model in memory (or going into it) on a box that is on; a resting model
+    /// is not in memory, so it gets "Load now" instead.
     public static func loadActions(_ target: TargetSettings, engines: EnginesReport?, machines: [MachineCard]) -> (load: ActionPlan?, unload: ActionPlan?) {
         guard let gate = loadControl(target, engines: engines, machines: machines),
               let lane = target.engineLane, let machine = Machines.machine(forLane: lane, in: machines) else { return (nil, nil) }
         let model = engines?.model(target.target)?.model
         let status = model?.status ?? target.engineStatus ?? "unknown"
-        if status == "loaded" || status == "loading" || status == "sleeping" {
+        // A box that is not on has nothing in memory, whatever its last listing says.
+        if machine.power == .on && (status == "loaded" || status == "loading") {
             let busy = model?.inFlight ?? 0
             let unloadGate: Gate = !gate.isAllowed ? gate : status == "loading" ? .disabled("Still loading")
                 : busy > 0 ? .disabled("Answering now · try when it is done") : .allowed

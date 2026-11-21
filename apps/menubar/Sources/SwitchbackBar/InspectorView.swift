@@ -157,16 +157,23 @@ private struct SettingLabel: View {
             SourceBadgeView(badge: draft.values[setting.key] == nil ? setting.badge
                             : draft.values[setting.key] == .reset ? .engine : .saved)
             Spacer(minLength: 4)
-            if setting.gate.isAllowed && (setting.value != nil || draft.values[setting.key] != nil) && draft.values[setting.key] != .reset {
+            // A waiting edit or reset shows "Undo" on its own row; with nothing waiting, the arrow resets a saved value.
+            if let undo = Inspector.rowUndo(setting, draft: draft) {
                 Button {
-                    if setting.value == nil { draft.values[setting.key] = nil } else { draft.values[setting.key] = .reset }
+                    Inspector.press(undo, for: setting, in: &draft)
                 } label: {
-                    Image(systemName: "arrow.uturn.backward").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-                        .frame(width: 20, height: 20).contentShape(Rectangle())
+                    if undo == .reset {
+                        Image(systemName: "arrow.uturn.backward").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                            .frame(width: 20, height: 20).contentShape(Rectangle())
+                    } else {
+                        Label("Undo", systemImage: "arrow.uturn.backward").labelStyle(TightLabelStyle())
+                            .font(.system(size: 11, weight: .medium)).foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 6).frame(height: 20).contentShape(Rectangle())
+                    }
                 }
                 .buttonStyle(PanelPressStyle()).focusable()
-                .help(setting.value == nil ? "Undo this change" : "Back to the engine’s own value")
-                .accessibilityLabel((setting.value == nil ? "Undo change to " : "Reset ") + setting.title)
+                .help(undo.help)
+                .accessibilityLabel(undo.spoken(setting.title))
             }
         }
     }

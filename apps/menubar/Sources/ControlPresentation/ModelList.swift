@@ -22,13 +22,15 @@ public enum Location: Sendable, Equatable {
     }
 }
 
+/// Whether a model is in memory. Every place says it the same way: "In memory" (a filled green dot) or "Resting"
+/// (a hollow dot: listed, not in memory; its engine loads it again when a request comes).
 public enum LoadState: String, Sendable, Equatable {
     case loaded, resting, loading, unloaded, failed
     /// Nothing loads this model (a cloud model, an image workflow): no dot.
     case none
     public var word: String {
         switch self {
-        case .loaded: "Loaded"
+        case .loaded: "In memory"
         case .resting: "Resting"
         case .loading: "Loading"
         case .unloaded: "Not loaded"
@@ -104,7 +106,12 @@ public enum ModelList {
         let targets = view.map { $0.targets.map(\.target) } ?? guessTargets(name, engines: engines, doctor: doctor)
         let locations = targets.map { location(ofTarget: $0, machines: machines) }
         let first = locations.first ?? .unknown
-        let states = targets.compactMap { target -> String? in engines?.model(target)?.model.status }
+        // A model on a machine that is not on is not in memory, whatever the engine listed before it powered off.
+        let states = targets.compactMap { target -> String? in
+            guard let status = engines?.model(target)?.model.status else { return nil }
+            if let machine = Machines.machine(ofTarget: target, in: machines), machine.power != .on { return "unloaded" }
+            return status
+        }
         let failed = targets.contains { engines?.model($0)?.model.failed == true }
         let load: LoadState
         if states.contains("loaded") { load = .loaded }
@@ -135,6 +142,12 @@ public enum ModelList {
     /// reach the same loaded model, and a resting model is listed but not in memory.
     public static func loadedCount(engines: EnginesReport?) -> Int {
         Set((engines?.lanes ?? []).flatMap(\.models).filter { $0.status == "loaded" }.map(\.target)).count
+    }
+    /// The sidebar count, in the words the machine cards use: "2 in memory"; nil when none. Counted from the
+    /// machines, so a box that is asleep adds nothing, whatever its engine listed before it powered off.
+    public static func inMemoryText(_ machines: [MachineCard]) -> String? {
+        let count = machines.reduce(0) { $0 + $1.inMemory }
+        return count == 0 ? nil : "\(count) in memory"
     }
 
     /// Before its settings are read, a name is matched to the engines' and the speed report's models by id.

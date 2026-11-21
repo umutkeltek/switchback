@@ -61,7 +61,9 @@ func box(power: Power = .on, uptime: Double? = 3600, busy: Int = 0, holds: Int =
     #expect(Machines.powerOff(box(busy: 3))?.gate == .disabled("Working on 3 requests"))
     #expect(Machines.powerOff(box(holds: 1))?.gate == .disabled("A hold keeps it on · release it first"))
     #expect(Machines.powerOff(box(holds: 2))?.gate == .disabled("2 holds keep it on · release them first"))
-    #expect(Machines.powerOff(box(power: .asleep))?.gate == .disabled("Already asleep"))
+    // Asleep or already powering off: no button at all (TruthTests).
+    #expect(Machines.powerOff(box(power: .asleep)) == nil)
+    #expect(Machines.powerOff(box(power: .poweringOff)) == nil)
     #expect(Machines.powerOff(box(power: .waking))?.gate == .disabled("Waking up"))
     #expect(Machines.powerOff(box(guardBusy: true))?.gate == .disabled("Someone else is using it"))
     // Unknown uptime: the window cannot judge it, and the gateway still checks.

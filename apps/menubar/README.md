@@ -63,11 +63,11 @@ no Dock icon, even while the panel is open.
 
 The window has four places (⌘1 to ⌘4):
 
-- **Now**: each machine's power (on, asleep, waking), when it powers off when idle, who has the GPU, the
-  loaded models with their memory, holds with Release, the account to use now (the panel's own card and
+- **Now**: each machine's power (on, asleep, waking), when it powers off when idle, who has the GPU, its
+  models, each "In memory" (a filled dot, with its memory) or "Resting" (a hollow dot), holds with Release, the account to use now (the panel's own card and
   rules), and anything wrong, one plain line each.
 - **Models**: every name by job (text, image, video, audio, segment) with where it runs (GPU box, Mac or
-  cloud), a loaded dot, its speed as a bar against its ceiling (dashed and against the fastest model of its
+  cloud), the same filled or hollow dot, its speed as a bar against its ceiling (dashed and against the fastest model of its
   job when no ceiling is saved) and a mark for saved settings. A route, a name that picks one of several
   models, carries a branch mark. Selecting a name opens the inspector: temperature and top P as sliders,
   max tokens as a stepper, thinking as Engine / On / Off and the reasoning guard as a switch; for a GPU box
@@ -79,14 +79,19 @@ The window has four places (⌘1 to ⌘4):
   no context handle or fit verdict until a size is chosen or known. Changes wait for Apply; Review shows each
   change from and to (resetting a locked setting "also removes the lock"), whether the model reloads, and the
   exact commands; Escape asks before unsaved changes are discarded. History offers Undo to here for every
-  earlier version (never on the Mac: a revert would also put back its load settings); Load, Unload, Try it and
+  earlier version (never on the Mac: a revert would also put back its load settings); a change or reset waiting
+  for Apply has Undo on its own row, which takes back only that row. Load, Unload, Try it and
   the speed report's findings in plain words (with "Use this" for a suggestion the inspector can show) sit
-  beside it. The "loaded" count counts each model in memory once, however many names reach it; a listed model
-  that is not in memory is "Resting".
-- **Machines**: a GPU box's state, uptime and GPU, its holds, Keep on (1 hour by default, menu for longer)
-  and Power off. Power off is disabled, with the reason, while the box has been up under 4 minutes, while
-  work runs or waits, while a hold is active, or while someone else uses it. The Mac is show-only: its
-  loaded models and memory, never wake, sleep, power off, release, load settings or Undo to here; Try it on
+  beside it. Unload shows only for a model in memory (for a route, the model chosen in its picker) on a box
+  that is on; a resting model offers Load now instead. The sidebar's "in memory" count is the machine cards'
+  count; a listed model that is not in memory is "Resting".
+- **Machines**: a GPU box's state, uptime and GPU, its holds, its models, Keep on (1 hour by default, menu
+  for longer) and Power off. Power off is disabled, with the reason, while the box has been up under 4
+  minutes, while work runs or waits, while a hold is active, or while someone else uses it; a box that is
+  asleep or already powering off shows no Power off at all, only the tiles that mean something then (how long
+  a wake takes, and the GPU), and no models: nothing is in memory on a box that is asleep. When the gateway
+  says when it read the engine's listing, what it had in memory or resting before it powered off shows muted
+  as "Last loaded: …". The Mac is show-only: its models, in memory or resting, never wake, sleep, power off, release, load settings or Undo to here; Try it on
   a Mac model says the Mac loads it if it is resting.
 - **Accounts**: the panel's gauge, drawn at window width, with the same rules.
 
@@ -113,7 +118,8 @@ GPU box") whenever any model behind the name (a route picks any of them) is on a
 know to be on, or when it does not know the name's models yet. The window does not know a GPU box is on when
 its last status read began more than 15 s ago, when that read failed, when the window just came back from
 hidden and has not read it again, or when the idle power-off is under 30 s away; Keep on then asks too and
-keeps the box on with a wake. The check runs again at the click, so a reading that went stale since the button
+keeps the box on with a wake, and the box's status line says so in muted text instead of "On": "Checking…",
+"Last seen on 40 s ago" or "About to power off · in 20 s". The check runs again at the click, so a reading that went stale since the button
 was drawn still asks. Load, settings and holds never wake without `--wake`, which the gateway enforces.
 
 The gateway names machines; the window calls one it wakes and powers off "GPU box" and an always-on one

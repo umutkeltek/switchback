@@ -208,8 +208,12 @@ public struct EngineLane: Sendable, Equatable {
     /// True when the engine takes load settings and load/unload; a listing-only engine has none.
     public let acceptsControl: Bool
     public let lastApplyError: String?
+    /// When the gateway last read this listing from the engine (ms); nil when it does not say. A listing is read
+    /// only while the engine's machine is up.
+    public let seenAtMs: Double?
     init(_ json: JSONValue) {
         lane = json["lane"].string ?? "?"
+        seenAtMs = json["seen_at_ms"].double
         kind = json["kind"].string ?? ""
         state = json["state"].string ?? "unknown"
         error = json["error"].string
@@ -220,9 +224,10 @@ public struct EngineLane: Sendable, Equatable {
         lastApplyError = apply["ok"].bool == false ? (apply["error"].string ?? "no detail") : nil
     }
     public init(lane: String, kind: String = "llama_cpp_router", state: String = "up", error: String? = nil,
-                models: [EngineModel], acceptsControl: Bool, lastApplyError: String? = nil) {
+                models: [EngineModel], acceptsControl: Bool, lastApplyError: String? = nil, seenAtMs: Double? = nil) {
         self.lane = lane; self.kind = kind; self.state = state; self.error = error
         self.models = models; self.acceptsControl = acceptsControl; self.lastApplyError = lastApplyError
+        self.seenAtMs = seenAtMs
     }
 }
 /// `sb ai engines --json`.

@@ -370,7 +370,7 @@ public enum ChatState: Sendable, Equatable {
     public func load(_ fixture: ControlFixture) {
         status = fixture.status; catalog = fixture.catalog; engines = fixture.engines; doctor = fixture.doctor
         settings = fixture.settings; histories = fixture.histories; readError = fixture.error
-        lastRead = fixture.now; feedback = fixture.feedback; chats = fixture.chats
+        lastRead = fixture.now.addingTimeInterval(-fixture.statusAge); feedback = fixture.feedback; chats = fixture.chats
         statusReadAt = fixture.status == nil ? nil : fixture.now.addingTimeInterval(-fixture.statusAge)
         statusFailed = fixture.error != nil
         awaitingFresh = false
