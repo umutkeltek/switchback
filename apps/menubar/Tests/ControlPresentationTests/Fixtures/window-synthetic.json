@@ -1,0 +1,1999 @@
+{
+ "doctor": {
+  "findings": [
+   {
+    "action": "turn on the reasoning guard: `sb ai set text/model-b reasoning=true reasoning_guard.min_tokens=1024`",
+    "evidence": "4 answers came back empty: the token limit ended them while the model was still thinking",
+    "kind": "empty_after_thinking",
+    "target": "text/model-b"
+   }
+  ],
+  "generated_at_ms": 1768478400000,
+  "hosts": [],
+  "object": "optimize.report",
+  "targets": [
+   {
+    "ceiling": {
+     "bytes_per_token": 6000000000,
+     "decode_tps": 168.0,
+     "prefill_tps": null,
+     "source": "sb ai fit example/model-a Q4_K_M at 1008 GB/s"
+    },
+    "configured": true,
+    "decode_tps_p50": 142.5,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 84.8,
+    "prompt_tps_p50": 3880.0,
+    "reasoning_guard": false,
+    "requests": 412,
+    "settings_revision": 3,
+    "target": "text/model-a",
+    "ttft_ms_p50": 410.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 61.0,
+    "empty_after_thinking": 4,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 1200.0,
+    "reasoning_guard": false,
+    "requests": 37,
+    "settings_revision": 2,
+    "target": "text/model-b",
+    "ttft_ms_p50": 900.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 38.2,
+    "host": "mac",
+    "lane": "mac",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 290.0,
+    "reasoning_guard": true,
+    "requests": 27,
+    "settings_revision": 1,
+    "target": "mac/vision-model",
+    "ttft_ms_p50": 2200.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": null,
+    "host": "gpu-box",
+    "lane": "media",
+    "pct_of_ceiling": null,
+    "requests": 5,
+    "target": "media/image/model-e"
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": null,
+    "host": "gpu-box",
+    "lane": "media",
+    "pct_of_ceiling": null,
+    "requests": 2,
+    "target": "media/video/model-f"
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": null,
+    "host": "gpu-box",
+    "lane": "media",
+    "pct_of_ceiling": null,
+    "requests": 3,
+    "target": "media/segment/model-g"
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": null,
+    "host": "mac",
+    "lane": "mac-audio",
+    "pct_of_ceiling": null,
+    "requests": 8,
+    "target": "mac-audio/speech-model"
+   }
+  ],
+  "view": "operator"
+ },
+ "engines": {
+  "data": [
+   {
+    "build": "b1000-0000000",
+    "deferred": [],
+    "error": null,
+    "kind": "llama_cpp_router",
+    "lane": "text",
+    "last_apply": null,
+    "models": [
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-a.gguf",
+       "--ctx-size",
+       "32768",
+       "--cache-type-k",
+       "q8_0",
+       "--parallel",
+       "2"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-a",
+      "in_flight": 0,
+      "memory": {
+       "effective": {
+        "bytes": 21152713932,
+        "host_bytes": 429496729,
+        "n_ctx": 32768
+       },
+       "max": {
+        "bytes": 35433480192,
+        "host_bytes": 429496729,
+        "n_ctx": 262144
+       },
+       "min": {
+        "bytes": 19434727014,
+        "host_bytes": 429496729,
+        "n_ctx": 4096
+       },
+       "status": "measured"
+      },
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "loaded",
+      "target": "text/model-a"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-b.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-b",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-b"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-c.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-c",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-c"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-d.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-d",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-d"
+     }
+    ],
+    "pending_apply": false,
+    "seen_at_ms": 1768478396000,
+    "settings_command": true,
+    "state": "up",
+    "variants": []
+   },
+   {
+    "build": "b1000-0000000",
+    "deferred": [],
+    "error": null,
+    "kind": "llama_cpp_router",
+    "lane": "mac",
+    "last_apply": null,
+    "models": [
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/vision-model.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "vision-model",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": true,
+       "mtp": true,
+       "sources": [
+        "args"
+       ],
+       "spec_type": "draft-mtp"
+      },
+      "status": "sleeping",
+      "target": "mac/vision-model"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/embedding-model.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "embedding-model",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "mac/embedding-model"
+     }
+    ],
+    "pending_apply": false,
+    "seen_at_ms": 1768478396000,
+    "settings_command": false,
+    "state": "up",
+    "variants": []
+   }
+  ],
+  "object": "list"
+ },
+ "history": {
+  "text/model-a": {
+   "history": [
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768475400000,
+     "changed": [
+      "load.cache_type_k"
+     ],
+     "document": {},
+     "revision": 3,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768467600000,
+     "changed": [
+      "temperature",
+      "top_p"
+     ],
+     "document": {},
+     "revision": 2,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768304400000,
+     "changed": [
+      "load.ctx_size"
+     ],
+     "document": {},
+     "revision": 1,
+     "role": "operator",
+     "source": "api (sb ai)"
+    }
+   ],
+   "revision": 3,
+   "target": "text/model-a"
+  }
+ },
+ "limits": {
+  "accounts": [
+   {
+    "account_id": {
+     "account_uuid": "uuid-seat1"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "seat1",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-seat1"
+    },
+    "provider": "claude",
+    "relogin_required": false,
+    "slot": "seat1",
+    "source": "native/claude",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 64,
+      "reset_in_seconds": 7400,
+      "resets_at": "2026-01-15T14:03:20Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 36,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 80,
+      "reset_in_seconds": 360000,
+      "resets_at": "2026-01-19T16:00:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 20,
+      "window_minutes": 10080
+     }
+    ]
+   },
+   {
+    "account_id": {
+     "account_uuid": "uuid-seat2"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "seat2",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-seat2"
+    },
+    "provider": "claude",
+    "relogin_required": false,
+    "slot": "seat2",
+    "source": "native/claude",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 30,
+      "reset_in_seconds": 3100,
+      "resets_at": "2026-01-15T12:51:40Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 70,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 12,
+      "reset_in_seconds": 200000,
+      "resets_at": "2026-01-17T19:33:20Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 88,
+      "window_minutes": 10080
+     }
+    ]
+   },
+   {
+    "account_id": {
+     "account_uuid": "uuid-seat3"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "seat3",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-seat3"
+    },
+    "provider": "claude",
+    "relogin_required": false,
+    "slot": "seat3",
+    "source": "native/claude",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 100,
+      "reset_in_seconds": null,
+      "resets_at": null,
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 0,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 55,
+      "reset_in_seconds": 420000,
+      "resets_at": "2026-01-20T08:40:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 45,
+      "window_minutes": 10080
+     }
+    ]
+   },
+   {
+    "account_id": {
+     "account_uuid": "uuid-work"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "work",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-work"
+    },
+    "provider": "codex",
+    "relogin_required": false,
+    "slot": "work",
+    "source": "native/codex",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 88,
+      "reset_in_seconds": 9000,
+      "resets_at": "2026-01-15T14:30:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 12,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 69,
+      "reset_in_seconds": 300000,
+      "resets_at": "2026-01-18T23:20:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 31,
+      "window_minutes": 10080
+     }
+    ]
+   }
+  ],
+  "coverage": [],
+  "generated_at": "2026-01-15T11:59:00Z",
+  "purpose": "observation",
+  "schema": "switchback/account-usage@1"
+ },
+ "models": {
+  "audio": [
+   "transcribe"
+  ],
+  "image": [
+   "image/model-e"
+  ],
+  "segment": [
+   "segment/model-g"
+  ],
+  "text": [
+   "default",
+   "fast",
+   "model-a",
+   "model-b",
+   "model-c",
+   "model-d",
+   "vision-model"
+  ],
+  "video": [
+   "video/model-f"
+  ]
+ },
+ "now": "2026-01-15T12:00:00Z",
+ "selected": "model-a",
+ "settings": {
+  "default": {
+   "model": "default",
+   "revision": null,
+   "targets": [
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 2,
+     "route_profile": null,
+     "target": "text/model-b",
+     "updated_at_ms": 1768473000000
+    },
+    {
+     "document": {
+      "reasoning": true,
+      "reasoning_guard": {
+       "enabled": true,
+       "min_tokens": 1024
+      }
+     },
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "mac",
+       "seen_at_ms": 1768478396000,
+       "status": "sleeping"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 1,
+     "route_profile": null,
+     "target": "mac/vision-model",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "fast": {
+   "model": "fast",
+   "revision": null,
+   "targets": [
+    {
+     "document": {
+      "defaults": {
+       "temperature": 0.6,
+       "top_p": 0.95
+      },
+      "load": {
+       "cache_type_k": "q8_0",
+       "ctx_size": 32768
+      },
+      "locked": [
+       "temperature"
+      ]
+     },
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": true,
+       "source": "defaults",
+       "value": 0.6
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "defaults",
+       "value": 0.95
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "loaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": {
+       "effective": {
+        "bytes": 21152713932,
+        "host_bytes": 429496729,
+        "n_ctx": 32768
+       },
+       "max": {
+        "bytes": 35433480192,
+        "host_bytes": 429496729,
+        "n_ctx": 262144
+       },
+       "min": {
+        "bytes": 19434727014,
+        "host_bytes": 429496729,
+        "n_ctx": 4096
+       },
+       "status": "measured"
+      },
+      "pending": false,
+      "settings": {
+       "cache_type_k": {
+        "engine_key": "cache-type-k",
+        "pending": false,
+        "value": "q8_0"
+       },
+       "ctx_size": {
+        "engine_key": "ctx-size",
+        "pending": false,
+        "value": 32768
+       }
+      }
+     },
+     "locked": [
+      "temperature"
+     ],
+     "profiles": {},
+     "request_load": {
+      "allow": [],
+      "bounds": {
+       "ctx_size": [
+        2048,
+        131072
+       ]
+      },
+      "estimate": {
+       "budget_bytes": 25232932864,
+       "head_dim": 256,
+       "kv_heads": 4,
+       "kv_layers": 40,
+       "weights_bytes": 18468359372
+      },
+      "max_variants": 2,
+      "variant_idle_ttl_secs": 3600
+     },
+     "revision": 3,
+     "route_profile": null,
+     "target": "text/model-a",
+     "updated_at_ms": 1768473000000
+    },
+    {
+     "document": {
+      "reasoning": true,
+      "reasoning_guard": {
+       "enabled": true,
+       "min_tokens": 1024
+      }
+     },
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "mac",
+       "seen_at_ms": 1768478396000,
+       "status": "sleeping"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 1,
+     "route_profile": null,
+     "target": "mac/vision-model",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "model-a": {
+   "model": "model-a",
+   "revision": 3,
+   "targets": [
+    {
+     "document": {
+      "defaults": {
+       "temperature": 0.6,
+       "top_p": 0.95
+      },
+      "load": {
+       "cache_type_k": "q8_0",
+       "ctx_size": 32768
+      },
+      "locked": [
+       "temperature"
+      ]
+     },
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": true,
+       "source": "defaults",
+       "value": 0.6
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "defaults",
+       "value": 0.95
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "loaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": {
+       "effective": {
+        "bytes": 21152713932,
+        "host_bytes": 429496729,
+        "n_ctx": 32768
+       },
+       "max": {
+        "bytes": 35433480192,
+        "host_bytes": 429496729,
+        "n_ctx": 262144
+       },
+       "min": {
+        "bytes": 19434727014,
+        "host_bytes": 429496729,
+        "n_ctx": 4096
+       },
+       "status": "measured"
+      },
+      "pending": false,
+      "settings": {
+       "cache_type_k": {
+        "engine_key": "cache-type-k",
+        "pending": false,
+        "value": "q8_0"
+       },
+       "ctx_size": {
+        "engine_key": "ctx-size",
+        "pending": false,
+        "value": 32768
+       }
+      }
+     },
+     "locked": [
+      "temperature"
+     ],
+     "profiles": {},
+     "request_load": {
+      "allow": [],
+      "bounds": {
+       "ctx_size": [
+        2048,
+        131072
+       ]
+      },
+      "estimate": {
+       "budget_bytes": 25232932864,
+       "head_dim": 256,
+       "kv_heads": 4,
+       "kv_layers": 40,
+       "weights_bytes": 18468359372
+      },
+      "max_variants": 2,
+      "variant_idle_ttl_secs": 3600
+     },
+     "revision": 3,
+     "route_profile": null,
+     "target": "text/model-a",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "model-b": {
+   "model": "model-b",
+   "revision": 2,
+   "targets": [
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 2,
+     "route_profile": null,
+     "target": "text/model-b",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "model-c": {
+   "model": "model-c",
+   "revision": 0,
+   "targets": [
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/model-c",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "model-d": {
+   "model": "model-d",
+   "revision": 0,
+   "targets": [
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/model-d",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "transcribe": {
+   "model": "transcribe",
+   "revision": 0,
+   "targets": [
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "mac-audio/speech-model",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "vision-model": {
+   "model": "vision-model",
+   "revision": 1,
+   "targets": [
+    {
+     "document": {
+      "reasoning": true,
+      "reasoning_guard": {
+       "enabled": true,
+       "min_tokens": 1024
+      }
+     },
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "mac",
+       "seen_at_ms": 1768478396000,
+       "status": "sleeping"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 1,
+     "route_profile": null,
+     "target": "mac/vision-model",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  }
+ },
+ "status": {
+  "lanes": [
+   {
+    "detail": "mac healthy",
+    "escalated": false,
+    "gpu_group": null,
+    "holds": [],
+    "holds_gpu": null,
+    "host": "mac",
+    "in_flight": 0,
+    "last_wake_ms": null,
+    "last_wake_result": null,
+    "level": "warn",
+    "name": "mac",
+    "observed_healthy": true,
+    "poweroff_configured": false,
+    "poweroff_in_secs": null,
+    "queue_depth": 0,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "healthy",
+    "wake_attempts": 0,
+    "wake_configured": false,
+    "wake_duration_ewma_ms": null,
+    "wake_duration_ms": null,
+    "wake_samples": null
+   },
+   {
+    "detail": "mac-audio healthy",
+    "escalated": false,
+    "gpu_group": null,
+    "holds": [],
+    "holds_gpu": null,
+    "host": "mac",
+    "in_flight": 0,
+    "last_wake_ms": null,
+    "last_wake_result": null,
+    "level": "warn",
+    "name": "mac-audio",
+    "observed_healthy": true,
+    "poweroff_configured": false,
+    "poweroff_in_secs": null,
+    "queue_depth": 0,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "healthy",
+    "wake_attempts": 0,
+    "wake_configured": false,
+    "wake_duration_ewma_ms": null,
+    "wake_duration_ms": null,
+    "wake_samples": null
+   },
+   {
+    "detail": "media idle_countdown",
+    "escalated": false,
+    "gpu_group": "gpu0",
+    "holds": [
+     {
+      "expires_at": "2026-01-15T13:12:00.000Z",
+      "expires_at_ms": 1768482720000,
+      "id": "hold_0001",
+      "owner": "owner",
+      "reason": "nightly check",
+      "state": "active",
+      "wake_detail": "woken: lane `text` is healthy"
+     }
+    ],
+    "holds_gpu": false,
+    "host": "gpu-box",
+    "in_flight": 0,
+    "last_wake_ms": 1768476120000,
+    "last_wake_result": "ok after 1 attempt(s)",
+    "level": "ok",
+    "name": "media",
+    "observed_healthy": null,
+    "poweroff_configured": true,
+    "poweroff_in_secs": null,
+    "queue_depth": 0,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "idle_countdown",
+    "wake_attempts": 1,
+    "wake_configured": true,
+    "wake_duration_ewma_ms": 68000,
+    "wake_duration_ms": 71000,
+    "wake_samples": 4
+   },
+   {
+    "detail": "text healthy",
+    "escalated": false,
+    "gpu_group": "gpu0",
+    "holds": [
+     {
+      "expires_at": "2026-01-15T13:12:00.000Z",
+      "expires_at_ms": 1768482720000,
+      "id": "hold_0001",
+      "owner": "owner",
+      "reason": "nightly check",
+      "state": "active",
+      "wake_detail": "woken: lane `text` is healthy"
+     }
+    ],
+    "holds_gpu": true,
+    "host": "gpu-box",
+    "in_flight": 0,
+    "last_wake_ms": 1768476120000,
+    "last_wake_result": "ok after 1 attempt(s)",
+    "level": "ok",
+    "name": "text",
+    "observed_healthy": null,
+    "poweroff_configured": true,
+    "poweroff_in_secs": null,
+    "queue_depth": 0,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "healthy",
+    "wake_attempts": 1,
+    "wake_configured": true,
+    "wake_duration_ewma_ms": 68000,
+    "wake_duration_ms": 71000,
+    "wake_samples": 4
+   }
+  ],
+  "machines": [
+   {
+    "machine": "gpu-box",
+    "power": "on"
+   },
+   {
+    "machine": "mac",
+    "power": "on"
+   }
+  ]
+ }
+}

@@ -1,0 +1,3149 @@
+{
+ "chat": {
+  "extremely-long-model-name-for-truncation-checks-01": {
+   "failed": "Asking the model: the gateway said 503: the model is paused while its settings apply; try again in a moment"
+  }
+ },
+ "doctor": {
+  "findings": [
+   {
+    "action": "turn on the reasoning guard: `sb ai set text/extremely-long-model-name-for-truncation-checks-01 reasoning=true reasoning_guard.min_tokens=1024`",
+    "evidence": "12 answers came back empty: the token limit ended them while the model was still thinking, which happens when max tokens is far below what the model needs to finish",
+    "kind": "empty_after_thinking",
+    "target": "text/extremely-long-model-name-for-truncation-checks-01"
+   },
+   {
+    "action": "keep one model loaded, or give the other model its own machine",
+    "evidence": "the model was swapped out 9 times in the last hour because two models share one GPU",
+    "kind": "swaps",
+    "target": "text/extremely-long-model-name-for-truncation-checks-01"
+   },
+   {
+    "action": "check what else runs: `sb ai engines`",
+    "evidence": "decode runs at 41% of its ceiling: something else uses the GPU memory bandwidth",
+    "kind": "below_ceiling",
+    "target": "text/extremely-long-model-name-for-truncation-checks-01"
+   }
+  ],
+  "generated_at_ms": 1768478400000,
+  "hosts": [],
+  "object": "optimize.report",
+  "targets": [
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 19.35483870967742,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 18.0,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 100,
+    "settings_revision": 0,
+    "target": "text/model-00-q4_k_m-with-a-very-long-suffix-v2.1",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 25.3,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 101,
+    "settings_revision": 1,
+    "target": "text/extremely-long-model-name-for-truncation-checks-01",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 32.6,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 102,
+    "settings_revision": 2,
+    "target": "text/instruct-02",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 50.75268817204301,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 47.2,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 104,
+    "settings_revision": 0,
+    "target": "text/coder-04",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 61.8,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 106,
+    "settings_revision": 2,
+    "target": "text/chat-06-q4_k_m-with-a-very-long-suffix-v2.1",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 82.15053763440861,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 76.4,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 108,
+    "settings_revision": 0,
+    "target": "text/model-08",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 91.0,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 110,
+    "settings_revision": 2,
+    "target": "text/instruct-10",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 113.54838709677418,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 105.6,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 112,
+    "settings_revision": 0,
+    "target": "text/coder-12-q4_k_m-with-a-very-long-suffix-v2.1",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 120.2,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 114,
+    "settings_revision": 2,
+    "target": "text/chat-14",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 144.94623655913978,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 134.8,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 116,
+    "settings_revision": 0,
+    "target": "text/model-16",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 149.4,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 118,
+    "settings_revision": 2,
+    "target": "text/instruct-18-q4_k_m-with-a-very-long-suffix-v2.1",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 176.34408602150538,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 164.0,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 120,
+    "settings_revision": 0,
+    "target": "text/coder-20",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 18.6,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 122,
+    "settings_revision": 2,
+    "target": "text/chat-22",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 35.69892473118278,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 33.2,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 124,
+    "settings_revision": 0,
+    "target": "text/model-24-q4_k_m-with-a-very-long-suffix-v2.1",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 47.8,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 126,
+    "settings_revision": 2,
+    "target": "text/instruct-26",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 67.09677419354838,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 62.4,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 128,
+    "settings_revision": 0,
+    "target": "text/coder-28",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 77.0,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 130,
+    "settings_revision": 2,
+    "target": "text/chat-30-q4_k_m-with-a-very-long-suffix-v2.1",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 98.49462365591397,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 91.6,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 132,
+    "settings_revision": 0,
+    "target": "text/model-32",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 106.2,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 134,
+    "settings_revision": 2,
+    "target": "text/instruct-34",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": {
+     "bytes_per_token": 1,
+     "decode_tps": 129.89247311827958,
+     "prefill_tps": null,
+     "source": "sb ai fit example/x"
+    },
+    "configured": true,
+    "decode_tps_p50": 120.8,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": 93.0,
+    "prompt_tps_p50": 900.0,
+    "requests": 136,
+    "settings_revision": 0,
+    "target": "text/coder-36-q4_k_m-with-a-very-long-suffix-v2.1",
+    "ttft_ms_p50": 800.0
+   },
+   {
+    "ceiling": null,
+    "configured": true,
+    "decode_tps_p50": 135.4,
+    "host": "gpu-box",
+    "lane": "text",
+    "pct_of_ceiling": null,
+    "prompt_tps_p50": 900.0,
+    "requests": 138,
+    "settings_revision": 2,
+    "target": "text/chat-38",
+    "ttft_ms_p50": 800.0
+   }
+  ],
+  "view": "operator"
+ },
+ "engines": {
+  "data": [
+   {
+    "build": "b1000-0000000",
+    "deferred": [],
+    "error": "engine control did not answer in 3 s; showing what it listed 4 min ago",
+    "kind": "llama_cpp_router",
+    "lane": "text",
+    "last_apply": {
+     "error": "settings command exited 1: the preset file is read-only",
+     "ok": false
+    },
+    "models": [
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-00-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-00-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-00-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/extremely-long-model-name-for-truncation-checks-01.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 3,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "extremely-long-model-name-for-truncation-checks-01",
+      "in_flight": 3,
+      "memory": {
+       "effective": {
+        "bytes": 16106127360,
+        "host_bytes": 429496729,
+        "n_ctx": 65536
+       },
+       "max": {
+        "bytes": 22548578304,
+        "host_bytes": 429496729,
+        "n_ctx": 131072
+       },
+       "min": {
+        "bytes": 9663676416,
+        "host_bytes": 429496729,
+        "n_ctx": 4096
+       },
+       "status": "measured"
+      },
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "loaded",
+      "target": "text/extremely-long-model-name-for-truncation-checks-01"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/instruct-02.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "instruct-02",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/instruct-02"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/vision-language-preview-build-03-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "vision-language-preview-build-03-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/vision-language-preview-build-03-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/coder-04.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "coder-04",
+      "in_flight": 0,
+      "memory": {
+       "effective": {
+        "bytes": 19327352832,
+        "host_bytes": 429496729,
+        "n_ctx": 65536
+       },
+       "max": {
+        "bytes": 25769803776,
+        "host_bytes": 429496729,
+        "n_ctx": 131072
+       },
+       "min": {
+        "bytes": 12884901888,
+        "host_bytes": 429496729,
+        "n_ctx": 4096
+       },
+       "status": "measured"
+      },
+      "pending": true,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "loaded",
+      "target": "text/coder-04"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/reasoning-distilled-experimental-merge-05.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "reasoning-distilled-experimental-merge-05",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/reasoning-distilled-experimental-merge-05"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/chat-06-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "chat-06-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/chat-06-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/a-07.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "a-07",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "loading",
+      "target": "text/a-07"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-08.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-08",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-08"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/extremely-long-model-name-for-truncation-checks-09-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "extremely-long-model-name-for-truncation-checks-09-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/extremely-long-model-name-for-truncation-checks-09-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/instruct-10.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "instruct-10",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "sleeping",
+      "target": "text/instruct-10"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/vision-language-preview-build-11.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "vision-language-preview-build-11",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/vision-language-preview-build-11"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/coder-12-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "coder-12-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/coder-12-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/reasoning-distilled-experimental-merge-13.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": {
+       "exit_code": 137,
+       "reason": "out of memory while loading"
+      },
+      "file": "0a1b2c3d4e5f",
+      "id": "reasoning-distilled-experimental-merge-13",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/reasoning-distilled-experimental-merge-13"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/chat-14.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "chat-14",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/chat-14"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/a-15-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "a-15-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/a-15-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-16.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-16",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-16"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/extremely-long-model-name-for-truncation-checks-17.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "extremely-long-model-name-for-truncation-checks-17",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/extremely-long-model-name-for-truncation-checks-17"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/instruct-18-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "instruct-18-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/instruct-18-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/vision-language-preview-build-19.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "vision-language-preview-build-19",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/vision-language-preview-build-19"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/coder-20.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "coder-20",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/coder-20"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/reasoning-distilled-experimental-merge-21-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "reasoning-distilled-experimental-merge-21-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/reasoning-distilled-experimental-merge-21-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/chat-22.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "chat-22",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/chat-22"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/a-23.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "a-23",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/a-23"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-24-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-24-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-24-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/extremely-long-model-name-for-truncation-checks-25.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "extremely-long-model-name-for-truncation-checks-25",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/extremely-long-model-name-for-truncation-checks-25"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/instruct-26.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "instruct-26",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/instruct-26"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/vision-language-preview-build-27-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "vision-language-preview-build-27-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/vision-language-preview-build-27-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/coder-28.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "coder-28",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/coder-28"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/reasoning-distilled-experimental-merge-29.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "reasoning-distilled-experimental-merge-29",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/reasoning-distilled-experimental-merge-29"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/chat-30-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "chat-30-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/chat-30-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/a-31.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "a-31",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/a-31"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/model-32.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "model-32",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/model-32"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/extremely-long-model-name-for-truncation-checks-33-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "extremely-long-model-name-for-truncation-checks-33-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/extremely-long-model-name-for-truncation-checks-33-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/instruct-34.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "instruct-34",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/instruct-34"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/vision-language-preview-build-35.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "vision-language-preview-build-35",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/vision-language-preview-build-35"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/coder-36-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "coder-36-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/coder-36-q4_k_m-with-a-very-long-suffix-v2.1"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/reasoning-distilled-experimental-merge-37.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "reasoning-distilled-experimental-merge-37",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 1,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/reasoning-distilled-experimental-merge-37"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/chat-38.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "chat-38",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 2,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/chat-38"
+     },
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/a-39-q4_k_m-with-a-very-long-suffix-v2.1.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "a-39-q4_k_m-with-a-very-long-suffix-v2.1",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 3,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "text/a-39-q4_k_m-with-a-very-long-suffix-v2.1"
+     }
+    ],
+    "pending_apply": true,
+    "seen_at_ms": 1768478396000,
+    "settings_command": true,
+    "state": "up",
+    "variants": []
+   },
+   {
+    "build": "b1000-0000000",
+    "deferred": [],
+    "error": null,
+    "kind": "llama_cpp_router",
+    "lane": "spare",
+    "last_apply": null,
+    "models": [
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/spare-model.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "spare-model",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "spare/spare-model"
+     }
+    ],
+    "pending_apply": false,
+    "seen_at_ms": 1768478396000,
+    "settings_command": true,
+    "state": "asleep",
+    "variants": []
+   },
+   {
+    "build": "b1000-0000000",
+    "deferred": [],
+    "error": "connection refused",
+    "kind": "llama_cpp_router",
+    "lane": "mac",
+    "last_apply": null,
+    "models": [
+     {
+      "args": [
+       "llama-server",
+       "--model",
+       "/models/vision-model.gguf",
+       "--ctx-size",
+       "16384"
+      ],
+      "dispatched": 0,
+      "failed": null,
+      "file": "0a1b2c3d4e5f",
+      "id": "vision-model",
+      "in_flight": 0,
+      "memory": null,
+      "pending": false,
+      "settings_revision": 0,
+      "sidecars": [],
+      "speculative": {
+       "draft_model": false,
+       "mtp": false,
+       "sources": [],
+       "spec_type": null
+      },
+      "status": "unloaded",
+      "target": "mac/vision-model"
+     }
+    ],
+    "pending_apply": false,
+    "seen_at_ms": 1768478396000,
+    "settings_command": false,
+    "state": "asleep",
+    "variants": []
+   }
+  ],
+  "object": "list"
+ },
+ "error": "Can\u2019t read the gateway \u00b7 the gateway does not answer (connection refused); showing what it said 2 min ago",
+ "feedback": {
+  "power-off:gpu-box": {
+   "failed": "The gateway refused to power gpu-box off (hold_active): 2 holds active on the machine (hold_waitfailed_000000000000000000000001, hold_0002); release them first"
+  },
+  "release:hold_0002": {
+   "running": true
+  }
+ },
+ "history": {
+  "text/extremely-long-model-name-for-truncation-checks-01": {
+   "history": [
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768478100000,
+     "changed": [
+      "temperature"
+     ],
+     "document": {},
+     "revision": 12,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768476300000,
+     "changed": [
+      "temperature",
+      "load.ctx_size"
+     ],
+     "document": {},
+     "revision": 11,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768474500000,
+     "changed": [
+      "temperature",
+      "load.ctx_size",
+      "load.cache_type_k"
+     ],
+     "document": {},
+     "revision": 10,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "revert",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768472700000,
+     "changed": [
+      "temperature",
+      "load.ctx_size",
+      "load.cache_type_k",
+      "load.parallel"
+     ],
+     "document": {},
+     "revision": 9,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768470900000,
+     "changed": [
+      "temperature",
+      "load.ctx_size",
+      "load.cache_type_k",
+      "load.parallel",
+      "max_tokens"
+     ],
+     "document": {},
+     "revision": 8,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768469100000,
+     "changed": [
+      "temperature"
+     ],
+     "document": {},
+     "revision": 7,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768467300000,
+     "changed": [
+      "temperature",
+      "load.ctx_size"
+     ],
+     "document": {},
+     "revision": 6,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768465500000,
+     "changed": [],
+     "document": {},
+     "revision": 5,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768463700000,
+     "changed": [
+      "temperature",
+      "load.ctx_size",
+      "load.cache_type_k",
+      "load.parallel"
+     ],
+     "document": {},
+     "revision": 4,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768461900000,
+     "changed": [
+      "temperature",
+      "load.ctx_size",
+      "load.cache_type_k",
+      "load.parallel",
+      "max_tokens"
+     ],
+     "document": {},
+     "revision": 3,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768460100000,
+     "changed": [
+      "temperature"
+     ],
+     "document": {},
+     "revision": 2,
+     "role": "operator",
+     "source": "api (sb ai)"
+    },
+    {
+     "action": "put",
+     "actor": "tenant=owner project=example",
+     "at_ms": 1768458300000,
+     "changed": [
+      "temperature",
+      "load.ctx_size"
+     ],
+     "document": {},
+     "revision": 1,
+     "role": "operator",
+     "source": "api (sb ai)"
+    }
+   ],
+   "revision": 12,
+   "target": "text/extremely-long-model-name-for-truncation-checks-01"
+  }
+ },
+ "limits": {
+  "accounts": [
+   {
+    "account_id": {
+     "account_uuid": "uuid-seat1"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "A seat label that is much longer than the tile",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-seat1"
+    },
+    "provider": "claude",
+    "relogin_required": false,
+    "slot": "seat1",
+    "source": "native/claude",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 4,
+      "reset_in_seconds": 7400,
+      "resets_at": "2026-01-15T14:03:20Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 96,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 1,
+      "reset_in_seconds": 360000,
+      "resets_at": "2026-01-19T16:00:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 99,
+      "window_minutes": 10080
+     }
+    ]
+   },
+   {
+    "account_id": {
+     "account_uuid": "uuid-seat2"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "seat2",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-seat2"
+    },
+    "provider": "claude",
+    "relogin_required": true,
+    "slot": "seat2",
+    "source": "native/claude",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": null,
+      "reset_in_seconds": null,
+      "resets_at": null,
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "unknown",
+      "used_percent": null,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 0,
+      "reset_in_seconds": 200000,
+      "resets_at": "2026-01-17T19:33:20Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 100,
+      "window_minutes": 10080
+     }
+    ]
+   },
+   {
+    "account_id": {
+     "account_uuid": "uuid-seat3"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "seat3",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-seat3"
+    },
+    "provider": "claude",
+    "relogin_required": false,
+    "slot": "seat3",
+    "source": "native/claude",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 0,
+      "reset_in_seconds": 600,
+      "resets_at": "2026-01-15T12:10:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 100,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 3,
+      "reset_in_seconds": 420000,
+      "resets_at": "2026-01-20T08:40:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 97,
+      "window_minutes": 10080
+     }
+    ]
+   },
+   {
+    "account_id": {
+     "account_uuid": "uuid-seat4"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "seat4",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-seat4"
+    },
+    "provider": "claude",
+    "relogin_required": false,
+    "slot": "seat4",
+    "source": "native/claude",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 80,
+      "reset_in_seconds": 7000,
+      "resets_at": "2026-01-15T13:56:40Z",
+      "sampled_at": "2026-01-15T11:10:00Z",
+      "state": "fresh",
+      "used_percent": 20,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 70,
+      "reset_in_seconds": 420000,
+      "resets_at": "2026-01-20T08:40:00Z",
+      "sampled_at": "2026-01-15T11:10:00Z",
+      "state": "fresh",
+      "used_percent": 30,
+      "window_minutes": 10080
+     }
+    ]
+   },
+   {
+    "account_id": {
+     "account_uuid": "uuid-work"
+    },
+    "enabled": true,
+    "identity_state": "matched",
+    "label": "work",
+    "observed_at": "2026-01-15T11:58:00Z",
+    "observed_identity": {
+     "account_uuid": "uuid-work"
+    },
+    "provider": "codex",
+    "relogin_required": false,
+    "slot": "work",
+    "source": "native/codex",
+    "state": "fresh",
+    "windows": [
+     {
+      "name": "five_hour",
+      "remaining_percent": 1,
+      "reset_in_seconds": 9000,
+      "resets_at": "2026-01-15T14:30:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 99,
+      "window_minutes": 300
+     },
+     {
+      "name": "seven_day",
+      "remaining_percent": 69,
+      "reset_in_seconds": 300000,
+      "resets_at": "2026-01-18T23:20:00Z",
+      "sampled_at": "2026-01-15T11:58:00Z",
+      "state": "fresh",
+      "used_percent": 31,
+      "window_minutes": 10080
+     }
+    ]
+   }
+  ],
+  "coverage": [],
+  "generated_at": "2026-01-15T11:59:00Z",
+  "purpose": "observation",
+  "schema": "switchback/account-usage@1"
+ },
+ "models": {
+  "audio": [
+   "transcribe",
+   "a-speech-model-name-that-keeps-going-and-going"
+  ],
+  "image": [
+   "image/instruct-02",
+   "image/model-e",
+   "image/an-image-model-with-a-long-name"
+  ],
+  "segment": [
+   "segment/model-g"
+  ],
+  "text": [
+   "default",
+   "fast",
+   "a-route-name-that-is-far-too-long-to-fit-in-any-sidebar-column",
+   "model-00-q4_k_m-with-a-very-long-suffix-v2.1",
+   "extremely-long-model-name-for-truncation-checks-01",
+   "instruct-02",
+   "vision-language-preview-build-03-q4_k_m-with-a-very-long-suffix-v2.1",
+   "coder-04",
+   "reasoning-distilled-experimental-merge-05",
+   "chat-06-q4_k_m-with-a-very-long-suffix-v2.1",
+   "a-07",
+   "model-08",
+   "extremely-long-model-name-for-truncation-checks-09-q4_k_m-with-a-very-long-suffix-v2.1",
+   "instruct-10",
+   "vision-language-preview-build-11",
+   "coder-12-q4_k_m-with-a-very-long-suffix-v2.1",
+   "reasoning-distilled-experimental-merge-13",
+   "chat-14",
+   "a-15-q4_k_m-with-a-very-long-suffix-v2.1",
+   "model-16",
+   "extremely-long-model-name-for-truncation-checks-17",
+   "instruct-18-q4_k_m-with-a-very-long-suffix-v2.1",
+   "vision-language-preview-build-19",
+   "coder-20",
+   "reasoning-distilled-experimental-merge-21-q4_k_m-with-a-very-long-suffix-v2.1",
+   "chat-22",
+   "a-23",
+   "model-24-q4_k_m-with-a-very-long-suffix-v2.1",
+   "extremely-long-model-name-for-truncation-checks-25",
+   "instruct-26",
+   "vision-language-preview-build-27-q4_k_m-with-a-very-long-suffix-v2.1",
+   "coder-28",
+   "reasoning-distilled-experimental-merge-29",
+   "chat-30-q4_k_m-with-a-very-long-suffix-v2.1",
+   "a-31",
+   "model-32",
+   "extremely-long-model-name-for-truncation-checks-33-q4_k_m-with-a-very-long-suffix-v2.1",
+   "instruct-34",
+   "vision-language-preview-build-35",
+   "coder-36-q4_k_m-with-a-very-long-suffix-v2.1"
+  ],
+  "video": [
+   "video/model-f",
+   "video/reasoning-distilled-experimental-merge-05"
+  ]
+ },
+ "now": "2026-01-15T12:00:00Z",
+ "selected": "extremely-long-model-name-for-truncation-checks-01",
+ "settings": {
+  "default": {
+   "model": "default",
+   "revision": null,
+   "targets": [
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/model-00-q4_k_m-with-a-very-long-suffix-v2.1",
+     "updated_at_ms": 1768473000000
+    },
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/extremely-long-model-name-for-truncation-checks-01",
+     "updated_at_ms": 1768473000000
+    },
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/instruct-02",
+     "updated_at_ms": 1768473000000
+    },
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/vision-language-preview-build-03-q4_k_m-with-a-very-long-suffix-v2.1",
+     "updated_at_ms": 1768473000000
+    },
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/coder-04",
+     "updated_at_ms": 1768473000000
+    },
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "text/reasoning-distilled-experimental-merge-05",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "extremely-long-model-name-for-truncation-checks-01": {
+   "model": "extremely-long-model-name-for-truncation-checks-01",
+   "revision": 12,
+   "targets": [
+    {
+     "document": {
+      "defaults": {
+       "max_tokens": 120000,
+       "reasoning": {
+        "enabled": false
+       },
+       "temperature": 1.35
+      },
+      "load": {
+       "cache_type_k": "q4_0",
+       "ctx_size": 131072,
+       "parallel": 8
+      },
+      "locked": [
+       "max_tokens",
+       "load.ctx_size"
+      ]
+     },
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": true,
+       "source": "defaults",
+       "value": 120000
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "defaults",
+       "value": {
+        "enabled": false
+       }
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "defaults",
+       "value": 1.35
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "route_profile:a-very-long-profile-name",
+       "value": 0.8
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "text",
+       "seen_at_ms": 1768478396000,
+       "status": "loaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": {
+       "effective": {
+        "bytes": 16106127360,
+        "host_bytes": 429496729,
+        "n_ctx": 65536
+       },
+       "max": {
+        "bytes": 22548578304,
+        "host_bytes": 429496729,
+        "n_ctx": 131072
+       },
+       "min": {
+        "bytes": 9663676416,
+        "host_bytes": 429496729,
+        "n_ctx": 4096
+       },
+       "status": "measured"
+      },
+      "pending": false,
+      "settings": {
+       "cache_type_k": {
+        "engine_key": "cache-type-k",
+        "pending": false,
+        "value": "q4_0"
+       },
+       "ctx_size": {
+        "engine_key": "ctx-size",
+        "pending": false,
+        "value": 131072
+       },
+       "parallel": {
+        "engine_key": "parallel",
+        "pending": false,
+        "value": 8
+       }
+      }
+     },
+     "locked": [
+      "max_tokens",
+      "load.ctx_size"
+     ],
+     "profiles": {},
+     "request_load": {
+      "allow": [],
+      "bounds": {
+       "ctx_size": [
+        2048,
+        131072
+       ]
+      },
+      "estimate": {
+       "budget_bytes": 25232932864,
+       "head_dim": 128,
+       "kv_heads": 8,
+       "kv_layers": 48,
+       "weights_bytes": 21474836480
+      },
+      "max_variants": 2,
+      "variant_idle_ttl_secs": 3600
+     },
+     "revision": 12,
+     "route_profile": "a-very-long-profile-name",
+     "target": "text/extremely-long-model-name-for-truncation-checks-01",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  },
+  "spare-model": {
+   "model": "spare-model",
+   "revision": 0,
+   "targets": [
+    {
+     "document": {},
+     "durable": true,
+     "effective": {
+      "extra": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "frequency_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "max_tokens": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "min_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "presence_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "reasoning": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_last_n": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "repeat_penalty": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "response_format": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "seed": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "stop": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "system_prompt_mode": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "temperature": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_k": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "top_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      },
+      "typical_p": {
+       "locked": false,
+       "source": "engine",
+       "value": null
+      }
+     },
+     "load": {
+      "engine": {
+       "kind": "llama_cpp_router",
+       "lane": "spare",
+       "seen_at_ms": 1768478396000,
+       "status": "unloaded"
+      },
+      "engine_args": {},
+      "last_apply": null,
+      "memory": null,
+      "pending": false,
+      "settings": {}
+     },
+     "locked": [],
+     "profiles": {},
+     "request_load": null,
+     "revision": 0,
+     "route_profile": null,
+     "target": "spare/spare-model",
+     "updated_at_ms": 1768473000000
+    }
+   ]
+  }
+ },
+ "status": {
+  "lanes": [
+   {
+    "detail": "mac offline",
+    "escalated": false,
+    "gpu_group": null,
+    "holds": [],
+    "holds_gpu": null,
+    "host": "mac",
+    "in_flight": 0,
+    "last_wake_ms": null,
+    "last_wake_result": null,
+    "level": "error",
+    "name": "mac",
+    "observed_healthy": true,
+    "poweroff_configured": false,
+    "poweroff_in_secs": null,
+    "queue_depth": 0,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "offline",
+    "wake_attempts": 0,
+    "wake_configured": false,
+    "wake_duration_ewma_ms": null,
+    "wake_duration_ms": null,
+    "wake_samples": null
+   },
+   {
+    "detail": "text degraded",
+    "escalated": false,
+    "gpu_group": "gpu0",
+    "holds": [
+     {
+      "expires_at": "2026-01-15T12:03:00.000Z",
+      "expires_at_ms": 1768478580000,
+      "id": "hold_waitfailed_000000000000000000000001",
+      "owner": "owner",
+      "reason": "a hold reason that is much longer than anyone would ever type into the box",
+      "state": "wake_failed",
+      "wake_detail": "no answer from the machine after 5 attempts over 10 min"
+     },
+     {
+      "expires_at": "2026-01-15T18:40:00.000Z",
+      "expires_at_ms": 1768502400000,
+      "id": "hold_0002",
+      "owner": "owner",
+      "reason": "benchmark",
+      "state": "active",
+      "wake_detail": "woken: lane `text` is healthy"
+     }
+    ],
+    "holds_gpu": true,
+    "host": "gpu-box",
+    "in_flight": 3,
+    "last_error": "engine exited with code 137 after loading reasoning-distilled-experimental-merge-13 and running out of GPU memory",
+    "last_wake_ms": 1768478220000,
+    "last_wake_result": "ok after 4 attempt(s)",
+    "level": "error",
+    "name": "text",
+    "observed_healthy": null,
+    "poweroff_configured": true,
+    "poweroff_guard_busy": true,
+    "poweroff_in_secs": null,
+    "queue_depth": 5,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "degraded",
+    "wake_attempts": 1,
+    "wake_configured": true,
+    "wake_duration_ewma_ms": 68000,
+    "wake_duration_ms": 71000,
+    "wake_samples": 4
+   },
+   {
+    "detail": "media healthy",
+    "escalated": false,
+    "gpu_group": "gpu0",
+    "holds": [
+     {
+      "expires_at": "2026-01-15T12:03:00.000Z",
+      "expires_at_ms": 1768478580000,
+      "id": "hold_waitfailed_000000000000000000000001",
+      "owner": "owner",
+      "reason": "a hold reason that is much longer than anyone would ever type into the box",
+      "state": "wake_failed",
+      "wake_detail": "no answer from the machine after 5 attempts over 10 min"
+     },
+     {
+      "expires_at": "2026-01-15T18:40:00.000Z",
+      "expires_at_ms": 1768502400000,
+      "id": "hold_0002",
+      "owner": "owner",
+      "reason": "benchmark",
+      "state": "active",
+      "wake_detail": "woken: lane `text` is healthy"
+     }
+    ],
+    "holds_gpu": false,
+    "host": "gpu-box",
+    "in_flight": 0,
+    "last_wake_ms": 1768478220000,
+    "last_wake_result": "ok after 4 attempt(s)",
+    "level": "ok",
+    "name": "media",
+    "observed_healthy": null,
+    "poweroff_configured": true,
+    "poweroff_in_secs": null,
+    "queue_depth": 0,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "healthy",
+    "wake_attempts": 1,
+    "wake_configured": true,
+    "wake_duration_ewma_ms": 68000,
+    "wake_duration_ms": 71000,
+    "wake_samples": 4
+   },
+   {
+    "detail": "spare offline",
+    "escalated": false,
+    "gpu_group": null,
+    "holds": [],
+    "holds_gpu": null,
+    "host": "gpu-box-2",
+    "in_flight": 0,
+    "last_wake_ms": 1768442400000,
+    "last_wake_result": "timeout",
+    "level": "error",
+    "name": "spare",
+    "observed_healthy": null,
+    "poweroff_configured": true,
+    "poweroff_in_secs": null,
+    "queue_depth": 0,
+    "restart_configured": false,
+    "retries_used": 0,
+    "slots": {
+     "in_use": 0,
+     "max_in_flight": 1,
+     "on_full": "spill",
+     "queue_timeout_secs": 60,
+     "queued": 0
+    },
+    "state": "offline",
+    "wake_attempts": 1,
+    "wake_configured": true,
+    "wake_duration_ewma_ms": 68000,
+    "wake_duration_ms": 71000,
+    "wake_samples": 4
+   }
+  ],
+  "machines": [
+   {
+    "machine": "gpu-box",
+    "power": "on"
+   },
+   {
+    "machine": "gpu-box-2",
+    "power": "off"
+   },
+   {
+    "machine": "mac",
+    "power": "off"
+   }
+  ]
+ }
+}
