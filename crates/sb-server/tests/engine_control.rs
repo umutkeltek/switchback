@@ -68,6 +68,9 @@ struct Router_ {
     failed_chats: Vec<String>,
     /// A plain `GET /models` (not a re-read) answers this much later.
     listing_delay_ms: u64,
+    /// How often each model's process was stopped: a chat's own load fails
+    /// when this changed while it loaded.
+    stops: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +126,7 @@ fn settle(inner: &mut Router_) {
 /// Stop a model's process: at once, or after `exit_delay_ms` (the
 /// listing says `loaded` until then).
 fn stop(inner: &mut Router_, id: &str) {
+    *inner.stops.entry(id.to_string()).or_default() += 1;
     if inner.exit_delay_ms == 0 {
         inner.status.insert(id.to_string(), "unloaded".to_string());
     } else if !inner.exiting.contains_key(id) {
@@ -321,12 +325,13 @@ async fn autoload(stub: &Stub, model: &str) -> Result<(), Box<Response>> {
                 .into_response(),
         ))
     };
-    let ms = {
+    let (ms, stops) = {
         let mut inner = stub.inner.lock().unwrap();
         settle(&mut inner);
         if inner.autoload_ms == 0 {
             return Ok(());
         }
+        let stops = inner.stops.get(model).copied().unwrap_or(0);
         if inner.exiting.contains_key(model) {
             drop(inner);
             return fail(stub, "the model's process is exiting");
@@ -341,11 +346,15 @@ async fn autoload(stub: &Stub, model: &str) -> Result<(), Box<Response>> {
                 inner.calls.push(format!("autoload {model}"));
             }
         }
-        inner.autoload_ms
+        (inner.autoload_ms, stops)
     };
     tokio::time::sleep(Duration::from_millis(ms)).await;
     let mut inner = stub.inner.lock().unwrap();
     settle(&mut inner);
+    if inner.stops.get(model).copied().unwrap_or(0) != stops {
+        drop(inner);
+        return fail(stub, "the model's load was ended");
+    }
     match inner.status.get(model).map(String::as_str) {
         Some("loading") if !inner.exiting.contains_key(model) => {
             start_process(&mut inner, model);
