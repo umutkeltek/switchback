@@ -438,6 +438,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **`sb ai tune --wake` waits for the machine it woke**: a machine woken by
+  the tuner's hold, with no request yet, reports `idle_countdown`, not
+  `healthy`; the tuner waited for `healthy`, so a run on a sleeping machine
+  gave up after 600 s although the machine was up in under a minute. It now
+  takes either state as up.
+
 - **The menu bar item is placed where macOS keeps it visible**: the item had
   no stored place, so macOS put it at the left end of the status items, the
   first place it hides when a browser's wide menus are in front (frame x=613

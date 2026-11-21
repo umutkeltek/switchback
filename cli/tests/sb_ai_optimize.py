@@ -128,6 +128,7 @@ class Fake:
         self.history = []
         self.lane_state = "healthy"
         self.lane_in_flight = 0
+        self.woken_state = "idle_countdown"
         self.lock_refusal = None       # ("lane_busy" | "quiet_window", message)
         self.locks = {}
         self.holds = {}
@@ -294,7 +295,9 @@ class Fake:
             hold_id = f"hold-{len(self.holds) + 1}"
             self.holds[hold_id] = body
             if body.get("wake"):
-                self.lane_state = "healthy"
+                # The real gateway: a machine woken by a hold, with no request
+                # yet, counts down to idle while the hold keeps it on.
+                self.lane_state = self.woken_state
             return 201, {"id": hold_id, "host": "gpu-box", "state": "active"}
         if method == "DELETE" and path.startswith("/v1/hosts/gpu-box/holds/"):
             hold_id = path.rsplit("/", 1)[1]
@@ -716,6 +719,18 @@ class TuneTests(Base):
         self.assertEqual(holds[0][2]["wake"], True)
         # The hold itself ends by the next quiet window, before any lock.
         self.assertEqual(holds[0][2]["until_quiet_window"], True)
+        self.assert_released()
+
+    def test_wake_runs_when_the_woken_machine_counts_down_to_idle(self):
+        # The real gateway reports a machine our hold woke as counting down to
+        # idle, not healthy, until a request arrives: the run must not wait for
+        # `healthy` and give up.
+        self.fake.lane_state = "offline"
+        self.fake.woken_state = "idle_countdown"
+        self.effect("flash_attn", "on", decode=1.18)
+        run = self.tune("--levers", "flash_attn", "--wake")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertNotIn("did not come up", run.stderr)
         self.assert_released()
 
     def test_a_busy_lane_is_refused(self):

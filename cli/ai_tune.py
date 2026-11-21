@@ -158,6 +158,9 @@ READ_PROMPT = ("Read the document. Reply with one line about what it is about.\n
 GREEDY_PROMPT = "List the first ten prime numbers, separated by commas, and nothing else."
 
 
+# Lane states of a machine that is up and serves requests.
+READY_STATES = ("healthy", "idle_countdown")
+
 class TuneError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -1153,7 +1156,9 @@ class Tuner:
         poll = float(getattr(self.args, "poll_secs", None) or 2.0)
         while time.monotonic() < deadline:
             lane = self.lane_state()
-            if lane and lane.get("state") == "healthy":
+            # A machine woken by our hold, with no request yet, counts down to
+            # idle (the hold keeps it on): it is up, as `healthy` is.
+            if lane and lane.get("state") in READY_STATES:
                 return
             time.sleep(poll)
         raise TuneError(FAIL, f"the machine of {self.target} did not come up within {timeout} s")
