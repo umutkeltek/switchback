@@ -7,11 +7,19 @@ import Foundation
 /// when the frontmost app's menus are wide. The app therefore writes a place toward the right end,
 /// beside the system's own items, before it creates the item, and keeps any place the owner chose
 /// by Command-dragging the item.
+///
+/// That place is only a request. macOS 27 also keeps its own record of a status item by its autosave
+/// name, outside the app's preferences, and that record wins over the app's key. An item that once
+/// had a record keeping it hidden stays at the left end and hidden under that name, whatever the
+/// app writes, whichever app uses the name. The app therefore uses a name with no such record and
+/// carries the owner's place from the retired name over once.
 public enum StatusItemPlacement {
     /// The app's place: its distance in points from the right end of the menu bar.
     public static let position = 280.0
     /// The status item's autosave name in the installed app.
-    public static let autosaveName = "SwitchbackBar"
+    public static let autosaveName = "dev.switchback.menubar.item"
+    /// The name the item had before: macOS keeps the item hidden under it.
+    public static let retiredAutosaveName = "SwitchbackBar"
     /// An Info.plist key a test copy sets so its item and its place stay apart from the installed app's.
     public static let autosaveNameInfoKey = "SBStatusItemAutosaveName"
     /// The app's own record of the place it wrote, to tell it apart from a place the owner chose.
@@ -36,6 +44,16 @@ public enum StatusItemPlacement {
         case keep
     }
 
+    /// The place for an item under a new name, from the retired name's place (`legacyStored`) and the
+    /// app's record of it (`legacyPlaced`): the owner's place when the owner had chosen one right of
+    /// the app's place, else the app's. A place the app wrote, or one further left, is not carried:
+    /// further left is where macOS hides the item first.
+    public static func carriedPlace(legacyStored: Double?, legacyPlaced: Double?, target: Double = position) -> Double {
+        guard let legacyStored, legacyStored.isFinite, legacyStored > 0, legacyStored < target,
+              legacyStored != legacyPlaced else { return target }
+        return legacyStored
+    }
+
     /// What to do before the item is created.
     /// - `stored`: the place macOS has for the item (`nil`: none, the item was never placed).
     /// - `placed`: the place the app wrote last time (`nil`: never, an install from before this rule).
@@ -55,11 +73,23 @@ public enum StatusItemPlacement {
 
     /// Reads `UserDefaults`, applies the decision and records the app's place. Call before the
     /// status item is created: macOS reads the place only then.
+    ///
+    /// The first time under a new name, the owner's place under `retiredName` is carried over: it is
+    /// written under the new name while the record keeps the app's place, so the next launch reads
+    /// it as the owner's and keeps it. The retired name's keys are left as they are.
     @discardableResult
-    public static func apply(_ defaults: UserDefaults, autosaveName: String, target: Double = position) -> Decision {
+    public static func apply(_ defaults: UserDefaults, autosaveName: String, retiredName: String? = retiredAutosaveName,
+                             target: Double = position) -> Decision {
         let key = positionKey(autosaveName)
-        let stored = (defaults.object(forKey: key) as? NSNumber)?.doubleValue
-        let placed = (defaults.object(forKey: placedKey) as? NSNumber)?.doubleValue
+        let number = { (key: String) in (defaults.object(forKey: key) as? NSNumber)?.doubleValue }
+        let stored = number(key)
+        let placed = number(placedKey)
+        if stored == nil, let retiredName, retiredName != autosaveName {
+            let value = carriedPlace(legacyStored: number(positionKey(retiredName)), legacyPlaced: placed, target: target)
+            defaults.set(value, forKey: key)
+            defaults.set(target, forKey: placedKey)
+            return .place(value)
+        }
         let decision = decide(stored: stored, placed: placed, target: target)
         if case .place(let value) = decision {
             defaults.set(value, forKey: key)

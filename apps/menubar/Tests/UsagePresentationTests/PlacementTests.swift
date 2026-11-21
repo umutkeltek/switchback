@@ -50,8 +50,73 @@ import Testing
 }
 
 @Test func aTestCopyNamesItsOwnItem() {
-    #expect(StatusItemPlacement.autosaveName(info: nil) == "SwitchbackBar")
-    #expect(StatusItemPlacement.autosaveName(info: "") == "SwitchbackBar")
+    let installed = StatusItemPlacement.autosaveName
+    #expect(StatusItemPlacement.autosaveName(info: nil) == installed)
+    #expect(StatusItemPlacement.autosaveName(info: "") == installed)
     #expect(StatusItemPlacement.autosaveName(info: "SwitchbackBarPlacementTest") == "SwitchbackBarPlacementTest")
-    #expect(StatusItemPlacement.autosaveName(info: "bad name with spaces") == "SwitchbackBar")
+    #expect(StatusItemPlacement.autosaveName(info: "bad name with spaces") == installed)
+}
+
+@Test func theInstalledItemNoLongerUsesTheNameMacOSKeepsHidden() {
+    // macOS keeps an item named "SwitchbackBar" hidden at the left end whatever place the app writes.
+    #expect(StatusItemPlacement.autosaveName != StatusItemPlacement.retiredAutosaveName)
+    #expect(StatusItemPlacement.retiredAutosaveName == "SwitchbackBar")
+    #expect(StatusItemPlacement.autosaveName(info: StatusItemPlacement.autosaveName) == StatusItemPlacement.autosaveName)
+}
+
+@Test func onlyAnOwnersPlaceRightOfTheAppsIsCarriedToTheNewName() {
+    // No old place, or the app's own: the app's place.
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: nil, legacyPlaced: nil) == 280)
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: 280, legacyPlaced: 280) == 280)
+    // The owner dragged it right of the app's place: kept.
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: 190, legacyPlaced: 280) == 190)
+    // From before the app wrote places, right of the app's place: the owner's, kept.
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: 150, legacyPlaced: nil) == 150)
+    // An old app place right of today's is the app's, not the owner's.
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: 200, legacyPlaced: 200) == 280)
+    // Further left is where macOS hides first: the app's place.
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: 612, legacyPlaced: 280) == 280)
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: 1307, legacyPlaced: nil) == 280)
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: .nan, legacyPlaced: nil) == 280)
+    #expect(StatusItemPlacement.carriedPlace(legacyStored: -5, legacyPlaced: nil) == 280)
+}
+
+@Test func anInstallUnderTheOldNameMovesToTheNewNameOnceAndKeepsAnOwnersPlace() throws {
+    let suite = "placement-test-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let old = StatusItemPlacement.positionKey("OldName")
+    let new = StatusItemPlacement.positionKey("NewName")
+
+    // Today's install: the app's place under the old name.
+    defaults.set(280.0, forKey: old)
+    defaults.set(280.0, forKey: StatusItemPlacement.placedKey)
+    #expect(StatusItemPlacement.apply(defaults, autosaveName: "NewName", retiredName: "OldName") == .place(280))
+    #expect(defaults.double(forKey: new) == 280)
+    #expect(defaults.double(forKey: old) == 280)
+    #expect(StatusItemPlacement.apply(defaults, autosaveName: "NewName", retiredName: "OldName") == .keep)
+
+    // The owner had dragged the old item right of the app's place: carried, and kept after.
+    defaults.removeObject(forKey: new)
+    defaults.set(175.0, forKey: old)
+    #expect(StatusItemPlacement.apply(defaults, autosaveName: "NewName", retiredName: "OldName") == .place(175))
+    #expect(defaults.double(forKey: new) == 175)
+    #expect(defaults.double(forKey: StatusItemPlacement.placedKey) == 280)
+    #expect(StatusItemPlacement.apply(defaults, autosaveName: "NewName", retiredName: "OldName") == .keep)
+    #expect(defaults.double(forKey: new) == 175)
+
+    // Dragged left of the app's place under the old name: the app's place, where macOS shows it.
+    defaults.removeObject(forKey: new)
+    defaults.set(905.0, forKey: old)
+    #expect(StatusItemPlacement.apply(defaults, autosaveName: "NewName", retiredName: "OldName") == .place(280))
+}
+
+@Test func aFreshInstallUnderTheNewNameGetsTheAppsPlace() throws {
+    let suite = "placement-test-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    #expect(StatusItemPlacement.apply(defaults, autosaveName: StatusItemPlacement.autosaveName) == .place(280))
+    #expect(defaults.double(forKey: StatusItemPlacement.positionKey(StatusItemPlacement.autosaveName)) == 280)
+    #expect(defaults.double(forKey: StatusItemPlacement.placedKey) == 280)
+    #expect(defaults.object(forKey: StatusItemPlacement.positionKey(StatusItemPlacement.retiredAutosaveName)) == nil)
 }
