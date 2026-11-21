@@ -437,3 +437,45 @@ struct SidebarBackground: NSViewRepresentable {
     }
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
+
+/// Lays its views out in rows, left to right, starting a new row when the next one would not fit.
+struct FlowLayout: Layout {
+    var spacing = 6.0
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
+        let width = rows.map { $0.width }.max() ?? 0
+        let height = rows.map(\.height).reduce(0, +) + spacing * Double(max(0, rows.count - 1))
+        return CGSize(width: min(width, proposal.width ?? width), height: height)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(width: bounds.width, subviews: subviews) {
+            var x = bounds.minX
+            for index in row.items {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+    private struct Row { var items: [Int] = []; var width = 0.0; var height = 0.0 }
+    private func arrange(width: Double, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var row = Row()
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(.unspecified)
+            let next = row.items.isEmpty ? size.width : row.width + spacing + size.width
+            if next > width, !row.items.isEmpty {
+                rows.append(row)
+                row = Row(items: [index], width: size.width, height: size.height)
+            } else {
+                row.items.append(index)
+                row.width = next
+                row.height = max(row.height, size.height)
+            }
+        }
+        if !row.items.isEmpty { rows.append(row) }
+        return rows
+    }
+}

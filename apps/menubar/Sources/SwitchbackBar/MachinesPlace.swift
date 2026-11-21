@@ -71,32 +71,13 @@ struct GPUBoxCard: View {
         .windowCard(padding: 20)
     }
 
-    /// "Keep on" with its duration, and "Power off" with the reason it may not run yet.
+    /// "Keep on" with its duration, and "Power off" with the reason it may not run yet. Side by side when they
+    /// fit, else one above the other, so no label is cut.
     private var controls: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                if let keep = Machines.keepOn(machine, duration: duration) {
-                    HStack(alignment: .top, spacing: 2) {
-                        // With a hold already in place, keeping it on longer is not the main thing to do here.
-                        ActionButton(plan: keep, store: store, look: machine.holds.isEmpty ? .prominent : .plain, symbol: "lock.fill",
-                                     current: { store.keepOn(machine.machine, duration: duration) })
-                        // How long: a small menu beside the button, so the duration shows once, on the button.
-                        Menu {
-                            Picker("Keep on for", selection: $duration) {
-                                ForEach(Machines.keepOnChoices, id: \.self) { Text("Keep on " + Machines.durationWords($0)).tag($0) }
-                            }
-                            .pickerStyle(.inline)
-                        } label: {
-                            Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold))
-                                .frame(width: 22, height: 28)
-                        }
-                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                        .help("How long to keep it on").accessibilityLabel("How long to keep it on")
-                    }
-                }
-                if let off = Machines.powerOff(machine) {
-                    ActionButton(plan: off, store: store, look: .destructive, symbol: "power", showsReason: false)
-                }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 8) { keepControl; offControl }
+                VStack(alignment: .trailing, spacing: 8) { keepControl; offControl }
             }
             if let reason = Machines.powerOff(machine)?.gate.reason {
                 Label("Power off: " + reason, systemImage: "info.circle")
@@ -105,6 +86,34 @@ struct GPUBoxCard: View {
             }
         }
         .frame(maxWidth: 460, alignment: .trailing)
+    }
+
+    @ViewBuilder private var keepControl: some View {
+        if let keep = Machines.keepOn(machine, duration: duration) {
+            HStack(alignment: .top, spacing: 2) {
+                // With a hold already in place, keeping it on longer is not the main thing to do here.
+                ActionButton(plan: keep, store: store, look: machine.holds.isEmpty ? .prominent : .plain, symbol: "lock.fill",
+                             current: { store.keepOn(machine.machine, duration: duration) })
+                // How long: a small menu beside the button, so the duration shows once, on the button.
+                Menu {
+                    Picker("Keep on for", selection: $duration) {
+                        ForEach(Machines.keepOnChoices, id: \.self) { Text("Keep on " + Machines.durationWords($0)).tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                } label: {
+                    Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold))
+                        .frame(width: 22, height: 28)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help("How long to keep it on").accessibilityLabel("How long to keep it on")
+            }
+        }
+    }
+
+    @ViewBuilder private var offControl: some View {
+        if let off = Machines.powerOff(machine) {
+            ActionButton(plan: off, store: store, look: .destructive, symbol: "power", showsReason: false)
+        }
     }
 
     private var stats: some View {

@@ -91,14 +91,17 @@ struct InspectorView: View {
                 Spacer(minLength: 0)
             }
             HStack(alignment: .top, spacing: 6) {
-                Pill(text: row.location.word + (row.elsewhere > 0 ? " +\(row.elsewhere)" : ""), symbol: row.location.symbol)
-                if !row.load.word.isEmpty {
-                    Pill(text: row.load.word, symbol: row.load == .failed ? "exclamationmark.triangle.fill" : "circle.fill",
-                         tint: row.load == .loaded ? .green : row.load == .failed ? .red : .secondary)
+                // The pills wrap onto a second line rather than push the window wider than it is.
+                FlowLayout(spacing: 6) {
+                    Pill(text: row.location.word + (row.elsewhere > 0 ? " +\(row.elsewhere)" : ""), symbol: row.location.symbol)
+                    if !row.load.word.isEmpty {
+                        Pill(text: row.load.word, symbol: row.load == .failed ? "exclamationmark.triangle.fill" : "circle.fill",
+                             tint: row.load == .loaded ? .green : row.load == .failed ? .red : .secondary)
+                    }
+                    if row.isRoute { Pill(text: "Route · picks 1 of \(row.targets.count)", symbol: "arrow.triangle.branch", tint: .purple) }
+                    if row.saved { Pill(text: "Saved settings", symbol: "slider.horizontal.3", tint: .accentColor) }
                 }
-                if row.isRoute { Pill(text: "Route · picks 1 of \(row.targets.count)", symbol: "arrow.triangle.branch", tint: .purple) }
-                if row.saved { Pill(text: "Saved settings", symbol: "slider.horizontal.3", tint: .accentColor) }
-                Spacer(minLength: 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 if let target {
                     let actions = Inspector.loadActions(target, engines: store.engines, machines: machines)
                     if let load = actions.load { ActionButton(plan: load, store: store, look: .prominent, symbol: "arrow.down.circle").fixedSize() }
