@@ -363,6 +363,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Changed
 
+- **Cached prompt tokens are counted once.** For OpenAI chat, Responses,
+  Gemini and llama.cpp upstreams, `input_tokens` in usage and ledger rows
+  now excludes the cached prompt tokens, which `cached_input_tokens`
+  carries (the Anthropic convention the cost code already assumed). Rows
+  written before this change counted the cached tokens in both, so they
+  overstate input tokens and cost. The prompt speed the gateway measures
+  itself (prompt tokens over time to first token) now counts only the
+  uncached tokens. Clients still see the whole prompt in their own wire
+  format: `prompt_tokens` (OpenAI chat), `input_tokens` (Responses) and
+  `promptTokenCount` (Gemini) include the cached part, and an Anthropic
+  client gets it as `cache_read_input_tokens` when there is one.
 - `/v1/images/generations` runs as a job task and waits for it: the answer
   is the same, the job is listed (`accepted`, then its progress) while it
   runs, it can be cancelled by id, and a client that disconnects no longer
