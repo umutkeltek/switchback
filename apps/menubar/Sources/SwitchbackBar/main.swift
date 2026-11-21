@@ -89,6 +89,12 @@ import ControlPresentation
         windowAccounts.onPin = { [weak self] in self?.togglePin($0) }
         windowAccounts.onRefresh = { [weak self] in self?.forceRefresh() }
         windowAccounts.onQuit = { NSApp.terminate(nil) }
+        // The window's copy of the gauge has the same Options menu: it changes the same settings as the panel's.
+        windowAccounts.onShortcut = { [weak self] in self?.panel.onShortcut($0) }
+        windowAccounts.onWindowShortcut = { [weak self] in self?.panel.onWindowShortcut($0) }
+        windowAccounts.onIconOnly = { [weak self] in self?.panel.onIconOnly($0) }
+        windowAccounts.onLimitNotices = { [weak self] in self?.panel.onLimitNotices($0) }
+        windowAccounts.onStyle = { [weak self] in self?.panel.onStyle($0) }
         panel.onLimitNotices = { [weak self] value in
             guard let self else { return }
             self.defaults.set(value, forKey: "limitNoticesEnabled")
@@ -100,7 +106,12 @@ import ControlPresentation
         GlobalShortcut.shared.onPress = { [weak self] in self?.openPanel() }
         applyShortcut()
         GlobalShortcut.window.onPress = { [weak self] in self?.openWindow() }
-        windowShortcutRegistered = GlobalShortcut.window.register(ShortcutChoice.window)
+        applyWindowShortcut()
+        panel.onWindowShortcut = { [weak self] on in
+            self?.defaults.set(on ? "on" : ShortcutChoice.off, forKey: ShortcutChoice.windowPreferenceKey)
+            self?.applyWindowShortcut()
+            self?.rebuild()
+        }
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(openWindowRequested(_:)), name: OpenWindowRequest.name, object: nil,
             suspensionBehavior: .deliverImmediately)
@@ -146,6 +157,7 @@ import ControlPresentation
         panel.iconOnly = defaults.bool(forKey: "menuBarIconOnly")
         panel.limitNotices = defaults.bool(forKey: "limitNoticesEnabled")
         panel.shortcutID = ShortcutChoice.selected(defaults.string(forKey: ShortcutChoice.preferenceKey))?.id ?? ShortcutChoice.off
+        panel.windowShortcutOn = ShortcutChoice.window(defaults.string(forKey: ShortcutChoice.windowPreferenceKey)) != nil
         panel.style = PanelStyle(preference: defaults.string(forKey: PanelStyle.preferenceKey))
         var fullTitle = "Switchback account limits"
         var title = ""
@@ -189,6 +201,8 @@ import ControlPresentation
         windowAccounts.limitNotices = panel.limitNotices
         windowAccounts.iconOnly = panel.iconOnly
         windowAccounts.shortcutID = panel.shortcutID
+        windowAccounts.windowShortcutOn = panel.windowShortcutOn
+        windowAccounts.style = panel.style
         let iconOnly = panel.iconOnly || (panel.style == .gauge && gaugeImage == nil)
         item?.length = iconOnly ? PanelMetrics.statusIconWidth : NSStatusItem.variableLength
         item?.button?.image = gaugeImage ?? statusIcon
@@ -230,13 +244,20 @@ import ControlPresentation
                       "outside_click_monitor_active": dismissal.isMonitoring,
                       "outside_dismissals": outsideDismissals, "ui": "account-panel",
                       "window_open": controlWindow?.isOpen ?? false,
-                      "window_shortcut": ShortcutChoice.window.title, "window_shortcut_registered": windowShortcutRegistered],
+                      "window_shortcut": GlobalShortcut.window.registered?.title ?? ShortcutChoice.off,
+                      "window_shortcut_registered": windowShortcutRegistered],
                      forKey: "statusItemDiagnostics")
     }
     private func statusItemOnScreen() -> Bool {
         guard let window = item?.button?.window else { return false }
         return StatusItemVisibility.onScreen(frame: window.frame, screens: NSScreen.screens.map(\.frame),
                                              occlusionVisible: window.occlusionState.contains(.visible))
+    }
+    /// ⌃⌥⌘W, registered only while the app runs, unless the owner turned it off in Options.
+    private func applyWindowShortcut() {
+        let choice = ShortcutChoice.window(defaults.string(forKey: ShortcutChoice.windowPreferenceKey))
+        windowShortcutRegistered = GlobalShortcut.window.register(choice) && choice != nil
+        recordStatusItem()
     }
     private func applyShortcut() {
         shortcutRegistered = GlobalShortcut.shared.register(

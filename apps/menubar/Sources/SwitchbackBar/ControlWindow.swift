@@ -63,11 +63,10 @@ final class ControlWindowController: NSObject, NSWindowDelegate {
     func windowDidBecomeKey(_ notification: Notification) { updateVisibility() }
     func windowWillClose(_ notification: Notification) {
         store.setVisible(false)
-        // Back to a menu bar app: no Dock icon once the window is gone.
-        DispatchQueue.main.async {
-            if NSApp.windows.allSatisfy({ !$0.isVisible || $0 is NSPanel || $0.className.contains("StatusBar") }) {
-                NSApp.setActivationPolicy(.accessory)
-            }
+        // Back to a menu bar app: no Dock icon once the window is gone, even while the panel is open (the panel
+        // never needs one).
+        DispatchQueue.main.async { [weak self] in
+            if self?.window?.isVisible != true { NSApp.setActivationPolicy(.accessory) }
         }
     }
 

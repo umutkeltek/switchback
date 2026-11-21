@@ -37,6 +37,10 @@ public struct ShortcutChoice: Sendable, Equatable, Identifiable {
     /// The fixed shortcut that opens the Switchback window.
     public static let window = ShortcutChoice(id: "control-option-command-w", title: "⌃⌥⌘W", keyCode: 0x0D,
                                               modifiers: control | option | command)
+    /// UserDefaults key for the window shortcut: "off" turns it off, anything else (or nothing) leaves it on.
+    public static let windowPreferenceKey = "openWindowShortcut"
+    /// The window shortcut to register, or nil when the owner turned it off.
+    public static func window(_ preference: String?) -> ShortcutChoice? { preference == off ? nil : window }
     public static let off = "off"
     /// UserDefaults key for the selected shortcut id.
     public static let preferenceKey = "openPanelShortcut"

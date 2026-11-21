@@ -36,3 +36,13 @@ import Testing
     // Every choice needs three modifiers so it cannot collide with ordinary typing.
     #expect(ShortcutChoice.all.allSatisfy { $0.modifiers.nonzeroBitCount == 3 })
 }
+
+@Test func windowShortcutDefaultsOnAndCanBeTurnedOffTheSameWay() {
+    #expect(ShortcutChoice.window(nil) == ShortcutChoice.window)
+    #expect(ShortcutChoice.window("on")?.title == "⌃⌥⌘W")
+    #expect(ShortcutChoice.window(ShortcutChoice.off) == nil)
+    // Its own preference, apart from the panel's, and a key no panel choice uses.
+    #expect(ShortcutChoice.windowPreferenceKey != ShortcutChoice.preferenceKey)
+    #expect(!ShortcutChoice.all.contains { $0.keyCode == ShortcutChoice.window.keyCode })
+    #expect(ShortcutChoice.window.modifiers.nonzeroBitCount == 3)
+}

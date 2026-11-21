@@ -35,6 +35,8 @@ enum PanelMotion {
     var limitNotices = false
     /// The global open-panel shortcut id, or `ShortcutChoice.off`.
     var shortcutID = ShortcutChoice.off
+    /// The window shortcut (⌃⌥⌘W) is on.
+    var windowShortcutOn = true
     var maximumHeight = PanelMetrics.maximumHeight
     var style = PanelStyle.standard
     @ObservationIgnored var onResize: (Double) -> Void = { _ in }
@@ -108,6 +110,7 @@ enum PanelMotion {
     @ObservationIgnored var onIconOnly: (Bool) -> Void = { _ in }
     @ObservationIgnored var onLimitNotices: (Bool) -> Void = { _ in }
     @ObservationIgnored var onShortcut: (String) -> Void = { _ in }
+    @ObservationIgnored var onWindowShortcut: (Bool) -> Void = { _ in }
     @ObservationIgnored var onStyle: (PanelStyle) -> Void = { _ in }
     /// Opens the Switchback window; the window's own copy of the gauge has no button for it.
     @ObservationIgnored var onOpenWindow: () -> Void = {}
@@ -335,6 +338,8 @@ struct PanelOptionsMenu: View {
                 Text("Off").tag(ShortcutChoice.off)
                 ForEach(ShortcutChoice.all) { choice in Text(choice.title).tag(choice.id) }
             }
+            Toggle("Window shortcut (\(ShortcutChoice.window.title))", isOn: Binding(
+                get: { state.windowShortcutOn }, set: { state.onWindowShortcut($0) }))
             Divider()
             Button("Quit Switchback", action: state.onQuit).keyboardShortcut("q", modifiers: .command)
         } label: {
