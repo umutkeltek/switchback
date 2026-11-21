@@ -62,8 +62,10 @@ struct NowPlace: View {
             if holds.isEmpty {
                 HStack(spacing: 8) {
                     Image(systemName: "lock.open").foregroundStyle(.tertiary).accessibilityHidden(true)
-                    Text(machines.contains { $0.kind == .gpuBox } ? "Nothing keeps the GPU box on; it powers off when idle"
-                                                                 : "Nothing is held")
+                    // A machine of unknown kind shows no holds: "nothing is held" would be a guess.
+                    Text(machines.contains { $0.kind == .unknown } ? "Holds show only on a GPU box; the window can’t tell what these machines can do"
+                         : machines.contains { $0.kind == .gpuBox } ? "Nothing keeps the GPU box on; it powers off when idle"
+                         : "Nothing is held")
                         .font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText)
                 }
                 .frame(maxWidth: .infinity, minHeight: GaugeLayout.hero, alignment: .leading)

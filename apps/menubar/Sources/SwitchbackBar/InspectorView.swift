@@ -69,6 +69,9 @@ struct InspectorView: View {
         if let machine = Machines.machine(forLane: lane, in: machines), machine.kind == .mac {
             return "The Mac’s engine chooses how it loads models; this window only shows them"
         }
+        if let machine = Machines.machine(forLane: lane, in: machines), machine.kind == .unknown {
+            return "The window can’t tell what this machine can do; load settings are not offered"
+        }
         return "This engine only lists its models; load settings are not offered"
     }
 
