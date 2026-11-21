@@ -1385,6 +1385,55 @@ async fn revert_to_zero_applies_like_an_unset_of_the_load_settings() {
     assert_eq!(revert_calls, unset_calls);
 }
 
+/// A settings command that refuses a change exits non-zero and prints its
+/// reason on stdout (stderr empty). The API's apply error and the message
+/// `sb ai set ... --load` prints carry that reason, not a bare "exit 2:".
+#[tokio::test]
+async fn a_refused_settings_change_shows_the_commands_reason() {
+    let command = "cat >/dev/null; echo 'refused: key X is pinned'; exit 2".to_string();
+    let (s, _) = setup_with(Opts {
+        settings_command: Some(command),
+        ..Opts::default()
+    })
+    .await;
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["ok"], json!(false), "{view}");
+    let error = view["apply"]["error"].as_str().unwrap_or_default();
+    assert!(error.contains("exit 2: refused: key X is pinned"), "{view}");
+    assert!(
+        view["apply"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refused: key X is pinned"),
+        "{view}"
+    );
+
+    // The same through the CLI.
+    let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cli/ai_gateway.py");
+    let home = temp("cli-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let run = tokio::process::Command::new("python3")
+        .arg("-B")
+        .arg(&cli)
+        .args(["set", "text/m", "ctx_size=16384", "--load"])
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &home)
+        .env("SWITCHBACK_AI_URL", &s.gw)
+        .output()
+        .await
+        .expect("python3 runs the CLI");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("refused: key X is pinned"),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+}
+
 fn spawn_embedding(gw: &str) -> tokio::task::JoinHandle<u16> {
     let gw = gw.to_string();
     tokio::spawn(async move {

@@ -817,9 +817,40 @@ impl SettingsCommandRunner for ShellSettingsRunner {
                 .code()
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "signal".to_string());
-            Err(format!("exit {code}: {}", tail(&err)))
+            Err(format!("exit {code}: {}", refusal_reason(&err, &out)))
         }
     }
+}
+
+/// Why a settings command failed, for the error the API and the CLI show:
+/// its stderr, or its stdout when stderr is empty (a control script that
+/// refuses a change prints the reason there), cut to its last 300 bytes,
+/// on one line with control characters removed.
+fn refusal_reason(stderr: &[u8], stdout: &[u8]) -> String {
+    const LIMIT: usize = 300;
+    let pick = if String::from_utf8_lossy(stderr).trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    let text = String::from_utf8_lossy(pick);
+    let mut line = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            // A newline or tab ends a word; other control bytes go.
+            if c.is_whitespace() && !line.ends_with(' ') {
+                line.push(' ');
+            }
+        } else {
+            line.push(c);
+        }
+    }
+    let line = line.trim();
+    let mut start = line.len().saturating_sub(LIMIT);
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    line[start..].trim_start().to_string()
 }
 
 // ---------------------------------------------------------------- engine kinds
@@ -3442,6 +3473,49 @@ mod tests {
         let draft = map(json!({"model-draft": "/m/d.gguf"}));
         assert!(LlamaCppRouter.check_args(&draft, false).is_err());
         LlamaCppRouter.check_args(&draft, true).unwrap();
+    }
+
+    #[test]
+    fn a_refusal_reason_is_one_bounded_clean_line() {
+        // stdout when stderr is empty, stderr when it has text.
+        assert_eq!(
+            refusal_reason(b"", b"refused: key X is pinned\n"),
+            "refused: key X is pinned"
+        );
+        assert_eq!(refusal_reason(b" \n", b"out"), "out");
+        assert_eq!(refusal_reason(b"err\n", b"out"), "err");
+        // One line, control characters removed.
+        assert_eq!(
+            refusal_reason(b"", b"line one\r\nline\ttwo\x1b[31m red\x07\n"),
+            "line one line two[31m red"
+        );
+        // The last 300 bytes, cut on a character boundary.
+        let long = format!("{}{}", "a".repeat(400), "\u{e9}".repeat(200));
+        let reason = refusal_reason(b"", long.as_bytes());
+        assert!(reason.len() <= 300, "{}", reason.len());
+        assert!(reason.ends_with('\u{e9}'));
+        assert!(!reason.contains('a'));
+        assert_eq!(refusal_reason(b"", b""), "");
+    }
+
+    #[tokio::test]
+    async fn a_refused_change_shows_the_reason_the_command_printed_on_stdout() {
+        let runner = ShellSettingsRunner;
+        let error = runner
+            .run(
+                "cat >/dev/null; echo 'refused: key X is pinned'; exit 2",
+                b"{}",
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "exit 2: refused: key X is pinned");
+        // The success path still answers with the short stdout.
+        let ok = runner
+            .run("cat >/dev/null; echo done", b"{}", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(ok, "done");
     }
 
     #[tokio::test]
