@@ -635,6 +635,62 @@ async fn revisions_conflicts_patch_history_and_revert() {
     assert_eq!(view["revision"], json!(3));
 }
 
+/// Revert to revision 0 is "no saved settings and no locks": a new
+/// revision with an empty document, the history kept, and requests reach the
+/// engine as if nothing had been set.
+#[tokio::test]
+async fn revert_to_zero_clears_settings_and_locks_and_keeps_the_history() {
+    let (upstream, seen) = spawn_upstream().await;
+    let (gw, _) = spawn_gateway(&config(&upstream, ""), None).await;
+    let client = reqwest::Client::new();
+    let doc = json!({"defaults": {"seed": 7, "top_k": 20},
+                     "profiles": {"precise": {"temperature": 0.2}},
+                     "locked": ["seed"]});
+    assert_eq!(put_settings(&gw, "text/m", 0, doc).await.status(), 200);
+
+    let r = client
+        .post(format!("{gw}/v1/models/text/m/settings/revert"))
+        .header("if-match", "1")
+        .json(&json!({"revision": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    assert_eq!(r.headers()["etag"], "\"2\"");
+    let view: Value = r.json().await.unwrap();
+    assert_eq!(view["revision"], json!(2));
+    assert_eq!(view["document"], json!({}));
+    assert_eq!(view["locked"], json!([]));
+    assert_eq!(view["effective"]["seed"]["source"], json!("engine"));
+
+    let history: Value = client
+        .get(format!("{gw}/v1/models/text/m/settings/history"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let revisions: Vec<u64> = history["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|change| change["revision"].as_u64().unwrap())
+        .collect();
+    assert_eq!(revisions, vec![2, 1]);
+    assert_eq!(history["history"][0]["action"], json!("revert:0"));
+
+    // The lock is gone: the request's own seed reaches the engine, and no
+    // saved default is added.
+    let mut body = hi("fast");
+    body["seed"] = json!(99);
+    let r = chat(&gw, None, body, None).await;
+    assert_eq!(r.status(), 200);
+    let sent = last_body(&seen);
+    assert_eq!(sent["seed"], json!(99));
+    assert!(sent.get("top_k").is_none(), "{sent}");
+}
+
 #[tokio::test]
 async fn settings_survive_a_restart() {
     let (upstream, seen) = spawn_upstream().await;

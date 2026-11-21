@@ -1325,6 +1325,66 @@ async fn revert_needs_a_revision_and_applies_like_a_put() {
     );
 }
 
+/// A load setting reverted to revision 0 is applied exactly like an unset
+/// of it (a PUT without it): the same overlay reaches the settings command,
+/// so the engine's config returns to its base, and the same apply runs.
+#[tokio::test]
+async fn revert_to_zero_applies_like_an_unset_of_the_load_settings() {
+    async fn after(clear: &str) -> (Value, Value, Vec<String>) {
+        let s = setup(true, "", None).await;
+        let (status, _) = put(
+            &s.gw,
+            "text/m",
+            0,
+            json!({"load": {"ctx_size": 8192}, "locked": ["load.ctx_size"]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            overlay_of(&s)["models"]["m"]["settings"]["ctx-size"],
+            json!("8192")
+        );
+        let before = s.stub.calls().len();
+        let (status, view) = if clear == "unset" {
+            put(&s.gw, "text/m", 1, json!({})).await
+        } else {
+            let r = reqwest::Client::new()
+                .post(format!("{}/v1/models/text/m/settings/revert", s.gw))
+                .header("if-match", "1")
+                .json(&json!({"revision": 0}))
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.json().await.unwrap())
+        };
+        assert_eq!(status, 200, "{clear}: {view}");
+        assert_eq!(view["revision"], json!(2), "{clear}: {view}");
+        assert_eq!(view["document"], json!({}), "{clear}: {view}");
+        // The message names the revision and `at_ms` the time; the rest
+        // is what the engine did.
+        let mut apply = view["apply"].clone();
+        if let Some(apply) = apply.as_object_mut() {
+            apply.remove("message");
+            apply.remove("at_ms");
+        }
+        let calls = s.stub.calls()[before..].to_vec();
+        (overlay_of(&s), apply, calls)
+    }
+    let (unset_overlay, unset_apply, unset_calls) = after("unset").await;
+    let (revert_overlay, revert_apply, revert_calls) = after("revert").await;
+    assert_eq!(unset_apply["ok"], json!(true), "{unset_apply}");
+    assert_eq!(unset_apply["mode"], json!("next_load"), "{unset_apply}");
+    assert!(
+        unset_overlay["models"]["m"]["settings"]
+            .get("ctx-size")
+            .is_none(),
+        "{unset_overlay}"
+    );
+    assert_eq!(revert_overlay, unset_overlay);
+    assert_eq!(revert_apply, unset_apply);
+    assert_eq!(revert_calls, unset_calls);
+}
+
 fn spawn_embedding(gw: &str) -> tokio::task::JoinHandle<u16> {
     let gw = gw.to_string();
     tokio::spawn(async move {

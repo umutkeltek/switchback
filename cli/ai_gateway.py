@@ -83,6 +83,7 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai unset MODEL key ... [--profile NAME]
                                  remove settings (and their locks)
   sb ai revert MODEL REVISION    put back the settings of an earlier revision
+                                 (0: no saved settings and no locks, the engine's own values)
   sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake]
                                  change load settings (ctx_size=65536 cache_type_k=q8_0)
   sb ai chat MODEL "prompt" [--profile NAME] [--set key=value ...] [--load key=value ...]
@@ -2135,6 +2136,8 @@ def cmd_unset(gw, args):
 
 
 def cmd_revert(gw, args):
+    if args.revision < 0:
+        raise Fail(USAGE, "REVISION is a revision number (0: no saved settings)")
     # A revert is a write: it names the revision it edits, like set.
     target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
     try:
@@ -2142,12 +2145,18 @@ def cmd_revert(gw, args):
                          body={"revision": args.revision},
                          headers={"If-Match": str(target.get("revision", 0))}, timeout=120)
     except GatewayError as error:
-        if error.status == 409:
+        if error.status == 404 and error.error_type == "not_found" and args.revision == 0:
+            # A gateway from before revision 0 was revertable: an empty
+            # document is the same write (what `unset` of every key sends).
+            answer = write_settings(gw, args.model, lambda doc: doc.clear())
+        elif error.status == 409:
             raise Fail(GATEWAY_ERROR, f"the settings changed meanwhile ({error.message}); "
                                       "run the command again") from None
-        raise gateway_fail(error, "reverting the settings") from None
-    print(f"{answer.get('target')}: revision {answer.get('revision')} "
-          f"(the settings of revision {args.revision})")
+        else:
+            raise gateway_fail(error, "reverting the settings") from None
+    what = ("no saved settings: the engine's own values" if args.revision == 0
+            else f"the settings of revision {args.revision}")
+    print(f"{answer.get('target')}: revision {answer.get('revision')} ({what})")
     apply = answer.get("apply")
     if isinstance(apply, dict) and apply.get("message"):
         print(apply["message"])

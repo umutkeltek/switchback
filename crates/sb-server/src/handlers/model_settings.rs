@@ -730,7 +730,8 @@ pub(crate) async fn post(
 /// `POST /v1/models/{model}/settings/revert {"revision": N}`: write
 /// revision N's document again, through the same path as a PUT (engine
 /// checks, apply). The revision being edited comes in `If-Match` (428
-/// without it, 409 when stale), as for any write.
+/// without it, 409 when stale), as for any write. Revision 0 is "no saved
+/// settings and no locks": an empty document, applied like an unset.
 async fn revert(
     state: &AppState,
     principal: &Principal,

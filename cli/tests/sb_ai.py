@@ -152,6 +152,7 @@ class Fake:
         self.settings_doc, self.settings_revision, self.settings_history = {}, 0, []
         self.settings_conflict = False  # the next write loses to another writer
         self.settings_fallback = False  # text/m also reaches other/m (a route named like its target)
+        self.revert_zero_unknown = False  # a gateway from before revision 0 was revertable
         self.routes = {
             ("GET", "/health"): lambda r: (200, b"ok", "text/plain"),
             ("GET", "/v1/workloads/capacity"): lambda r: self.json({"object": "list", "data": self.lanes}),
@@ -219,7 +220,16 @@ class Fake:
         if request["headers"].get("If-Match") != str(self.settings_revision):
             return self.json({"error": {"message": "settings changed",
                                         "type": "revision_conflict"}}, 409)
-        return self.json({"target": "text/m", "revision": self.settings_revision + 1})
+        revision = (request["json"] or {}).get("revision")
+        known = {change.get("revision") for change in self.settings_history}
+        if revision not in known and (revision != 0 or self.revert_zero_unknown):
+            return self.json({"error": {"message": f"no settings revision {revision} in the history",
+                                        "type": "not_found"}}, 404)
+        if revision == 0:
+            self.settings_doc = {}
+        self.settings_revision += 1
+        return self.json({"target": "text/m", "revision": self.settings_revision,
+                          "document": self.settings_doc})
 
     def settings_get(self, request):
         # With `settings_fallback`, text/m is a public name that also reaches a second target.
@@ -1594,11 +1604,44 @@ class SbAi(unittest.TestCase):
         self.assertEqual(json.loads(run.stdout)["revision"], 3)
         run = self.sb("settings", "text/m", "--history")
         self.assertIn("patch: defaults.top_k", run.stdout)
-        run = self.sb("revert", "text/m", "2")
+        run = self.sb("revert", "text/m", "3")
         self.assertEqual(run.returncode, 0, run.stderr)
         revert = self.posted("/v1/models/text/m/settings/revert")
-        self.assertEqual(revert["json"], {"revision": 2})
+        self.assertEqual(revert["json"], {"revision": 3})
         self.assertEqual(revert["headers"]["If-Match"], "3")
+        self.assertIn("(the settings of revision 3)", run.stdout)
+        run = self.sb("revert", "text/m", "2")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("no settings revision 2", run.stderr)
+
+    def test_revert_to_zero_means_no_saved_settings(self):
+        self.fake.settings_doc = {"defaults": {"top_k": 20}, "locked": ["top_k"],
+                                  "load": {"ctx_size": 8192}}
+        self.fake.settings_revision = 3
+        run = self.sb("revert", "text/m", "0")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        revert = self.posted("/v1/models/text/m/settings/revert")
+        self.assertEqual(revert["json"], {"revision": 0})
+        self.assertEqual(revert["headers"]["If-Match"], "3")
+        self.assertIn("text/m: revision 4 (no saved settings", run.stdout)
+        self.assertEqual(self.fake.settings_doc, {})
+        self.assertEqual(self.requests("PUT"), [])
+        run = self.sb("revert", "text/m", "-1")
+        self.assertEqual(run.returncode, 2)
+
+    def test_revert_to_zero_on_an_older_gateway_writes_an_empty_document(self):
+        # A gateway that cannot revert to 0 gets the same write as `unset`
+        # of every key: an empty document, with the revision it edits.
+        self.fake.revert_zero_unknown = True
+        self.fake.settings_doc = {"defaults": {"top_k": 20}, "locked": ["top_k"],
+                                  "load": {"ctx_size": 8192}}
+        self.fake.settings_revision = 3
+        run = self.sb("revert", "text/m", "0")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        put = self.posted_with("PUT", "/v1/models/text/m/settings")
+        self.assertEqual(put["json"], {})
+        self.assertEqual(put["headers"]["If-Match"], "3")
+        self.assertIn("text/m: revision 4 (no saved settings", run.stdout)
 
     def test_chat_sends_profile_and_settings_and_prints_stats(self):
         self.fake.chat_headers = {"x-switchback-route": "strategy=pinned_order selected=text/m",

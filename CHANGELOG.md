@@ -438,6 +438,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **Revert to revision 0 means "no saved settings"**: `sb ai revert MODEL 0`
+  and `POST /v1/models/{model}/settings/revert {"revision": 0}` answered 404,
+  so the only way back to the engine's own values was `sb ai unset` with
+  every key. Revision 0 now reverts to an empty document (no defaults,
+  profiles, load settings or locks) written as a new revision, so the
+  history stays; load settings are applied the same way an unset applies
+  them, so a lane's `settings_command` puts the engine's config back to its
+  base. Against an older gateway, `sb ai revert MODEL 0` writes the empty
+  document itself.
+
 - **A settings name shared with its first target writes that target**: a
   route named like one of its targets (`mac/x` -> `mac/x`, `box/y`) answered
   `ambiguous_model` to settings writes, load and unload, and `sb ai set`

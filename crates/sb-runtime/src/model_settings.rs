@@ -676,12 +676,17 @@ impl ModelSettingsRegistry {
     }
 
     /// Revision `to`'s document, searched in every revision the history
-    /// keeps.
+    /// keeps. Revision 0 is the state before the first write: no saved
+    /// settings and no locks, so a revert to 0 is a new revision with an
+    /// empty document (the history stays).
     pub fn revision_doc(
         &self,
         target: &str,
         to: u64,
     ) -> Result<ModelSettingsDoc, SettingsWriteError> {
+        if to == 0 {
+            return Ok(ModelSettingsDoc::default());
+        }
         let history = self
             .history(target, self.history_keep())
             .map_err(SettingsWriteError::Store)?;
@@ -1405,6 +1410,34 @@ local_executors:
             registry.revision_doc("text/m", 2).unwrap_err(),
             SettingsWriteError::UnknownRevision(2)
         );
+    }
+
+    #[test]
+    fn revert_to_zero_writes_an_empty_document_as_a_new_revision() {
+        let registry = ModelSettingsRegistry::new();
+        registry
+            .write(
+                "text/m",
+                doc(json!({"defaults": {"top_k": 20}, "locked": ["top_k"],
+                           "load": {"ctx_size": 8192}})),
+                0,
+                &actor(),
+                "put",
+            )
+            .unwrap();
+        let reverted = registry.revert("text/m", 0, 1, &actor()).unwrap();
+        assert_eq!(reverted.revision, 2);
+        assert_eq!(*reverted.doc, ModelSettingsDoc::default());
+        let history = registry.history("text/m", 10).unwrap();
+        assert_eq!(
+            history.iter().map(|c| c.revision).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(history[0].action, "revert:0");
+        // A target that never had settings reverts to 0 the same way.
+        let fresh = registry.revert("text/n", 0, 0, &actor()).unwrap();
+        assert_eq!(fresh.revision, 1);
+        assert_eq!(*fresh.doc, ModelSettingsDoc::default());
     }
 
     #[tokio::test]
