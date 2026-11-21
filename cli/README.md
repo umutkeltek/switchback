@@ -1474,6 +1474,7 @@ sb menubar build --scratch-path "$SWITCHBACK_MENUBAR_SCRATCH"
 sb menubar install --launch-at-login --scratch-path "$SWITCHBACK_MENUBAR_SCRATCH"
 sb menubar start
 sb bar open        # open the panel even when macOS hides the menu bar item
+sb bar window      # open the Switchback window: what runs, models, machines, accounts
 sb menubar status
 ```
 
