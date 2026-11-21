@@ -1301,6 +1301,101 @@ class KeepRuleUnitTests(unittest.TestCase):
         self.assertIn("budget ran out while measuring the noise", result["reason"])
         self.assertLessEqual(clock.now, 70 + 40)
 
+    def test_the_printed_bar_is_the_judges_bar(self):
+        """The bar the run prints after the noise runs, the `--json` bar
+        and the judge's bar over the same runs are one number: the SD
+        floored and widened for so few runs. The win-twice rule and the
+        budget's round count use that SD too."""
+        decode = iter([100.0, 104.5, 95.5, 103.0, 97.0])  # SD 3.8%, widened 5.2%
+
+        def measure(state, rng, metrics):
+            return {"decode": next(decode), "ttft_ms": 200.0}
+        _, tuner = sim_tuner(4, measure=measure)
+        tuner.measure_noise("decode")
+        self.assertEqual(tuner.noise_runs, 5)
+        printed = [line for line in tuner.logs if "a win must clear about" in line][-1]
+        _, _, _, bar = tuner.judge("decode", list(tuner.noise_data), [dict(tuner.noise_data[0])],
+                                   False)
+        self.assertEqual(round(bar * 100, 1), tuner.noise_view()["win_needs_pct"])
+        self.assertIn(f"about +{bar * 100:.0f}%", printed)
+        # Raw SD under 5%, widened over it: a win must hold twice, and the
+        # budget counts two rounds.
+        self.assertLess(tuner.noise["decode"], 0.05)
+        self.assertGreater(tuner.noise_sd("decode"), 0.05)
+        keep, _, _, _ = tuner.judge("decode", list(tuner.noise_data),
+                                    [{"decode": 200.0, "ttft_ms": 200.0}], False)
+        self.assertIsNone(keep)
+        tuner.apply_secs, tuner.run_secs = [10.0], {"decode": [50.0]}
+        tuner.last_control = dict(tuner.noise_data[-1])
+        tuner.gate_secs = {"greedy": [0.0]}
+        tuner.budget, tuner.started = 10_000, 0.0
+        tuner.clock = lambda: 10_000 - 200.0
+        self.assertFalse(tuner.experiment_fits(tuner.plan[0]))  # two rounds: 240 s
+        tuner.clock = lambda: 10_000 - 240.0
+        self.assertTrue(tuner.experiment_fits(tuner.plan[0]))
+
+
+def ai_tune_win_sd():
+    return load_tuner_module().WIN_SD
+
+
+def load_lever_run(budget, noise_s=40.0, load_run_s=240.0, apply_s=70.0, seed=7):
+    """The mmap lever (judged on load time) on a fake engine: a run of the
+    noise runs takes `noise_s`, a load-time run (three unloads and loads)
+    `load_run_s`, an apply `apply_s`. Returns (tuner, clock)."""
+    clock = Clock()
+
+    def measure(state, rng, metrics):
+        out = {"decode": 100.0 * rng.gauss(1, 0.03), "ttft_ms": 200.0 * rng.gauss(1, 0.01)}
+        if "load_s" in metrics:
+            out["load_s"] = 20.0 * rng.gauss(1, 0.03)
+        return out
+    ai_tune, tuner = sim_tuner(seed, levers=("mmap",), apply_s=apply_s, budget=budget,
+                               clock=clock, measure=measure)
+
+    def fake_measure(*metrics):
+        took = load_run_s if "load_s" in metrics else noise_s
+        clock.now += took
+        tuner.run_secs.setdefault(ai_tune.run_kind(metrics), []).append(took)
+        return measure(tuner.state, random.Random(len(tuner.rows)), metrics), None
+    tuner.measure = fake_measure
+    tuner.take_hold_and_lock = lambda: setattr(tuner, "lock_id", "lock")
+    tuner.release = lambda: setattr(tuner, "lock_id", None)
+    tuner.run_trapped()
+    return tuner, clock
+
+
+class BudgetUnitTests(unittest.TestCase):
+    """What a lever costs is known before it starts, so the budget holds."""
+
+    def test_a_load_time_lever_overruns_the_budget_by_at_most_one_run(self):
+        """Noise runs take 40 s, a load-time run 240 s: before any load-time
+        run was measured, its cost is taken from the apply (three loads),
+        not from the 40 s noise runs. The run ends at most one load-time run
+        past its budget."""
+        for budget in (600, 900, 1200):
+            tuner, clock = load_lever_run(f"{budget}s")
+            overrun = clock.now - budget
+            print(f"\nbudget {budget} s: ended at {clock.now:.0f} s (overrun {overrun:+.0f} s)",
+                  file=sys.stderr)
+            self.assertLessEqual(overrun, 240, (budget, clock.now, tuner.notes, tuner.logs))
+
+    def test_the_first_trials_gate_is_counted(self):
+        """A greedy gate that takes 100 s: a change whose rounds fit only
+        without it is not started."""
+        ai_tune, tuner = sim_tuner(1, run_s=40.0, apply_s=20.0, budget="1h")
+        tuner.noise = {"decode": 0.03}
+        tuner.noise_data = [{"decode": v, "ttft_ms": 200.0} for v in (100.0, 103.0, 97.0)]
+        tuner.noise_runs = 3
+        tuner.apply_secs, tuner.run_secs = [20.0], {"decode": [40.0]}
+        tuner.last_control = {"decode": 100.0, "ttft_ms": 200.0}
+        entry = tuner.plan[0]
+        rounds = 2 * (20.0 + 40.0)  # one round on a quiet machine
+        tuner.clock.now = 3600 - rounds - 50
+        self.assertTrue(tuner.experiment_fits(entry))
+        tuner.gate_secs = {"greedy": [100.0]}
+        self.assertFalse(tuner.experiment_fits(entry))
+
 
 if __name__ == "__main__":
     unittest.main()

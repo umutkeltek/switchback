@@ -5,6 +5,7 @@ Every run goes through the real `sb` dispatcher in a child process."""
 
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -1528,13 +1529,35 @@ class SbAi(unittest.TestCase):
 
     def test_unload_waits_for_the_gateway_longer_than_a_plain_call(self):
         # The gateway answers an unload once the model's requests ended and
-        # its process exited: the client waits for that (10 minutes by
-        # default, --timeout), not the 30 s of a plain call.
+        # its process exited: the client waits for that (longer than the
+        # gateway's worst case by default, --timeout), not the 30 s of a
+        # plain call.
         import importlib.util
         spec = importlib.util.spec_from_file_location("ai_gateway_under_test", CLI / "ai_gateway.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self.assertEqual(module.UNLOAD_TIMEOUT, 600)
+        # The gateway's worst case, read from its own sources: the engine's
+        # default apply wait and load timeout, and its unload call's bound.
+        root = CLI.parent
+        config = (root / "crates/sb-core/src/config.rs").read_text()
+        control = (root / "crates/sb-server/src/engine_control.rs").read_text()
+
+        def default(name):
+            found = re.search(rf"fn {name}\(\) -> u64 {{\s*(\d+)\s*}}", config)
+            self.assertIsNotNone(found, name)
+            return int(found.group(1))
+        unload_call = re.search(r'"/models/unload",\s*Some\(json!\(\{"model": model\}\)\),'
+                                r'\s*Duration::from_secs\((\d+)\)', control)
+        self.assertIsNotNone(unload_call)
+        worst = (default("default_engine_apply_wait_secs") + int(unload_call.group(1))
+                 + default("default_engine_load_timeout_secs"))
+        self.assertEqual(worst, 780)
+        self.assertGreater(module.UNLOAD_TIMEOUT, worst)
+        tune = module.ai_tune
+        self.assertEqual((tune.GATEWAY_APPLY_WAIT_S, tune.GATEWAY_UNLOAD_CALL_S,
+                          tune.GATEWAY_LOAD_TIMEOUT_S),
+                         (default("default_engine_apply_wait_secs"), int(unload_call.group(1)),
+                          default("default_engine_load_timeout_secs")))
         answer = self.fake.routes[("POST", "/v1/models/text/m/unload")]
 
         def later(request):

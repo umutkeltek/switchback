@@ -201,7 +201,7 @@ default) leaves a loaded model on its old settings until it loads again;
 --apply now reloads it once nothing is in flight on it (exit 1 when it stays
 busy). Neither wakes a sleeping machine unless --wake. load preloads a model
 (exit 3 when the machine sleeps and --wake is not given); unload never powers
-anything off and waits up to --timeout SECS (default 600) while the gateway
+anything off and waits up to --timeout SECS (default 810) while the gateway
 lets the model's requests end and its process exit. engines never wakes anything: a sleeping lane shows what it had
 loaded when it was last seen. hold --load MODEL loads the model once the
 machine is up.
@@ -234,7 +234,10 @@ SPEECH_FORMATS = {".mp3": "mp3", ".wav": "wav", ".opus": "opus", ".ogg": "opus",
 VIDEO_FPS = 24
 # How long `sb ai on` keeps the machine on when no duration is given.
 DEFAULT_HOLD_DURATION = "1h"
-UNLOAD_TIMEOUT = 600  # s: an unload waits for requests to end and the process to exit
+# s: an unload waits for requests to end and the process to exit; the
+# gateway's worst case plus a margin (ai_tune derives it, the tuner's own
+# unloads wait as long).
+UNLOAD_TIMEOUT = ai_tune.UNLOAD_TIMEOUT
 POLL_SECS = float(os.environ.get("SB_AI_POLL_SECS") or 2.0)  # tests shorten it
 VIDEO_MP = 0.4
 LANE_WORDS = {"offline": "off", "waking": "waking", "healthy": "idle", "draining": "busy",
@@ -2200,8 +2203,9 @@ def cmd_load(gw, args):
 def cmd_unload(gw, args):
     try:
         # The gateway answers once the model's requests ended and its
-        # process exited (bounded by the lane's apply wait and load
-        # timeout, which the CLI cannot read): 10 minutes by default.
+        # process exited (bounded by the lane's apply wait, its unload call
+        # and its load timeout, which the CLI cannot read): longer than
+        # their defaults together by default (UNLOAD_TIMEOUT).
         answer = gw.post(model_path(args.model, "unload"), {}, timeout=args.timeout)
     except GatewayError as error:
         raise gateway_fail(error, f"unloading {args.model}") from None

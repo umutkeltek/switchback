@@ -101,6 +101,17 @@ MIN_SAMPLES = 6     # decode samples per run (the median is used)
 MAX_SAMPLES = 24    # the most samples per run the noise rule may raise to
 HEARTBEAT_S = 30    # renew the lock and read the quiet window at most this often
 APPLY_WAIT_S = 600  # how long a held-back apply (model busy) may stay pending
+# The gateway's worst case for an unload, with its default engine settings:
+# it waits `apply_wait_secs` (120 s) for the model's requests to end, its
+# unload call to the engine up to 60 s, then up to `load_timeout_secs`
+# (600 s) for the model's process to exit. A client waits longer than all
+# of it, so an unload the gateway still finishes is never cut off.
+GATEWAY_APPLY_WAIT_S = 120
+GATEWAY_UNLOAD_CALL_S = 60
+GATEWAY_LOAD_TIMEOUT_S = 600
+UNLOAD_TIMEOUT = GATEWAY_APPLY_WAIT_S + GATEWAY_UNLOAD_CALL_S + GATEWAY_LOAD_TIMEOUT_S + 30
+# A load-time run unloads and loads the model this many times.
+LOAD_TIMES = 3
 PAUSED_WAIT_S = 300  # how long a request retries a paused model (503 model_paused)
 
 # The lever catalogue, per engine kind, ordered by expected payoff. Each
@@ -303,6 +314,10 @@ class Tuner:
         # Seconds each kind of run and each apply took: what a next one costs.
         self.run_secs = {}
         self.apply_secs = []
+        # Seconds each kind of gate took (a change's first trial runs one),
+        # and each unload and load of a load-time run.
+        self.gate_secs = {}
+        self.load_secs = []
         self.budget_cut = False
         self.untuned_reason = None
         self.lock_id = None
@@ -749,14 +764,34 @@ class Tuner:
     def run_cost(self, metric):
         """Seconds a run measuring `metric` takes: the mean of such runs so
         far, else of the noise runs (they measure every metric the plan
-        uses, so they cost at least as much), else 0."""
-        times = self.run_secs.get(run_kind((metric,))) or \
-            self.run_secs.get(run_kind(self.noise_metrics)) or [0.0]
-        return statistics.fmean(times)
+        uses, so they cost at least as much), else 0. A load-time run not
+        measured yet is not like a noise run: it unloads and loads the model
+        LOAD_TIMES times, so it costs at least that many applies (each a
+        reload)."""
+        times = self.run_secs.get(run_kind((metric,)))
+        if times:
+            return statistics.fmean(times)
+        noise_run = statistics.fmean(self.run_secs.get(run_kind(self.noise_metrics)) or [0.0])
+        if metric == "load_s":
+            return max(noise_run, LOAD_TIMES * self.apply_cost())
+        return noise_run
+
+    def gate_cost(self, kind):
+        """Seconds a gate of `kind` takes: the mean of such gates so far
+        (the greedy reference counts for the greedy gate), else one noise
+        run; nothing for a lever with no gate."""
+        if kind in (None, "none"):
+            return 0.0
+        times = self.gate_secs.get(kind)
+        if times:
+            return statistics.fmean(times)
+        return statistics.fmean(self.run_secs.get(run_kind(self.noise_metrics)) or [0.0])
 
     def apply_cost(self):
-        """Seconds a settings write with its apply (a reload) takes."""
-        return statistics.fmean(self.apply_secs) if self.apply_secs else 0.0
+        """Seconds a settings write with its apply (a reload) takes; before
+        any apply, an unload and load of a load-time run (also a reload)."""
+        times = self.apply_secs or self.load_secs
+        return statistics.fmean(times) if times else 0.0
 
     def round_cost(self, metric):
         """One more round of an experiment: apply the candidate, measure
@@ -769,11 +804,13 @@ class Tuner:
     def load_time(self):
         path = f"/v1/models/{urllib.parse.quote(self.target, safe='/')}"
         times = []
-        for _ in range(3):
-            self.call("POST", path + "/unload", body={}, doing="unloading")
+        for _ in range(LOAD_TIMES):
+            reload_started = self.clock()
+            self.call("POST", path + "/unload", body={}, timeout=UNLOAD_TIMEOUT, doing="unloading")
             started = time.monotonic()
             self.call("POST", path + "/load", body={"wake": False}, timeout=900, doing="loading")
             times.append(time.monotonic() - started)
+            self.load_secs.append(self.clock() - reload_started)
         return median(times)
 
     # ------------------------------------------------------------ gates
@@ -883,6 +920,13 @@ class Tuner:
             sd = max(noise.values(), default=0.0)
         return max(NOISE_FLOOR, sd)
 
+    def noise_sd(self, metric):
+        """The SD the judge starts from before an experiment adds runs of
+        its own: `experiment_sd` over the noise runs alone (floored and
+        widened alike). The printed bar, the `--json` bar, the win-twice
+        rule and the budget's round count all use it."""
+        return self.experiment_sd(metric, [], [])
+
     def experiment_sd(self, metric, controls, cands):
         """The SD of one run on `metric` for an experiment: pooled over the
         noise runs (around their mean), the experiment's controls (around
@@ -966,7 +1010,9 @@ class Tuner:
         except TuneError as error:
             raise ApplyFailed(error.message) from None
         if gate:
+            started = self.clock()
             problem = self.gate(entry["gate"], doc)
+            self.gate_secs.setdefault(entry["gate"], []).append(self.clock() - started)
             if problem:
                 return None, problem
         metrics, problem = self.measure(entry["metric"])
@@ -1233,7 +1279,7 @@ class Tuner:
             return
         self.log(f"  noise ±{self.noise.get(metric, 0.0) * 100:.1f}% (SD of one run) on {metric} "
                  f"between {len(runs)} runs of the same settings ({self.samples} samples per run); "
-                 f"a win must clear about +{WIN_SD * self.sd_for(metric) * 100:.0f}%")
+                 f"a win must clear about +{WIN_SD * self.noise_sd(metric) * 100:.0f}%")
 
     def raise_samples(self, per_sample, metric):
         """More samples per run, when the noise runs' SD is over the floor
@@ -1282,7 +1328,10 @@ class Tuner:
                 f"between {self.noise_runs} runs of the same settings (at most "
                 f"±{TOO_NOISY * 100:.0f}% can be tuned); nothing was changed")
             return self.untuned_reason
+        started = self.clock()
         greedy = self.run_parallel([lambda: self.chat(GREEDY_PROMPT, 64, temperature=0, fresh=False)])[0]
+        # The greedy gate asks the same: what it costs.
+        self.gate_secs.setdefault("greedy", []).append(self.clock() - started)
         self.greedy_reference = greedy.get("text")
         self.ceiling_row = self.ceiling()
         flat = 0
@@ -1329,7 +1378,7 @@ class Tuner:
             for change in fresh:
                 if self.stopping:
                     break
-                if not self.experiment_fits(entry):
+                if not self.starts_within_budget(entry):
                     self.budget_cut = True
                     self.notes.append(f"{entry['lever']} {json.dumps(change)}: not started, the "
                                       "budget left could not pay for its runs")
@@ -1361,20 +1410,37 @@ class Tuner:
                 flat += 1
                 if flat >= PLATEAU:
                     stop = (f"plateau: {PLATEAU} levers in a row inside the noise "
-                            f"(±{self.sd_for(baseline_metric) * 100:.1f}%)")
+                            f"(±{self.noise_sd(baseline_metric) * 100:.1f}%)")
                     break
         return stop
 
     def experiment_fits(self, entry):
         """The budget left pays for the fewest runs that could keep a change:
-        a control when none is at hand, then one round (two on a machine
-        noisier than REPEAT_ABOVE: a win must hold twice)."""
+        a control when none is at hand, the first trial's gate, then one
+        round (two on a machine noisier than REPEAT_ABOVE: a win must hold
+        twice, by the same SD the judge uses)."""
         metric = entry["metric"]
-        rounds = 2 if self.sd_for(metric) > REPEAT_ABOVE else 1
-        cost = rounds * self.round_cost(metric)
+        rounds = 2 if self.noise_sd(metric) > REPEAT_ABOVE else 1
+        cost = rounds * self.round_cost(metric) + self.gate_cost(entry.get("gate"))
         if self.last_control is None or metric not in self.last_control:
             cost += self.run_cost(metric)
         return self.budget_fits(cost)
+
+    def starts_within_budget(self, entry):
+        """`experiment_fits`, and when the lever's runs cost is only an
+        estimate (no such run measured yet: a load-time run before the
+        first), its first control is measured and the budget checked again
+        with what that run took. The experiment uses that control. So a
+        change never starts on a guess: the run ends at most one run past
+        its budget."""
+        if not self.experiment_fits(entry):
+            return False
+        metric = entry["metric"]
+        if self.run_secs.get(run_kind((metric,))):
+            return True
+        self.current_lever, self.current_metric = entry["lever"], metric
+        self.control()
+        return self.experiment_fits(entry)
 
     def advice(self, entry):
         """sleep_idle_seconds: weigh swaps against what a load costs."""
@@ -1462,7 +1528,7 @@ class Tuner:
         return {"metric": metric, "sd_pct": round(sd * 100, 1),
                 "by_metric_sd_pct": {key: round(value * 100, 1) for key, value in sorted(self.noise.items())},
                 "runs": self.noise_runs, "samples_per_run": self.samples,
-                "win_needs_pct": round(WIN_SD * max(NOISE_FLOOR, sd) * 100, 1),
+                "win_needs_pct": round(WIN_SD * self.noise_sd(metric) * 100, 1),
                 "floor_pct": round(NOISE_FLOOR * 100, 1),
                 "repeat_above_pct": round(REPEAT_ABOVE * 100, 1),
                 "too_noisy_above_pct": round(TOO_NOISY * 100, 1)}
