@@ -119,7 +119,11 @@ struct ActionButton: View {
     var symbol: String?
     var showsReason = true
     var compact = false
-    @State private var asking = false
+    /// The plan as it is at the moment of the click, for actions whose question depends on how fresh the power
+    /// reading is ("Keep on"); nil uses `plan`.
+    var current: (() -> ActionPlan?)? = nil
+    /// The plan the owner is being asked about.
+    @State private var asking: ActionPlan?
     @State private var hovered = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -135,9 +139,9 @@ struct ActionButton: View {
                     .disabled(!enabled)
                     .onHover { hovered = $0 }
                     .animation(reduceMotion ? nil : PanelMotion.feedback, value: hovered)
-                    .help(plan.gate.reason ?? (plan.wakes ? "This wakes the GPU box" : plan.title))
-                    .accessibilityLabel(plan.title)
-                    .accessibilityHint(plan.gate.reason ?? (plan.wakes ? "Wakes the GPU box. Asks first." : ""))
+                    .help(plan.gate.reason ?? (plan.wakes ? (plan.confirmation?.title ?? "This wakes the GPU box") + " · asks first" : plan.title))
+                    .accessibilityLabel(plan.spoken)
+                    .accessibilityHint(plan.gate.reason ?? (plan.wakes ? (plan.confirmation?.title ?? "Wakes the GPU box") + ". Asks first." : ""))
                     .accessibilityValue(running ? "Running" : "")
                 CommandCopyButton(command: plan.command)
             }
@@ -148,13 +152,14 @@ struct ActionButton: View {
             }
             ResultLine(feedback: running ? nil : feedback)
         }
-        .confirmationDialog(plan.confirmation?.title ?? "", isPresented: $asking, titleVisibility: .visible) {
-            if let question = plan.confirmation {
-                Button(question.confirm, role: question.destructive ? .destructive : nil) { run(confirmed: true) }
+        .confirmationDialog(asking?.confirmation?.title ?? "", isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
+                            titleVisibility: .visible, presenting: asking) { question in
+            if let words = question.confirmation {
+                Button(words.confirm, role: words.destructive ? .destructive : nil) { run(question, confirmed: true) }
                 Button("Cancel", role: .cancel) {}
             }
-        } message: {
-            Text(plan.confirmation?.message ?? "")
+        } message: { question in
+            Text(question.confirmation?.message ?? "")
         }
     }
 
@@ -199,9 +204,17 @@ struct ActionButton: View {
         }
     }
     private func trigger() {
-        if plan.confirmation != nil { asking = true } else { run(confirmed: false) }
+        let now: ActionPlan
+        if let current {
+            guard let fresh = current() else { return }
+            now = fresh
+        } else {
+            now = plan
+        }
+        guard now.gate.isAllowed else { return }
+        if now.confirmation != nil { asking = now } else { run(now, confirmed: false) }
     }
-    private func run(confirmed: Bool) {
+    private func run(_ plan: ActionPlan, confirmed: Bool) {
         Task { await store.perform(plan, confirmed: confirmed) }
     }
 }
@@ -362,10 +375,14 @@ struct MemoryBar: View {
                 }
                 .frame(width: width, height: 5)
             }
-            Text(used.map { u in showsBudget ? budget.map { Words.bytes(u).replacingOccurrences(of: " GB", with: "") + " of " + Words.bytes($0) } ?? Words.bytes(u) : Words.bytes(u) } ?? "memory unknown")
-                .font(.system(size: 11, weight: used == nil ? .regular : .medium)).monospacedDigit()
-                .foregroundStyle(used == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(WindowColor.secondaryText))
-                .fixedSize()
+            // Memory shows only when the engine measured it.
+            if let used {
+                Text(showsBudget ? budget.map { Words.bytes(used).replacingOccurrences(of: " GB", with: "") + " of " + Words.bytes($0) } ?? Words.bytes(used)
+                                 : Words.bytes(used))
+                    .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                    .foregroundStyle(WindowColor.secondaryText)
+                    .fixedSize()
+            }
         }
         .help(used.map { u in budget.map { "\(Words.bytes(u)) of \(Words.bytes($0)) GPU memory" } ?? "\(Words.bytes(u)) of GPU memory" }
               ?? "The engine has not measured this model’s memory yet")

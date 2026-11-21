@@ -56,8 +56,10 @@ When the item is hidden, the panel still opens, under the right side of the menu
 
 One native window for everything `sb ai` offers, by clicking. Open it from the panel's window button, with
 ⌃⌥⌘W (system hot key, no Accessibility permission), or with `sb bar window` (starts the app first when it is
-not running). ⌃⌥⌘L still opens the panel. While the window is open the app shows a Dock icon and an Edit
-menu, so copy and paste work in its fields; closing it makes the app a menu bar app again.
+not running; an app older than the window says so in one line: run `sb menubar install`). ⌃⌥⌘L still opens
+the panel; Options › Window shortcut turns ⌃⌥⌘W off the same way. While the window is open the app shows a Dock
+icon and an Edit menu, so copy and paste work in its fields; closing it makes the app a menu bar app again, with
+no Dock icon, even while the panel is open.
 
 The window has four places (⌘1 to ⌘4):
 
@@ -68,41 +70,61 @@ The window has four places (⌘1 to ⌘4):
   cloud), a loaded dot, its speed as a bar against its ceiling (dashed and against the fastest model of its
   job when no ceiling is saved) and a mark for saved settings. A route, a name that picks one of several
   models, carries a branch mark. Selecting a name opens the inspector: temperature and top P as sliders,
-  max tokens as a stepper, thinking and the reasoning guard as switches; for a GPU box engine that takes
-  them, context size with a "fits / won't fit in memory" bar, KV cache type and parallel slots. Every value
-  shows where it comes from: engine default, saved for this model, a profile (not editable here) or locked.
-  Changes wait for Apply; Review shows each change from and to, whether the model reloads, and the exact
-  commands. History offers Undo to here for every earlier version; Load, Unload, Try it and the speed
-  report's findings in plain words (with "Use this" for a suggestion the inspector can show) sit beside it.
+  max tokens as a stepper, thinking as Engine / On / Off and the reasoning guard as a switch; for a GPU box
+  engine that takes them, context size with a "fits / won't fit in memory" bar, KV cache type and parallel
+  slots. Every value shows where it comes from: engine default, saved for this model, a profile (not editable
+  here) or locked. Nothing saved means the engine decides, and the window shows only what it knows: the
+  engine's own value from its start arguments when it has one, otherwise a dashed "Engine decides" slider
+  track with no handle (a click or drag on it starts a value), "auto" on a stepper until it is pressed, and
+  no context handle or fit verdict until a size is chosen or known. Changes wait for Apply; Review shows each
+  change from and to (resetting a locked setting "also removes the lock"), whether the model reloads, and the
+  exact commands; Escape asks before unsaved changes are discarded. History offers Undo to here for every
+  earlier version (never on the Mac: a revert would also put back its load settings); Load, Unload, Try it and
+  the speed report's findings in plain words (with "Use this" for a suggestion the inspector can show) sit
+  beside it. The "loaded" count counts each model in memory once, however many names reach it; a listed model
+  that is not in memory is "Resting".
 - **Machines**: a GPU box's state, uptime and GPU, its holds, Keep on (1 hour by default, menu for longer)
   and Power off. Power off is disabled, with the reason, while the box has been up under 4 minutes, while
   work runs or waits, while a hold is active, or while someone else uses it. The Mac is show-only: its
-  loaded models and memory, never wake, sleep, power off, release or load settings.
+  loaded models and memory, never wake, sleep, power off, release, load settings or Undo to here; Try it on
+  a Mac model says the Mac loads it if it is resting.
 - **Accounts**: the panel's gauge, drawn at window width, with the same rules.
 
 The window holds no keys and calls no HTTP. It runs the installed `sb` with exact arguments (no shell):
 
 | Reads (about every 10 s while the window is visible; paused when hidden, minimized or covered) |
 | --- |
-| `sb ai status --json`, `sb ai engines --json`; `sb ai doctor --json` every 30 s; `sb ai models --json` every 60 s |
-| `sb ai settings NAME --json` and `sb ai settings MODEL --history --json` for the open model; every name's settings every 5 min |
+| `sb ai status --json`; `sb ai engines --json` (every 60 s instead while every GPU box is known to be asleep); `sb ai doctor --json` every 30 s; `sb ai models --json` every 60 s |
+| `sb ai settings NAME --json` for the open model; `sb ai settings MODEL --history --json` once when it is picked and after a write |
+| every text and audio name's settings every 5 min, beside the reads above so the status keeps refreshing |
 
-None of these wakes a machine: the gateway answers each from what it already knows. Each write is one
-command: `sb ai set`, `unset`, `revert`, `load`, `unload`, `hold`, `release`, `on`, `off` and `sb ai chat MODEL
-"prompt" --json` for Try it. Every action button has a small terminal button beside it: hover shows the exact
-command, click copies it. A button shows a spinner while it runs, then one result line, or one plain line with
-the reason `sb` gave. A button that would wake the GPU box says so ("Load now · wakes the GPU box") and asks
-once; Power off asks too.
+Picking a model reads it once the pick has held for 300 ms; picking another stops a read still running, and its
+`sb` process. Hiding the window stops the reads too, and a read stopped that way is no gateway error. None of
+the reads wakes a machine: the gateway answers most from what it already knows, and the engines read may check
+an engine's health. Each write is one command: `sb ai set`, `unset`, `revert`, `load`, `unload`, `hold`,
+`release`, `on`, `off` and `sb ai chat --json -- MODEL "prompt"` for Try it (options first and `--` before the
+model, so a prompt such as "-h" is sent as text). Every action button has a small terminal button beside it:
+hover shows the exact command, click copies it. A button shows a spinner while it runs, then one result line,
+or one plain line with the reason `sb` gave. A button that would wake the GPU box says so ("Load now · wakes
+the GPU box") and asks once; Power off asks too.
+
+Try it always reaches the gateway, which wakes a sleeping GPU box for it. It asks first ("Send · may wake the
+GPU box") whenever any model behind the name (a route picks any of them) is on a GPU box the window does not
+know to be on, or when it does not know the name's models yet. The window does not know a GPU box is on when
+its last status read began more than 15 s ago, when that read failed, when the window just came back from
+hidden and has not read it again, or when the idle power-off is under 30 s away; Keep on then asks too and
+keeps the box on with a wake. The check runs again at the click, so a reading that went stale since the button
+was drawn still asks. Load, settings and holds never wake without `--wake`, which the gateway enforces.
 
 The gateway names machines; the window calls one it wakes and powers off "GPU box" and an always-on one
-"Mac". Uptime comes from the gateway when it reports `up_since_ms`; otherwise from the machine's engines' last
-successful wakes, only when they agree within 10 minutes, and unknown otherwise (the gateway still refuses an
-early power-off and the window shows its reason). The rules live in `ControlPresentation`, tested without
-AppKit.
+"Mac". Uptime comes from the gateway when it reports `up_since_ms`; otherwise from the newest successful wake
+among the machine's engines, shown as approximate ("~12 min"): it may be later than the machine's start, never
+earlier, so Power off waits 4 minutes after it, with the reason. With neither, uptime is unknown and the
+gateway's own check decides. The rules live in `ControlPresentation`, tested without AppKit.
 
 Render a place offscreen, with no window on screen and no command run, from one file of saved answers
 (`{"now", "status", "models", "engines", "doctor", "settings": {NAME: …}, "history": {MODEL: …}, "limits",
-"selected"}`, each the JSON the matching command prints):
+"selected"}`, each the JSON the matching command prints; `"status_age": SECONDS` renders an old reading):
 
     SwitchbackBar --render-window window.json --place models --theme dark --output models.png
 

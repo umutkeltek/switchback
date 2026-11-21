@@ -26,7 +26,8 @@ struct InspectorView: View {
                     if let target {
                         if state.drafts[target.target] == nil { ResultLine(feedback: store.feedback["apply:" + target.target]) }
                         if view?.isRoute == true { routePicker }
-                        AnswerCard(target: target, draft: draftBinding(target.target))
+                        AnswerCard(target: target, draft: draftBinding(target.target),
+                                   engineModel: store.engines?.model(target.target)?.model)
                         if let load = Inspector.loadSettings(target, engines: store.engines, machines: machines) {
                             LoadCard(target: target, rows: load, draft: draftBinding(target.target),
                                      engineModel: store.engines?.model(target.target)?.model)
@@ -174,23 +175,70 @@ private struct SliderSetting: View {
     let range: ClosedRange<Double>
     var step = 0.05
     var body: some View {
-        let value = shownValue(setting, draft: draft)?.double
+        let face = Inspector.face(setting, draft: draft) { $0.double.map(JSONValue.numberText) ?? Words.value($0) }
         VStack(alignment: .leading, spacing: 4) {
             SettingLabel(setting: setting, draft: $draft)
             HStack(spacing: 10) {
-                Slider(value: Binding(get: { value ?? range.lowerBound + (range.upperBound - range.lowerBound) / 2 },
-                                      set: { draft.values[setting.key] = .set(.number(($0 / step).rounded() * step)) }),
-                       in: range)
-                    .controlSize(.small)
-                    .disabled(!setting.gate.isAllowed)
-                    .opacity(value == nil || !setting.gate.isAllowed ? 0.5 : 1)
+                if let value = face.value?.double {
+                    Slider(value: Binding(get: { min(range.upperBound, max(range.lowerBound, value)) },
+                                          set: { draft.values[setting.key] = .set(.number(($0 / step).rounded() * step)) }),
+                           in: range)
+                        .controlSize(.small)
+                        .disabled(!setting.gate.isAllowed)
+                        .opacity(setting.gate.isAllowed ? 1 : 0.5)
+                        .accessibilityLabel(setting.title)
+                        .accessibilityValue(face.text + ", " + (face.source == .engine ? "the engine's own value" : setting.badge.word))
+                    Text(face.text).font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .monospacedDigit().foregroundStyle(face.source == .engine ? .secondary : .primary)
+                        .frame(width: 42, alignment: .trailing)
+                } else {
+                    // Nothing saved and the engine's value unknown: no handle and no made-up position.
+                    NeutralTrack(range: range, step: step, enabled: setting.gate.isAllowed) {
+                        draft.values[setting.key] = .set(.number($0))
+                    }
                     .accessibilityLabel(setting.title)
-                    .accessibilityValue((value.map(JSONValue.numberText) ?? "engine default") + ", " + setting.badge.word)
-                Text(value.map(JSONValue.numberText) ?? "auto").font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .monospacedDigit().foregroundStyle(value == nil ? .secondary : .primary).frame(width: 42, alignment: .trailing)
+                    Color.clear.frame(width: 42, height: 1)
+                }
             }
             if let reason = setting.gate.reason { ReasonLine(reason) }
         }
+    }
+}
+
+/// A slider's track while the engine decides: dashed, no handle, "Engine decides". A click or drag on it starts a
+/// value there; until then nothing is set.
+private struct NeutralTrack: View {
+    let range: ClosedRange<Double>
+    let step: Double
+    let enabled: Bool
+    let start: (Double) -> Void
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                Capsule().strokeBorder(Color.secondary.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .frame(height: 6)
+                Text("Engine decides").font(.system(size: 10, weight: .medium)).foregroundStyle(WindowColor.secondaryText)
+                    .padding(.horizontal, 6).background(WindowColor.card)
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onChanged { drag in
+                guard enabled, geometry.size.width > 0 else { return }
+                let fraction = min(1, max(0, drag.location.x / geometry.size.width))
+                start(value(at: fraction))
+            })
+        }
+        .frame(height: 20)
+        .opacity(enabled ? 1 : 0.5)
+        .help(enabled ? "Nothing is saved: the engine decides. Click or drag to choose a value." : "")
+        .accessibilityElement(children: .ignore)
+        .accessibilityValue("Engine decides")
+        .accessibilityHint(enabled ? "Adjust to choose a value" : "")
+        .accessibilityAdjustableAction { _ in if enabled { start(value(at: 0.5)) } }
+    }
+    private func value(at fraction: Double) -> Double {
+        let raw = range.lowerBound + fraction * (range.upperBound - range.lowerBound)
+        return (raw / step).rounded() * step
     }
 }
 
@@ -201,27 +249,49 @@ private struct StepperSetting: View {
     let steps: [Double]
     var words: (Double) -> String = { JSONValue.numberText($0) }
     var body: some View {
-        let value = shownValue(setting, draft: draft)?.double
+        // "auto" until a value is saved, chosen or known from the engine; the first press starts at a sensible value.
+        let face = Inspector.face(setting, draft: draft, neutral: "auto") { $0.double.map(words) ?? Words.value($0) }
         VStack(alignment: .leading, spacing: 4) {
             SettingLabel(setting: setting, draft: $draft)
             HStack(spacing: 10) {
-                Text(value.map(words) ?? "auto").font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
-                    .foregroundStyle(value == nil ? .secondary : .primary)
+                Text(face.text).font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+                    .foregroundStyle(face.source == .draft || face.source == .saved ? .primary : .secondary)
                 Spacer()
-                Stepper(setting.title, onIncrement: { change(value, by: 1) }, onDecrement: { change(value, by: -1) })
+                Stepper(setting.title, onIncrement: { press(up: true) }, onDecrement: { press(up: false) })
                     .labelsHidden().controlSize(.small).disabled(!setting.gate.isAllowed)
                     .accessibilityLabel(setting.title)
-                    .accessibilityValue((value.map(words) ?? "engine default") + ", " + setting.badge.word)
+                    .accessibilityValue((face.neutral ? "the engine decides" : face.text) + ", " + setting.badge.word)
             }
             if let reason = setting.gate.reason { ReasonLine(reason) }
         }
     }
-    private func change(_ value: Double?, by direction: Int) {
-        let allowed = steps.filter { range.contains($0) }
-        guard !allowed.isEmpty else { return }
-        let current = value ?? allowed[allowed.count / 2]
-        let next = direction > 0 ? (allowed.first { $0 > current } ?? allowed.last!) : (allowed.last { $0 < current } ?? allowed.first!)
-        draft.values[setting.key] = .set(.number(next))
+    private func press(up: Bool) {
+        if let next = Inspector.step(setting, draft: draft, steps: steps, range: range, up: up) {
+            draft.values[setting.key] = .set(.number(next))
+        }
+    }
+}
+
+/// Thinking: Engine, On or Off. "Engine" is what nothing saved means; the window never shows "Off" for it.
+private struct ThinkingSetting: View {
+    let setting: SettingState
+    @Binding var draft: SettingsDraft
+    var body: some View {
+        let choice = Inspector.thinking(setting, draft: draft)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                SettingLabel(setting: setting, draft: $draft)
+                Picker(setting.title, selection: Binding(get: { choice },
+                                                        set: { Inspector.choose($0, for: setting, in: &draft) })) {
+                    ForEach(ThinkingChoice.allCases) { Text($0.title).tag($0) }
+                }
+                .labelsHidden().pickerStyle(.segmented).fixedSize().controlSize(.small)
+                .disabled(!setting.gate.isAllowed)
+                .accessibilityLabel(setting.title)
+                .accessibilityValue(choice == .engine ? "the engine decides" : choice.title)
+            }
+            if let reason = setting.gate.reason { ReasonLine(reason) }
+        }
     }
 }
 
@@ -260,8 +330,9 @@ private struct ReasonLine: View {
 private struct AnswerCard: View {
     let target: TargetSettings
     @Binding var draft: SettingsDraft
+    let engineModel: EngineModel?
     var body: some View {
-        let rows = Dictionary(uniqueKeysWithValues: Inspector.answerSettings(target).map { ($0.key, $0) })
+        let rows = Dictionary(uniqueKeysWithValues: Inspector.answerSettings(target, engineModel: engineModel).map { ($0.key, $0) })
         VStack(alignment: .leading, spacing: 14) {
             CardTitle(title: "Answers", symbol: "text.bubble", trailing: "take effect on the next answer")
             if let row = rows["temperature"] { SliderSetting(setting: row, draft: $draft, range: Inspector.range("temperature")) }
@@ -270,7 +341,7 @@ private struct AnswerCard: View {
                 StepperSetting(setting: row, draft: $draft, range: Inspector.range("max_tokens"),
                                steps: [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]) { Words.tokens(Int($0)) + " tokens" }
             }
-            if let row = rows["reasoning.enabled"] { ToggleSetting(setting: row, draft: $draft) }
+            if let row = rows["reasoning.enabled"] { ThinkingSetting(setting: row, draft: $draft) }
             if let guardRow = rows["reasoning_guard.enabled"] {
                 let on = shownValue(guardRow, draft: draft)?.bool ?? false
                 ToggleSetting(setting: guardRow, draft: $draft,
@@ -325,23 +396,29 @@ private struct LoadCard: View {
     private func contextRow(_ context: SettingState, cache: SettingState?) -> some View {
         let range = Inspector.range(context.key, target: target)
         let steps = LoadCard.contexts.filter { range.contains($0) }
-        let value = shownValue(context, draft: draft)?.double
-        let index = value.flatMap { v in steps.firstIndex { $0 >= v } } ?? max(0, steps.count / 2)
-        let type = cache.flatMap { shownValue($0, draft: draft)?.string } ?? "f16"
-        let fit = Inspector.fit(context: Int(value ?? steps[safe: index] ?? 32768), cacheK: type, target: target, engineModel: engineModel)
+        // No handle and no verdict until a size is chosen or the engine's own size is known.
+        let face = Inspector.contextFace(context, cache: cache, draft: draft, steps: steps, target: target, engineModel: engineModel)
         return VStack(alignment: .leading, spacing: 6) {
             SettingLabel(setting: context, draft: $draft)
             HStack(spacing: 10) {
-                Slider(value: Binding(get: { Double(index) },
-                                      set: { draft.values[context.key] = .set(.number(steps[safe: Int($0.rounded())] ?? steps.last ?? 32768)) }),
-                       in: 0...Double(max(1, steps.count - 1)), step: 1)
-                    .controlSize(.small).disabled(!context.gate.isAllowed || steps.count < 2)
+                if let index = face.index {
+                    Slider(value: Binding(get: { Double(index) },
+                                          set: { draft.values[context.key] = .set(.number(steps[safe: Int($0.rounded())] ?? steps.last ?? 32768)) }),
+                           in: 0...Double(max(1, steps.count - 1)), step: 1)
+                        .controlSize(.small).disabled(!context.gate.isAllowed || steps.count < 2)
+                        .accessibilityLabel("Context size")
+                        .accessibilityValue(face.text + " tokens" + (face.fit.map { ", " + $0.text } ?? ""))
+                    Text(face.text).font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .monospacedDigit().frame(width: 42, alignment: .trailing)
+                } else {
+                    NeutralTrack(range: 0...Double(max(1, steps.count - 1)), step: 1, enabled: context.gate.isAllowed && steps.count > 1) {
+                        draft.values[context.key] = .set(.number(steps[safe: Int($0)] ?? steps.last ?? 32768))
+                    }
                     .accessibilityLabel("Context size")
-                    .accessibilityValue((value.map { Words.tokens(Int($0)) + " tokens" } ?? "engine default") + ", " + fit.text)
-                Text(value.map { Words.tokens(Int($0)) } ?? "auto").font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .monospacedDigit().frame(width: 42, alignment: .trailing)
+                    Color.clear.frame(width: 42, height: 1)
+                }
             }
-            FitBar(fit: fit)
+            if let fit = face.fit { FitBar(fit: fit) }
             if let reason = context.gate.reason { ReasonLine(reason) }
         }
     }
@@ -381,6 +458,7 @@ private struct ApplyBar: View {
     let target: TargetSettings
     let draft: SettingsDraft
     let machines: [MachineCard]
+    @State private var askingDiscard = false
     var body: some View {
         let plan = Inspector.plan(target: target, draft: draft, engines: store.engines, machines: machines)
         let id = "apply:" + target.target
@@ -395,8 +473,8 @@ private struct ApplyBar: View {
                     Text(plan.notes.last ?? "").font(.system(size: 11)).foregroundStyle(WindowColor.secondaryText).lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                Button("Discard") { state.drafts[target.target] = nil; state.reviewing = false }
-                    .controlSize(.regular).keyboardShortcut(.cancelAction)
+                Button("Discard") { discard() }
+                    .controlSize(.regular)
                 Button(state.reviewing ? "Hide" : "Review…") { state.reviewing.toggle() }
                     .controlSize(.regular).buttonStyle(.borderedProminent).disabled(plan.isEmpty)
                     .keyboardShortcut(.defaultAction)
@@ -405,6 +483,22 @@ private struct ApplyBar: View {
         }
         .background(.bar)
         .overlay(alignment: .top) { Rectangle().fill(WindowColor.hairline).frame(height: 1) }
+        .background {
+            // Escape asks before unsaved edits are thrown away.
+            Button("") { askingDiscard = true }.keyboardShortcut(.cancelAction).opacity(0).accessibilityHidden(true)
+        }
+        .confirmationDialog(discardQuestion(plan), isPresented: $askingDiscard, titleVisibility: .visible) {
+            Button("Discard", role: .destructive) { discard() }
+            Button("Keep editing", role: .cancel) {}
+        } message: { Text("Nothing has been applied to \(target.target) yet.") }
+    }
+
+    private func discardQuestion(_ plan: ChangePlan) -> String {
+        plan.lines.count == 1 ? "Discard 1 unsaved change?" : "Discard \(max(plan.lines.count, draft.values.count)) unsaved changes?"
+    }
+    private func discard() {
+        state.drafts[target.target] = nil
+        state.reviewing = false
     }
 
     private func preview(_ plan: ChangePlan, id: String, feedback: ActionFeedback?) -> some View {
@@ -479,10 +573,11 @@ private struct TryItCard: View {
     @Bindable var state: ControlWindowState
     let row: ModelRow
     let machines: [MachineCard]
-    @State private var asking = false
+    /// The plan the owner is being asked about, made at the click.
+    @State private var asking: ActionPlan?
     var body: some View {
         let prompt = state.prompts[row.name] ?? ""
-        let plan = Inspector.tryIt(row.name, targets: row.targets, prompt: prompt, machines: machines)
+        let plan = store.tryIt(row, prompt: prompt)
         let chat = store.chats[row.name]
         VStack(alignment: .leading, spacing: 10) {
             CardTitle(title: "Try it", symbol: "paperplane")
@@ -490,9 +585,9 @@ private struct TryItCard: View {
                 TextField("Ask something short", text: Binding(get: { prompt }, set: { state.prompts[row.name] = $0 }), axis: .vertical)
                     .textFieldStyle(.plain).font(.system(size: 12)).lineLimit(1...4)
                     .padding(8).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
-                    .onSubmit { send(plan) }
+                    .onSubmit { send() }
                     .accessibilityLabel("Prompt for \(row.name)")
-                Button { send(plan) } label: {
+                Button { send() } label: {
                     HStack(spacing: 5) {
                         if chat == .running { ProgressView().controlSize(.mini) }
                         else { Image(systemName: plan.wakes ? "sunrise.fill" : "paperplane.fill").font(.system(size: 11)) }
@@ -505,9 +600,14 @@ private struct TryItCard: View {
                 }
                 .buttonStyle(PanelPressStyle()).focusable().disabled(!plan.gate.isAllowed || chat == .running)
                 .keyboardShortcut(.return, modifiers: .command)
-                .help(plan.gate.reason ?? "Send (⌘Return)")
+                .help(plan.gate.reason ?? (plan.confirmation.map { $0.title + " · asks first (⌘Return)" } ?? "Send (⌘Return)"))
                 .accessibilityLabel(plan.title)
+                .accessibilityHint(plan.confirmation == nil ? "" : "Asks first")
                 CommandCopyButton(command: plan.command)
+            }
+            if let note = Inspector.tryItNote(targets: row.targets, machines: machines) {
+                Label(note, systemImage: "desktopcomputer").font(.system(size: 11)).foregroundStyle(WindowColor.secondaryText)
+                    .labelStyle(TightLabelStyle())
             }
             switch chat {
             case .answered(let answer):
@@ -530,14 +630,18 @@ private struct TryItCard: View {
             }
         }
         .windowCard()
-        .confirmationDialog(plan.confirmation?.title ?? "", isPresented: $asking, titleVisibility: .visible) {
-            Button(plan.confirmation?.confirm ?? "Send") { Task { await store.send(plan, model: row.name, confirmed: true) } }
+        .confirmationDialog(asking?.confirmation?.title ?? "", isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
+                            titleVisibility: .visible, presenting: asking) { question in
+            Button(question.confirmation?.confirm ?? "Send") { Task { await store.send(question, model: row.name, confirmed: true) } }
             Button("Cancel", role: .cancel) {}
-        } message: { Text(plan.confirmation?.message ?? "") }
+        } message: { question in Text(question.confirmation?.message ?? "") }
     }
-    private func send(_ plan: ActionPlan) {
+    /// Decides at the click, from the power as it is now: a reading that went stale since the button was drawn
+    /// asks first.
+    private func send() {
+        let plan = store.tryIt(row, prompt: state.prompts[row.name] ?? "")
         guard plan.gate.isAllowed else { return }
-        if plan.confirmation != nil { asking = true } else { Task { await store.send(plan, model: row.name) } }
+        if plan.confirmation != nil { asking = plan } else { Task { await store.send(plan, model: row.name) } }
     }
 }
 
@@ -623,7 +727,7 @@ private struct HistoryCard: View {
     let store: ControlStore
     let history: SettingsHistory
     var body: some View {
-        let rows = Inspector.versions(history, now: store.now)
+        let rows = Inspector.versions(history, now: store.now, machines: store.machines)
         VStack(alignment: .leading, spacing: 8) {
             CardTitle(title: "History", symbol: "clock.arrow.circlepath", trailing: "\(rows.count) versions")
             ForEach(rows.prefix(8)) { row in

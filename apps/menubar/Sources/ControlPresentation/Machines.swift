@@ -80,6 +80,29 @@ public struct MachineCard: Sendable, Equatable, Identifiable {
     public let wakeSeconds: Double?
     /// The machine's engines (lane names), for matching models to it.
     public let lanes: [String]
+    /// Why the window cannot be sure of a GPU box's power right now ("last read 40 s ago"); nil when it can.
+    /// Anything that could wake the box asks first while there is a doubt.
+    public var powerDoubt: String? = nil
+    /// The uptime is an estimate from the newest wake: the gateway did not say when the machine came up.
+    public var uptimeApproximate: Bool = false
+
+    /// On, and the window's reading of it is fresh: nothing sent to it can wake it.
+    public var knownOn: Bool { power == .on && powerDoubt == nil }
+    /// Models in memory now; a resting model is listed but not in memory.
+    public var inMemory: Int { loaded.filter { $0.state == .loaded || $0.state == .loading }.count }
+}
+
+/// How far the window can trust the power it last read.
+public struct PowerEvidence: Sendable, Equatable {
+    /// When the status read that gave the power began; nil when there is none.
+    public let readAt: Date?
+    /// The last status read failed.
+    public let failed: Bool
+    /// The window came back from hidden and no status read has finished since.
+    public let awaitingFresh: Bool
+    public init(readAt: Date?, failed: Bool = false, awaitingFresh: Bool = false) {
+        self.readAt = readAt; self.failed = failed; self.awaitingFresh = awaitingFresh
+    }
 }
 
 public enum Machines {
@@ -89,7 +112,14 @@ public enum Machines {
     public static let keepOnChoices = ["1h", "30m", "2h", "4h", "8h"]
     static let holdReason = "kept on from the Switchback window"
 
-    public static func cards(status: AIStatus?, engines: EnginesReport?, doctor: DoctorReport?, now: Date) -> [MachineCard] {
+    /// Power older than this is unknown for anything that could wake a machine.
+    public static let powerTrust: Double = 15
+    /// An idle countdown this close to its end means the box may be asleep by the time a request arrives.
+    public static let countdownTrust: Double = 30
+
+    /// Every machine the status names. `evidence` says how old that status is; nil means it was just read.
+    public static func cards(status: AIStatus?, engines: EnginesReport?, doctor: DoctorReport?, now: Date,
+                             evidence: PowerEvidence? = nil) -> [MachineCard] {
         guard let status else { return [] }
         var order: [String] = status.power.map(\.machine)
         for lane in status.lanes where !order.contains(lane.machine) { order.append(lane.machine) }
@@ -105,7 +135,7 @@ public enum Machines {
             let title = sameKind > 1 ? kind.title + " · " + machine : kind.title
             let powerText = status.power.first { $0.machine == machine }?.power ?? "off"
             return card(machine: machine, title: title, kind: kind, powerText: powerText, lanes: lanes,
-                        engines: engines, doctor: doctor, now: now)
+                        engines: engines, doctor: doctor, now: now, evidence: evidence)
         }
     }
 
@@ -115,7 +145,7 @@ public enum Machines {
     }
 
     static func card(machine: String, title: String, kind: MachineKind, powerText: String, lanes: [LaneReport],
-                     engines: EnginesReport?, doctor: DoctorReport?, now: Date) -> MachineCard {
+                     engines: EnginesReport?, doctor: DoctorReport?, now: Date, evidence: PowerEvidence? = nil) -> MachineCard {
         let power: Power = switch powerText {
         case "on": .on
         case "waking": .waking
@@ -131,10 +161,13 @@ public enum Machines {
         }
         var holds: [HoldReport] = []
         for lane in lanes { for hold in lane.holds where !holds.contains(where: { $0.id == hold.id }) { holds.append(hold) } }
+        // How old the reading is: a countdown keeps running after it was read.
+        let age = evidence?.readAt.map { max(0, now.timeIntervalSince($0)) } ?? 0
         // A countdown only when nothing holds the machine and the gateway gives one.
-        let countdown = holds.isEmpty ? lanes.compactMap(\.poweroffInSecs).filter { $0 >= 0 }.min() : nil
+        let countdown = holds.isEmpty ? lanes.compactMap(\.poweroffInSecs).filter { $0 >= 0 }.min().map { max(0, $0 - age) } : nil
         let nowMs = now.timeIntervalSince1970 * 1000
-        let uptime = power == .on ? upSince(lanes).map { max(0, nowMs - $0) / 1000 } : nil
+        let up = power == .on ? upSince(lanes) : nil
+        let uptime = up.map { max(0, nowMs - $0.ms) / 1000 }
         let gpuLane = lanes.first { $0.holdsGPU == true }
         let machineLanes = lanes.map(\.name)
         let loaded: [LoadedModel] = (engines?.lanes ?? []).filter { machineLanes.contains($0.lane) }.flatMap { lane in
@@ -161,7 +194,8 @@ public enum Machines {
                 if let left { until += " · " + Words.duration(left) + " left" }
             }
             let release = ActionPlan(id: "release:\(hold.id)", title: "Release",
-                                     command: Commands.release(hold.id, machine: machine))
+                                     command: Commands.release(hold.id, machine: machine),
+                                     spoken: "Release the hold: " + (hold.reason ?? "kept on"))
             return HoldCard(id: hold.id, machine: machine, reason: hold.reason ?? "Kept on", owner: hold.owner,
                             secondsLeft: left, untilText: until, waking: hold.state == "waking",
                             wakeFailed: hold.state == "wake_failed" ? (hold.wakeDetail ?? "no detail") : nil,
@@ -176,18 +210,58 @@ public enum Machines {
             problems: problems(title: title, kind: kind, power: power, lanes: lanes, holds: holdCards,
                                engines: (engines?.lanes ?? []).filter { machineLanes.contains($0.lane) }),
             wakeSeconds: lanes.compactMap(\.wakeDurationAverageMs).max().map { $0 / 1000 },
-            lanes: machineLanes)
+            lanes: machineLanes,
+            powerDoubt: kind == .gpuBox ? powerDoubt(power: power, countdown: countdown, evidence: evidence, now: now) : nil,
+            uptimeApproximate: up?.approximate ?? false)
     }
 
-    /// When the machine came up: the gateway's own time when it gives one. Otherwise each lane's last
-    /// successful wake (plus how long it took) stands in, but only when they agree within 10 minutes: a lane can
-    /// be started on a machine that was already up, so wakes far apart say nothing about the machine.
-    static func upSince(_ lanes: [LaneReport]) -> Double? {
-        if let reported = lanes.compactMap(\.upSinceMs).min() { return reported }
+    /// Why the window cannot be sure of a GPU box's power now, in a few words; nil when it can. The power is
+    /// unknown when it was read more than 15 s ago, when the last read failed, when the window just came back
+    /// from hidden and has not read it again, and when the idle power-off is under 30 s away.
+    static func powerDoubt(power: Power, countdown: Double?, evidence: PowerEvidence?, now: Date) -> String? {
+        if let evidence {
+            if evidence.failed { return "the last reading failed" }
+            if evidence.awaitingFresh { return "the window is reading it again" }
+            guard let readAt = evidence.readAt else { return "it has not been read yet" }
+            let age = now.timeIntervalSince(readAt)
+            if age > powerTrust { return "it was last read \(Words.duration(age)) ago" }
+        }
+        if power == .on, let countdown, countdown < countdownTrust { return "it powers off in \(Words.duration(countdown))" }
+        return nil
+    }
+
+    /// When the machine came up: the gateway's own time when it gives one. Otherwise the newest successful
+    /// wake among its engines (plus how long it took), marked approximate: an engine can be started on a machine
+    /// that was already up, so the newest wake may be later than the machine's start, never earlier. Power off
+    /// then waits at least as long as it must.
+    static func upSince(_ lanes: [LaneReport]) -> (ms: Double, approximate: Bool)? {
+        if let reported = lanes.compactMap(\.upSinceMs).min() { return (reported, false) }
         let wakes = lanes.filter { ($0.lastWakeResult ?? "").hasPrefix("ok") }
             .compactMap { lane in lane.lastWakeMs.map { $0 + (lane.wakeDurationMs ?? 0) } }
-        guard let newest = wakes.max(), let oldest = wakes.min(), newest - oldest <= 600_000 else { return nil }
-        return newest
+        return wakes.max().map { ($0, true) }
+    }
+
+    /// "12 min", or "~12 min" when the uptime is an estimate from the newest wake.
+    public static func uptimeText(_ machine: MachineCard) -> String? {
+        machine.uptime.map { (machine.uptimeApproximate ? "~" : "") + Words.duration($0) }
+    }
+
+    /// One short line over every machine: "GPU box on · Mac on", "2 GPU boxes · 1 on · Mac not answering".
+    public static func summary(_ cards: [MachineCard]) -> String {
+        var parts: [String] = []
+        let boxes = cards.filter { $0.kind == .gpuBox }
+        if boxes.count == 1 { parts.append("GPU box " + boxes[0].powerWord.lowercased()) }
+        if boxes.count > 1 {
+            parts.append("\(boxes.count) GPU boxes")
+            parts.append("\(boxes.filter { $0.power == .on }.count) on")
+        }
+        let macs = cards.filter { $0.kind == .mac }
+        if macs.count == 1 { parts.append("Mac " + macs[0].powerWord.lowercased()) }
+        if macs.count > 1 {
+            let on = macs.filter { $0.power == .on }.count
+            parts.append(on == macs.count ? "\(macs.count) Macs on" : "\(macs.count) Macs · \(macs.count - on) not answering")
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// Who uses an engine, in everyday words: "Text models", "Images and video".
@@ -249,7 +323,7 @@ public enum Machines {
         } else if machine.busy > 0 {
             gate = .disabled(machine.busy == 1 ? "Working on 1 request" : "Working on \(machine.busy) requests")
         } else if let uptime = machine.uptime, uptime < minimumUptime {
-            gate = .disabled("Up \(Words.duration(uptime)) · it can power off after 4 min")
+            gate = .disabled("Up \(uptimeText(machine) ?? Words.duration(uptime)) · it can power off after 4 min")
         } else if machine.guardBusy {
             gate = .disabled("Someone else is using it")
         } else { gate = .allowed }
@@ -260,7 +334,9 @@ public enum Machines {
                           gate: gate)
     }
 
-    /// "Keep on" for a duration: a hold on a GPU box that is on, a hold with a wake on one that sleeps.
+    /// "Keep on" for a duration: a hold on a GPU box that is on, a hold with a wake on one that sleeps. When the
+    /// window cannot be sure the box is on (old or failed reading, an idle power-off about to run), it asks first
+    /// and keeps it on with a wake, which also covers a box that went to sleep meanwhile.
     public static func keepOn(_ machine: MachineCard, duration: String = keepOnChoices[0]) -> ActionPlan? {
         guard machine.kind == .gpuBox else { return nil }
         let words = durationWords(duration)
@@ -270,6 +346,15 @@ public enum Machines {
                               command: Commands.on(duration, reason: holdReason, machine: machine.machine), wakes: true,
                               confirmation: WakeWarning.confirmation("Keep on \(words)", machine: machine.title,
                                                                      wakeSeconds: machine.wakeSeconds))
+        }
+        if let doubt = machine.powerDoubt {
+            let title = WakeWarning.mayWakeLabel("Keep on \(words)", machine: machine.kind.title)
+            return ActionPlan(id: "keep-on:\(machine.machine)", title: title,
+                              command: Commands.on(duration, reason: holdReason, machine: machine.machine), wakes: true,
+                              confirmation: WakeWarning.mayWakeConfirmation(
+                                "Keep on \(words)", machine: machine.title,
+                                reason: "The window can’t be sure the \(machine.title) is on: \(doubt).",
+                                wakeSeconds: machine.wakeSeconds))
         }
         return ActionPlan(id: "keep-on:\(machine.machine)", title: "Keep on \(words)",
                           command: Commands.hold(duration, reason: holdReason, machine: machine.machine))
@@ -294,5 +379,9 @@ public enum Machines {
     /// The machine a model's engine lives on.
     public static func machine(forLane lane: String, in cards: [MachineCard]) -> MachineCard? {
         cards.first { $0.lanes.contains(lane) }
+    }
+    /// The machine a target ("text/model-a") runs on: its engine is the part before the first `/`.
+    public static func machine(ofTarget target: String, in cards: [MachineCard]) -> MachineCard? {
+        target.split(separator: "/").first.flatMap { machine(forLane: String($0), in: cards) }
     }
 }

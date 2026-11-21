@@ -44,7 +44,8 @@ public enum ApplyMode: String, Sendable {
 
 /// Every command the window can run, built with exact arguments.
 public enum Commands {
-    // Reads: none of them wakes a machine (the gateway answers each from what it already knows).
+    // Reads: none of them wakes a machine. The gateway answers most from what it already knows; the engines read
+    // may check an engine's health, which reaches a machine that is on.
     public static let status = ControlCommand(["ai", "status", "--json"], writes: false, timeout: 30)
     public static let models = ControlCommand(["ai", "models", "--json"], writes: false, timeout: 30)
     public static let engines = ControlCommand(["ai", "engines", "--json"], writes: false, timeout: 30)
@@ -97,8 +98,9 @@ public enum Commands {
     public static func off(_ machine: String) -> ControlCommand {
         ControlCommand(["ai", "off", "--host", machine], writes: true, timeout: 120)
     }
-    /// One quick request to try a model. A request to a sleeping machine's model wakes it.
+    /// One quick request to try a model. A request to a sleeping machine's model wakes it. `--json` comes first and
+    /// `--` ends the options, so a prompt that starts with "-" (even "-h") is sent as text.
     public static func chat(_ model: String, prompt: String) -> ControlCommand {
-        ControlCommand(["ai", "chat", model, prompt, "--json"], writes: true, timeout: 920)
+        ControlCommand(["ai", "chat", "--json", "--", model, prompt], writes: true, timeout: 920)
     }
 }

@@ -25,7 +25,9 @@ import Testing
     #expect(Commands.release("hold_1", machine: "gpu-box").arguments == ["ai", "release", "hold_1", "--host", "gpu-box"])
     #expect(Commands.on("1h", reason: "x", machine: "gpu-box").arguments == ["ai", "on", "1h", "x", "--host", "gpu-box"])
     #expect(Commands.off("gpu-box").arguments == ["ai", "off", "--host", "gpu-box"])
-    #expect(Commands.chat("fast", prompt: "Say hi; then stop").arguments == ["ai", "chat", "fast", "Say hi; then stop", "--json"])
+    #expect(Commands.chat("fast", prompt: "Say hi; then stop").arguments == ["ai", "chat", "--json", "--", "fast", "Say hi; then stop"])
+    // A prompt that looks like an option stays the prompt: options come first and `--` ends them.
+    #expect(Commands.chat("fast", prompt: "-h").arguments == ["ai", "chat", "--json", "--", "fast", "-h"])
 }
 
 @Test func readsAreReadsAndWritesAreWrites() {
@@ -51,7 +53,7 @@ import Testing
 
 @Test func theCopyableCommandIsQuotedForAShell() {
     #expect(Commands.off("gpu-box").display == "sb ai off --host gpu-box")
-    #expect(Commands.chat("fast", prompt: "it's fine").display == #"sb ai chat fast 'it'\''s fine' --json"#)
+    #expect(Commands.chat("fast", prompt: "it's fine").display == #"sb ai chat --json -- fast 'it'\''s fine'"#)
     #expect(Commands.hold("1h", reason: "kept on from the Switchback window", machine: "gpu-box").display
             == "sb ai hold 1h 'kept on from the Switchback window' --host gpu-box")
     #expect(Commands.set("t", [("stop", .array([.string("\n")]))]).display == #"sb ai set t 'stop=["\n"]'"#)

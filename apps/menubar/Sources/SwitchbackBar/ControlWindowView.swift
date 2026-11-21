@@ -123,7 +123,8 @@ struct ControlWindowView: View {
             let problems = store.problems
             return problems.isEmpty ? nil : .count(problems.count, problems.contains(where: \.serious) ? .red : .orange)
         case .models:
-            let loaded = store.rows.filter { $0.load == .loaded && !$0.isRoute }.count
+            // Models in memory, each once: several names can reach one loaded model.
+            let loaded = ModelList.loadedCount(engines: store.engines)
             return loaded == 0 ? nil : .text("\(loaded) loaded")
         case .machines:
             guard let box = store.machines.first(where: { $0.kind == .gpuBox }) else { return nil }
@@ -175,7 +176,7 @@ struct ControlWindowView: View {
         case .now:
             let machines = store.machines
             if machines.isEmpty { return store.readError == nil ? "Reading what runs…" : "Nothing to show until the gateway answers" }
-            return machines.map { "\($0.title) \($0.powerWord.lowercased())" }.joined(separator: " · ")
+            return Machines.summary(machines)
         case .models:
             let rows = store.rows
             let routes = rows.filter(\.isRoute).count

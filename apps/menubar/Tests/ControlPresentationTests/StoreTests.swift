@@ -16,13 +16,16 @@ final class TestClock: @unchecked Sendable {
     let store = ControlStore(runner: runner, clock: { Fixture.now })
     store.selectedModel = "model-a"
     await store.tick()
+    await store.sweepTask?.value
     let calls = runner.calls
     #expect(!calls.isEmpty)
     #expect(calls.allSatisfy { !$0.writes }, "a refresh ran a write: \(calls.filter(\.writes).map(\.display))")
     #expect(!calls.contains { $0.arguments.contains("--wake") })
     #expect(calls.contains(Commands.status) && calls.contains(Commands.engines) && calls.contains(Commands.doctor()))
-    #expect(calls.contains(Commands.settings("model-a")) && calls.contains(Commands.history("text/model-a")))
-    // The first refresh also reads every text and audio name's settings.
+    #expect(calls.contains(Commands.settings("model-a")))
+    // The open model's history is read when it is picked and after a write, never every round.
+    #expect(!calls.contains(Commands.history("text/model-a")))
+    // The first refresh also starts the read of every text and audio name's settings, beside the status reads.
     #expect(calls.contains(Commands.settings("fast")) && calls.contains(Commands.settings("transcribe")))
     #expect(store.machines.map(\.title) == ["GPU box", "Mac"])
     #expect(store.rows.first { $0.name == "fast" }?.isRoute == true)
@@ -34,6 +37,7 @@ final class TestClock: @unchecked Sendable {
     let clock = TestClock(Fixture.now)
     let store = ControlStore(runner: runner, clock: { clock.now })
     await store.tick()
+    await store.sweepTask?.value
     let first = runner.calls.count
     clock.advance(10)
     await store.tick()
@@ -73,6 +77,7 @@ final class TestClock: @unchecked Sendable {
     // The first read starts at once; then the loop waits its 10 seconds.
     for _ in 0..<200 where await slept.values.isEmpty { try await Task.sleep(for: .milliseconds(5)) }
     #expect(await slept.values == [10])
+    await store.sweepTask?.value
     let count = runner.calls.count
     store.setVisible(false)
     try await Task.sleep(for: .milliseconds(50))

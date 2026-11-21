@@ -29,7 +29,7 @@ public enum LoadState: String, Sendable, Equatable {
     public var word: String {
         switch self {
         case .loaded: "Loaded"
-        case .resting: "Loaded, resting"
+        case .resting: "Resting"
         case .loading: "Loading"
         case .unloaded: "Not loaded"
         case .failed: "Failed to load"
@@ -129,6 +129,12 @@ public enum ModelList {
                         location: first, elsewhere: Set(locations.map(\.word)).subtracting([first.word]).count,
                         load: load, speed: speed, saved: view?.targets.contains(where: \.hasSaved) ?? false,
                         known: view != nil)
+    }
+
+    /// Models in memory now, each counted once: several names (a route, a name that stands for a model) can
+    /// reach the same loaded model, and a resting model is listed but not in memory.
+    public static func loadedCount(engines: EnginesReport?) -> Int {
+        Set((engines?.lanes ?? []).flatMap(\.models).filter { $0.status == "loaded" }.map(\.target)).count
     }
 
     /// Before its settings are read, a name is matched to the engines' and the speed report's models by id.

@@ -122,7 +122,7 @@ func box(power: Power = .on, uptime: Double? = 3600, busy: Int = 0, holds: Int =
     #expect(card.uptime == nil)
 }
 
-@Test func uptimeComesFromTheGatewayOrFromWakesThatAgree() throws {
+@Test func uptimeComesFromTheGatewayOrFromTheNewestWake() throws {
     func status(_ lanes: String) throws -> AIStatus {
         AIStatus(try JSONValue.parse(Data(("{\"machines\":[{\"machine\":\"gpu-box\",\"power\":\"on\"}],\"lanes\":[" + lanes + "]}").utf8)))
     }
@@ -138,14 +138,29 @@ func box(power: Power = .on, uptime: Double? = 3600, busy: Int = 0, holds: Int =
     }
     // Two lanes woken together: up since the newer wake ended.
     #expect(try uptime(lane("a", wokeMinutesAgo: 30) + "," + lane("b", wokeMinutesAgo: 28)) == 27 * 60)
-    // One lane started long after the other: the wakes say nothing about the machine, so uptime is unknown
-    // and power-off is left to the gateway's own check.
-    #expect(try uptime(lane("a", wokeMinutesAgo: 600) + "," + lane("b", wokeMinutesAgo: 2)) == nil)
-    // A gateway that reports when the machine came up is believed.
+    // One lane started long after the other: the newest wake stands in, marked approximate. It may be later than
+    // the machine's start, never earlier, so Power off waits at least as long as it must.
+    #expect(try uptime(lane("a", wokeMinutesAgo: 600) + "," + lane("b", wokeMinutesAgo: 2)) == 60)
+    let woken = try #require(Machines.cards(status: try status(lane("a", wokeMinutesAgo: 600) + "," + lane("b", wokeMinutesAgo: 2)),
+                                            engines: nil, doctor: nil, now: Fixture.now).first)
+    #expect(woken.uptimeApproximate)
+    #expect(Machines.uptimeText(woken) == "~1 min")
+    #expect(Machines.powerOff(woken)?.gate == .disabled("Up ~1 min · it can power off after 4 min"))
+    // Four minutes after the newest wake, Power off is offered again.
+    let later = try #require(Machines.cards(status: try status(lane("a", wokeMinutesAgo: 600) + "," + lane("b", wokeMinutesAgo: 6)),
+                                            engines: nil, doctor: nil, now: Fixture.now).first)
+    #expect(Machines.uptimeText(later) == "~5 min")
+    #expect(Machines.powerOff(later)?.gate == .allowed)
+    // A gateway that reports when the machine came up is believed first, and is exact.
     #expect(try uptime(lane("a", wokeMinutesAgo: 600, upSince: 3) + "," + lane("b", wokeMinutesAgo: 2)) == 180)
     let young = try #require(Machines.cards(status: try status(lane("a", wokeMinutesAgo: 600, upSince: 3)), engines: nil,
                                             doctor: nil, now: Fixture.now).first)
+    #expect(!young.uptimeApproximate && Machines.uptimeText(young) == "3 min")
     #expect(Machines.powerOff(young)?.gate == .disabled("Up 3 min · it can power off after 4 min"))
+    // No successful wake and no time from the gateway: unknown, and the gateway's own check decides.
+    let unknown = try #require(Machines.cards(status: try status(#"{"name":"a","host":"gpu-box","state":"healthy","holds":[],"wake_configured":true,"last_wake_result":"timeout"}"#),
+                                              engines: nil, doctor: nil, now: Fixture.now).first)
+    #expect(unknown.uptime == nil && Machines.uptimeText(unknown) == nil)
 }
 
 @Test func gpuBoxesComeBeforeTheMac() throws {

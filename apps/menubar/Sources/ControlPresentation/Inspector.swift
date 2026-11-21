@@ -86,6 +86,42 @@ public struct FitHint: Sendable, Equatable {
     public let text: String
 }
 
+/// What a setting's control shows.
+public struct SettingFace: Sendable, Equatable {
+    public enum Source: Sendable, Equatable { case draft, saved, engine, unknown }
+    /// The value shown; nil when the engine decides and the window does not know its value.
+    public let value: JSONValue?
+    public let source: Source
+    /// The words beside the control: "0.6", "Engine decides", "auto".
+    public let text: String
+    /// No value: a slider draws a neutral track with no handle; dragging on it starts a value.
+    public var neutral: Bool { value == nil }
+}
+
+/// Thinking: the engine decides, or on, or off.
+public enum ThinkingChoice: String, Sendable, CaseIterable, Identifiable {
+    case engine, on, off
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .engine: "Engine"
+        case .on: "On"
+        case .off: "Off"
+        }
+    }
+}
+
+/// The context size control.
+public struct ContextFace: Sendable, Equatable {
+    /// The size shown; nil until one is chosen or the engine's own size is known.
+    public let size: Int?
+    /// The slider position among the steps; nil draws no handle.
+    public let index: Int?
+    /// Whether the size fits; nil without a size.
+    public let fit: FitHint?
+    public let text: String
+}
+
 public struct VersionRow: Sendable, Equatable, Identifiable {
     public var id: Int { revision }
     public let revision: Int
@@ -136,22 +172,40 @@ public enum Inspector {
         return .allowed
     }
 
-    /// Answer settings: temperature, top P, max tokens, thinking and the reasoning guard.
-    public static func answerSettings(_ target: TargetSettings) -> [SettingState] {
+    /// The engine's own value for an answer setting, when the window can see it: from the gateway's effective
+    /// settings when it reports one, else from the engine's start arguments (`--temperature 0.8`).
+    static func engineValue(_ key: String, effective: EffectiveSetting?, engineModel: EngineModel?) -> JSONValue? {
+        if let effective, effective.source == "engine", !effective.value.isNull { return effective.value }
+        let names: [String] = switch key {
+        case "temperature": ["--temperature", "--temp"]
+        case "top_p": ["--top-p"]
+        case "max_tokens": ["--n-predict", "--predict", "-n"]
+        default: []
+        }
+        guard let text = engineModel?.argument(names), let number = Double(text) else { return nil }
+        // -1 means "until the context is full": no number to show.
+        return key == "max_tokens" && number <= 0 ? nil : .number(number)
+    }
+
+    /// Answer settings: temperature, top P, max tokens, thinking and the reasoning guard. Nothing saved means the
+    /// engine decides: `value` stays nil and `shown` holds the engine's own value only when it is known.
+    public static func answerSettings(_ target: TargetSettings, engineModel: EngineModel? = nil) -> [SettingState] {
         var rows: [SettingState] = []
         for key in ["temperature", "top_p", "max_tokens"] {
             let effective = target.effective[key] ?? EffectiveSetting(value: .null, source: "engine")
             let badge = SourceBadge.of(source: effective.source, locked: effective.locked)
-            rows.append(SettingState(key: key, title: Words.setting(key), value: effective.value.isNull ? nil : effective.value,
-                                     shown: nil, badge: badge, gate: gate(target, badge: badge)))
+            let set = effective.source != "engine" && !effective.value.isNull
+            rows.append(SettingState(key: key, title: Words.setting(key), value: set ? effective.value : nil,
+                                     shown: engineValue(key, effective: effective, engineModel: engineModel),
+                                     badge: badge, gate: gate(target, badge: badge)))
         }
-        // Thinking is `reasoning.enabled`; unset, a model marked as one that thinks shows on.
+        // Thinking is `reasoning.enabled`: on, off, or (nothing saved) the engine decides. The window never guesses.
         let reasoning = target.effective["reasoning"] ?? EffectiveSetting(value: .null, source: "engine")
         let enabled = reasoning.value["enabled"]
         let thinks = target.document?["reasoning"].bool ?? false
         let thinkingBadge = enabled.isNull ? SourceBadge.engine : SourceBadge.of(source: reasoning.source, locked: reasoning.locked)
         rows.append(SettingState(key: "reasoning.enabled", title: "Thinking", value: enabled.isNull ? nil : enabled,
-                                 shown: .bool(thinks), badge: thinkingBadge, gate: gate(target, badge: thinkingBadge)))
+                                 shown: nil, badge: thinkingBadge, gate: gate(target, badge: thinkingBadge)))
         // The reasoning guard is target-wide: it is active when the model is marked as thinking and the guard is on.
         let guardDoc = target.document?["reasoning_guard"] ?? .null
         let active = thinks && (guardDoc["enabled"].bool ?? false)
@@ -163,6 +217,81 @@ public enum Inspector {
                                  value: guardDoc["min_tokens"].isNull ? nil : guardDoc["min_tokens"], shown: .number(1024),
                                  badge: guardDoc["min_tokens"].isNull ? .engine : .saved, gate: guardGate))
         return rows
+    }
+
+    // MARK: What each control shows
+
+    /// What a control shows: the edit waiting for Apply, else the saved value, else the engine's own value when it
+    /// is known, else nothing (the engine decides; no handle, no made-up position).
+    public static func face(_ setting: SettingState, draft: SettingsDraft, neutral: String = "Engine decides",
+                            words: (JSONValue) -> String = { Words.value($0) }) -> SettingFace {
+        switch draft.values[setting.key] {
+        case .set(let value): return SettingFace(value: value, source: .draft, text: words(value))
+        case .reset:
+            return setting.shown.map { SettingFace(value: $0, source: .engine, text: words($0)) }
+                ?? SettingFace(value: nil, source: .unknown, text: neutral)
+        case nil:
+            if let value = setting.value { return SettingFace(value: value, source: .saved, text: words(value)) }
+            if let shown = setting.shown { return SettingFace(value: shown, source: .engine, text: words(shown)) }
+            return SettingFace(value: nil, source: .unknown, text: neutral)
+        }
+    }
+
+    /// Thinking as a three-way choice; "Engine" whenever nothing is saved or about to be.
+    public static func thinking(_ setting: SettingState, draft: SettingsDraft) -> ThinkingChoice {
+        switch draft.values[setting.key] {
+        case .set(let value): value.bool.map { $0 ? .on : .off } ?? .engine
+        case .reset: .engine
+        case nil: setting.value?.bool.map { $0 ? .on : .off } ?? .engine
+        }
+    }
+    /// The edit a thinking choice makes: none when it matches what is saved.
+    public static func choose(_ choice: ThinkingChoice, for setting: SettingState, in draft: inout SettingsDraft) {
+        let wanted: JSONValue? = switch choice {
+        case .engine: nil
+        case .on: .bool(true)
+        case .off: .bool(false)
+        }
+        if wanted == setting.value { draft.values[setting.key] = nil }
+        else if let wanted { draft.values[setting.key] = .set(wanted) }
+        else { draft.values[setting.key] = .reset }
+    }
+
+    /// Where a stepper starts when it shows "auto" and the engine's value is unknown: shown only once pressed.
+    public static func stepperStart(_ key: String) -> Double {
+        switch key {
+        case "max_tokens": 4096
+        case "load.parallel": 1
+        case "reasoning_guard.min_tokens": 1024
+        default: 1
+        }
+    }
+    /// The value a stepper press moves to: the next allowed step from what it shows, or its start when it shows
+    /// "auto".
+    public static func step(_ setting: SettingState, draft: SettingsDraft, steps: [Double], range: ClosedRange<Double>,
+                            up: Bool) -> Double? {
+        let allowed = steps.filter { range.contains($0) }
+        guard let first = allowed.first, let last = allowed.last else { return nil }
+        guard let current = face(setting, draft: draft).value?.double else {
+            let start = stepperStart(setting.key)
+            return allowed.min { abs($0 - start) < abs($1 - start) } ?? first
+        }
+        return up ? (allowed.first { $0 > current } ?? last) : (allowed.last { $0 < current } ?? first)
+    }
+
+    /// The context size control: a handle only once a size is chosen or the engine's own size is known, and a
+    /// fit verdict only for a real size.
+    public static func contextFace(_ context: SettingState, cache: SettingState?, draft: SettingsDraft, steps: [Double],
+                                   target: TargetSettings, engineModel: EngineModel?) -> ContextFace {
+        let shown = face(context, draft: draft).value?.double.map { Int($0) }
+        guard let size = shown else {
+            return ContextFace(size: nil, index: nil, fit: nil, text: "Engine decides")
+        }
+        let index = steps.firstIndex { $0 >= Double(size) } ?? max(0, steps.count - 1)
+        let type = cache.flatMap { face($0, draft: draft).value?.string } ?? "f16"
+        return ContextFace(size: size, index: index,
+                           fit: fit(context: size, cacheK: type, target: target, engineModel: engineModel),
+                           text: Words.tokens(size))
     }
 
     /// Whether the window offers load settings, load and unload for a target, and why not.
@@ -245,7 +374,8 @@ public enum Inspector {
     /// What "Apply" will change, whether the model must reload, and the exact commands.
     public static func plan(target: TargetSettings, draft: SettingsDraft, engines: EnginesReport?,
                             machines: [MachineCard]) -> ChangePlan {
-        let answer = Dictionary(uniqueKeysWithValues: answerSettings(target).map { ($0.key, $0) })
+        let engineModel = engines?.model(target.target)?.model
+        let answer = Dictionary(uniqueKeysWithValues: answerSettings(target, engineModel: engineModel).map { ($0.key, $0) })
         let load = Dictionary(uniqueKeysWithValues: (loadSettings(target, engines: engines, machines: machines) ?? []).map { ($0.key, $0) })
         var lines: [ChangeLine] = []
         var sets: [(String, JSONValue)] = [], resets: [String] = []
@@ -264,7 +394,9 @@ public enum Inspector {
                 if key.hasPrefix("load.") { loadSets.append((String(key.dropFirst(5)), value)) } else { sets.append((key, value)) }
             case .reset:
                 guard current != nil else { continue }
-                lines.append(ChangeLine(key: key, title: Words.setting(key), from: fromWord, to: "engine default"))
+                let locked = state?.badge == .locked || target.locked.contains(key)
+                lines.append(ChangeLine(key: key, title: Words.setting(key), from: fromWord,
+                                        to: locked ? "engine default · also removes the lock" : "engine default"))
                 if key.hasPrefix("load.") { loadResets.append(String(key.dropFirst(5))) } else { resets.append(key) }
             }
         }
@@ -318,24 +450,68 @@ public enum Inspector {
                            gate: loadGate), nil)
     }
 
-    /// "Try it": one request to the name. A request to a model on a sleeping GPU box wakes it.
-    public static func tryIt(_ name: String, targets: [String], prompt: String, machines: [MachineCard]) -> ActionPlan {
-        let first = targets.first.flatMap { target in
-            target.split(separator: "/").first.flatMap { Machines.machine(forLane: String($0), in: machines) }
-        }
-        let wakes = first.map { $0.kind == .gpuBox && ($0.power == .asleep || $0.power == .poweringOff) } ?? false
-        let machine = first?.title ?? "GPU box"
-        let word = first?.kind.title ?? "GPU box"
+    /// "Try it": one request to the name, which the gateway always sends, waking a sleeping GPU box. A route
+    /// picks any of its models, so every model behind the name counts: it asks first whenever any of them is on a
+    /// GPU box the window does not know to be on, and whenever it does not know the name's models yet.
+    public static func tryIt(_ name: String, targets: [String], targetsKnown: Bool = true, prompt: String,
+                             machines: [MachineCard]) -> ActionPlan {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        return ActionPlan(id: "chat:\(name)", title: WakeWarning.label("Send", wakes: wakes, machine: word),
-                          command: Commands.chat(name, prompt: trimmed), wakes: wakes,
-                          confirmation: wakes ? WakeWarning.confirmation("Send", machine: machine, wakeSeconds: first?.wakeSeconds) : nil,
-                          gate: trimmed.isEmpty ? .disabled("Write a prompt first") : .allowed)
+        let command = Commands.chat(name, prompt: trimmed)
+        let gate: Gate = trimmed.isEmpty ? .disabled("Write a prompt first") : .allowed
+        var boxes: [MachineCard] = []
+        for target in targets {
+            if let card = Machines.machine(ofTarget: target, in: machines), card.kind == .gpuBox, !card.knownOn,
+               !boxes.contains(where: { $0.machine == card.machine }) { boxes.append(card) }
+        }
+        let unknown = !targetsKnown || targets.isEmpty || machines.isEmpty
+        guard unknown || !boxes.isEmpty else {
+            return ActionPlan(id: "chat:\(name)", title: "Send", command: command, gate: gate)
+        }
+        let box = boxes.count == 1 ? boxes[0] : nil
+        let word = box?.kind.title ?? "GPU box"
+        let machine = box?.title ?? "GPU box"
+        let wakeSeconds = boxes.compactMap(\.wakeSeconds).max()
+        func asleep(_ card: MachineCard) -> Bool {
+            (card.power == .asleep || card.power == .poweringOff) && card.powerDoubt == nil
+        }
+        // Every model behind the name sits on a box known to be asleep: the request surely wakes it.
+        let surely = !unknown && targets.allSatisfy { target in
+            Machines.machine(ofTarget: target, in: machines).map { card in boxes.contains { $0.machine == card.machine } && asleep(card) } ?? false
+        }
+        if surely {
+            return ActionPlan(id: "chat:\(name)", title: WakeWarning.label("Send", wakes: true, machine: word), command: command,
+                              wakes: true, confirmation: WakeWarning.confirmation("Send", machine: machine, wakeSeconds: wakeSeconds),
+                              gate: gate)
+        }
+        let reason: String
+        if unknown {
+            reason = "The window does not know yet which models \(name) uses."
+        } else if let first = boxes.first, asleep(first) {
+            reason = "\(name) can answer from a model on the \(first.title), which is asleep."
+        } else if let first = boxes.first {
+            reason = "The window can’t be sure the \(first.title) is on: \(first.powerDoubt ?? first.powerWord.lowercased())."
+        } else {
+            reason = "The window can’t be sure where \(name) runs."
+        }
+        return ActionPlan(id: "chat:\(name)", title: WakeWarning.mayWakeLabel("Send", machine: word), command: command,
+                          wakes: true, confirmation: WakeWarning.mayWakeConfirmation("Send", machine: machine, reason: reason,
+                                                                                    wakeSeconds: wakeSeconds),
+                          gate: gate)
     }
 
-    /// The versions of a target's settings, newest first, each but the current with "Undo to here".
-    public static func versions(_ history: SettingsHistory, now: Date) -> [VersionRow] {
-        history.entries.map { entry in
+    /// What "Try it" does on the Mac: its engine loads a resting model by itself to answer.
+    public static func tryItNote(targets: [String], machines: [MachineCard]) -> String? {
+        let mac = targets.contains { Machines.machine(ofTarget: $0, in: machines)?.kind == .mac }
+        return mac ? "Loads it on the Mac if it is resting" : nil
+    }
+
+    /// The versions of a target's settings, newest first, each but the current with "Undo to here". Never on the
+    /// Mac (or a machine not read yet): a revert puts back the whole saved document, `load.*` keys included, and
+    /// the window never changes what the Mac loads.
+    public static func versions(_ history: SettingsHistory, now: Date, machines: [MachineCard]) -> [VersionRow] {
+        let machine = Machines.machine(ofTarget: history.target, in: machines)
+        let showOnly = machines.isEmpty || machine?.kind == .mac
+        return history.entries.map { entry in
             let current = entry.revision == history.revision
             let what: String
             if entry.action == "revert" { what = "Went back to an earlier version" }
@@ -346,8 +522,10 @@ public enum Inspector {
                 what = names.joined(separator: ", ")
             }
             let when = entry.atMs.map { Words.ago(now.timeIntervalSince1970 - $0 / 1000) } ?? ""
-            let undo = current ? nil : ActionPlan(id: "revert:\(history.target):\(entry.revision)", title: "Undo to here",
-                                                  command: Commands.revert(history.target, to: entry.revision))
+            let undo = current || showOnly ? nil
+                : ActionPlan(id: "revert:\(history.target):\(entry.revision)", title: "Undo to here",
+                             command: Commands.revert(history.target, to: entry.revision),
+                             spoken: "Undo to version \(entry.revision)")
             return VersionRow(revision: entry.revision, title: "Version \(entry.revision)", when: when, what: what,
                               isCurrent: current, undo: undo)
         }

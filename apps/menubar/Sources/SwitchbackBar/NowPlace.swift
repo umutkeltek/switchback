@@ -162,6 +162,10 @@ struct LoadedList: View {
                     Spacer(minLength: 6)
                     if model.state == .failed {
                         Text("failed").font(.system(size: 11, weight: .medium)).foregroundStyle(.red)
+                    } else if model.state == .resting {
+                        // Listed but not in memory: its engine loads it again when work comes.
+                        Text("Resting").font(.system(size: 11)).foregroundStyle(WindowColor.secondaryText)
+                            .help("Listed, not in memory: it loads again when a request comes")
                     } else {
                         MemoryBar(used: model.memoryBytes, budget: budget, width: 70)
                     }
@@ -188,7 +192,7 @@ struct LoadedList: View {
 enum MachineWords {
     static func status(_ machine: MachineCard) -> String {
         var parts = [machine.powerWord]
-        if let uptime = machine.uptime { parts.append("up \(Words.duration(uptime))") }
+        if let uptime = Machines.uptimeText(machine) { parts.append("up \(uptime)") }
         if machine.kind == .gpuBox && machine.power == .asleep { parts.append("wakes when work arrives") }
         return parts.joined(separator: " · ")
     }

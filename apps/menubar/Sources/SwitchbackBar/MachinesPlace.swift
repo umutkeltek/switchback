@@ -62,7 +62,7 @@ struct GPUBoxCard: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 VStack(alignment: .leading, spacing: 10) {
-                    CardTitle(title: "Loaded", symbol: "square.stack.3d.up", trailing: machine.loaded.isEmpty ? nil : "\(machine.loaded.count)")
+                    CardTitle(title: "Loaded", symbol: "square.stack.3d.up", trailing: machine.inMemory == 0 ? nil : "\(machine.inMemory)")
                     LoadedList(models: machine.loaded, budget: budget)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -77,7 +77,9 @@ struct GPUBoxCard: View {
             HStack(alignment: .top, spacing: 8) {
                 if let keep = Machines.keepOn(machine, duration: duration) {
                     HStack(alignment: .top, spacing: 2) {
-                        ActionButton(plan: keep, store: store, look: .prominent, symbol: "lock.fill")
+                        // With a hold already in place, keeping it on longer is not the main thing to do here.
+                        ActionButton(plan: keep, store: store, look: machine.holds.isEmpty ? .prominent : .plain, symbol: "lock.fill",
+                                     current: { store.keepOn(machine.machine, duration: duration) })
                         // How long: a small menu beside the button, so the duration shows once, on the button.
                         Menu {
                             Picker("Keep on for", selection: $duration) {
@@ -107,16 +109,20 @@ struct GPUBoxCard: View {
 
     private var stats: some View {
         HStack(spacing: 10) {
-            Stat(title: "Up", value: machine.uptime.map(Words.duration) ?? "—", symbol: "clock",
+            Stat(title: "Up", value: Machines.uptimeText(machine) ?? "—", symbol: "clock",
                  help: machine.uptime == nil ? "Unknown: the gateway does not say when it came up"
-                                             : "Estimated from its last wake; it can power off after 4 min")
+                     : machine.uptimeApproximate ? "About: from its newest wake, so it may have been up longer; it can power off after 4 min"
+                     : "Since it came up; it can power off after 4 min")
             Stat(title: "GPU", value: machine.gpuUser ?? "free", symbol: "memorychip", help: "Who has the GPU now")
             Stat(title: "Working", value: machine.busy == 0 ? "idle" : "\(machine.busy)", symbol: "bolt",
                  help: "Requests running or waiting", tint: machine.busy > 0 ? .orange : nil)
             Stat(title: "Powers off", value: machine.powerOffIn.map { "in " + Words.duration($0) } ?? (machine.holds.isEmpty ? "—" : "held"),
                  symbol: "power", help: "The idle power-off countdown")
-            Stat(title: "Wakes in", value: machine.wakeSeconds.map { "~" + Words.duration($0) } ?? "—", symbol: "sunrise",
-                 help: "How long a wake takes, on average")
+            // How long a wake takes matters only while it sleeps.
+            if machine.power == .asleep || machine.power == .poweringOff, let wake = machine.wakeSeconds {
+                Stat(title: "Wake takes", value: "~" + Words.duration(wake), symbol: "sunrise",
+                     help: "How long a wake takes, on average")
+            }
         }
     }
 }
@@ -165,7 +171,7 @@ struct MacCard: View {
             if !machine.problems.isEmpty {
                 VStack(alignment: .leading, spacing: 6) { ForEach(machine.problems) { ProblemRow(problem: $0, short: true) } }
             }
-            CardTitle(title: "Loaded", symbol: "square.stack.3d.up", trailing: machine.loaded.isEmpty ? nil : "\(machine.loaded.count)")
+            CardTitle(title: "Loaded", symbol: "square.stack.3d.up", trailing: machine.inMemory == 0 ? nil : "\(machine.inMemory)")
             LoadedList(models: machine.loaded, budget: nil)
         }
         .windowCard(padding: 20)

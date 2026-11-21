@@ -96,7 +96,7 @@ import Testing
     // Trying a model on a sleeping box wakes it too, and says so.
     let send = Inspector.tryIt("model-b", targets: ["text/model-b"], prompt: "hi", machines: asleep)
     #expect(send.wakes && send.title == "Send · wakes the GPU box")
-    #expect(send.command.arguments == ["ai", "chat", "model-b", "hi", "--json"])
+    #expect(send.command.arguments == ["ai", "chat", "--json", "--", "model-b", "hi"])
     #expect(Inspector.tryIt("model-b", targets: ["text/model-b"], prompt: "  ", machines: asleep).gate.isAllowed == false)
     // A loaded model offers Unload, never while it answers.
     let loaded = Inspector.loadActions(try #require(fixture.target("model-a")), engines: fixture.engines, machines: fixture.machines)
@@ -161,7 +161,7 @@ import Testing
 
 @Test func historyOffersUndoToEveryEarlierVersion() throws {
     let history = try #require(try Fixture.synthetic.histories["text/model-a"])
-    let rows = Inspector.versions(history, now: Fixture.now)
+    let rows = Inspector.versions(history, now: Fixture.now, machines: try Fixture.synthetic.machines)
     #expect(rows.map(\.title) == ["Version 3", "Version 2", "Version 1"])
     #expect(rows[0].isCurrent && rows[0].undo == nil)
     #expect(rows[1].what == "Temperature, Top P")

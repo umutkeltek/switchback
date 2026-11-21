@@ -34,43 +34,79 @@ public enum ChatState: Sendable, Equatable {
     /// Why the last status read failed, as one plain line; the last good data stays on screen.
     public private(set) var readError: String?
     public private(set) var lastRead: Date?
+    /// When the last status read that succeeded began: the age of the power the window shows.
+    public private(set) var statusReadAt: Date?
+    /// The last status read failed, so the power on screen may be old.
+    public private(set) var statusFailed = false
+    /// The window came back from hidden and no status read has finished since.
+    public private(set) var awaitingFresh = false
     public private(set) var reading = false
     public private(set) var feedback: [String: ActionFeedback] = [:]
     public private(set) var chats: [String: ChatState] = [:]
     public private(set) var visible = false
-    /// The model whose inspector is open.
+    /// The model whose inspector is open. Picking another reads its settings and history once the pick has
+    /// held for `debounce` seconds; a read still running for the earlier pick is stopped.
     public var selectedModel: String? {
-        didSet { if selectedModel != oldValue, visible { Task { await readSelected() } } }
+        didSet { if selectedModel != oldValue, visible { scheduleSelectionRead() } }
     }
 
     /// Reads at most this often.
     public static let interval: TimeInterval = 10
+    /// Power read longer ago than this counts as unknown for anything that could wake a machine.
+    public static let powerTrust: TimeInterval = 15
     static let doctorEvery: TimeInterval = 30, modelsEvery: TimeInterval = 60, sweepEvery: TimeInterval = 300
+    /// While every GPU box is known to be asleep, the engines are read only this often.
+    static let enginesAsleepEvery: TimeInterval = 60
 
     @ObservationIgnored let runner: any CommandRunning
     @ObservationIgnored let clock: @Sendable () -> Date
     @ObservationIgnored let sleep: @Sendable (TimeInterval) async throws -> Void
+    /// How long a model pick must hold before its settings are read.
+    @ObservationIgnored let debounce: TimeInterval
     @ObservationIgnored private var loop: Task<Void, Never>?
     @ObservationIgnored private(set) var lastTick: Date?
     @ObservationIgnored private var lastDoctor: Date?
     @ObservationIgnored private var lastModels: Date?
+    @ObservationIgnored private var lastEngines: Date?
     @ObservationIgnored private var lastSweep: Date?
+    @ObservationIgnored private var visibleSince: Date?
+    /// The one read of the open model's settings and history; a new pick cancels it.
+    @ObservationIgnored private(set) var selectionTask: Task<Void, Never>?
+    /// The five-minute read of every name's settings, run beside the status reads, never in their way.
+    @ObservationIgnored private(set) var sweepTask: Task<Void, Never>?
 
     public init(runner: any CommandRunning, clock: @escaping @Sendable () -> Date = { Date() },
-                sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }) {
-        self.runner = runner; self.clock = clock; self.sleep = sleep
+                sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) },
+                debounce: TimeInterval = 0.3) {
+        self.runner = runner; self.clock = clock; self.sleep = sleep; self.debounce = debounce
     }
 
     // MARK: Derived
 
     public var now: Date { clock() }
-    public var machines: [MachineCard] { Machines.cards(status: status, engines: engines, doctor: doctor, now: now) }
+    /// How far the power on screen can be trusted: its age, a failed read, a read still due after the window was hidden.
+    public var powerEvidence: PowerEvidence {
+        PowerEvidence(readAt: statusReadAt, failed: statusFailed, awaitingFresh: awaitingFresh)
+    }
+    public var machines: [MachineCard] {
+        Machines.cards(status: status, engines: engines, doctor: doctor, now: now, evidence: powerEvidence)
+    }
     public var rows: [ModelRow] {
         ModelList.rows(catalog: catalog, engines: engines, doctor: doctor, machines: machines, settings: settings)
     }
     /// Anything wrong, one plain line each: the gateway first, then each machine.
     public var problems: [Problem] {
         (readError.map { [Problem(text: $0, serious: true)] } ?? []) + machines.flatMap(\.problems)
+    }
+
+    /// "Try it" for a model, from the power as it is now: a click asks first when the power has gone stale
+    /// since the button was drawn.
+    public func tryIt(_ row: ModelRow, prompt: String) -> ActionPlan {
+        Inspector.tryIt(row.name, targets: row.targets, targetsKnown: row.known, prompt: prompt, machines: machines)
+    }
+    /// "Keep on" for a machine, from the power as it is now.
+    public func keepOn(_ machine: String, duration: String = Machines.keepOnChoices[0]) -> ActionPlan? {
+        machines.first { $0.machine == machine }.flatMap { Machines.keepOn($0, duration: duration) }
     }
 
     // MARK: Refresh
@@ -81,7 +117,17 @@ public enum ChatState: Sendable, Equatable {
         self.visible = visible
         loop?.cancel()
         loop = nil
-        guard visible else { return }
+        guard visible else {
+            // Nothing reads while hidden; a read cut short this way is not a gateway problem.
+            selectionTask?.cancel()
+            selectionTask = nil
+            sweepTask?.cancel()
+            return
+        }
+        // What the window shows was read before it hid: until a new status read finishes, the power may be old.
+        visibleSince = now
+        awaitingFresh = true
+        if selectedModel != nil { scheduleSelectionRead() }
         loop = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -107,8 +153,9 @@ public enum ChatState: Sendable, Equatable {
         await tick()
     }
 
-    /// One round of reads: status and engines every time; the speed report, the model list and the settings of
-    /// every model less often; the open model's settings and history every time.
+    /// One round of reads, all at once: status every time; the engines every time while a GPU box may be on (once
+    /// a minute while every box is asleep); the speed report and the model list less often; the open model's
+    /// settings when no read for it is running. The five-minute read of every name's settings starts beside it.
     public func tick() async {
         let started = now
         lastTick = started
@@ -116,35 +163,88 @@ public enum ChatState: Sendable, Equatable {
         defer { reading = false }
         let wantDoctor = lastDoctor.map { started.timeIntervalSince($0) >= ControlStore.doctorEvery } ?? true
         let wantModels = lastModels.map { started.timeIntervalSince($0) >= ControlStore.modelsEvery } ?? true
+        let wantEngines = enginesDue(at: started)
+        let open = selectionTask == nil ? selectedModel : nil
         async let statusRead = read(Commands.status)
-        async let enginesRead = read(Commands.engines)
+        async let enginesRead = wantEngines ? read(Commands.engines) : nil
         async let doctorRead = wantDoctor ? read(Commands.doctor()) : nil
         async let modelsRead = wantModels ? read(Commands.models) : nil
-        let (statusJSON, enginesJSON, doctorJSON, modelsJSON) = await (statusRead, enginesRead, doctorRead, modelsRead)
+        async let openRead = open != nil ? read(Commands.settings(open ?? "")) : nil
+        let (statusJSON, enginesJSON, doctorJSON, modelsJSON, openJSON) = await (statusRead, enginesRead, doctorRead, modelsRead, openRead)
+        // Hidden mid-read: what was stopped says nothing about the gateway.
+        if Task.isCancelled && statusJSON == nil { return }
         switch statusJSON {
-        case .some(.success(let json)): status = AIStatus(json); readError = nil
-        case .some(.failure(let failure)): readError = "Can’t read the gateway · " + failure.message
+        case .some(.success(let json)): applyStatus(json, readAt: started)
+        case .some(.failure(let failure)):
+            readError = "Can’t read the gateway · " + failure.message
+            statusFailed = true
         case .none: break
         }
-        if case .some(.success(let json)) = enginesJSON { engines = EnginesReport(json) }
+        if case .some(.success(let json)) = enginesJSON { engines = EnginesReport(json); lastEngines = started }
         if case .some(.success(let json)) = doctorJSON { doctor = DoctorReport(json); lastDoctor = started }
         if case .some(.success(let json)) = modelsJSON { catalog = ModelCatalog(json); lastModels = started }
+        if let open, open == selectedModel, case .some(.success(let json)) = openJSON { settings[open] = SettingsView(json) }
         lastRead = started
-        await readSelected()
-        if lastSweep.map({ started.timeIntervalSince($0) >= ControlStore.sweepEvery }) ?? true {
-            lastSweep = started
-            await sweepSettings()
+        startSweepIfDue(at: started)
+    }
+
+    private func applyStatus(_ json: JSONValue, readAt started: Date) {
+        status = AIStatus(json)
+        readError = nil
+        statusFailed = false
+        statusReadAt = max(started, statusReadAt ?? started)
+        if let since = visibleSince, started >= since { awaitingFresh = false }
+    }
+
+    /// The engines are read every round while any GPU box may be on; once a minute while every one is known to be
+    /// asleep, because then nothing on them changes (the read may still check an engine's health).
+    func enginesDue(at time: Date) -> Bool {
+        guard let last = lastEngines else { return true }
+        let boxes = machines.filter { $0.kind == .gpuBox }
+        let allAsleep = !statusFailed && !boxes.isEmpty && boxes.allSatisfy { $0.power == .asleep }
+        return !allAsleep || time.timeIntervalSince(last) >= ControlStore.enginesAsleepEvery
+    }
+
+    private func startSweepIfDue(at time: Date) {
+        guard visible || loop == nil, sweepTask == nil,
+              lastSweep.map({ time.timeIntervalSince($0) >= ControlStore.sweepEvery }) ?? true else { return }
+        lastSweep = time
+        sweepTask = Task { [weak self] in
+            await self?.sweepSettings()
+            guard let self else { return }
+            // Cut short by hiding: the next round starts it again.
+            if Task.isCancelled { self.lastSweep = nil }
+            self.sweepTask = nil
         }
     }
 
-    /// The open model's settings, and the history of each model behind it.
+    /// Reads the open model's settings and the history of each model behind it, at once (no debounce).
     public func readSelected() async {
         guard let name = selectedModel else { return }
-        if case .success(let json) = await read(Commands.settings(name)) {
-            settings[name] = SettingsView(json)
+        await readSelection(name)
+    }
+
+    private func scheduleSelectionRead() {
+        selectionTask?.cancel()
+        selectionTask = nil
+        guard let name = selectedModel else { return }
+        let wait = debounce
+        selectionTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(wait)) } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            await self.readSelection(name)
+            // A cancelled read was replaced by a newer pick; only the current one clears its slot.
+            if !Task.isCancelled { self.selectionTask = nil }
         }
+    }
+
+    private func readSelection(_ name: String) async {
+        guard case .success(let json) = await read(Commands.settings(name)), !Task.isCancelled, selectedModel == name else { return }
+        settings[name] = SettingsView(json)
         for target in settings[name]?.targets.map(\.target) ?? [] {
-            if case .success(let json) = await read(Commands.history(target)) { histories[target] = SettingsHistory(json) }
+            let answer = await read(Commands.history(target))
+            guard !Task.isCancelled else { return }
+            if case .success(let json) = answer { histories[target] = SettingsHistory(json) }
         }
     }
 
@@ -156,7 +256,7 @@ public enum ChatState: Sendable, Equatable {
         await withTaskGroup(of: (String, JSONValue?).self) { group in
             var pending = names.makeIterator()
             func next() {
-                guard let name = pending.next() else { return }
+                guard !Task.isCancelled, let name = pending.next() else { return }
                 group.addTask {
                     guard let result = try? await runner.run(Commands.settings(name)), result.succeeded else { return (name, nil) }
                     return (name, try? JSONValue.parse(result.stdout))
@@ -164,22 +264,23 @@ public enum ChatState: Sendable, Equatable {
             }
             for _ in 0..<3 { next() }
             for await (name, json) in group {
-                if let json { settings[name] = SettingsView(json) }
+                if let json, !Task.isCancelled { settings[name] = SettingsView(json) }
                 next()
             }
         }
     }
 
     enum ReadResult { case success(JSONValue), failure(CommandFailure) }
+    /// One read. Nil when it was stopped (the window hid, or another model was picked): that is no failure.
     private func read(_ command: ControlCommand) async -> ReadResult? {
         do {
             let result = try await runner.run(command)
-            guard result.succeeded else { return .failure(CommandFailure(Outcome.errorLine(result))) }
+            guard result.succeeded else { return Task.isCancelled ? nil : .failure(CommandFailure(Outcome.errorLine(result))) }
             return .success(try JSONValue.parse(result.stdout))
         } catch let failure as CommandFailure {
-            return .failure(failure)
+            return failure.cancelled || Task.isCancelled ? nil : .failure(failure)
         } catch {
-            return .failure(CommandFailure("sb sent an answer the window cannot read"))
+            return Task.isCancelled ? nil : .failure(CommandFailure("sb sent an answer the window cannot read"))
         }
     }
 
@@ -215,7 +316,8 @@ public enum ChatState: Sendable, Equatable {
         return outcome
     }
 
-    /// "Try it": one request; the answer shows with its speed and the model that answered.
+    /// "Try it": one request; the answer shows with its speed and the model that answered. A plan with a
+    /// question (it may wake the GPU box) runs only once the owner said yes.
     public func send(_ plan: ActionPlan, model: String, confirmed: Bool = false) async {
         guard plan.gate.isAllowed, plan.confirmation == nil || confirmed, chats[model] != .running else { return }
         chats[model] = .running
@@ -249,10 +351,11 @@ public enum ChatState: Sendable, Equatable {
     /// After a write, what it changed is read again at once.
     private func reread(after command: ControlCommand) async {
         let verb = command.arguments.count > 1 ? command.arguments[1] : ""
+        let started = now
         if ["hold", "release", "on", "off"].contains(verb) {
-            if case .success(let json) = await read(Commands.status) { status = AIStatus(json) }
+            if case .success(let json) = await read(Commands.status) { applyStatus(json, readAt: started) }
         } else {
-            if case .success(let json) = await read(Commands.engines) { engines = EnginesReport(json) }
+            if case .success(let json) = await read(Commands.engines) { engines = EnginesReport(json); lastEngines = started }
             let name = selectedModel ?? (command.arguments.count > 2 ? command.arguments[2] : "")
             if case .success(let json) = await read(Commands.settings(name)) { settings[name] = SettingsView(json) }
             if command.arguments.count > 2, case .success(let json) = await read(Commands.history(command.arguments[2])) {
@@ -268,12 +371,16 @@ public enum ChatState: Sendable, Equatable {
         status = fixture.status; catalog = fixture.catalog; engines = fixture.engines; doctor = fixture.doctor
         settings = fixture.settings; histories = fixture.histories; readError = fixture.error
         lastRead = fixture.now; feedback = fixture.feedback; chats = fixture.chats
+        statusReadAt = fixture.status == nil ? nil : fixture.now.addingTimeInterval(-fixture.statusAge)
+        statusFailed = fixture.error != nil
+        awaitingFresh = false
         selectedModel = fixture.selected
     }
 }
 
 /// Saved answers of every read, in one file: `{"now": ISO date, "status": …, "models": …, "engines": …,
-/// "doctor": …, "settings": {NAME: …}, "history": {TARGET: …}, "limits": …, "selected": NAME, "error": TEXT}`.
+/// "doctor": …, "settings": {NAME: …}, "history": {TARGET: …}, "limits": …, "selected": NAME, "error": TEXT,
+/// "status_age": SECONDS}`.
 public struct ControlFixture: Sendable {
     public let now: Date
     public let status: AIStatus?
@@ -284,6 +391,8 @@ public struct ControlFixture: Sendable {
     public let histories: [String: SettingsHistory]
     public let selected: String?
     public let error: String?
+    /// How old the status was when the answers were saved, in seconds ("status_age"); 0 when not given.
+    public let statusAge: TimeInterval
     public let feedback: [String: ActionFeedback]
     public let chats: [String: ChatState]
     /// The raw `sb limits --json` answer, for the account gauges.
@@ -300,6 +409,7 @@ public struct ControlFixture: Sendable {
         histories = (json["history"].object ?? [:]).mapValues(SettingsHistory.init)
         selected = json["selected"].string
         error = json["error"].string
+        statusAge = json["status_age"].double ?? 0
         var feedback: [String: ActionFeedback] = [:]
         for (id, row) in json["feedback"].object ?? [:] {
             if let line = row["done"].string { feedback[id] = .done(line) }
