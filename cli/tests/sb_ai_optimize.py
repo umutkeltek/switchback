@@ -4,7 +4,8 @@ against a fake gateway on a local port.
 
 The fake's engine is fast and deterministic enough to tune: its decode and
 prompt speed follow the load settings it was loaded with (each setting has
-an effect factor), with a seeded jitter of 5 to 10%; it keeps the slot count
+an effect factor), with a seeded jitter of 2% on decode and 1% on time to
+first token; it keeps the slot count
 (concurrent requests beyond it wait), answers needles unless a setting
 breaks them, changes its greedy answer when a setting is lossy, and fails
 loads it is told to fail. Every run goes through the real `sb` dispatcher
@@ -36,7 +37,9 @@ class Engine:
     def __init__(self, seed=11):
         self.rng = random.Random(seed)
         self.rng_lock = threading.Lock()
-        self.spread = 0.05  # decode and prefill jitter; a test may narrow it
+        # Decode jitter. Under 3% between two controls' medians, so a run
+        # judged on decode is noisy only when a test makes it so.
+        self.spread = 0.02
         self.base_decode = 800.0      # tok/s; a 64-token answer takes ~80 ms
         self.base_ttft_ms = 200.0     # long enough that scheduling noise stays under 1%
         self.base_prefill = 60000.0   # tok/s
@@ -62,9 +65,10 @@ class Engine:
         return out
 
     def jitter(self, spread=None):
-        """Seeded run-to-run noise: 5% on the tuned metrics (decode, prefill),
-        1% on time to first token, so the 3% rule on a metric a lever does
-        not touch is tested by its own case, not by chance."""
+        """Seeded run-to-run noise: `spread` (2%) on decode, 1% on time to
+        first token, so the 3% rules (a side metric against the controls, a
+        run noisy on its judged metric) are tested by their own cases, not
+        by chance."""
         spread = self.spread if spread is None else spread
         with self.rng_lock:
             return 1.0 + self.rng.uniform(-spread, spread)
