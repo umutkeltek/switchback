@@ -8,18 +8,23 @@ live gateway: measure a baseline, read the ceiling, change one load setting
 at a time from the current best, and judge each change with
 control / candidate / control runs. Before the first lever it measures the
 noise: three runs of the same settings (five, with more samples per run
-when the budget allows, when those spread wider than 5%); their spread is
-the noise band, never under 5%, and a band over 40% stops the run with
-"too noisy to tune" and changes nothing. A change is kept only when it
-beats both neighbouring controls on its own metric by more than the band
-and no other measured metric is worse than the mean of the two controls
-(than the worse control, when the two differ by more than that) by more
-than its own noise band (also measured, also never under 5%); a win of more than
-20%, any win on a machine noisier than 5%, or a run whose two controls
-differ by more than the band on the judged metric (noisy), is repeated
-once first and must win again. A trial whose settings do not apply or load
-is a failed trial: shown as such, not a rejection, and not a lever inside
-the noise.
+when the budget allows, when those differ by more than 2%), measuring every
+metric the planned levers use. The noise is the standard deviation (SD) of
+one run, per metric, never taken under 2%; an SD over 20% stops the run
+with "too noisy to tune" and changes nothing. Each change then runs
+control, candidate, control, candidate, control... (each candidate run
+between two controls) until the result is clear, at most ten candidate
+runs: kept when its gain over the controls' mean is larger than 1.7 SD
+with two standard errors to spare (or, after the last run, larger than
+both 1.7 SD and two standard errors), rejected as soon as the gain plus
+two standard errors stays under 1.7 SD. The SD is pooled over the noise
+runs, the controls and the candidate runs (so an unsteady candidate widens
+it). On a machine noisier than 5%, or for a win over 20%, a win must hold
+over two candidate runs or more. No other measured metric may get worse
+than the controls' mean by more than such a win would need on it. A trial
+whose settings do not apply or load is a failed trial: shown as such, not a
+rejection, and not a lever inside the noise. A change that cannot finish
+inside the budget is not started; one the budget cuts off changes nothing.
 Changes that claim to be lossless must give the same greedy answer; changes
 to the KV cache or context must find needles at about half and all of the
 context; a change to the slot count must survive a concurrent soak at full
@@ -61,11 +66,36 @@ from concurrent.futures import TimeoutError as FutureTimeout
 OK, FAIL, USAGE = 0, 1, 2
 INTERRUPTED = 130
 
-NOISE_FLOOR = 0.05  # the noise band is never narrower than +-5%
+# The noise is the standard deviation (SD) of one run, relative to the
+# runs' mean, per metric: the sample SD of the noise runs, then pooled with
+# each experiment's own runs. Sample SD, not MAD x 1.4826: with three to
+# five runs the MAD is the middle gap of a handful of numbers (with three
+# runs, the smaller of two), half the true spread on average and zero
+# whenever two runs agree; there is no run to be robust against, since a
+# run that fails is never a number.
+NOISE_FLOOR = 0.02  # the SD is never taken under 2%: a few runs can look steadier than the machine
 NOISE_RUNS = 3      # runs of the same settings that measure the noise before any lever
-NOISE_MORE = 2      # more such runs when those 3 spread wider than the floor
-TOO_NOISY = 0.40    # a band wider than +-40%: no lever's win could show; stop
-SURPRISE = 0.20     # a win over 20% is repeated once before it is kept
+NOISE_MORE = 2      # more such runs when those 3 have an SD over the floor
+# An SD over 20%: stop. A kept win must clear 1.7 SD (34% here) with room
+# to spare, so only a speed-up of +40% or more could show, and runs that
+# differ by 40% from one another say little about any setting. The first
+# real box measured an SD of about 6 to 8%.
+TOO_NOISY = 0.20
+REPEAT_ABOVE = 0.05  # an SD over 5%: a win must hold over two candidate runs or more
+SURPRISE = 0.20     # so must a win over 20%
+# The keep rule. A trial's gain is measured against the mean of the
+# controls; with n candidate runs and n + 1 controls its standard error is
+# SD x sqrt(1/n + 1/(n+1)) (SD x sqrt(1.5) for one candidate between two
+# controls). A win is kept when it clears WIN_SD x SD by CONFIDENCE
+# standard errors, or (at the last run) when it is larger than both
+# WIN_SD x SD and CONFIDENCE standard errors; rejected once CONFIDENCE
+# standard errors above it stay under WIN_SD x SD. At an SD of 7% that keeps
+# a real +20% in about 94 of 100 runs and a real +5% in about 3 (see the
+# seeded simulation in cli/tests/sb_ai_optimize.py): a smaller WIN_SD keeps
+# more small wins that are noise, fewer MAX_ROUNDS miss more real ones.
+WIN_SD = 1.7
+CONFIDENCE = 2.0
+MAX_ROUNDS = 10     # candidate runs per change at most (one more control than that)
 PLATEAU = 3         # three levers in a row inside the noise: stop
 MIN_SAMPLES = 6     # decode samples per run (the median is used)
 MAX_SAMPLES = 24    # the most samples per run the noise rule may raise to
@@ -204,24 +234,43 @@ def short_hash(text):
     return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
-def spreads(runs):
-    """Per metric, how far runs of the same settings spread: their range over
-    their median, corrected for the number of runs. The range of k runs
-    falls short of the whole spread: for values spread evenly over a band,
-    k runs cover (k-1)/(k+1) of it on average, so the range of 3 runs is
-    doubled and that of 5 runs taken 1.5 times."""
+def noise_sds(runs):
+    """Per metric, the noise of runs of the same settings: their sample
+    standard deviation over their mean (0.07 = 7%). A metric some run
+    lacks is left out; fewer than two runs measure nothing."""
     out = {}
-    k = len(runs)
-    if k < 2:
+    if len(runs) < 2:
         return out
     for key in HIGHER_IS_BETTER:
         values = [run[key] for run in runs if isinstance(run.get(key), (int, float))]
-        if len(values) != k:
+        if len(values) != len(runs):
             continue
-        mid = median(values)
-        if mid and mid > 0:
-            out[key] = (max(values) - min(values)) / mid * (k + 1) / (k - 1)
+        mean = statistics.fmean(values)
+        if mean > 0:
+            out[key] = statistics.stdev(values) / mean
     return out
+
+
+def pooled_sd(groups):
+    """The relative SD pooled over groups of runs that each share their
+    own settings (each group around its own mean), and its degrees of
+    freedom: (sd, df), (None, 0) when no group has two runs."""
+    squares, df = 0.0, 0
+    for values in groups:
+        if len(values) < 2:
+            continue
+        mean = statistics.fmean(values)
+        if mean <= 0:
+            continue
+        squares += sum(((value - mean) / mean) ** 2 for value in values)
+        df += len(values) - 1
+    if df == 0:
+        return None, 0
+    return math.sqrt(squares / df), df
+
+def run_kind(metrics):
+    """The key a run's cost is kept under: the metrics it measured."""
+    return "+".join(sorted(set(metrics)))
 
 
 class Tuner:
@@ -235,14 +284,24 @@ class Tuner:
         self.samples = max(MIN_SAMPLES, int(getattr(args, "samples", None) or MIN_SAMPLES))
         self.requested_samples = self.samples
         # Measured before the first lever (`measure_noise`): per metric, the
-        # corrected spread of runs of the same settings.
+        # SD of one run of the same settings, and those runs themselves.
         self.noise = {}
+        self.noise_data = []
         self.noise_runs = 0
+        self.noise_metrics = ("decode",)
+        self.sample_counts = []
         self.failed = []
         self.concurrency = parse_concurrency(args.concurrency)
         self.budget = parse_budget(args.budget)
         self.workload = args.workload
-        self.started = time.monotonic()
+        # The budget's clock (a test passes its own).
+        self.clock = time.monotonic
+        self.started = self.clock()
+        # Seconds each kind of run and each apply took: what a next one costs.
+        self.run_secs = {}
+        self.apply_secs = []
+        self.budget_cut = False
+        self.untuned_reason = None
         self.lock_id = None
         self.hold = None
         self.stopping = False
@@ -250,6 +309,7 @@ class Tuner:
         self.notes = []
         self.unverified = []
         self.gains = []
+        self.best_metrics = None
         self.applied_doc = None
         self.revision = 0
         self.base_revision = 0
@@ -460,6 +520,7 @@ class Tuner:
         # unknown: a Ctrl-C or a client timeout can stop us while the
         # gateway still applies `doc`. Unknown makes `restore_best` write.
         self.applied_doc = None
+        started = self.clock()
         try:
             answer = self.gw.call("PUT", path, body=body, timeout=900,
                                   headers={"If-Match": f'"{self.revision}"'})
@@ -479,6 +540,7 @@ class Tuner:
             raise TuneError(FAIL, apply.get("message") or apply.get("error") or "the engine did not load it")
         if apply.get("pending"):
             self.wait_applied(apply)
+        self.apply_secs.append(self.clock() - started)
         return answer
 
     def wait_applied(self, apply):
@@ -634,13 +696,15 @@ class Tuner:
             return "a looping answer (the same words over and over)"
         return None
 
-    def measure(self, metric):
-        """One run: the metric the lever is judged on plus decode and time to
-        first token, each the median over the run's samples. Fresh prompts
-        (no cache hits). The first request after a load is discarded."""
+    def measure(self, *metrics):
+        """One run: the metrics asked for plus decode and time to first
+        token, each the median over the run's samples. Fresh prompts (no
+        cache hits). The first request after a load is discarded. What the
+        run took is kept per kind of run (`run_cost`)."""
         if self.stopping:
             raise Interrupted()
         self.heartbeat()
+        started = self.clock()
         self.run_parallel([lambda: self.chat(CHAT_PROMPT, 64)])  # warm-up, discarded
         out = {}
         answers = []
@@ -651,7 +715,7 @@ class Tuner:
             return None, problem
         out["decode"] = median([a["decode_tps"] for a in answers])
         out["ttft_ms"] = median([a["ttft_ms"] for a in answers])
-        if metric == "prefill" or self.workload in ("read", "mixed"):
+        if "prefill" in metrics or self.workload in ("read", "mixed"):
             reads = []
             for _ in range(self.samples):
                 reads.extend(self.run_parallel([lambda: self.chat(READ_PROMPT, 16)]))
@@ -659,7 +723,7 @@ class Tuner:
             if problem:
                 return None, problem
             out["prefill"] = median([a["prompt_tps"] for a in reads])
-        if metric in ("aggregate", "weighted"):
+        if "aggregate" in metrics or "weighted" in metrics:
             per = {}
             for n in self.concurrency:
                 values = []
@@ -674,9 +738,30 @@ class Tuner:
             out["per_concurrency"] = per
             out["aggregate"] = per[max(self.concurrency)]
             out["weighted"] = sum(per.values()) / len(per)
-        if metric == "load_s":
+        if "load_s" in metrics:
             out["load_s"] = self.load_time()
+        self.run_secs.setdefault(run_kind(metrics), []).append(self.clock() - started)
         return out, None
+
+    def run_cost(self, metric):
+        """Seconds a run measuring `metric` takes: the mean of such runs so
+        far, else of the noise runs (they measure every metric the plan
+        uses, so they cost at least as much), else 0."""
+        times = self.run_secs.get(run_kind((metric,))) or \
+            self.run_secs.get(run_kind(self.noise_metrics)) or [0.0]
+        return statistics.fmean(times)
+
+    def apply_cost(self):
+        """Seconds a settings write with its apply (a reload) takes."""
+        return statistics.fmean(self.apply_secs) if self.apply_secs else 0.0
+
+    def round_cost(self, metric):
+        """One more round of an experiment: apply the candidate, measure
+        it, put the best back, measure a control."""
+        return 2 * (self.apply_cost() + self.run_cost(metric))
+
+    def budget_fits(self, seconds):
+        return self.elapsed() + seconds <= self.budget
 
     def load_time(self):
         path = f"/v1/models/{urllib.parse.quote(self.target, safe='/')}"
@@ -780,72 +865,82 @@ class Tuner:
     # ------------------------------------------------------------ experiments
 
     def elapsed(self):
-        return time.monotonic() - self.started
+        return self.clock() - self.started
 
     def out_of_budget(self):
         return self.elapsed() >= self.budget
 
-    def band(self, metric):
-        """The noise band a win on `metric` must clear: its measured spread
-        (`measure_noise`), never under the floor. A metric the noise runs
-        did not measure (aggregate, load time) takes the widest measured."""
-        spread = getattr(self, "noise", {}).get(metric)
-        if spread is None:
-            spread = max(getattr(self, "noise", {}).values(), default=0.0)
-        return max(NOISE_FLOOR, spread)
+    def sd_for(self, metric):
+        """The noise the noise runs measured on `metric` (its SD of one run),
+        never under the floor. A metric they did not measure (load time)
+        takes the widest one measured."""
+        noise = getattr(self, "noise", {})
+        sd = noise.get(metric)
+        if sd is None:
+            sd = max(noise.values(), default=0.0)
+        return max(NOISE_FLOOR, sd)
 
-    def tolerance(self, metric):
-        """How much worse a side metric may get: its own noise band (its
-        measured spread, never under the floor). A smaller loss cannot be
-        told from noise; a fixed 3% failed trials on clock jitter alone."""
-        return max(NOISE_FLOOR, getattr(self, "noise", {}).get(metric, 0.0))
+    def experiment_sd(self, metric, controls, cands):
+        """The SD of one run on `metric` for an experiment: pooled over the
+        noise runs (around their mean), the experiment's controls (around
+        theirs) and its candidate runs (around theirs), never under the
+        floor, and widened by 1 + 1/sqrt(2 df) for what so few runs cannot
+        pin down (an SD from 5 runs is off by a third as often as not)."""
+        def values(runs):
+            return [run[metric] for run in runs if isinstance(run.get(metric), (int, float))]
+        noise = [run for run in getattr(self, "noise_data", [])
+                 if not any(run is control for control in controls)]
+        sd, df = pooled_sd([values(noise), values(controls), values(cands)])
+        if sd is None:
+            sd, df = self.sd_for(metric), max(1, getattr(self, "noise_runs", 0) - 1)
+        return max(NOISE_FLOOR, sd) * (1 + 1 / math.sqrt(2 * df))
 
-    def verdict(self, metric, c1, cand, c2):
-        """(accepted, gain, reason, noisy) by the skill's rules, with the
-        measured noise. A win must beat both controls by more than the noise
-        band. Every other metric is held to the mean of the two controls, or
-        to the worse control when the two differ by more than its tolerance.
-        `noisy` when the two controls differ by more than the band on the
-        judged metric, so the run says too little and is repeated."""
+    def judge(self, metric, controls, cands, last):
+        """(decision, gain, reason, bar) for a change after its latest
+        candidate run: `decision` True (keep), False (reject) or None (not
+        clear yet: one more candidate run and control). `last`: no run
+        follows, so decide now. See WIN_SD and CONFIDENCE."""
         higher = HIGHER_IS_BETTER[metric]
-        band = self.band(metric)
-        a, b, x = c1[metric], c2[metric], cand[metric]
-        base = (a + b) / 2
-        gain = (x / base - 1) if higher else (base / x - 1 if x > 0 else 0)
-        noisy = base > 0 and abs(a - b) / base > band
-        beats = x > max(a, b) if higher else x < min(a, b)
-        if not beats:
-            return False, gain, (f"{metric} {x:.1f} did not beat both controls ({a:.1f}, {b:.1f})"), False
-        if gain <= band:
-            return False, gain, (f"{metric} {gain * 100:+.1f}% over the controls is inside the "
-                                 f"noise (±{band * 100:.0f}%)"), False
+        sd = self.experiment_sd(metric, controls, cands)
+        base = statistics.fmean(run[metric] for run in controls)
+        now = statistics.fmean(run[metric] for run in cands)
+        gain = (now / base - 1) if higher else (base / now - 1 if now > 0 else 0.0)
+        n = len(cands)
+        error = sd * math.sqrt(1 / n + 1 / len(controls))
+        bar = WIN_SD * sd
+        need = 2 if sd > REPEAT_ABOVE or gain > SURPRISE else 1
+        said = (f"{metric} {gain * 100:+.1f}% over the controls after {n} run{'s' if n > 1 else ''} "
+                f"(noise ±{sd * 100:.1f}%; a win must clear +{bar * 100:.1f}%)")
+        if last:
+            if gain <= max(CONFIDENCE * error, bar) or n < need:
+                return False, gain, f"{said}: not clearly over the noise", bar
+        elif gain + CONFIDENCE * error < bar:
+            return False, gain, f"{said}: inside the noise", bar
+        elif gain - CONFIDENCE * error <= bar or n < need:
+            return None, gain, said, bar
+        worse = self.side_loss(metric, controls, cands)
+        if worse:
+            return False, gain, f"{metric} gained {gain * 100:.0f}% but {worse}", bar
+        return True, gain, said, bar
+
+    def side_loss(self, metric, controls, cands):
+        """Why another measured metric got worse than the controls' mean by
+        more than a win on it would have to be (its own pooled noise), or
+        None."""
         for other in ("decode", "ttft_ms", "prefill", "aggregate"):
-            if other == metric or other not in cand or other not in c1 or other not in c2:
+            if other == metric or any(other not in run for run in controls + cands):
                 continue
-            mean = (c1[other] + c2[other]) / 2
-            if mean <= 0:
+            base = statistics.fmean(run[other] for run in controls)
+            now = statistics.fmean(run[other] for run in cands)
+            if base <= 0:
                 continue
-            tolerance = self.tolerance(other)
-            reference, against = mean, "the controls' mean"
-            if abs(c1[other] - c2[other]) / mean > tolerance:
-                # The controls disagree on a side metric: hold it to the
-                # worse control, not the run's verdict to a repeat.
-                pick = min if HIGHER_IS_BETTER[other] else max
-                reference, against = pick(c1[other], c2[other]), "the worse control"
-            if reference <= 0:
-                continue
-            if HIGHER_IS_BETTER[other]:
-                worse = (reference - cand[other]) / reference
-            else:
-                worse = (cand[other] - reference) / reference
-            if worse > tolerance:
-                return False, gain, (f"{metric} gained {gain * 100:.0f}% but {other} got "
-                                     f"{worse * 100:.0f}% worse than {against} "
-                                     f"(more than {tolerance * 100:.0f}%)"), noisy
-        if noisy:
-            return True, gain, (f"{metric} {gain * 100:+.0f}% over both controls, but the controls "
-                                f"differ by more than the noise (±{band * 100:.0f}%) on {metric}"), True
-        return True, gain, f"{metric} {gain * 100:+.0f}% over both controls", False
+            worse = (base - now) / base if HIGHER_IS_BETTER[other] else (now - base) / base
+            sd = self.experiment_sd(other, controls, cands)
+            allowed = max(CONFIDENCE * sd * math.sqrt(1 / len(cands) + 1 / len(controls)), WIN_SD * sd)
+            if worse > allowed:
+                return (f"{other} got {worse * 100:.0f}% worse than the controls' mean "
+                        f"(more than the {allowed * 100:.0f}% its own noise allows)")
+        return None
 
     def control(self):
         if self.last_control is not None and self.current_metric in self.last_control:
@@ -858,17 +953,19 @@ class Tuner:
         self.last_control = metrics
         return metrics
 
-    def trial(self, entry, change):
-        """Apply a candidate, gate it and measure it. (metrics, problem).
-        Settings that do not apply or load raise `ApplyFailed`."""
+    def trial(self, entry, change, gate=True):
+        """Apply the candidate, gate it (first run only) and measure it.
+        (metrics, problem). Settings that do not apply or load raise
+        `ApplyFailed`."""
         doc = self.with_change(self.best, change)
         try:
             self.put_doc(doc, f"tune {self.run_id} trial {entry['lever']}")
         except TuneError as error:
             raise ApplyFailed(error.message) from None
-        problem = self.gate(entry["gate"], doc)
-        if problem:
-            return None, problem
+        if gate:
+            problem = self.gate(entry["gate"], doc)
+            if problem:
+                return None, problem
         metrics, problem = self.measure(entry["metric"])
         return metrics, problem
 
@@ -895,63 +992,59 @@ class Tuner:
         raise TuneError(FAIL, "interrupted twice while restoring; run `sb ai revert "
                               f"{self.target}` to undo the tuning writes")
 
-    def experiment(self, entry, change, repeat=False):
-        """Control, candidate, control. Returns (accepted, gain, reason);
-        `accepted` is None when the trial failed (its settings did not apply
-        or load), so nothing was measured."""
+    def experiment(self, entry, change):
+        """Control, candidate, control, candidate, control... until `judge`
+        decides (MAX_ROUNDS candidate runs at most). Returns (accepted,
+        gain, reason); `accepted` None when a trial failed (its settings did
+        not apply or load), so nothing was measured. A round the budget
+        cannot pay for ends the experiment as rejected (nothing changes)."""
         lever, metric = entry["lever"], entry["metric"]
         self.current_lever, self.current_metric = lever, metric
-        c1 = self.control()
-        try:
-            cand, problem = self.trial(entry, change)
-        except ApplyFailed as failure:
+        controls, cands = [self.control()], []
+        first = None
+        while True:
+            try:
+                cand, problem = self.trial(entry, change, gate=not cands)
+            except ApplyFailed as failure:
+                self.restore_best("control")
+                self.last_control = None
+                reason = f"did not load: {failure}"
+                self.record({"role": "verdict", "lever": lever, "value": change, "metrics": None,
+                             "samples": self.samples, "verdict": "failed", "reason": reason})
+                return None, 0.0, reason
             self.restore_best("control")
             self.last_control = None
-            reason = f"did not load: {failure}"
-            self.record({"role": "verdict", "lever": lever, "value": change, "metrics": None,
-                         "samples": self.samples, "verdict": "failed", "reason": reason})
-            return None, 0.0, reason
-        self.restore_best("control")
-        self.last_control = None
-        if problem:
-            self.record({"role": "verdict", "lever": lever, "value": change, "metrics": cand,
-                         "samples": self.samples, "verdict": "rejected", "reason": problem})
-            return False, 0.0, problem
-        self.record({"role": "candidate", "lever": lever, "value": change, "metrics": cand,
-                     "samples": self.samples})
-        c2 = self.control()
-        accepted, gain, reason, noisy = self.verdict(metric, c1, cand, c2)
-        if noisy and repeat:
-            # Noisy twice: the run cannot tell, so nothing changes.
-            accepted, reason = False, f"noisy again: {reason}"
-        surprising = accepted and gain > SURPRISE
-        # On a machine whose measured noise is wider than the floor, one
-        # win can still be luck: every win must win twice.
-        confirm = accepted and self.band(metric) > NOISE_FLOOR
-        if (surprising or noisy or confirm) and not repeat:
-            why = ("a surprising win" if surprising else "noisy controls" if noisy
-                   else f"a win on a noisy machine (±{self.band(metric) * 100:.0f}%)")
-            self.log(f"  {lever} {json.dumps(change)}: {gain * 100:+.0f}%, {why}; repeating it once")
-            again, gain2, reason2 = self.experiment(entry, change, repeat=True)
-            if again is None:
-                # The repeat's settings did not load: a failed trial (its
-                # verdict row is written), not a rejection.
-                return None, 0.0, reason2
-            if not again:
-                reason = (f"a {gain * 100:+.0f}% win did not repeat ({reason2})" if accepted
-                          else f"{reason}; repeated: {reason2}")
-                self.record({"role": "verdict", "lever": lever, "value": change, "verdict": "rejected",
-                             "reason": reason, "metrics": cand, "samples": self.samples})
-                return False, 0.0, reason
-            # The repeat decides: a noisy run rejected the first time is
-            # kept when its repeat (with agreeing controls) wins.
-            accepted = True
-            gain = min(gain, gain2)
-            reason = f"{reason}; repeated: {reason2}"
-        if not repeat:
-            self.record({"role": "verdict", "lever": lever, "value": change, "metrics": cand,
-                         "samples": self.samples, "verdict": "accepted" if accepted else "rejected",
-                         "reason": reason, "gain": round(gain, 4)})
+            if problem:
+                self.record({"role": "verdict", "lever": lever, "value": change, "metrics": cand,
+                             "samples": self.samples, "verdict": "rejected", "reason": problem})
+                return False, 0.0, problem
+            self.record({"role": "candidate", "lever": lever, "value": change, "metrics": cand,
+                         "samples": self.samples, "round": len(cands) + 1})
+            cands.append(cand)
+            controls.append(self.control())
+            accepted, gain, reason, bar = self.judge(metric, controls, cands,
+                                                     last=len(cands) >= MAX_ROUNDS)
+            if first is None:
+                first = (gain, bar)
+            if accepted is None:
+                if self.stopping:
+                    raise Interrupted()
+                if self.budget_fits(self.round_cost(metric)):
+                    if len(cands) == 1:
+                        self.log(f"  {lever} {json.dumps(change)}: {reason}; not clear yet, "
+                                 "measuring again")
+                    continue
+                self.budget_cut = True
+                accepted, reason = False, f"{reason}: the budget ran out before it was clear"
+            if not accepted and len(cands) > 1 and first[0] > first[1]:
+                reason = f"a {first[0] * 100:+.0f}% first run did not hold: {reason}"
+            break
+        if accepted:
+            self.best_metrics = {key: statistics.fmean(run[key] for run in cands)
+                                 for key in HIGHER_IS_BETTER if all(key in run for run in cands)}
+        self.record({"role": "verdict", "lever": lever, "value": change, "metrics": cands[-1],
+                     "samples": self.samples, "verdict": "accepted" if accepted else "rejected",
+                     "reason": reason, "gain": round(gain, 4), "runs": len(cands)})
         return accepted, gain, reason
 
     def sweep(self, entry, changes):
@@ -959,7 +1052,10 @@ class Tuner:
         then faces its controls."""
         table = {}
         for change in changes:
-            if self.out_of_budget() or self.stopping:
+            if self.stopping:
+                break
+            if not self.budget_fits(self.apply_cost() + self.run_cost("weighted")):
+                self.budget_cut = True
                 break
             doc = self.with_change(self.best, change)
             try:
@@ -1088,59 +1184,73 @@ class Tuner:
                 return row.get("ceiling") or {}
         return {}
 
-    def noise_run(self, metric, runs):
-        metrics, problem = self.measure(metric)
+    def noise_run(self, runs):
+        metrics, problem = self.measure(*self.noise_metrics)
         if problem:
             raise TuneError(FAIL, f"the baseline run failed: {problem}")
         self.record({"role": "baseline", "lever": "baseline", "value": None, "metrics": metrics,
                      "samples": self.samples, "noise_run": len(runs) + 1})
         runs.append(metrics)
+        self.sample_counts.append(self.samples)
 
     def measure_noise(self, metric):
-        """Before any lever: NOISE_RUNS runs of the same (current) settings.
-        Their spread, per metric, is the noise band every later verdict
-        uses (never under NOISE_FLOOR). When it is wider than the floor,
-        more samples per run when the budget allows (`raise_samples`) and
-        NOISE_MORE more runs, measured again over all of them. The baseline
-        is the median of the runs; the last run is the first control."""
+        """Before any lever: NOISE_RUNS runs of the same (current) settings,
+        measuring every metric the plan judges or holds (`noise_metrics`).
+        Their SD of one run, per metric, is the noise every later verdict
+        starts from (`noise_sds`). Over the floor: more samples per run
+        when the budget allows (`raise_samples`) and NOISE_MORE more runs,
+        measured again over all of them. The baseline is the runs' median;
+        the last run is the first control. Stops between runs when the
+        budget ran out: fewer than NOISE_RUNS runs leave the run untuned."""
         runs = []
-        started = time.monotonic()
+        started = self.clock()
         for _ in range(NOISE_RUNS):
-            self.noise_run(metric, runs)
-        self.noise = spreads(runs)
-        if self.band(metric) > NOISE_FLOOR:
-            per_sample = (time.monotonic() - started) / (len(runs) * (self.samples + 1))
+            if runs and self.out_of_budget():
+                break
+            self.noise_run(runs)
+        self.noise = noise_sds(runs)
+        if len(runs) == NOISE_RUNS and self.noise.get(metric, 0.0) > NOISE_FLOOR:
+            per_sample = (self.clock() - started) / (len(runs) * (self.samples + 1))
             self.raise_samples(per_sample, metric)
             for _ in range(NOISE_MORE):
-                self.noise_run(metric, runs)
-            self.noise = spreads(runs)
+                if self.out_of_budget():
+                    break
+                self.noise_run(runs)
+            self.noise = noise_sds(runs)
+        self.noise_data = runs
         self.noise_runs = len(runs)
         self.baseline = {key: median([run[key] for run in runs]) for key in runs[0]
                          if key in HIGHER_IS_BETTER and all(key in run for run in runs)}
         self.last_control = runs[-1]
-        self.log(f"  noise: ±{self.band(metric) * 100:.0f}% on {metric} between {len(runs)} runs of "
-                 f"the same settings ({self.samples} samples per run); a win must clear it")
+        if len(runs) < NOISE_RUNS:
+            self.untuned_reason = (f"the budget ran out while measuring the noise ({len(runs)} of "
+                                   f"{NOISE_RUNS} runs); nothing changed")
+            return
+        self.log(f"  noise ±{self.noise.get(metric, 0.0) * 100:.1f}% (SD of one run) on {metric} "
+                 f"between {len(runs)} runs of the same settings ({self.samples} samples per run); "
+                 f"a win must clear about +{WIN_SD * self.sd_for(metric) * 100:.0f}%")
 
     def raise_samples(self, per_sample, metric):
-        """More samples per run, when the noise runs spread wider than the
-        floor and the budget allows. The median of n samples narrows the
-        noise inside a run about as 1/sqrt(n), so (band / floor)^2 times the
-        samples would bring that part to the floor. Drift between runs
-        (heat, other work on the machine) does not narrow with samples, so
-        the count is capped at twice the requested samples (MAX_SAMPLES at
-        most), and at what fits when half the remaining budget pays for the
-        plan's runs (NOISE_MORE more noise runs, then about four runs per
-        lever: control, candidate, control and a repeat's share) at the
-        time one sample took so far. The noise is measured again after."""
-        want = math.ceil(self.samples * (self.band(metric) / NOISE_FLOOR) ** 2)
+        """More samples per run, when the noise runs' SD is over the floor
+        and the budget allows. The median of n samples narrows the noise
+        inside a run about as 1/sqrt(n), so (SD / floor)^2 times the samples
+        would bring that part to the floor. Drift between runs (heat,
+        other work on the machine) does not narrow with samples, so the
+        count is capped at twice the requested samples (MAX_SAMPLES at
+        most), and fits when half the remaining budget pays the plan's runs
+        (NOISE_MORE more noise runs, then per lever about three runs on a
+        quiet machine and nine on a noisy one, at the time one sample took
+        so far). The noise is measured again after."""
+        sd = self.noise.get(metric, 0.0)
+        want = math.ceil(self.samples * (sd / NOISE_FLOOR) ** 2)
         levers = max(1, len([entry for entry in self.plan if entry.get("kind") != "advice"]))
-        runs = NOISE_MORE + 4 * levers
+        runs = NOISE_MORE + (9 if sd > REPEAT_ABOVE else 3) * levers
         remaining = max(0.0, self.budget - self.elapsed())
         fits = int(remaining * 0.5 / (runs * per_sample)) if per_sample > 0 else want
         new = min(want, fits, 2 * self.requested_samples, MAX_SAMPLES)
         if new > self.samples:
-            self.log(f"  the runs spread ±{self.band(metric) * 100:.0f}% on {metric}: {new} samples "
-                     f"per run from now (was {self.samples})")
+            self.log(f"  runs differ by ±{sd * 100:.1f}% (SD) on {metric}: {new} samples "
+                     f"per run now (was {self.samples})")
             self.samples = new
 
     def tune(self):
@@ -1148,22 +1258,31 @@ class Tuner:
         past = self.history()
         baseline_metric = "prefill" if self.workload == "read" else "decode"
         self.current_metric = baseline_metric
+        # The noise runs measure every metric a planned lever judges or
+        # holds (load time aside: it unloads the model three times), so
+        # each has its own measured noise.
+        used = {entry.get("metric") for entry in self.plan} & {"prefill", "aggregate", "weighted"}
+        self.noise_metrics = (baseline_metric, *sorted(used - {baseline_metric}))
         self.log(f"sb ai tune {self.target}: run {self.run_id}, engine {self.build}, "
                  f"{self.samples} samples per run, budget {self.budget // 60} min")
         self.measure_noise(baseline_metric)
-        band = self.band(baseline_metric)
-        if band > TOO_NOISY:
-            # No lever could show a win within the budget: each would have
-            # to clear the band twice. Nothing was changed.
-            return (f"too noisy to tune: ±{band * 100:.0f}% on {baseline_metric} between "
-                    f"{self.noise_runs} runs of the same settings (at most ±{TOO_NOISY * 100:.0f}% "
-                    "can be tuned); nothing was changed")
+        if self.untuned_reason:
+            return self.untuned_reason
+        sd = self.noise.get(baseline_metric, 0.0)
+        if sd > TOO_NOISY:
+            # A kept win would have to clear about 1.7 times this noise
+            # with room to spare: nothing the levers do could show.
+            self.untuned_reason = (
+                f"too noisy to tune: noise ±{sd * 100:.1f}% (SD of one run) on {baseline_metric} "
+                f"between {self.noise_runs} runs of the same settings (at most "
+                f"±{TOO_NOISY * 100:.0f}% can be tuned); nothing was changed")
+            return self.untuned_reason
         greedy = self.run_parallel([lambda: self.chat(GREEDY_PROMPT, 64, temperature=0, fresh=False)])[0]
         self.greedy_reference = greedy.get("text")
         self.ceiling_row = self.ceiling()
         flat = 0
         for entry in self.plan:
-            if self.out_of_budget():
+            if self.out_of_budget() or self.budget_cut:
                 stop = "the budget ran out"
                 break
             if self.stopping:
@@ -1199,11 +1318,16 @@ class Tuner:
                          if not v.get("failed")]
                 measured = bool(swept)
                 if not fresh and swept:
-                    self.notes.append(f"{entry['lever']}: the current value was best in the sweep")
+                    self.notes.append(f"{entry['lever']}: the current value is best in the sweep")
                 elif not fresh and len(self.failed) > failed_before:
                     self.log(f"  {entry['lever']}: FAILED, no value of the sweep loaded")
             for change in fresh:
-                if self.out_of_budget() or self.stopping:
+                if self.stopping:
+                    break
+                if not self.experiment_fits(entry):
+                    self.budget_cut = True
+                    self.notes.append(f"{entry['lever']} {json.dumps(change)}: not started, the "
+                                      "budget left could not pay for its runs")
                     break
                 accepted, gain, reason = self.experiment(entry, change)
                 if accepted is None:
@@ -1221,15 +1345,31 @@ class Tuner:
                     self.put_doc(self.best, f"tune {self.run_id} best")
                     self.last_control = None
                     self.gains.append((entry["lever"], change, gain, reason))
+                if self.budget_cut:
+                    break
+            if self.budget_cut:
+                stop = "the budget ran out"
+                break
             if kept:
                 flat = 0
             elif measured:
                 flat += 1
                 if flat >= PLATEAU:
                     stop = (f"plateau: {PLATEAU} levers in a row inside the noise "
-                            f"(±{self.band(baseline_metric) * 100:.0f}%)")
+                            f"(±{self.sd_for(baseline_metric) * 100:.1f}%)")
                     break
         return stop
+
+    def experiment_fits(self, entry):
+        """The budget left pays for the fewest runs that could keep a change:
+        a control when none is at hand, then one round (two on a machine
+        noisier than REPEAT_ABOVE: a win must hold twice)."""
+        metric = entry["metric"]
+        rounds = 2 if self.sd_for(metric) > REPEAT_ABOVE else 1
+        cost = rounds * self.round_cost(metric)
+        if self.last_control is None or metric not in self.last_control:
+            cost += self.run_cost(metric)
+        return self.budget_fits(cost)
 
     def advice(self, entry):
         """sleep_idle_seconds: weigh swaps against what a load costs."""
@@ -1250,12 +1390,18 @@ class Tuner:
                 self.notes.append("sleep_idle_seconds: no change suggested (few swaps)")
 
     def final_metrics(self):
+        """The settings now in force, measured once more when the budget
+        pays for it; else the kept change's own candidate runs."""
         if not self.gains:
             return self.baseline
-        metrics, problem = self.measure(self.current_metric if self.current_metric != "load_s" else "decode")
-        if problem:
-            self.notes.append(f"the final measurement failed: {problem}")
-            return self.baseline
+        metric = self.current_metric if self.current_metric != "load_s" else "decode"
+        if not self.budget_fits(self.run_cost(metric)):
+            metrics = dict(self.best_metrics or {})
+        else:
+            metrics, problem = self.measure(metric)
+            if problem:
+                self.notes.append(f"the final measurement failed: {problem}")
+                return self.baseline
         for key, value in self.baseline.items():
             metrics.setdefault(key, value)
         return metrics
@@ -1263,6 +1409,12 @@ class Tuner:
     def summary(self, stop, final):
         ceiling = self.ceiling_row
         how = f"median of {self.samples}, warm, fresh prompts, through the gateway (client clock)"
+        counts = sorted(set(self.sample_counts))
+        if len(counts) > 1:
+            # The noise rule raised the samples after the first runs.
+            first = self.sample_counts.count(counts[0])
+            how = (f"median of {self.samples} ({counts[0]} in the first {first} baseline runs), "
+                   "warm, fresh prompts, through the gateway (client clock)")
         table = []
         # Decode is measured one request at a time (concurrency 1): a c1
         # figure. The aggregate row is the concurrent one.
@@ -1281,25 +1433,33 @@ class Tuner:
             "quality beyond these checks (reasoning, tools) was not measured",
             "numbers include the network and the gateway between this machine and the engine",
         ]
-        return {"target": self.target, "run_id": self.run_id, "engine_build": self.build,
-                "model_file": self.model_file, "stopped": stop, "table": table,
-                "gains": [{"lever": g[0], "value": g[1], "gain_pct": round(g[2] * 100, 1),
-                           "reason": g[3]} for g in self.gains],
-                "sweeps": {k: {kk: {str(c): v for c, v in (vv.get("per_concurrency") or {}).items()}
-                               for kk, vv in t.items()} for k, t in self.sweep_tables.items()},
-                "noise": self.noise_view(),
-                "failed": self.failed,
-                "notes": self.notes, "not_verified": unverified,
-                "settings_revision": self.revision, "undo": f"sb ai revert {self.target} {self.base_revision}",
-                "elapsed_s": round(self.elapsed(), 1)}
+        result = {"target": self.target, "run_id": self.run_id, "engine_build": self.build,
+                  "model_file": self.model_file, "tuned": self.untuned_reason is None,
+                  "stopped": stop, "table": table,
+                  "gains": [{"lever": g[0], "value": g[1], "gain_pct": round(g[2] * 100, 1),
+                             "reason": g[3]} for g in self.gains],
+                  "sweeps": {k: {kk: {str(c): v for c, v in (vv.get("per_concurrency") or {}).items()}
+                                 for kk, vv in t.items()} for k, t in self.sweep_tables.items()},
+                  "noise": self.noise_view(),
+                  "failed": self.failed,
+                  "notes": self.notes, "not_verified": unverified,
+                  "settings_revision": self.revision, "undo": f"sb ai revert {self.target} {self.base_revision}",
+                  "elapsed_s": round(self.elapsed(), 1)}
+        if self.untuned_reason:
+            result["reason"] = self.untuned_reason
+        return result
 
     def noise_view(self):
-        """The measured noise, for the output and `--json`."""
+        """The measured noise, for the output and `--json`: `sd_pct` is the
+        SD of one run (in % of the runs' mean) on the baseline metric."""
         metric = "prefill" if self.workload == "read" else "decode"
-        return {"metric": metric, "band_pct": round(self.band(metric) * 100, 1),
-                "by_metric_pct": {key: round(value * 100, 1) for key, value in sorted(self.noise.items())},
+        sd = self.noise.get(metric, 0.0)
+        return {"metric": metric, "sd_pct": round(sd * 100, 1),
+                "by_metric_sd_pct": {key: round(value * 100, 1) for key, value in sorted(self.noise.items())},
                 "runs": self.noise_runs, "samples_per_run": self.samples,
+                "win_needs_pct": round(WIN_SD * max(NOISE_FLOOR, sd) * 100, 1),
                 "floor_pct": round(NOISE_FLOOR * 100, 1),
+                "repeat_above_pct": round(REPEAT_ABOVE * 100, 1),
                 "too_noisy_above_pct": round(TOO_NOISY * 100, 1)}
 
     def print_summary(self, result):
@@ -1326,14 +1486,16 @@ class Tuner:
             self.log(f"failed (not measured): {failure['lever']} {json.dumps(failure['value'])}: "
                      f"{failure['reason']}")
         noise = result["noise"]
-        self.log(f"noise: ±{noise['band_pct']:.0f}% on {noise['metric']} between {noise['runs']} runs "
-                 f"of the same settings, {noise['samples_per_run']} samples per run "
-                 f"(a win must clear it; floor ±{noise['floor_pct']:.0f}%)")
+        self.log(f"noise: ±{noise['sd_pct']:.1f}% (SD of one run) on {noise['metric']} between "
+                 f"{noise['runs']} runs of the same settings, {noise['samples_per_run']} samples per run "
+                 f"(a win must clear about +{noise['win_needs_pct']:.0f}%; floor ±{noise['floor_pct']:.0f}%)")
         self.log(f"stopped: {result['stopped']}")
         for note in result["notes"]:
             self.log(f"note: {note}")
         self.log("not verified: " + "; ".join(result["not_verified"]))
         self.log(f"undo with: {result['undo']}")
+        if not result["tuned"]:
+            self.log(f"not tuned: {result['reason']}")
 
     def _stop_signal(self, signum, _frame):
         """SIGTERM and SIGHUP stop the run like Ctrl-C: requests in flight

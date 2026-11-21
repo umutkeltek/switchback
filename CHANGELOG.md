@@ -530,20 +530,57 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   the plateau, and the run goes on with the next lever; a later run tries
   it again.
 
-- **`sb ai tune` measures the noise instead of assuming ±5%**: real
-  machines spread far more than that between runs of the same settings
-  (8% and 22% on the first real run), so almost every trial was judged
-  noisy or repeated against a fixed 3% rule. The baseline is now three runs
-  of the same settings (five, with more samples per run when the budget
-  allows, when those spread wider than 5%); their corrected spread, never
-  under ±5%, is the band a win must clear and the line for "controls too
-  far apart". Side metrics are held to their own measured band too (never
-  under ±5%) instead of a fixed 3%, which clock jitter alone crossed on a
-  busy machine (the soak test failed that way).
-  On a machine noisier than ±5% every win must win twice. A band wider than
-  ±40% stops the run with `too noisy to tune: ±N%` and changes nothing.
-  The summary and `--json` (`noise`) report the band. The tests' fake
-  engine can drift between runs, seeded, so noisy cases are reproducible.
+- **`sb ai tune` finds real 10-20% wins on a noisy machine**: the noise was
+  the runs' range times (k+1)/(k-1) and a win had to beat that whole width,
+  twice. With two controls 15% apart (an SD of one run of about 7%, like the
+  first real box) the band was about 44%; in the review's simulation 59%
+  of runs stopped as "too noisy" before any lever, and in 200 seeded runs
+  at an SD of 7% a real +20% was kept in 16% of them. The noise is now the sample standard deviation (SD) of one run,
+  per metric, never taken under 2%. Each change runs control, candidate,
+  control, candidate, control... until the result is clear (ten candidate
+  runs at most): kept when its gain over the controls' mean clears 1.7 SD
+  with two standard errors to spare, rejected once it clearly cannot; the
+  SD is pooled over the noise runs, the controls and the candidate runs.
+  On a machine noisier than 5%, and for a win over 20%, a win must hold over
+  two candidate runs or more. In 200 seeded simulated runs at an SD of 7% a
+  real +20% is kept in 93% and a +5% in 2.5%. "Too noisy to tune" is now an
+  SD over 20% (a kept win would have to be +34% or more), and the run then
+  exits 0 with `"tuned": false` and the reason in `--json`, and a last line
+  `not tuned: ...`.
+- **`sb ai tune` prints the noise it measured**: the old figure was the
+  corrected range, about twice the spread of one run. Output and `--json`
+  now give the SD of one run: `noise ±X% (SD of one run)`, `noise.sd_pct`
+  and `noise.by_metric_sd_pct` (replacing `band_pct` and `by_metric_pct`,
+  which nothing read).
+- **`sb ai tune`: side metrics have their own measured noise**: the noise
+  runs now measure every metric a planned lever judges (prefill, aggregate,
+  weighted), so a draft-length win judged on the weighted speed is no
+  longer rejected because the concurrent speed moved inside its own noise
+  but past a 5% floor.
+- **`sb ai tune` keeps to its budget**: it checks the budget between noise
+  runs, estimates each run's time per kind of run (not from decode runs
+  only) and each apply's time, and does not start a change or another round
+  that cannot finish inside the budget. With a 10-minute budget a simulated
+  run ends within a minute of it. The "how measured" column says when the
+  first baseline runs used fewer samples.
+- **A load right after a pending apply loads the new settings**:
+  `sb ai load` (`POST /v1/models/{model}/load`) ran a pending apply and then
+  loaded at once; the engine was still ending the model's old process,
+  answered 400 "model is already running", and the old settings were
+  recorded as loaded. The load now waits for that process to end first,
+  and `apply: now` treats "already running" after its own unload as an
+  error.
+- **`apply: now` checks that the new settings took effect**: after the
+  reload it compares the engine's argument list for the model
+  (`status.args`) with the new load settings (context, GPU layers, KV
+  cache types, flash attention, batch sizes, slots, threads, speculative
+  decoding); a mismatch answers `ok: false` with "the engine still runs the
+  old settings" and the keys that differ.
+- **`sb ai unload` waits for the gateway**: the gateway answers once the
+  model's requests ended and its process exited, which can take longer
+  than the client's 30 s; it now waits up to `--timeout` (600 s by
+  default). The gateway polls the engine every 250 ms (was 100 ms) while it
+  waits for a process to end.
 
 - **A settings name shared with its first target writes that target**: a
   route named like one of its targets (`mac/x` -> `mac/x`, `box/y`) answered

@@ -6,15 +6,19 @@ The fake's engine is fast and deterministic enough to tune: its decode and
 prompt speed follow the load settings it was loaded with (each setting has
 an effect factor), with a seeded jitter of 2% on decode and 1% on time to
 first token, and, when a test sets it, a seeded drift of decode speed
-between runs (`run_noise`); it keeps the slot count
+between runs (`run_sd`, or a fixed `drift_plan`); it keeps the slot count
 (concurrent requests beyond it wait), answers needles unless a setting
 breaks them, changes its greedy answer when a setting is lossy, and fails
 loads it is told to fail. Every run goes through the real `sb` dispatcher
 in a child process."""
 
+import argparse
+import io
 import json
 import os
 import random
+import statistics
+import sys
 import re
 import signal
 import subprocess
@@ -40,7 +44,7 @@ class Engine:
         self.rng_lock = threading.Lock()
         # Decode jitter. Well under the 5% noise floor between two
         # controls' medians, so a run judged on decode is noisy only when a
-        # test makes it so (`run_noise`).
+        # test makes it so (`run_sd`, `drift_plan`).
         self.spread = 0.02
         self.base_decode = 400.0      # tok/s; a 64-token answer takes ~160 ms, so scheduling noise stays near 1%
         self.base_ttft_ms = 200.0     # long enough that scheduling noise stays under 1%
@@ -49,10 +53,11 @@ class Engine:
         # speed moves between runs (heat, other work) more than within one,
         # and a run's median does not narrow it. The tuner opens every run
         # with one 64-token warm-up request; there the fake draws a new
-        # decode factor within +-run_noise/2, so two runs of the same
-        # settings differ by up to `run_noise`. Seeded: a test sees the same
-        # draws every time.
-        self.run_noise = 0.0
+        # decode factor around 1 with standard deviation `run_sd` (seeded:
+        # a test sees the same draws every time), or takes the next factor
+        # of `drift_plan` (the last one stays), for a known noise.
+        self.run_sd = 0.0
+        self.drift_plan = []
         self.drift = 1.0
         self.drift_rng = random.Random(seed + 1)
         self.effects = {}             # (key, json value) -> {"decode": f, "ttft": f, "prefill": f}
@@ -78,9 +83,11 @@ class Engine:
         return out
 
     def new_run(self):
-        if self.run_noise:
-            with self.rng_lock:
-                self.drift = 1.0 + self.drift_rng.uniform(-self.run_noise / 2, self.run_noise / 2)
+        with self.rng_lock:
+            if self.drift_plan:
+                self.drift = self.drift_plan.pop(0) if len(self.drift_plan) > 1 else self.drift_plan[0]
+            elif self.run_sd:
+                self.drift = max(0.05, self.drift_rng.gauss(1.0, self.run_sd))
 
     def jitter(self, spread=None):
         """Seeded run-to-run noise: `spread` (2%) on decode, 1% on time to
@@ -457,7 +464,7 @@ class TuneTests(Base):
         self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
         verdict = self.verdicts()[-1]
         self.assertEqual(verdict["verdict"], "rejected")
-        self.assertIn("did not beat both controls", verdict["reason"])
+        self.assertIn("inside the noise", verdict["reason"])
         self.assert_released()
 
     def test_a_win_that_costs_another_metric_more_than_its_noise_is_rejected(self):
@@ -468,7 +475,7 @@ class TuneTests(Base):
         verdict = self.verdicts()[-1]
         self.assertEqual(verdict["verdict"], "rejected", verdict)
         self.assertIn("ttft_ms got", verdict["reason"])
-        self.assertIn("more than 5%", verdict["reason"])
+        self.assertIn("its own noise allows", verdict["reason"])
         self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
 
     def test_a_surprising_win_is_repeated_and_a_fluke_is_dropped(self):
@@ -477,10 +484,10 @@ class TuneTests(Base):
         run = self.tune("--levers", "flash_attn")
         self.assertEqual(run.returncode, 0, run.stderr)
         candidates = [row for row in self.fake.ledger if row.get("role") == "candidate"]
-        self.assertEqual(len(candidates), 2, "the surprising win was not repeated")
+        self.assertGreaterEqual(len(candidates), 2, "the surprising win was not repeated")
         verdict = self.verdicts()[-1]
         self.assertEqual(verdict["verdict"], "rejected", verdict)
-        self.assertIn("did not repeat", verdict["reason"])
+        self.assertIn("first run did not hold", verdict["reason"])
         self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
 
     def test_a_surprising_win_that_repeats_is_kept(self):
@@ -515,8 +522,8 @@ class TuneTests(Base):
     def test_more_slots_need_a_concurrent_soak(self):
         # The soak is under test here, not the noise rule: 1% jitter keeps
         # the controls' side metrics in step (and a side metric may move by
-        # its noise band, never under 5%, so clock jitter on a busy machine
-        # does not reject the change).
+        # what a win on it would need, its own noise never under 2%, so
+        # clock jitter on a busy machine does not reject the change).
         self.fake.engine.spread = 0.01
         self.fake.doc = {"load": {"ctx_size": 4096}}
         run = self.tune("--levers", "parallel", "--concurrency", "1,2")
@@ -586,28 +593,35 @@ class TuneTests(Base):
         self.fake.engine.load_fails.add(("flash_attn", json.dumps("on")))
         run = self.sb("tune", TARGET, "--budget", "10m", "--samples", "8", "--levers", "flash_attn")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertIn("noise: ±5% on decode between 3 runs", run.stdout)
+        self.assertRegex(run.stdout, r"noise: ±\d+\.\d% \(SD of one run\) on decode between 3 runs")
         self.assertIn('failed (not measured): flash_attn {"flash_attn": "on"}', run.stdout)
 
     # ------------------------------------------------------------ measured noise
 
-    def test_with_15_percent_noise_a_40_percent_win_is_kept(self):
-        self.fake.engine.run_noise = 0.15
-        self.effect("flash_attn", "on", decode=1.40)
+    # The first real tune saw two controls differ by 22% and by 8%: an SD
+    # of one run of about 7%. There a real +20% must be kept and a +5% (no
+    # better than the noise) rejected.
+
+    def test_with_7_percent_noise_a_20_percent_win_is_kept(self):
+        self.fake.engine.run_sd = 0.07
+        self.effect("flash_attn", "on", decode=1.20)
         run = self.tune("--levers", "flash_attn")
         self.assertEqual(run.returncode, 0, run.stderr)
         result = json.loads(run.stdout)
         self.assertEqual([g["lever"] for g in result["gains"]], ["flash_attn"], self.verdicts())
         self.assertEqual(self.fake.doc["load"]["flash_attn"], "on")
         noise = result["noise"]
-        # Wider than the floor: two more runs, with more samples each.
-        self.assertGreater(noise["band_pct"], 5.0, noise)
+        # Over the floor: two more runs, with more samples each.
+        self.assertGreater(noise["sd_pct"], 2.0, noise)
         self.assertEqual(noise["runs"], 5, noise)
         self.assertGreater(noise["samples_per_run"], 8, noise)
+        self.assertTrue(result["tuned"])
+        # A noisy machine: the win held over two candidate runs or more.
+        self.assertGreaterEqual(self.verdicts()[-1]["runs"], 2, self.verdicts())
         self.assert_released()
 
-    def test_with_15_percent_noise_a_5_percent_win_is_rejected(self):
-        self.fake.engine.run_noise = 0.15
+    def test_with_7_percent_noise_a_5_percent_win_is_rejected(self):
+        self.fake.engine.run_sd = 0.07
         self.effect("flash_attn", "on", decode=1.05)
         run = self.tune("--levers", "flash_attn")
         self.assertEqual(run.returncode, 0, run.stderr)
@@ -618,30 +632,44 @@ class TuneTests(Base):
         self.assert_released()
 
     def test_with_2_percent_noise_a_10_percent_win_is_kept(self):
-        self.fake.engine.run_noise = 0.02
+        self.fake.engine.run_sd = 0.02
         self.effect("flash_attn", "on", decode=1.10)
         run = self.tune("--levers", "flash_attn")
         self.assertEqual(run.returncode, 0, run.stderr)
         result = json.loads(run.stdout)
         self.assertEqual([g["lever"] for g in result["gains"]], ["flash_attn"], self.verdicts())
-        # Inside the floor: three runs, the floor as the band.
-        self.assertEqual((result["noise"]["band_pct"], result["noise"]["runs"]), (5.0, 3),
-                         result["noise"])
+        self.assertLess(result["noise"]["sd_pct"], 5.0, result["noise"])
 
-    def test_with_60_percent_noise_the_run_stops_and_changes_nothing(self):
-        self.fake.engine.run_noise = 0.60
+    def test_with_30_percent_noise_the_run_stops_and_changes_nothing(self):
+        # Five noise runs whose SD is 30%.
+        self.fake.engine.drift_plan = [1.0, 1.3, 0.7, 1.3, 0.7]
         self.effect("flash_attn", "on", decode=1.40)
         self.fake.doc = {"load": {"ctx_size": 4096}}
         run = self.tune("--levers", "flash_attn,ubatch_size")
         self.assertEqual(run.returncode, 0, run.stderr)
         result = json.loads(run.stdout)
-        self.assertIn("too noisy to tune: ±", result["stopped"])
-        self.assertGreater(result["noise"]["band_pct"], 40.0, result["noise"])
+        self.assertIn("too noisy to tune: noise ±", result["stopped"])
+        self.assertFalse(result["tuned"])
+        self.assertIn("too noisy to tune", result["reason"])
+        self.assertAlmostEqual(result["noise"]["sd_pct"], 30.0, delta=1.5)
         self.assertEqual(self.fake.calls("PUT"), [], "a setting was written")
         self.assertEqual(self.fake.doc, {"load": {"ctx_size": 4096}})
         self.assertEqual(self.fake.engine.applies, [])
         self.assertEqual(self.verdicts(), [])
         self.assert_released()
+
+    def test_the_printed_noise_is_the_sd_of_one_run(self):
+        # Runs at 1.0, 1.25, 0.75, 1.25, 0.75 times the speed: an SD of 25%
+        # (the old corrected range printed 75%). Too noisy: the last line
+        # says the run did not tune, and the exit code stays 0.
+        self.fake.engine.drift_plan = [1.0, 1.25, 0.75, 1.25, 0.75]
+        run = self.sb("tune", TARGET, "--budget", "10m", "--samples", "8", "--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        printed = re.search(r"noise: ±(\d+\.\d)% \(SD of one run\) on decode between 5 runs", run.stdout)
+        self.assertTrue(printed, run.stdout)
+        self.assertAlmostEqual(float(printed.group(1)), 25.0, delta=1.5)
+        last = run.stdout.strip().splitlines()[-1]
+        self.assertRegex(last, r"^not tuned: too noisy to tune: noise ±2[3-6]\.\d% \(SD of one run\)")
 
     # ------------------------------------------------------------ ledger
 
@@ -1011,6 +1039,7 @@ class RestoreUnitTests(unittest.TestCase):
         tuner.applied_doc = json.loads(json.dumps(tuner.best))
         tuner.run_id, tuner.target, tuner.revision = "tune_x", TARGET, 3
         tuner.fail_types = (RuntimeError,)
+        tuner.clock, tuner.apply_secs = time.monotonic, []
         puts = []
 
         class Gateway:
@@ -1047,151 +1076,215 @@ class RestoreUnitTests(unittest.TestCase):
 
 
 
-class VerdictUnitTests(unittest.TestCase):
-    """The keep rule: a win must clear the noise band; other metrics against
-    the mean of the two controls, or the worse control when the two disagree
-    by more than that metric's band; controls that disagree by more than the
-    band on the judged metric make the run noisy (repeated). Bands are the
-    measured spread, never under 5%."""
+class Clock:
+    """A clock a test moves by hand (the budget's clock)."""
 
-    def tuner(self):
-        ai_tune = load_tuner_module()
-        tuner = ai_tune.Tuner.__new__(ai_tune.Tuner)
-        tuner.records, tuner.logs = [], []
-        tuner.record = tuner.records.append
-        tuner.log = tuner.logs.append
-        tuner.restore_best = lambda why: None
-        tuner.samples = 6
-        tuner.last_control = None
-        tuner.noise = {}
-        return tuner
+    def __init__(self):
+        self.now = 0.0
 
-    def test_other_metrics_are_held_to_the_mean_of_the_controls(self):
-        tuner = self.tuner()
-        c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 102.5}
-        cand = {"prefill": 1200.0, "decode": 96.0}
-        # 4% under the worse control but 5.2% under the mean: rejected.
-        accepted, _, reason, noisy = tuner.verdict("prefill", c1, cand, c2)
-        self.assertFalse(accepted, reason)
-        self.assertIn("mean", reason)
-        self.assertFalse(noisy)
-        cand["decode"] = 97.5
-        accepted, _, reason, noisy = tuner.verdict("prefill", c1, cand, c2)
-        self.assertTrue(accepted, reason)
-        self.assertFalse(noisy)
+    def __call__(self):
+        return self.now
 
-    def test_controls_that_disagree_on_a_side_metric_use_the_worse_control(self):
-        tuner = self.tuner()
-        # Decode controls 100 and 110 (10% apart); prefill is judged and steady.
-        c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 110.0}
-        # 98 is 6.7% under the mean but 2% under the worse control: kept,
-        # and the run is not noisy.
-        accepted, _, reason, noisy = tuner.verdict(
-            "prefill", c1, {"prefill": 1100.0, "decode": 98.0}, c2)
-        self.assertTrue(accepted, reason)
-        self.assertFalse(noisy, reason)
-        # 94 is 6% under the worse control: rejected, not repeated.
-        accepted, _, reason, noisy = tuner.verdict(
-            "prefill", c1, {"prefill": 1100.0, "decode": 94.0}, c2)
-        self.assertFalse(accepted, reason)
-        self.assertIn("worse control", reason)
-        self.assertFalse(noisy, reason)
-        # Lower is better (time to first token): the worse control is the higher one.
-        c1, c2 = {"prefill": 1000.0, "ttft_ms": 200.0}, {"prefill": 1000.0, "ttft_ms": 220.0}
-        accepted, _, reason, noisy = tuner.verdict(
-            "prefill", c1, {"prefill": 1100.0, "ttft_ms": 224.0}, c2)
-        self.assertTrue(accepted and not noisy, reason)
 
-    def test_controls_that_disagree_on_the_judged_metric_make_the_run_noisy(self):
-        tuner = self.tuner()
-        c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1060.0, "decode": 100.0}
-        accepted, _, reason, noisy = tuner.verdict(
-            "prefill", c1, {"prefill": 1100.0, "decode": 100.0}, c2)
-        self.assertTrue(accepted and noisy, reason)
-        self.assertIn("differ by more than the noise (±5%) on prefill", reason)
+def sim_tuner(seed, sd=0.07, effect=1.0, levers=("flash_attn",), concurrency="1", run_s=0.0,
+              apply_s=0.0, budget="10h", clock=None, measure=None):
+    """A tuner on a simulated machine, in this process: each run's decode is
+    100 tok/s times the trial's true effect (`effect` when flash_attn is
+    on) times a seeded Gaussian draw with SD `sd`; time to first token is
+    steady (1%). Runs and applies move `clock` by `run_s` and `apply_s`.
+    Talking to a gateway is stubbed out."""
+    ai_tune = load_tuner_module()
+    args = argparse.Namespace(samples=6, concurrency=concurrency, budget=budget, workload="chat",
+                              poll_secs=None, json=True, levers=",".join(levers), wake=False,
+                              dry_run=False)
+    tuner = ai_tune.Tuner(None, args, (RuntimeError,), out=io.StringIO(), err=io.StringIO())
+    rng = random.Random(seed)
+    clock = clock or Clock()
+    tuner.clock, tuner.started = clock, clock()
+    tuner.run_id, tuner.target, tuner.model, tuner.lane = "tune_sim", TARGET, "m", "box"
+    tuner.build, tuner.model_file, tuner.listing_row = "b1", "f1", {}
+    tuner.kind, tuner.locked = "llama_cpp_router", set()
+    tuner.best, tuner.applied_doc = {"load": {}}, {"load": {}}
+    tuner.rows, tuner.logs = [], []
+    tuner.record = tuner.rows.append
+    tuner.log = tuner.logs.append
+    tuner.gate = lambda kind, doc: None
+    tuner.heartbeat = lambda force=False: None
+    tuner.history = lambda: []
+    tuner.ceiling = lambda: {}
+    tuner.run_parallel = lambda jobs: [{"text": PRIMES}]
+    tuner.state = {}
 
-    def test_a_win_must_clear_the_measured_noise(self):
-        tuner = self.tuner()
-        tuner.noise = {"decode": 0.15, "ttft_ms": 0.01}
-        c1, c2 = {"decode": 100.0, "ttft_ms": 200.0}, {"decode": 101.0, "ttft_ms": 200.0}
-        # +10% beats both controls but is inside +-15%: rejected, not repeated.
-        accepted, _, reason, noisy = tuner.verdict(
-            "decode", c1, {"decode": 111.0, "ttft_ms": 200.0}, c2)
-        self.assertFalse(accepted or noisy, reason)
-        self.assertIn("inside the noise (±15%)", reason)
-        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 130.0, "ttft_ms": 200.0}, c2)
-        self.assertTrue(accepted, reason)
-        # Controls 12% apart are normal at +-15%, not noisy.
-        accepted, _, reason, noisy = tuner.verdict(
-            "decode", c1, {"decode": 140.0, "ttft_ms": 200.0}, {"decode": 113.0, "ttft_ms": 200.0})
-        self.assertTrue(accepted and not noisy, reason)
-        # The floor: without a measurement the band is +-5%.
-        tuner.noise = {}
-        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 104.0, "ttft_ms": 200.0}, c2)
-        self.assertFalse(accepted, reason)
-        self.assertIn("inside the noise (±5%)", reason)
+    def run(metrics):
+        if measure:
+            return measure(tuner.state, rng, metrics)
+        factor = effect if tuner.state.get("flash_attn") == "on" else 1.0
+        return {"decode": 100.0 * factor * rng.gauss(1, sd), "ttft_ms": 200.0 * rng.gauss(1, 0.01)}
 
-    def test_a_side_metric_is_held_to_its_own_noise_band(self):
-        tuner = self.tuner()
-        tuner.noise = {"decode": 0.02, "ttft_ms": 0.08}
-        c1, c2 = {"decode": 100.0, "ttft_ms": 200.0}, {"decode": 100.0, "ttft_ms": 200.0}
-        # Time to first token 6% later: inside its own +-8%, kept.
-        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 120.0, "ttft_ms": 212.0}, c2)
-        self.assertTrue(accepted, reason)
-        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 120.0, "ttft_ms": 220.0}, c2)
-        self.assertFalse(accepted, reason)
-        self.assertIn("more than 8%", reason)
+    def fake_measure(*metrics):
+        clock.now += run_s
+        tuner.run_secs.setdefault(ai_tune.run_kind(metrics), []).append(run_s)
+        return run(metrics), None
 
-    def test_spread_is_the_corrected_range_of_the_runs(self):
+    def put_doc(doc, note):
+        clock.now += apply_s
+        tuner.apply_secs.append(apply_s)
+        tuner.state = dict(doc.get("load") or {})
+        tuner.applied_doc = json.loads(json.dumps(doc))
+    tuner.measure = fake_measure
+    tuner.put_doc = put_doc
+    tuner.plan = tuner.levers()
+    return ai_tune, tuner
+
+
+class KeepRuleUnitTests(unittest.TestCase):
+    """The keep rule: the noise is the SD of one run; a change runs control,
+    candidate, control, ... until its gain over the controls' mean clearly
+    clears 1.7 SD (kept) or clearly cannot (rejected); other metrics are
+    held to the controls' mean by their own noise."""
+
+    def test_noise_is_the_sd_of_one_run(self):
         ai_tune = load_tuner_module()
         runs = [{"decode": 100.0, "ttft_ms": 200.0}, {"decode": 110.0, "ttft_ms": 200.0},
-                {"decode": 105.0, "ttft_ms": 202.0}]
-        out = ai_tune.spreads(runs)
-        # Range 10 over median 105, doubled for three runs.
-        self.assertAlmostEqual(out["decode"], 10 / 105 * 2)
-        self.assertAlmostEqual(out["ttft_ms"], 2 / 200 * 2)
-        five = runs + [{"decode": 100.0, "ttft_ms": 200.0}, {"decode": 105.0, "ttft_ms": 200.0}]
-        self.assertAlmostEqual(ai_tune.spreads(five)["decode"], 10 / 105 * 1.5)
-        self.assertEqual(ai_tune.spreads(runs[:1]), {})
+                {"decode": 90.0, "ttft_ms": 202.0}]
+        out = ai_tune.noise_sds(runs)
+        self.assertAlmostEqual(out["decode"], 0.10)
+        self.assertAlmostEqual(out["ttft_ms"], statistics.stdev([200.0, 200.0, 202.0]) / (602 / 3))
+        self.assertEqual(ai_tune.noise_sds(runs[:1]), {})
 
-    def run_experiment(self, tuner, controls, cand):
-        controls = list(controls)
-        tuner.control = lambda: controls.pop(0)
-        tuner.trial = lambda entry, change: (dict(cand), None)
-        return tuner.experiment({"lever": "ubatch_size", "metric": "prefill"}, {"ubatch_size": 1024})
+    def judge(self, tuner, noise, controls, cands, last=False, metric="decode"):
+        tuner.noise_data = [dict(decode=v, ttft_ms=200.0) for v in noise]
+        tuner.noise_runs = len(noise)
+        tuner.noise = load_tuner_module().noise_sds(tuner.noise_data)
+        runs = lambda values: [dict(decode=v, ttft_ms=200.0) for v in values]  # noqa: E731
+        return tuner.judge(metric, runs(controls), runs(cands), last)
+
+    def test_a_clear_win_on_a_quiet_machine_is_kept_after_one_run(self):
+        _, tuner = sim_tuner(1)
+        keep, gain, reason, bar = self.judge(tuner, [100, 101, 100.5], [100, 100.5], [112])
+        self.assertTrue(keep, reason)
+        self.assertAlmostEqual(gain, 112 / 100.25 - 1)
+        # Under the 2% floor: the bar is 1.7 x the floor, widened for so few runs.
+        self.assertLess(bar, 0.06)
+        # +3% is not clear after one run: one more run is asked for.
+        keep, _, reason, _ = self.judge(tuner, [100, 101, 100.5], [100, 100.5], [103.3])
+        self.assertIsNone(keep, reason)
+        # -10%: rejected at once.
+        keep, _, reason, _ = self.judge(tuner, [100, 101, 100.5], [100, 100.5], [90])
+        self.assertFalse(keep)
+        self.assertIn("inside the noise", reason)
+
+    def test_a_win_on_a_noisy_machine_must_hold_over_two_runs(self):
+        _, tuner = sim_tuner(1)
+        noise = [100, 108, 93, 106, 94]  # SD about 6.5%
+        keep, _, reason, _ = self.judge(tuner, noise, [100, 101], [160])
+        self.assertIsNone(keep, reason)
+        keep, _, reason, _ = self.judge(tuner, noise, [100, 101, 99], [160, 158])
+        self.assertTrue(keep, reason)
+
+    def test_the_last_run_decides(self):
+        _, tuner = sim_tuner(1)
+        noise = [100, 108, 93, 106, 94]
+        # +9.5% after two runs: at the last run it must clear the bar (about
+        # +11% here) and two standard errors, and it does not.
+        keep, _, reason, _ = self.judge(tuner, noise, [100, 101, 99], [109, 110], last=True)
+        self.assertFalse(keep, reason)
+        self.assertIn("not clearly over the noise", reason)
+
+    def test_a_side_metric_is_held_to_its_own_noise(self):
+        _, tuner = sim_tuner(1)
+        tuner.noise_data = [{"decode": 100.0, "ttft_ms": t} for t in (200.0, 216.0, 186.0)]
+        tuner.noise_runs = 3
+        controls = [{"decode": 100.0, "ttft_ms": 200.0}, {"decode": 100.5, "ttft_ms": 204.0}]
+        # Time to first token 6% later: inside its own noise (SD about 7%).
+        keep, _, reason, _ = tuner.judge("decode", controls, [{"decode": 120.0, "ttft_ms": 214.0}], False)
+        self.assertTrue(keep, reason)
+        # 60% later: rejected, whatever the decode win.
+        keep, _, reason, _ = tuner.judge("decode", controls, [{"decode": 120.0, "ttft_ms": 324.0}], False)
+        self.assertFalse(keep)
+        self.assertIn("ttft_ms got", reason)
 
     def test_a_trial_that_does_not_load_is_failed_not_rejected(self):
-        ai_tune = load_tuner_module()
-        tuner = self.tuner()
-        tuner.control = lambda: {"prefill": 1000.0, "decode": 105.0}
+        ai_tune, tuner = sim_tuner(1)
 
-        def trial(entry, change):
+        def trial(entry, change, gate=True):
             raise ai_tune.ApplyFailed("the engine answered 400: model is already running")
         tuner.trial = trial
+        tuner.last_control = {"prefill": 1000.0, "decode": 105.0}
+        tuner.current_metric = "prefill"
         accepted, gain, reason = tuner.experiment({"lever": "ubatch_size", "metric": "prefill"},
                                                   {"ubatch_size": 1024})
         self.assertIsNone(accepted)
         self.assertEqual(gain, 0.0)
         self.assertIn("model is already running", reason)
-        self.assertEqual([(r["role"], r["verdict"]) for r in tuner.records], [("verdict", "failed")])
+        self.assertEqual([(r["role"], r.get("verdict")) for r in tuner.rows], [("verdict", "failed")])
 
-    def test_a_noisy_run_is_repeated_and_noisy_twice_changes_nothing(self):
-        noisy = [{"prefill": 1000.0, "decode": 105.0}, {"prefill": 1060.0, "decode": 105.0}]
-        steady = [{"prefill": 1000.0, "decode": 105.0}, {"prefill": 1005.0, "decode": 105.5}]
-        cand = {"prefill": 1100.0, "decode": 105.0}
-        # Noisy, then steady: the repeat decides, kept.
-        tuner = self.tuner()
-        accepted, _, reason = self.run_experiment(tuner, noisy + steady, cand)
-        self.assertTrue(accepted, reason)
-        self.assertTrue(any("noisy controls" in line for line in tuner.logs), tuner.logs)
-        self.assertEqual(sum(1 for r in tuner.records if r["role"] == "candidate"), 2)
-        # Noisy twice: rejected.
-        tuner = self.tuner()
-        accepted, _, reason = self.run_experiment(tuner, noisy + noisy, cand)
-        self.assertFalse(accepted)
-        self.assertIn("noisy again", reason)
-        verdicts = [r for r in tuner.records if r["role"] == "verdict"]
-        self.assertEqual([v["verdict"] for v in verdicts], ["rejected"])
+    def keep_rate(self, sd, effect, runs=200):
+        kept = 0
+        for seed in range(runs):
+            _, tuner = sim_tuner(seed, sd=sd, effect=effect)
+            tuner.measure_noise("decode")
+            accepted, _, _ = tuner.experiment(tuner.plan[0], {"flash_attn": "on"})
+            kept += bool(accepted)
+        return kept / runs
+
+    def test_simulated_noisy_machine_keeps_real_wins_and_drops_small_ones(self):
+        """200 seeded runs on a machine whose runs have an SD of 7% (the
+        first real box): a real +20% is kept in at least 90% of them, a +5%
+        (inside the noise) in at most 5%. The old range-based band kept the
+        +20% in about 16%."""
+        win = self.keep_rate(0.07, 1.20)
+        fake = self.keep_rate(0.07, 1.05)
+        print(f"\nsimulated SD 7%: +20% kept {win:.1%}, +5% kept {fake:.1%}", file=sys.stderr)
+        self.assertGreaterEqual(win, 0.90)
+        self.assertLessEqual(fake, 0.05)
+
+    def test_a_weighted_lever_is_kept_while_aggregate_moves_inside_its_own_noise(self):
+        """draft_max is judged on the workload-weighted speed. The noise runs
+        measure aggregate and weighted too, so aggregate (the c2 speed, SD
+        6% here) is held to its own noise, not to the floor."""
+        def measure(state, rng, metrics):
+            better = state.get("draft_max") == 3
+            out = {"decode": 100.0 * rng.gauss(1, 0.01), "ttft_ms": 200.0 * rng.gauss(1, 0.01)}
+            if "aggregate" in metrics or "weighted" in metrics:
+                c1 = 100.0 * (2.0 if better else 1.0) * rng.gauss(1, 0.01)
+                c2 = 180.0 * rng.gauss(1, 0.06)
+                out.update(per_concurrency={1: c1, 2: c2}, aggregate=c2, weighted=(c1 + c2) / 2)
+            return out
+        _, tuner = sim_tuner(3, levers=("draft_max",), concurrency="1,2", measure=measure)
+        tuner.listing_row = {"speculative": {"spec_type": "draft-mtp"}}
+        tuner.best = {"load": {"spec_type": "draft-mtp", "draft_max": 1}}
+        stop = tuner.tune()
+        self.assertIn("aggregate", tuner.noise, tuner.noise)
+        self.assertIn("weighted", tuner.noise, tuner.noise)
+        self.assertGreater(tuner.noise["aggregate"], 0.02, tuner.noise)
+        self.assertEqual([g[0] for g in tuner.gains], ["draft_max"], (stop, tuner.rows[-1]))
+        self.assertEqual(tuner.best["load"]["draft_max"], 3)
+
+    def test_a_ten_minute_budget_ends_within_a_minute_of_it(self):
+        """Runs of 40 s and applies of 20 s on a noisy machine (many runs per
+        change): the run ends within about a minute of its 10 minutes, the
+        final restore included."""
+        clock = Clock()
+        _, tuner = sim_tuner(5, sd=0.07, effect=1.0, run_s=40.0, apply_s=20.0, budget="10m",
+                             clock=clock, levers=("flash_attn", "ubatch_size", "cache_type"))
+        tuner.take_hold_and_lock = lambda: setattr(tuner, "lock_id", "lock")
+        tuner.release = lambda: setattr(tuner, "lock_id", None)
+        code = tuner.run_trapped()
+        self.assertEqual(code, 0)
+        self.assertLessEqual(clock.now, 600 + 60, tuner.logs)
+        result = json.loads(tuner.out.getvalue())
+        self.assertIn("budget ran out", result["stopped"])
+        # Out of budget between noise runs: untuned, nothing changed.
+        clock = Clock()
+        _, tuner = sim_tuner(5, sd=0.07, run_s=40.0, apply_s=20.0, budget="70s", clock=clock)
+        tuner.take_hold_and_lock = lambda: setattr(tuner, "lock_id", "lock")
+        tuner.release = lambda: setattr(tuner, "lock_id", None)
+        self.assertEqual(tuner.run_trapped(), 0)
+        result = json.loads(tuner.out.getvalue())
+        self.assertFalse(result["tuned"])
+        self.assertIn("budget ran out while measuring the noise", result["reason"])
+        self.assertLessEqual(clock.now, 70 + 40)
 
 
 if __name__ == "__main__":

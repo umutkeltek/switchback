@@ -1340,33 +1340,39 @@ sb ai tune gpu-box/qwen [--levers LIST] [--budget 30m] [--wake]
 The method, exactly:
 
 1. **Baseline and noise**, then the **ceiling** (from the speed report).
-   The baseline is three runs of the same settings; how far they spread
-   (their range over their median, doubled for three runs because a few
-   runs never show the whole spread) is the **noise band**, never under
-   ±5%. When the three spread wider than 5%, the tuner takes more samples
-   per run when the budget allows (up to twice `--samples`, at most 24) and
-   runs two more, measuring the band again over all five (the range then
-   taken 1.5 times). A band wider than ±40% stops the run at once with
-   `too noisy to tune: ±N%`, and nothing is changed. The summary and
-   `--json` (`noise`) report the band.
+   The baseline is three runs of the same settings, measuring every metric
+   the planned levers judge (decode, and prefill, aggregate or weighted
+   when a lever uses them). Their sample standard deviation over their mean
+   is the **noise** of one run (SD), per metric, never taken under 2%. When
+   the SD is over 2%, the tuner takes more samples per run when the budget
+   allows (up to twice `--samples`, at most 24) and runs two more,
+   measuring the SD again over all five. An SD over 20% stops the run at
+   once with `too noisy to tune: noise ±N%`, and nothing is changed (a
+   kept win would have to clear about 1.7 times the SD, +34% or more). The
+   summary and `--json` (`noise.sd_pct`, per metric `noise.by_metric_sd_pct`)
+   report the SD; `--json` also says `"tuned": false` and the reason when
+   the run did not tune.
 2. **One change per experiment**, derived from the current best settings,
    applied with `apply: now` (the model reloads once nothing is in flight).
    Settings that do not apply or load make a **failed** trial: shown as
    failed, written to the ledger as `failed`, never counted as a lever
    inside the noise, and the run goes on with the next lever.
-3. **Control, candidate, control.** Each run is at least 6 samples, and
-   the median counts; prompts are fresh (a new first line every request), so
-   no run reads the prefix cache; the first request after a load is dropped.
-4. **Keep it only if** the candidate beats both neighbouring controls on its
-   metric by more than the noise band and no other measured metric is
-   worse than the mean of the two controls by more than that metric's own
-   band (also measured, also never under ±5%). When the two controls differ by
-   more than that on one of those other metrics, that metric is held to the
-   worse control instead. A win of more than 20%, and any win when the band
-   is wider than ±5%, is repeated once first and must win again. A run
-   whose two controls differ by more than the band on the judged metric
-   itself is noisy: it is repeated once the same way, the repeat decides,
-   and a repeat that is noisy again changes nothing.
+3. **Control, candidate, control, candidate, control...** Each run has at
+   least 6 samples, and the median counts; prompts are fresh (a new first
+   line on every request), so no run reads the prefix cache; the first
+   request after a load is dropped. The candidate runs again (each run
+   between two controls) until the result is clear, ten candidate runs at
+   most; a change the budget left cannot pay for is not started.
+4. **Keep only if** the gain over the mean of the controls is larger than
+   1.7 SD with two standard errors to spare (after the last run: larger
+   than both 1.7 SD and two standard errors). The standard error is
+   SD x sqrt(1/n + 1/(n+1)) for n candidate runs (SD x sqrt(1.5) for one
+   between two controls), and the SD is pooled over the noise runs, the
+   controls and the candidate runs. On a machine noisier than 5%, and for
+   any win over 20%, the win must hold over two candidate runs or more.
+   No other measured metric may be worse than the controls' mean by more
+   than such a win would need on it (its own noise). At an SD of 7% this
+   keeps a real +20% in about 94 of 100 runs and a +5% in about 3.
 5. **Gates:** every answer must be non-empty, not looping and not failed; a
    change claimed lossless must give the same greedy answer at temperature 0;
    a change to the KV cache or the context must find two needles (at about
@@ -1482,13 +1488,13 @@ An example session:
 ```
 $ sb ai tune gpu-box/qwen --concurrency 1,2 --budget 45m
 sb ai tune gpu-box/qwen: run tune_3f9a0c21d4, engine b12464, 6 samples per run, budget 45 min
-  noise: ±5% on decode between 3 runs of the same settings (6 samples per run); a win must clear it
-  spec_type {"spec_type": "draft-mtp"}: +48%, a surprising win; repeating it once
-  spec_type {"spec_type": "draft-mtp"}: kept (decode +48% over both controls; repeated: decode +44% over both controls)
-  draft_max {"draft_max": 2}: kept (weighted +7% over both controls)
-  flash_attn {"flash_attn": "on"}: rejected (decode 321.0 did not beat both controls (318.4, 324.9))
-  ubatch_size {"ubatch_size": 1024, "batch_size": 2048}: rejected (prefill 9930.1 did not beat both controls (9871.2, 10044.0))
-  cache_type {"cache_type_k": "q8_0", "cache_type_v": "q8_0"}: rejected (decode 170.2 did not beat both controls (322.0, 319.8))
+  noise ±1.3% (SD of one run) on decode between 3 runs of the same settings (6 samples per run); a win must clear about +5%
+  spec_type {"spec_type": "draft-mtp"}: decode +48.0% over the controls after 1 run (noise ±2.6%; a win must clear +4.4%); not clear yet, measuring again
+  spec_type {"spec_type": "draft-mtp"}: kept (decode +46.1% over the controls after 2 runs (noise ±2.4%; a win must clear +4.1%))
+  draft_max {"draft_max": 2}: kept (weighted +7.2% over the controls after 2 runs (noise ±2.2%; a win must clear +3.7%))
+  flash_attn {"flash_attn": "on"}: rejected (decode +0.4% over the controls after 2 runs (noise ±2.2%; a win must clear +3.7%): inside the noise)
+  ubatch_size {"ubatch_size": 1024, "batch_size": 2048}: rejected (prefill -0.3% over the controls after 1 run (noise ±2.5%; a win must clear +4.3%): inside the noise)
+  cache_type {"cache_type_k": "q8_0", "cache_type_v": "q8_0"}: rejected (decode -46.9% over the controls after 1 run (noise ±2.5%; a win must clear +4.3%): inside the noise)
 
 metric                     baseline        now    ceiling  how measured
 decode tok/s (c1, median)     218.0      323.1      410.0  median of 6, warm, fresh prompts, through the gateway (client clock)
@@ -1498,9 +1504,9 @@ draft_max by concurrency (aggregate tok/s):
   {"draft_max": 2}: c1 318, c2 471
   {"draft_max": 3}: c1 322, c2 431
   {"draft_max": 4}: c1 309, c2 398
-kept: spec_type {"spec_type": "draft-mtp"} (+44%); draft_max {"draft_max": 2} (+7%)
-noise: ±5% on decode between 3 runs of the same settings, 6 samples per run (a win must clear it; floor ±5%)
-stopped: plateau: 3 levers in a row inside the noise (±5%)
+kept: spec_type {"spec_type": "draft-mtp"} (+46%); draft_max {"draft_max": 2} (+7%)
+noise: ±1.3% (SD of one run) on decode between 3 runs of the same settings, 6 samples per run (a win must clear about +5%; floor ±2%)
+stopped: plateau: 3 levers in a row inside the noise (±2.0%)
 not verified: greedy equality on one fixed prompt only; needle checks at two depths, not a full long-context evaluation; quality beyond these checks (reasoning, tools) was not measured; numbers include the network and the gateway between this machine and the engine
 undo with: sb ai revert gpu-box/qwen 12
 ```
