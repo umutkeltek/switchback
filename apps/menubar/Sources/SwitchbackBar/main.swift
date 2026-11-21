@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import UsagePresentation
+import ControlPresentation
 
 @MainActor final class BarDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var item: NSStatusItem?
@@ -23,6 +24,10 @@ import UsagePresentation
     private var lastChecked: Date?
     private let defaults = UserDefaults.standard
     private let panel = UsagePanelState()
+    /// The Switchback window, made on first use, and its own copy of the account gauges.
+    private var controlWindow: ControlWindowController?
+    private let windowAccounts = UsagePanelState()
+    private var windowShortcutRegistered = false
     private var statusIcon: NSImage?
     private var pins: Set<String>? {
         defaults.stringArray(forKey: "pinnedAccountKeys").map(Set.init)
@@ -76,6 +81,14 @@ import UsagePresentation
             self?.applyShortcut()
             self?.rebuild()
         }
+        panel.canOpenWindow = true
+        panel.onOpenWindow = { [weak self] in
+            self?.closePanel()
+            self?.openWindow()
+        }
+        windowAccounts.onPin = { [weak self] in self?.togglePin($0) }
+        windowAccounts.onRefresh = { [weak self] in self?.forceRefresh() }
+        windowAccounts.onQuit = { NSApp.terminate(nil) }
         panel.onLimitNotices = { [weak self] value in
             guard let self else { return }
             self.defaults.set(value, forKey: "limitNoticesEnabled")
@@ -86,6 +99,11 @@ import UsagePresentation
         }
         GlobalShortcut.shared.onPress = { [weak self] in self?.openPanel() }
         applyShortcut()
+        GlobalShortcut.window.onPress = { [weak self] in self?.openWindow() }
+        windowShortcutRegistered = GlobalShortcut.window.register(ShortcutChoice.window)
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(openWindowRequested(_:)), name: OpenWindowRequest.name, object: nil,
+            suspensionBehavior: .deliverImmediately)
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(openRequested(_:)), name: OpenPanelRequest.name, object: nil,
             suspensionBehavior: .deliverImmediately)
@@ -164,6 +182,13 @@ import UsagePresentation
             let minutes = max(0, Int(Date().timeIntervalSince(lastChecked) / 60))
             panel.checkedText = minutes == 0 ? "Checked just now" : "Checked \(minutes)m ago"
         }
+        windowAccounts.presentation = panel.presentation
+        windowAccounts.busy = panel.busy
+        windowAccounts.failure = panel.failure
+        windowAccounts.checkedText = panel.checkedText
+        windowAccounts.limitNotices = panel.limitNotices
+        windowAccounts.iconOnly = panel.iconOnly
+        windowAccounts.shortcutID = panel.shortcutID
         let iconOnly = panel.iconOnly || (panel.style == .gauge && gaugeImage == nil)
         item?.length = iconOnly ? PanelMetrics.statusIconWidth : NSStatusItem.variableLength
         item?.button?.image = gaugeImage ?? statusIcon
@@ -203,7 +228,9 @@ import UsagePresentation
                       "panel_width": PanelMetrics.width, "ui_revision": "compact-5-gauge",
                       "panel_open": popover?.isShown ?? false,
                       "outside_click_monitor_active": dismissal.isMonitoring,
-                      "outside_dismissals": outsideDismissals, "ui": "account-panel"],
+                      "outside_dismissals": outsideDismissals, "ui": "account-panel",
+                      "window_open": controlWindow?.isOpen ?? false,
+                      "window_shortcut": ShortcutChoice.window.title, "window_shortcut_registered": windowShortcutRegistered],
                      forKey: "statusItemDiagnostics")
     }
     private func statusItemOnScreen() -> Bool {
@@ -218,6 +245,17 @@ import UsagePresentation
     }
     @objc private func statusItemMoved(_ notification: Notification) { recordStatusItem() }
     @objc private func openRequested(_ notification: Notification) { openPanel() }
+    @objc private func openWindowRequested(_ notification: Notification) { openWindow() }
+    /// Opens the Switchback window (or brings it forward): from the panel's button, ⌃⌥⌘W or `sb bar window`.
+    private func openWindow() {
+        if controlWindow == nil {
+            let runner: any CommandRunning = ProcessCommandRunner.installed() ?? MissingCommandRunner()
+            controlWindow = ControlWindowController(store: ControlStore(runner: runner), accounts: windowAccounts)
+        }
+        rebuild()
+        controlWindow?.show()
+        recordStatusItem()
+    }
     /// Opens (never toggles) the panel: from the shortcut or `sb bar open`.
     private func openPanel() {
         if popover?.isShown == true {
@@ -460,6 +498,26 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
     } catch {
         FileHandle.standardError.write(Data("Could not render status item\n".utf8)); exit(1)
     }
+} else if let index = arguments.firstIndex(of: "--render-window"), arguments.indices.contains(index + 1) {
+    // One place of the Switchback window, offscreen, from a saved set of answers. Runs no command.
+    func value(_ key: String, fallback: String) -> String {
+        guard let i = arguments.firstIndex(of: key), arguments.indices.contains(i + 1) else { return fallback }
+        return arguments[i + 1]
+    }
+    do {
+        let output = value("--output", fallback: "")
+        guard !output.isEmpty, let place = WindowPlace(rawValue: value("--place", fallback: "now")) else { throw OwnerError.failed }
+        try renderWindow(arguments[index + 1], place: place, theme: value("--theme", fallback: "light"), output: output,
+                         scale: Double(value("--scale", fallback: "2")) ?? -1,
+                         width: Double(value("--width", fallback: String(WindowMetrics.width))) ?? WindowMetrics.width,
+                         height: Double(value("--height", fallback: String(WindowMetrics.height))) ?? WindowMetrics.height,
+                         review: arguments.contains("--review"))
+    } catch {
+        FileHandle.standardError.write(Data("Could not render the Switchback window\n".utf8)); exit(1)
+    }
+} else if arguments == [arguments[0], "--open-window"] {
+    // Asks a running Switchback Bar to open the Switchback window; does nothing else.
+    OpenWindowRequest.post()
 } else if arguments == [arguments[0], "--open-panel"] {
     // Asks a running Switchback Bar to open its panel; does nothing else.
     OpenPanelRequest.post()
@@ -484,7 +542,7 @@ if let index = arguments.firstIndex(of: "--render-panel"), arguments.indices.con
         exit(1)
     }
 } else if arguments.count != 1 {
-    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --open-panel | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style gauge|a|cards|rings|strip] [--open-seat ACCOUNT_KEY] | --render-status snapshot.json --output item.png [--theme light|dark] [--style gauge|rings|strip]]\n".utf8))
+    FileHandle.standardError.write(Data("Usage: SwitchbackBar [--version | --open-panel | --open-window | --print-menu snapshot.json [--text] | --render-panel snapshot.json --output panel.png [--theme light|dark] [--provider PROVIDER] [--scale 1|2] [--reduce-transparency] [--style gauge|a|cards|rings|strip] [--open-seat ACCOUNT_KEY] | --render-status snapshot.json --output item.png [--theme light|dark] [--style gauge|rings|strip] | --render-window window.json --output window.png [--place now|models|machines|accounts] [--theme light|dark] [--scale 1|2] [--width W --height H] [--review]]\n".utf8))
     exit(2)
 } else {
     // One bar only: a second copy (for example started by `sb bar open` while launchd waits to relaunch

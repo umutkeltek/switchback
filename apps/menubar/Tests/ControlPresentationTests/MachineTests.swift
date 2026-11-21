@@ -121,3 +121,38 @@ func box(power: Power = .on, uptime: Double? = 3600, busy: Int = 0, holds: Int =
     #expect(card.powerOffIn == 540)
     #expect(card.uptime == nil)
 }
+
+@Test func uptimeComesFromTheGatewayOrFromWakesThatAgree() throws {
+    func status(_ lanes: String) throws -> AIStatus {
+        AIStatus(try JSONValue.parse(Data(("{\"machines\":[{\"machine\":\"gpu-box\",\"power\":\"on\"}],\"lanes\":[" + lanes + "]}").utf8)))
+    }
+    let now = Fixture.now.timeIntervalSince1970 * 1000
+    func lane(_ name: String, wokeMinutesAgo: Double, upSince: Double? = nil) -> String {
+        let up = upSince.map { ",\"up_since_ms\":\(now - $0 * 60_000)" } ?? ""
+        return "{\"name\":\"\(name)\",\"host\":\"gpu-box\",\"state\":\"healthy\",\"holds\":[],\"wake_configured\":true," +
+            "\"poweroff_configured\":true,\"last_wake_result\":\"ok after 1 attempt(s)\",\"wake_duration_ms\":60000," +
+            "\"last_wake_ms\":\(now - wokeMinutesAgo * 60_000)\(up)}"
+    }
+    func uptime(_ lanes: String) throws -> Double? {
+        Machines.cards(status: try status(lanes), engines: nil, doctor: nil, now: Fixture.now).first?.uptime
+    }
+    // Two lanes woken together: up since the newer wake ended.
+    #expect(try uptime(lane("a", wokeMinutesAgo: 30) + "," + lane("b", wokeMinutesAgo: 28)) == 27 * 60)
+    // One lane started long after the other: the wakes say nothing about the machine, so uptime is unknown
+    // and power-off is left to the gateway's own check.
+    #expect(try uptime(lane("a", wokeMinutesAgo: 600) + "," + lane("b", wokeMinutesAgo: 2)) == nil)
+    // A gateway that reports when the machine came up is believed.
+    #expect(try uptime(lane("a", wokeMinutesAgo: 600, upSince: 3) + "," + lane("b", wokeMinutesAgo: 2)) == 180)
+    let young = try #require(Machines.cards(status: try status(lane("a", wokeMinutesAgo: 600, upSince: 3)), engines: nil,
+                                            doctor: nil, now: Fixture.now).first)
+    #expect(Machines.powerOff(young)?.gate == .disabled("Up 3 min · it can power off after 4 min"))
+}
+
+@Test func gpuBoxesComeBeforeTheMac() throws {
+    let json = try JSONValue.parse(Data(#"""
+    {"machines":[{"machine":"mac","power":"on"},{"machine":"gpu-box","power":"off"}],
+     "lanes":[{"name":"mac","host":"mac","state":"healthy","holds":[],"wake_configured":false,"poweroff_configured":false},
+              {"name":"text","host":"gpu-box","state":"offline","holds":[],"wake_configured":true,"poweroff_configured":true}]}
+    """#.utf8))
+    #expect(Machines.cards(status: AIStatus(json), engines: nil, doctor: nil, now: Fixture.now).map(\.title) == ["GPU box", "Mac"])
+}

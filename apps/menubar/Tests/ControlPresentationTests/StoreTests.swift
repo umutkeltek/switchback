@@ -158,3 +158,18 @@ actor Slept {
     #expect(store.status != nil)
     #expect(store.problems.first?.serious == true)
 }
+
+@MainActor @Test func readingNowStillWaitsTenSeconds() async throws {
+    let runner = try FakeRunner()
+    let clock = TestClock(Fixture.now)
+    let store = ControlStore(runner: runner, clock: { clock.now })
+    await store.readNow()
+    let first = runner.calls.count
+    #expect(first > 0)
+    clock.advance(4)
+    await store.readNow()
+    #expect(runner.calls.count == first)
+    clock.advance(6)
+    await store.readNow()
+    #expect(runner.calls.count > first)
+}

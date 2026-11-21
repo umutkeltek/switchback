@@ -42,9 +42,15 @@ public struct LoadedModel: Sendable, Equatable, Identifiable {
 /// Something wrong, in one plain line.
 public struct Problem: Sendable, Equatable, Identifiable {
     public var id: String { text }
+    /// The line with the machine it is about, for lists across machines.
     public let text: String
+    /// The same line inside the machine's own card, without its name.
+    public let short: String
     /// A worse problem draws red; a softer one orange.
     public let serious: Bool
+    public init(text: String, short: String? = nil, serious: Bool) {
+        self.text = text; self.short = short ?? text; self.serious = serious
+    }
 }
 
 /// One machine as the window shows it.
@@ -90,6 +96,8 @@ public enum Machines {
         let kinds = Dictionary(uniqueKeysWithValues: order.map { machine in
             (machine, kind(of: status.lanes.filter { $0.machine == machine }))
         })
+        // GPU boxes first, then the Mac; otherwise the gateway's order.
+        order = order.filter { kinds[$0] == .gpuBox } + order.filter { kinds[$0] != .gpuBox }
         return order.map { machine in
             let lanes = status.lanes.filter { $0.machine == machine }
             let kind = kinds[machine] ?? .mac
@@ -126,10 +134,7 @@ public enum Machines {
         // A countdown only when nothing holds the machine and the gateway gives one.
         let countdown = holds.isEmpty ? lanes.compactMap(\.poweroffInSecs).filter { $0 >= 0 }.min() : nil
         let nowMs = now.timeIntervalSince1970 * 1000
-        // The gateway does not report uptime; the newest successful wake (plus how long it took) is when it came up.
-        let woke = lanes.filter { ($0.lastWakeResult ?? "").hasPrefix("ok") }
-            .compactMap { lane in lane.lastWakeMs.map { $0 + (lane.wakeDurationMs ?? 0) } }.max()
-        let uptime = power == .on ? woke.map { max(0, nowMs - $0) / 1000 } : nil
+        let uptime = power == .on ? upSince(lanes).map { max(0, nowMs - $0) / 1000 } : nil
         let gpuLane = lanes.first { $0.holdsGPU == true }
         let machineLanes = lanes.map(\.name)
         let loaded: [LoadedModel] = (engines?.lanes ?? []).filter { machineLanes.contains($0.lane) }.flatMap { lane in
@@ -174,6 +179,17 @@ public enum Machines {
             lanes: machineLanes)
     }
 
+    /// When the machine came up: the gateway's own time when it gives one. Otherwise each lane's last
+    /// successful wake (plus how long it took) stands in, but only when they agree within 10 minutes: a lane can
+    /// be started on a machine that was already up, so wakes far apart say nothing about the machine.
+    static func upSince(_ lanes: [LaneReport]) -> Double? {
+        if let reported = lanes.compactMap(\.upSinceMs).min() { return reported }
+        let wakes = lanes.filter { ($0.lastWakeResult ?? "").hasPrefix("ok") }
+            .compactMap { lane in lane.lastWakeMs.map { $0 + (lane.wakeDurationMs ?? 0) } }
+        guard let newest = wakes.max(), let oldest = wakes.min(), newest - oldest <= 600_000 else { return nil }
+        return newest
+    }
+
     /// Who uses an engine, in everyday words: "Text models", "Images and video".
     static func jobWords(lane: String, engines: EnginesReport?, doctor: DoctorReport?) -> String {
         if engines?.lane(lane)?.kind.contains("llama") == true { return "Text models" }
@@ -188,19 +204,33 @@ public enum Machines {
                          engines: [EngineLane]) -> [Problem] {
         var found: [Problem] = []
         for lane in lanes where lane.state == "degraded" {
-            found.append(Problem(text: "\(title): something needs attention" + (lane.lastError.map { " · \(Words.plain($0))" } ?? ""),
+            let detail = lane.lastError.map { " · \(Words.plain($0))" } ?? ""
+            found.append(Problem(text: "\(title): something needs attention" + detail, short: "Something needs attention" + detail,
                                  serious: true))
         }
-        for hold in holds { if let failed = hold.wakeFailed { found.append(Problem(text: "\(title) did not wake · \(failed)", serious: true)) } }
-        if power != .on, let failed = lanes.compactMap(\.lastWakeResult).first(where: { $0.hasPrefix("failed") || $0 == "timeout" }) {
-            found.append(Problem(text: "\(title) did not wake last time · \(failed)", serious: false))
+        for hold in holds {
+            if let failed = hold.wakeFailed {
+                found.append(Problem(text: "\(title) did not wake · \(failed)", short: "Did not wake · \(failed)", serious: true))
+            }
         }
-        if kind == .mac && power == .asleep { found.append(Problem(text: "The Mac's engine is not answering", serious: true)) }
+        if power != .on, let failed = lanes.compactMap(\.lastWakeResult).first(where: { $0.hasPrefix("failed") || $0 == "timeout" }) {
+            found.append(Problem(text: "\(title) did not wake last time · \(failed)", short: "Did not wake last time · \(failed)", serious: false))
+        }
+        if kind == .mac && power == .asleep {
+            found.append(Problem(text: "The Mac’s engine is not answering", short: "Its engine is not answering", serious: true))
+        }
         for engine in engines {
-            if let error = engine.error { found.append(Problem(text: "\(title): could not read its models · \(Words.plain(error))", serious: false)) }
-            if let error = engine.lastApplyError { found.append(Problem(text: "\(title): saved settings did not reach the engine · \(Words.plain(error))", serious: true)) }
+            if let error = engine.error {
+                let words = "could not read its models · \(Words.plain(error))"
+                found.append(Problem(text: "\(title): " + words, short: "Could not read its models · \(Words.plain(error))", serious: false))
+            }
+            if let error = engine.lastApplyError {
+                let words = "saved settings did not reach the engine · \(Words.plain(error))"
+                found.append(Problem(text: "\(title): " + words, short: "Saved settings did not reach the engine · \(Words.plain(error))",
+                                     serious: true))
+            }
             for model in engine.models where model.failed {
-                found.append(Problem(text: "\(model.id) failed to load on the \(title)", serious: true))
+                found.append(Problem(text: "\(model.id) failed to load on the \(title)", short: "\(model.id) failed to load", serious: true))
             }
         }
         return found
@@ -235,7 +265,7 @@ public enum Machines {
         guard machine.kind == .gpuBox else { return nil }
         let words = durationWords(duration)
         if machine.power == .asleep || machine.power == .poweringOff {
-            let title = WakeWarning.label("Keep on \(words)", wakes: true, machine: machine.title)
+            let title = WakeWarning.label("Keep on \(words)", wakes: true, machine: machine.kind.title)
             return ActionPlan(id: "keep-on:\(machine.machine)", title: title,
                               command: Commands.on(duration, reason: holdReason, machine: machine.machine), wakes: true,
                               confirmation: WakeWarning.confirmation("Keep on \(words)", machine: machine.title,
@@ -252,6 +282,13 @@ public enum Machines {
         if let hours { return "\(hours) h" }
         if let minutes { return "\(minutes) min" }
         return duration
+    }
+
+    /// The GPU memory a machine's models may use, when the gateway keeps an estimate for one of them.
+    public static func memoryBudget(_ machine: MachineCard, settings: [String: SettingsView]) -> Double? {
+        settings.values.flatMap(\.targets).filter { target in
+            target.target.split(separator: "/").first.map { machine.lanes.contains(String($0)) } ?? false
+        }.compactMap { $0.estimate?.budgetBytes }.max()
     }
 
     /// The machine a model's engine lives on.

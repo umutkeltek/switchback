@@ -109,6 +109,9 @@ enum PanelMotion {
     @ObservationIgnored var onLimitNotices: (Bool) -> Void = { _ in }
     @ObservationIgnored var onShortcut: (String) -> Void = { _ in }
     @ObservationIgnored var onStyle: (PanelStyle) -> Void = { _ in }
+    /// Opens the Switchback window; the window's own copy of the gauge has no button for it.
+    @ObservationIgnored var onOpenWindow: () -> Void = {}
+    var canOpenWindow = false
 
     var visibleProviders: [ProviderPanel] {
         presentation.filtered(provider: selectedProvider, query: query, pinnedOnly: pinnedOnly)
@@ -207,6 +210,9 @@ struct UsagePanelView: View {
                     .font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText)
             }
             Spacer()
+            if state.canOpenWindow {
+                PanelIconButton(symbol: "macwindow", label: "Open the Switchback window (⌃⌥⌘W)", action: state.onOpenWindow)
+            }
             if state.busy {
                 ProgressView().controlSize(.small).frame(width: 28, height: 28)
                     .help("Refreshing account usage")

@@ -101,6 +101,12 @@ public enum ChatState: Sendable, Equatable {
         return max(0, ControlStore.interval - now.timeIntervalSince(lastTick))
     }
 
+    /// ⌘R: reads at once when the last read began at least `interval` ago; never sooner.
+    public func readNow() async {
+        guard !reading, nextReadDelay() == 0 else { return }
+        await tick()
+    }
+
     /// One round of reads: status and engines every time; the speed report, the model list and the settings of
     /// every model less often; the open model's settings and history every time.
     public func tick() async {

@@ -8,6 +8,9 @@ struct DirectionPanelView: View {
     @Bindable var state: UsagePanelState
     var interactive = true
     var solidBackground = false
+    /// The panel's width; the Switchback window draws the same gauge wider and as tall as it has room for.
+    var width = PanelMetrics.width
+    var fillsHeight = false
     @FocusState private var searchFocused: Bool
     @FocusState private var focusedSeat: String?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -69,7 +72,8 @@ struct DirectionPanelView: View {
             PanelRule()
             footer
         }
-        .frame(width: PanelMetrics.width, height: state.preferredHeight)
+        .frame(width: width, height: fillsHeight ? nil : state.preferredHeight)
+        .frame(maxHeight: fillsHeight ? .infinity : nil)
         .background {
             if reduceTransparency || solidBackground { PanelColor.canvas } else { Rectangle().fill(.regularMaterial) }
         }
@@ -101,6 +105,9 @@ struct DirectionPanelView: View {
             }
             Spacer()
             filterMenu
+            if state.canOpenWindow {
+                PanelIconButton(symbol: "macwindow", label: "Open the Switchback window (⌃⌥⌘W)", action: state.onOpenWindow)
+            }
             PanelIconButton(symbol: "magnifyingglass", label: state.searchOpen ? "Close search" : "Find an account",
                             selected: state.searchOpen) {
                 if state.searchOpen { closeSearch() } else { state.searchOpen = true; searchFocused = true }
@@ -241,7 +248,7 @@ struct DirectionPanelView: View {
 }
 
 /// The one answer that matters: which seat to use now, with any model whose best seat differs on the right.
-private struct BestNowCard: View {
+struct BestNowCard: View {
     let best: SeatGlyph
     let picks: [DirectionPresentation.ModelPick]
     let style: PanelStyle
@@ -335,7 +342,7 @@ private struct BestNowCard: View {
 /// The gauge's hero: one vertical gauge for the seat to use now.
 /// Every seat with a reading is at its limit: no seat is recommended. The card says so plainly and
 /// names the seat that is back first; clicking it opens that seat's details.
-private struct NoRoomCard: View {
+struct NoRoomCard: View {
     let notice: DirectionPresentation.NoRoom
     let action: () -> Void
     @Environment(\.colorSchemeContrast) private var contrast
@@ -374,7 +381,7 @@ private struct NoRoomCard: View {
 }
 
 /// No Claude seat has a fresh reading: a muted card in the place and size of "Use now". Clicking it refreshes.
-private struct NoFreshCard: View {
+struct NoFreshCard: View {
     let notice: DirectionPresentation.NoFresh
     let busy: Bool
     let action: () -> Void

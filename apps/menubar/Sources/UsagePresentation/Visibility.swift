@@ -34,6 +34,9 @@ public struct ShortcutChoice: Sendable, Equatable, Identifiable {
         ShortcutChoice(id: "control-option-command-b", title: "⌃⌥⌘B", keyCode: 0x0B, modifiers: control | option | command),
         ShortcutChoice(id: "control-option-command-s", title: "⌃⌥⌘S", keyCode: 0x01, modifiers: control | option | command),
     ]
+    /// The fixed shortcut that opens the Switchback window.
+    public static let window = ShortcutChoice(id: "control-option-command-w", title: "⌃⌥⌘W", keyCode: 0x0D,
+                                              modifiers: control | option | command)
     public static let off = "off"
     /// UserDefaults key for the selected shortcut id.
     public static let preferenceKey = "openPanelShortcut"

@@ -52,6 +52,64 @@ When the item is hidden, the panel still opens, under the right side of the menu
 
 `--install --launch-at-login` writes a LaunchAgent that relaunches the app after a crash, at most every 30 seconds, but not after Quit.
 
+## Switchback window
+
+One native window for everything `sb ai` offers, by clicking. Open it from the panel's window button, with
+⌃⌥⌘W (system hot key, no Accessibility permission), or with `sb bar window` (starts the app first when it is
+not running). ⌃⌥⌘L still opens the panel. While the window is open the app shows a Dock icon and an Edit
+menu, so copy and paste work in its fields; closing it makes the app a menu bar app again.
+
+The window has four places (⌘1 to ⌘4):
+
+- **Now**: each machine's power (on, asleep, waking), when it powers off when idle, who has the GPU, the
+  loaded models with their memory, holds with Release, the account to use now (the panel's own card and
+  rules), and anything wrong, one plain line each.
+- **Models**: every name by job (text, image, video, audio, segment) with where it runs (GPU box, Mac or
+  cloud), a loaded dot, its speed as a bar against its ceiling (dashed and against the fastest model of its
+  job when no ceiling is saved) and a mark for saved settings. A route, a name that picks one of several
+  models, carries a branch mark. Selecting a name opens the inspector: temperature and top P as sliders,
+  max tokens as a stepper, thinking and the reasoning guard as switches; for a GPU box engine that takes
+  them, context size with a "fits / won't fit in memory" bar, KV cache type and parallel slots. Every value
+  shows where it comes from: engine default, saved for this model, a profile (not editable here) or locked.
+  Changes wait for Apply; Review shows each change from and to, whether the model reloads, and the exact
+  commands. History offers Undo to here for every earlier version; Load, Unload, Try it and the speed
+  report's findings in plain words (with "Use this" for a suggestion the inspector can show) sit beside it.
+- **Machines**: a GPU box's state, uptime and GPU, its holds, Keep on (1 hour by default, menu for longer)
+  and Power off. Power off is disabled, with the reason, while the box has been up under 4 minutes, while
+  work runs or waits, while a hold is active, or while someone else uses it. The Mac is show-only: its
+  loaded models and memory, never wake, sleep, power off, release or load settings.
+- **Accounts**: the panel's gauge, drawn at window width, with the same rules.
+
+The window holds no keys and calls no HTTP. It runs the installed `sb` with exact arguments (no shell):
+
+| Reads (about every 10 s while the window is visible; paused when hidden, minimized or covered) |
+| --- |
+| `sb ai status --json`, `sb ai engines --json`; `sb ai doctor --json` every 30 s; `sb ai models --json` every 60 s |
+| `sb ai settings NAME --json` and `sb ai settings MODEL --history --json` for the open model; every name's settings every 5 min |
+
+None of these wakes a machine: the gateway answers each from what it already knows. Each write is one
+command: `sb ai set`, `unset`, `revert`, `load`, `unload`, `hold`, `release`, `on`, `off` and `sb ai chat MODEL
+"prompt" --json` for Try it. Every action button has a small terminal button beside it: hover shows the exact
+command, click copies it. A button shows a spinner while it runs, then one result line, or one plain line with
+the reason `sb` gave. A button that would wake the GPU box says so ("Load now · wakes the GPU box") and asks
+once; Power off asks too.
+
+The gateway names machines; the window calls one it wakes and powers off "GPU box" and an always-on one
+"Mac". Uptime comes from the gateway when it reports `up_since_ms`; otherwise from the machine's engines' last
+successful wakes, only when they agree within 10 minutes, and unknown otherwise (the gateway still refuses an
+early power-off and the window shows its reason). The rules live in `ControlPresentation`, tested without
+AppKit.
+
+Render a place offscreen, with no window on screen and no command run, from one file of saved answers
+(`{"now", "status", "models", "engines", "doctor", "settings": {NAME: …}, "history": {MODEL: …}, "limits",
+"selected"}`, each the JSON the matching command prints):
+
+    SwitchbackBar --render-window window.json --place models --theme dark --output models.png
+
+`--scale 1`, `--width W --height H` and, for a file with a saved `draft`, `--review` are optional. The
+synthetic files in `Tests/ControlPresentationTests/Fixtures` use neutral names; a render of real answers
+shows real model and machine names, so keep it private.
+
 ## Native account panel
 
 Click the Switchback symbol for the native panel. Its default look is the gauge, described below. In the ledger and card looks, Provider filters and account search replace nested menus; the pin in each account's expanded row (beside each card in the card look) updates its existing selection immediately. Two primary generation windows stay visible with remaining percentages and reset times. Model-only provider limits are supported. More limits, tools quotas, observation dates and reading details expand in place. OpenCode Go quota and Zen prepaid funds stay distinct. Search receives focus on every open. Tab reaches the provider filters and account controls. Escape dismisses the transient panel; Command-R refreshes. Right-click the status item for refresh and quit. Options includes an icon-only menu bar mode.

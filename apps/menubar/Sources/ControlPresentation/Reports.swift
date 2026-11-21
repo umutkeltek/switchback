@@ -47,6 +47,8 @@ public struct LaneReport: Sendable, Equatable {
     public let lastWakeResult: String?
     public let wakeDurationMs: Double?
     public let wakeDurationAverageMs: Double?
+    /// When the machine came up, when the gateway says so (newer gateways); else nil.
+    public let upSinceMs: Double?
     init(_ json: JSONValue) {
         name = json["name"].string ?? "?"
         machine = json["host"].string ?? name
@@ -65,6 +67,7 @@ public struct LaneReport: Sendable, Equatable {
         lastWakeResult = json["last_wake_result"].string
         wakeDurationMs = json["wake_duration_ms"].double
         wakeDurationAverageMs = json["wake_duration_ewma_ms"].double
+        upSinceMs = json["up_since_ms"].double
     }
 }
 

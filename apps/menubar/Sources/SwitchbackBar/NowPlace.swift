@@ -1,0 +1,251 @@
+import SwiftUI
+import ControlPresentation
+import UsagePresentation
+
+/// One glance at what runs: each machine's power and loaded models, the account to use, holds and problems.
+struct NowPlace: View {
+    let store: ControlStore
+    let state: ControlWindowState
+    let accounts: UsagePanelState
+
+    var body: some View {
+        let machines = store.machines
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if machines.isEmpty {
+                    EmptyPlace(symbol: store.readError == nil ? "hourglass" : "wifi.exclamationmark",
+                               title: store.readError == nil ? "Reading what runs…" : "The gateway does not answer",
+                               detail: store.readError == nil ? "This takes a moment the first time."
+                                                              : "The window tries again every 10 seconds while it is open.")
+                } else {
+                    // Two machines a row, so names and states keep their room.
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 16, alignment: .top),
+                                        GridItem(.flexible(), spacing: 16, alignment: .top)],
+                              alignment: .leading, spacing: 16) {
+                        ForEach(machines) { machine in
+                            MachineTile(machine: machine, budget: Machines.memoryBudget(machine, settings: store.settings))
+                        }
+                    }
+                }
+                HStack(alignment: .top, spacing: 16) {
+                    bestAccount.frame(maxWidth: .infinity)
+                    holds(machines).frame(maxWidth: .infinity)
+                }
+                problems
+            }
+            .padding(.horizontal, WindowMetrics.gutter).padding(.bottom, WindowMetrics.gutter)
+        }
+    }
+
+    private var bestAccount: some View {
+        let data = accounts.directionData
+        return VStack(alignment: .leading, spacing: 10) {
+            CardTitle(title: "Account to use", symbol: "person.crop.circle.badge.checkmark")
+            if let best = data.best {
+                BestNowCard(best: best, picks: data.modelBest, style: .gauge) { state.place = .accounts }
+            } else if let noRoom = data.noRoom {
+                NoRoomCard(notice: noRoom) { state.place = .accounts }
+            } else if let noFresh = data.noFresh {
+                NoFreshCard(notice: noFresh, busy: accounts.busy, action: accounts.onRefresh)
+            } else {
+                Text("No account reading yet").font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText)
+                    .frame(maxWidth: .infinity, minHeight: GaugeLayout.hero)
+            }
+        }
+        .windowCard()
+    }
+
+    private func holds(_ machines: [MachineCard]) -> some View {
+        let holds = machines.flatMap(\.holds)
+        return VStack(alignment: .leading, spacing: 10) {
+            CardTitle(title: "Holds", symbol: "lock", trailing: holds.isEmpty ? nil : "\(holds.count)")
+            if holds.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "lock.open").foregroundStyle(.tertiary).accessibilityHidden(true)
+                    Text(machines.contains { $0.kind == .gpuBox } ? "Nothing keeps the GPU box on; it powers off when idle"
+                                                                 : "Nothing is held")
+                        .font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText)
+                }
+                .frame(maxWidth: .infinity, minHeight: GaugeLayout.hero, alignment: .leading)
+            } else {
+                ForEach(holds) { hold in HoldRow(hold: hold, store: store) }
+            }
+        }
+        .windowCard()
+    }
+
+    private var problems: some View {
+        let problems = store.problems
+        return VStack(alignment: .leading, spacing: 8) {
+            CardTitle(title: "Needs attention", symbol: "exclamationmark.triangle", trailing: problems.isEmpty ? nil : "\(problems.count)")
+            if problems.isEmpty {
+                Label("Nothing needs attention", systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 12)).foregroundStyle(.green).labelStyle(TightLabelStyle())
+            } else {
+                ForEach(problems) { problem in ProblemRow(problem: problem) }
+            }
+        }
+        .windowCard()
+    }
+}
+
+struct ProblemRow: View {
+    let problem: Problem
+    /// Inside the machine's own card: the line without its name.
+    var short = false
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Image(systemName: problem.serious ? "exclamationmark.octagon.fill" : "exclamationmark.triangle.fill")
+                .font(.system(size: 11)).foregroundStyle(problem.serious ? Color.red : Color.orange).accessibilityHidden(true)
+            Text(short ? problem.short : problem.text).font(.system(size: 12)).lineLimit(2).truncationMode(.tail).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .help(problem.text)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// A machine at a glance: power, how long until it powers off, who has the GPU, and what is loaded.
+struct MachineTile: View {
+    let machine: MachineCard
+    let budget: Double?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                PowerGlyph(power: machine.power, kind: machine.kind, size: 40)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(machine.title).font(.system(size: 15, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+                    Text(MachineWords.status(machine)).font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText).lineLimit(1)
+                }
+                .layoutPriority(1)
+                Spacer(minLength: 6)
+                MachineWords.timer(machine)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(machine.title + ": " + MachineWords.status(machine))
+            HStack(spacing: 6) {
+                if let gpu = machine.gpuUser { Pill(text: "GPU: " + gpu, symbol: "memorychip") }
+                if machine.busy > 0 { Pill(text: "\(machine.busy) working", symbol: "bolt.fill", tint: .orange) }
+                if machine.kind == .mac { Pill(text: "Always on", symbol: "infinity") }
+                if !machine.problems.isEmpty {
+                    Pill(text: "\(machine.problems.count) \(machine.problems.count == 1 ? "problem" : "problems")",
+                         symbol: "exclamationmark.triangle.fill", tint: .red)
+                }
+            }
+            Rectangle().fill(WindowColor.hairline).frame(height: 1).accessibilityHidden(true)
+            LoadedList(models: machine.loaded, budget: budget, limit: 4)
+        }
+        .windowCard()
+    }
+}
+
+/// Loaded models with their memory.
+struct LoadedList: View {
+    let models: [LoadedModel]
+    let budget: Double?
+    var limit = 99
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if models.isEmpty {
+                Text("Nothing loaded").font(.system(size: 12)).foregroundStyle(.tertiary)
+            }
+            ForEach(models.prefix(limit)) { model in
+                HStack(spacing: 8) {
+                    LoadDot(state: model.state == .loaded ? .loaded : model.state == .resting ? .resting
+                                   : model.state == .loading ? .loading : .failed)
+                    Text(model.name).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                        .help(model.name)
+                    if model.answering > 0 {
+                        Image(systemName: "waveform").font(.system(size: 10)).foregroundStyle(.orange)
+                            .help("Answering \(model.answering) now").accessibilityLabel("answering")
+                    }
+                    Spacer(minLength: 6)
+                    if model.state == .failed {
+                        Text("failed").font(.system(size: 11, weight: .medium)).foregroundStyle(.red)
+                    } else {
+                        MemoryBar(used: model.memoryBytes, budget: budget, width: 70)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("\(model.name), \(LoadState(rawValue: model.state.rawValue)?.word ?? model.state.rawValue)")
+            }
+            if models.count > limit {
+                Text("+\(models.count - limit) more").font(.system(size: 11)).foregroundStyle(.tertiary)
+            }
+            if let budget, models.contains(where: { $0.memoryBytes != nil }) {
+                let used = models.compactMap(\.memoryBytes).reduce(0, +)
+                HStack(spacing: 8) {
+                    Text("GPU memory").font(.system(size: 11)).foregroundStyle(WindowColor.secondaryText)
+                    Spacer(minLength: 4)
+                    MemoryBar(used: used, budget: budget, width: 110, showsBudget: true)
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+}
+
+enum MachineWords {
+    static func status(_ machine: MachineCard) -> String {
+        var parts = [machine.powerWord]
+        if let uptime = machine.uptime { parts.append("up \(Words.duration(uptime))") }
+        if machine.kind == .gpuBox && machine.power == .asleep { parts.append("wakes when work arrives") }
+        return parts.joined(separator: " · ")
+    }
+    /// The idle countdown as a ring, "Kept on" while a hold runs, nothing otherwise.
+    @ViewBuilder static func timer(_ machine: MachineCard) -> some View {
+        if let seconds = machine.powerOffIn {
+            HStack(spacing: 6) {
+                TimeRing(fraction: seconds / 900, tint: seconds < 120 ? .orange : .accentColor)
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text("Powers off in").font(.system(size: 10)).foregroundStyle(WindowColor.secondaryText)
+                    Text(Words.duration(seconds)).font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Powers off in " + Words.duration(seconds))
+        } else if !machine.holds.isEmpty {
+            Pill(text: "Kept on", symbol: "lock.fill", tint: .accentColor)
+                .help("A hold keeps it on")
+        }
+    }
+}
+
+struct HoldRow: View {
+    let hold: HoldCard
+    let store: ControlStore
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: hold.wakeFailed != nil ? "exclamationmark.triangle.fill" : hold.waking ? "sunrise.fill" : "lock.fill")
+                .font(.system(size: 12)).foregroundStyle(hold.wakeFailed != nil ? Color.red : Color.accentColor)
+                .frame(width: 18).padding(.top, 5).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(hold.reason).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.tail).help(hold.reason)
+                Text(hold.wakeFailed.map { "Did not wake · " + $0 } ?? hold.untilText)
+                    .font(.system(size: 11)).monospacedDigit().foregroundStyle(hold.wakeFailed != nil ? Color.red : WindowColor.secondaryText)
+                    .lineLimit(1).truncationMode(.tail)
+            }
+            .layoutPriority(1)
+            Spacer(minLength: 6)
+            ActionButton(plan: hold.release, store: store, symbol: "lock.open", compact: true)
+                .fixedSize()
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
+struct EmptyPlace: View {
+    let symbol: String
+    let title: String
+    let detail: String
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: symbol).font(.system(size: 26)).foregroundStyle(.tertiary).accessibilityHidden(true)
+            Text(title).font(.system(size: 14, weight: .semibold))
+            Text(detail).font(.system(size: 12)).foregroundStyle(WindowColor.secondaryText).multilineTextAlignment(.center)
+                .lineLimit(3).frame(maxWidth: 420)
+        }
+        .frame(maxWidth: .infinity).padding(.vertical, 36)
+        .windowCard()
+    }
+}

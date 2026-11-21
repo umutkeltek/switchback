@@ -310,7 +310,7 @@ public enum Inspector {
         }
         let asleep = machine.power == .asleep || machine.power == .poweringOff
         let loadGate: Gate = !gate.isAllowed ? gate : machine.power == .waking ? .disabled("Waking up · try in a moment") : .allowed
-        let title = WakeWarning.label("Load now", wakes: asleep, machine: machine.title)
+        let title = WakeWarning.label("Load now", wakes: asleep, machine: machine.kind.title)
         return (ActionPlan(id: "load:\(target.target)", title: title, command: Commands.load(target.target, wake: asleep),
                            wakes: asleep,
                            confirmation: asleep ? WakeWarning.confirmation("Load now", machine: machine.title,
@@ -325,8 +325,9 @@ public enum Inspector {
         }
         let wakes = first.map { $0.kind == .gpuBox && ($0.power == .asleep || $0.power == .poweringOff) } ?? false
         let machine = first?.title ?? "GPU box"
+        let word = first?.kind.title ?? "GPU box"
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        return ActionPlan(id: "chat:\(name)", title: WakeWarning.label("Send", wakes: wakes, machine: machine),
+        return ActionPlan(id: "chat:\(name)", title: WakeWarning.label("Send", wakes: wakes, machine: word),
                           command: Commands.chat(name, prompt: trimmed), wakes: wakes,
                           confirmation: wakes ? WakeWarning.confirmation("Send", machine: machine, wakeSeconds: first?.wakeSeconds) : nil,
                           gate: trimmed.isEmpty ? .disabled("Write a prompt first") : .allowed)
