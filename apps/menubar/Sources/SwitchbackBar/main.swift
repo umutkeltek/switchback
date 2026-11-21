@@ -31,8 +31,12 @@ import UsagePresentation
         NSApp.setActivationPolicy(.accessory)
         defaults.register(defaults: ["menuBarIconOnly": true])
         panel.selectedProvider = defaults.string(forKey: "selectedProvider") ?? "all"
+        // macOS reads the item's place only when the item is created: write it first.
+        let autosaveName = StatusItemPlacement.autosaveName(
+            info: Bundle.main.object(forInfoDictionaryKey: StatusItemPlacement.autosaveNameInfoKey) as? String)
+        StatusItemPlacement.apply(defaults, autosaveName: autosaveName)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item?.autosaveName = "SwitchbackBar"
+        item?.autosaveName = autosaveName
         item?.isVisible = true
         if let button = item?.button {
             let icon = NSImage(systemSymbolName: "arrow.triangle.swap", accessibilityDescription: "Switchback")?
@@ -188,6 +192,8 @@ import UsagePresentation
                       // and the last changes between shown and hidden.
                       "item_on_screen": onScreen,
                       "item_frame": NSStringFromRect(button.window?.frame ?? .zero),
+                      "item_preferred_position": defaults.object(
+                        forKey: StatusItemPlacement.positionKey(item.autosaveName ?? StatusItemPlacement.autosaveName)) ?? "none",
                       "item_occlusion_visible": button.window?.occlusionState.contains(.visible) ?? false,
                       "menu_bar_visible": NSMenu.menuBarVisible(),
                       "visibility_changes": visibilityHistory,

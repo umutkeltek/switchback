@@ -438,6 +438,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **The menu bar item is placed where macOS keeps it visible**: the item had
+  no stored place, so macOS put it at the left end of the status items, the
+  first place it hides when a browser's wide menus are in front (frame x=613
+  on a 1920-point menu bar, reported hidden). Before it creates the item the
+  app now writes its place, 280 points from the right end, beside the
+  system's own items (macOS reads it only at creation, which is why writing
+  it while the app ran did nothing). A place the owner chose by
+  Command-dragging the item is kept; an older install whose item sits
+  further left gets the new place once. A test copy measured x=1520,
+  visible, with a browser in front.
+
 - **No connection to a machine the gateway knows is off**: the supervisor
   probed every routed lane's health endpoint every 10 s, and a lane on a
   machine that adopts outside wakes as well, so a powered-off machine kept
