@@ -1160,7 +1160,7 @@ server:
   optimize:
     stickiness: true            # keep a conversation on its machine
     sticky_ttl_secs: 1800       # how long a conversation stays sticky
-    sticky_max_conversations: 10000
+    sticky_max_conversations: 10000   # at the limit, the busiest tenant forgets its oldest
     loaded_aware: true          # prefer the target whose model is loaded
     big_prompt_tokens: 8000     # a prompt this big goes to the fastest prefill
 routes:

@@ -1207,6 +1207,7 @@ impl Engine {
                                         target,
                                         &settings_plan,
                                         conversation.clone(),
+                                        req.tenant.as_deref(),
                                         prompt_key.clone(),
                                     );
                                     let lane_busy = lane_busy.take();
@@ -1482,6 +1483,7 @@ impl Engine {
                                             target,
                                             &settings_plan,
                                             conversation.clone(),
+                                            req.tenant.as_deref(),
                                             prompt_key.clone(),
                                         )
                                         .served(

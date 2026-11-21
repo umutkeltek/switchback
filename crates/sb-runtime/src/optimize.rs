@@ -91,8 +91,9 @@ struct Counters {
 #[derive(Default)]
 struct Inner {
     conversations: HashMap<String, Sticky>,
-    /// Insertion order of `conversations`, oldest first (for the bound).
-    conversation_order: VecDeque<String>,
+    /// Per tenant (`""` for none), the insertion order of its
+    /// `conversations`, oldest first (for the bound).
+    conversation_order: HashMap<String, VecDeque<String>>,
     loaded: HashMap<String, Loaded>,
     targets: HashMap<String, Counters>,
     queue_waits: HashMap<String, u64>,
@@ -133,6 +134,9 @@ pub(crate) struct Served<'a> {
     pub provider_id: &'a str,
     pub engine_model: &'a str,
     pub conversation: Option<&'a str>,
+    /// The request's tenant: each tenant's conversations are bounded
+    /// apart (`None` = no tenant).
+    pub tenant: Option<&'a str>,
     pub prompt_key: Option<&'a str>,
     pub usage: &'a Usage,
     pub prompt_tps: Option<f64>,
@@ -373,31 +377,51 @@ impl OptimizeState {
                 settings_revision: served.settings_revision,
                 at_ms: now,
             };
+            let tenant = served.tenant.unwrap_or("");
             if inner
                 .conversations
                 .insert(conversation.to_string(), sticky)
                 .is_none()
             {
-                inner.conversation_order.push_back(conversation.to_string());
+                inner
+                    .conversation_order
+                    .entry(tenant.to_string())
+                    .or_default()
+                    .push_back(conversation.to_string());
             }
-            // Bound: forget conversations past the TTL at the front (in
-            // insertion order), then the oldest beyond the limit.
+            // Bound: forget this tenant's conversations past the TTL at the
+            // front (in insertion order). Then, over the limit, forget the
+            // oldest of the tenant that holds the most, so a busy tenant
+            // pushes out its own conversations, never another tenant's
+            // smaller share. One tenant alone keeps the whole limit.
             let Inner {
                 conversations,
                 conversation_order,
                 ..
             } = &mut *inner;
-            while let Some(key) = conversation_order.front() {
-                let expired = conversations
-                    .get(key)
-                    .is_none_or(|s| now - s.at_ms > served.sticky_ttl_ms);
-                if !expired && conversation_order.len() <= served.sticky_max.max(1) {
-                    break;
-                }
-                if let Some(key) = conversation_order.pop_front() {
-                    conversations.remove(&key);
+            if let Some(order) = conversation_order.get_mut(tenant) {
+                while let Some(key) = order.front() {
+                    let expired = conversations
+                        .get(key)
+                        .is_none_or(|s| now - s.at_ms > served.sticky_ttl_ms);
+                    if !expired {
+                        break;
+                    }
+                    if let Some(key) = order.pop_front() {
+                        conversations.remove(&key);
+                    }
                 }
             }
+            while conversations.len() > served.sticky_max.max(1) {
+                let Some(order) = conversation_order.values_mut().max_by_key(|o| o.len()) else {
+                    break;
+                };
+                let Some(key) = order.pop_front() else {
+                    break;
+                };
+                conversations.remove(&key);
+            }
+            conversation_order.retain(|_, order| !order.is_empty());
         }
     }
 
@@ -884,6 +908,7 @@ pub(crate) struct Observer {
     provider_id: String,
     engine_model: String,
     conversation: Option<String>,
+    tenant: Option<String>,
     prompt_key: Option<String>,
     guard_applied: bool,
     engine_lane: Option<Option<u32>>,
@@ -899,6 +924,7 @@ impl Observer {
             provider_id: &self.provider_id,
             engine_model: &self.engine_model,
             conversation: self.conversation.as_deref(),
+            tenant: self.tenant.as_deref(),
             prompt_key: self.prompt_key.as_deref(),
             usage,
             prompt_tps,
@@ -1208,6 +1234,7 @@ impl crate::Engine {
         target: &sb_core::ExecutionTarget,
         settings_plan: &crate::model_settings::SettingsPlan,
         conversation: Option<String>,
+        tenant: Option<&str>,
         prompt_key: Option<String>,
     ) -> Observer {
         let optimize = &snap.config.server.optimize;
@@ -1217,6 +1244,7 @@ impl crate::Engine {
             provider_id: target.provider_id.clone(),
             engine_model: settings_plan.engine_model(target),
             conversation: conversation.filter(|_| stickiness_configured(snap)),
+            tenant: tenant.map(str::to_string),
             prompt_key,
             guard_applied: settings_plan
                 .summary_for(&target.id)
@@ -1462,6 +1490,7 @@ mod tests {
             provider_id: provider,
             engine_model: model,
             conversation: None,
+            tenant: None,
             prompt_key: None,
             usage,
             prompt_tps: None,
@@ -1609,6 +1638,48 @@ mod tests {
         assert_eq!(state.is_loaded("box", "a"), Some(true));
         assert_eq!(state.is_loaded("box", "b"), Some(false));
         assert_eq!(state.is_loaded("elsewhere", "a"), None);
+    }
+
+    // The stickiness memory is shared, but a busy tenant pushes out only
+    // its own conversations: at the limit the tenant holding the most loses
+    // its oldest. One tenant alone keeps the whole limit.
+    #[test]
+    fn a_busy_tenant_cannot_push_out_another_tenants_conversations() {
+        let state = OptimizeState::new();
+        let usage = Usage::default();
+        let remember = |tenant: Option<&str>, conversation: &str| {
+            let mut one = served("box/a", "box", "a", &usage);
+            one.conversation = Some(conversation);
+            one.tenant = tenant;
+            state.observe(one);
+        };
+        let quiet: Vec<String> = (0..10).map(|i| format!("b{i}")).collect();
+        for conversation in &quiet {
+            remember(Some("b"), conversation);
+        }
+        for i in 0..200 {
+            remember(Some("a"), &format!("a{i}"));
+        }
+        for conversation in &quiet {
+            assert!(
+                state.sticky(conversation, 60_000).is_some(),
+                "{conversation} was pushed out by another tenant"
+            );
+        }
+        // The limit (100) holds: the busy tenant keeps its newest 90.
+        assert!(state.sticky("a109", 60_000).is_none());
+        assert!(state.sticky("a110", 60_000).is_some());
+        assert!(state.sticky("a199", 60_000).is_some());
+
+        let alone = OptimizeState::new();
+        for i in 0..150 {
+            let mut one = served("box/a", "box", "a", &usage);
+            let conversation = format!("c{i}");
+            one.conversation = Some(&conversation);
+            alone.observe(one);
+        }
+        assert!(alone.sticky("c49", 60_000).is_none());
+        assert!(alone.sticky("c50", 60_000).is_some());
     }
 
     #[test]

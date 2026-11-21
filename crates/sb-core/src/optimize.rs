@@ -38,7 +38,9 @@ pub struct OptimizeConfig {
     pub stickiness: bool,
     /// How long a conversation stays sticky after its last request.
     pub sticky_ttl_secs: u64,
-    /// Most conversations remembered (oldest forgotten first).
+    /// Most conversations remembered. At the limit the tenant holding the
+    /// most forgets its oldest, so a busy tenant never pushes out another
+    /// tenant's conversations.
     pub sticky_max_conversations: usize,
     /// Among targets on one machine that is up, prefer the one whose model
     /// the engine has loaded (a swap costs seconds).
