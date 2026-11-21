@@ -151,6 +151,7 @@ class Fake:
         # Model settings of text/m: the document, its revision and history.
         self.settings_doc, self.settings_revision, self.settings_history = {}, 0, []
         self.settings_conflict = False  # the next write loses to another writer
+        self.settings_fallback = False  # text/m also reaches other/m (a route named like its target)
         self.routes = {
             ("GET", "/health"): lambda r: (200, b"ok", "text/plain"),
             ("GET", "/v1/workloads/capacity"): lambda r: self.json({"object": "list", "data": self.lanes}),
@@ -221,7 +222,10 @@ class Fake:
         return self.json({"target": "text/m", "revision": self.settings_revision + 1})
 
     def settings_get(self, request):
-        return self.json({"model": "text/m", "targets": [self.settings_view()],
+        # With `settings_fallback`, text/m is a public name that also reaches a second target.
+        others = [{"target": "other/m", "revision": 0, "durable": True, "effective": {},
+                   "profiles": {}, "document": {}}] if self.settings_fallback else []
+        return self.json({"model": "text/m", "targets": [self.settings_view()] + others,
                           "revision": self.settings_revision})
 
     def settings_put(self, request):
@@ -1539,6 +1543,14 @@ class SbAi(unittest.TestCase):
         self.assertEqual(puts[-1]["headers"]["If-Match"], "1")
         self.assertNotIn("temperature", puts[-1]["json"]["profiles"]["nothink"])
         self.assertNotIn("temperature", puts[-1]["json"]["locked"])
+
+    def test_set_on_a_name_shared_with_its_first_target_writes_that_target(self):
+        self.fake.settings_fallback = True
+        run = self.sb("set", "text/m", "top_k=20")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        put = self.posted_with("PUT", "/v1/models/text/m/settings")
+        self.assertEqual(put["json"]["defaults"], {"top_k": 20})
+        self.assertEqual(self.requests("PUT", "/v1/models/other/m/settings"), [])
 
     def test_set_load_keys_need_load_and_carry_apply(self):
         run = self.sb("set", "text/m", "ctx_size=65536")

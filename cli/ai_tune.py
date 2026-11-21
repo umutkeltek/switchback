@@ -244,6 +244,10 @@ class Tuner:
         path = f"/v1/models/{urllib.parse.quote(self.args.model, safe='/')}/settings"
         view = self.call("GET", path, doing="reading the settings")
         targets = view.get("targets") or []
+        # A public name can share its id with one of its targets: that exact target is meant.
+        exact = [t for t in targets if t.get("target") == self.args.model]
+        if len(targets) > 1 and len(exact) == 1:
+            targets = exact
         if len(targets) != 1:
             names = ", ".join(t.get("target", "?") for t in targets)
             raise TuneError(USAGE, f"{self.args.model} reaches {len(targets)} targets ({names}); name one")

@@ -1930,6 +1930,11 @@ def settings_view(gw, model, doing):
 
 def one_target(view, model):
     targets = view.get("targets") or []
+    # A public name can share its id with one of its targets (a route `mac/x`
+    # whose first target is `mac/x`): that exact target is the one asked for.
+    exact = [t for t in targets if t.get("target") == model]
+    if len(targets) > 1 and len(exact) == 1:
+        return exact[0]
     if len(targets) != 1:
         names = ", ".join(t.get("target", "?") for t in targets)
         raise Fail(USAGE, f"{model} reaches {len(targets)} targets ({names}); name one")
