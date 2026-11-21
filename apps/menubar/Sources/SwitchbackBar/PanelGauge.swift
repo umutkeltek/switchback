@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UsagePresentation
 
 /// The compact panel shared by the visual looks. The gauge is the default look: one segmented gauge per
@@ -26,6 +27,9 @@ struct DirectionPanelView: View {
                             BestNowCard(best: best, picks: data.modelBest, style: state.style) { toggle(best.id) }
                         } else if let noRoom = data.noRoom {
                             NoRoomCard(notice: noRoom) { if let seat = noRoom.seat { toggle(seat.id) } }
+                        } else if let noFresh = data.noFresh {
+                            // The card keeps its place and size; clicking it refreshes.
+                            NoFreshCard(notice: noFresh, busy: state.busy, action: state.onRefresh)
                         }
                         if state.style == .strip, let claude = data.sections.first(where: { $0.id == "claude" }) {
                             ResetHeatStrip(seats: claude.seats)
@@ -159,9 +163,12 @@ struct DirectionPanelView: View {
                     .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1).truncationMode(.middle)
                     .help(state.failure ?? "")
             } else {
-                Circle().fill(state.busy ? Color.orange : Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
+                // A check that ran is not a reading that arrived: old readings say their age, with an orange dot.
+                let line = Presenter.footer(checked: state.checkedText,
+                                            readingsAgeSeconds: state.presentation.readingsAgeSeconds, busy: state.busy)
+                Circle().fill(state.busy || line.old ? Color.orange : Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
                     .accessibilityHidden(true)
-                Text(Presenter.footerStatus(checked: state.checkedText, busy: state.busy))
+                Text(line.text)
                     .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
             }
             Spacer()
@@ -206,7 +213,7 @@ struct DirectionPanelView: View {
                     ForEach(row.count..<columns, id: \.self) { _ in Color.clear.frame(maxWidth: .infinity, maxHeight: 1) }
                 }
             }
-            if let legend = section.legend { GaugeLegend(model: legend) }
+            if let legend = section.legend { GaugeLegend(model: legend, spoken: section.legendSpoken ?? legend) }
         }
     }
     private func move(from id: String, by step: Int, in seats: [SeatGlyph]) {
@@ -267,7 +274,11 @@ private struct BestNowCard: View {
                 if let pick = picks.first {
                     VStack(alignment: .trailing, spacing: 1) {
                         Text("For " + pick.model).font(.system(size: 10, weight: .semibold)).foregroundStyle(modelTint)
-                        if let back = pick.backText {
+                        if pick.sameAsBest {
+                            // The same seat as on the left: its name is said once, there.
+                            Text(pick.roomText + "%").font(.system(size: 15, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                        } else if let back = pick.backText {
                             // No seat has room for this model: say so, with when the first one is back.
                             Text("No room").font(.system(size: 12, weight: .semibold)).lineLimit(1)
                             Group {
@@ -290,7 +301,9 @@ private struct BestNowCard: View {
                         }
                     }
                     .padding(.trailing, 4)
-                    .frame(minWidth: 76, maxWidth: 116, alignment: .trailing)
+                    // Only a number: as narrow as it is, so the seat's name on the left keeps the room.
+                    .frame(minWidth: pick.sameAsBest ? nil : 76, maxWidth: pick.sameAsBest ? nil : 116, alignment: .trailing)
+                    .fixedSize(horizontal: pick.sameAsBest, vertical: false)
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 1) {
                     Text(best.roomText).font(.system(size: 30, weight: .semibold, design: .rounded)).monospacedDigit()
@@ -360,6 +373,76 @@ private struct NoRoomCard: View {
     }
 }
 
+/// No Claude seat has a fresh reading: a muted card in the place and size of "Use now". Clicking it refreshes.
+private struct NoFreshCard: View {
+    let notice: DirectionPresentation.NoFresh
+    let busy: Bool
+    let action: () -> Void
+    @Environment(\.colorSchemeContrast) private var contrast
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Group {
+                    if busy { ProgressView().controlSize(.small) }
+                    else { Image(systemName: "arrow.clockwise").font(.system(size: 20, weight: .medium)) }
+                }
+                .foregroundStyle(PanelColor.secondaryText).frame(width: 48, height: 48)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Use now").font(.system(size: 10, weight: .medium)).foregroundStyle(PanelColor.secondaryText)
+                    Text(notice.title).font(.system(size: 15, weight: .semibold)).foregroundStyle(PanelColor.secondaryText)
+                        .lineLimit(1)
+                    Text(notice.detail).font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
+                        .monospacedDigit().lineLimit(1)
+                }
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 12).frame(height: GaugeLayout.hero)
+            .background(Color.primary.opacity(contrast == .increased ? 0.10 : 0.05), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(
+                Color.secondary.opacity(contrast == .increased ? 0.9 : 0.35), style: StrokeStyle(lineWidth: 1, dash: [3, 3])))
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(PanelPressStyle()).focusable().disabled(busy)
+        .help(notice.help)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(notice.spoken)
+        .accessibilityHint("Refreshes account usage")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+/// The exact command that signs a seat in again, with a Copy button. The app never runs it.
+private struct SignInCommandRow: View {
+    let command: String
+    @State private var copied = false
+    @Environment(\.displayScale) private var displayScale
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(command).font(.system(size: 10, design: .monospaced)).lineLimit(1).minimumScaleFactor(0.8).truncationMode(.middle)
+                .textSelection(.enabled).help(command)
+                .accessibilityLabel("Sign-in command: " + command)
+            Spacer(minLength: 2)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(command, forType: .string)
+                copied = true
+            } label: {
+                // An icon, so the whole command fits on its line; the tooltip and VoiceOver say "Copy".
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .medium)).foregroundStyle(Color.accentColor)
+                    .frame(width: 18, height: 18).contentShape(Rectangle())
+            }
+            .buttonStyle(PanelPressStyle()).focusable()
+            .help(copied ? "Copied" : "Copy").accessibilityLabel(copied ? "Copied sign-in command" : "Copy sign-in command")
+        }
+        .padding(.horizontal, 7).frame(height: GaugeLayout.commandRow - 4)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5))
+        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(PanelColor.hairline, lineWidth: 1 / displayScale))
+        .padding(.vertical, 2)
+        .onChange(of: command) { _, _ in copied = false }
+    }
+}
+
 struct VerticalFuel: View {
     let seat: SeatGlyph
     var body: some View {
@@ -387,7 +470,8 @@ private struct GaugeSegmentButton: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var contrast
 
-    private var symbol: String { seat.partial ? "circle.lefthalf.filled" : seat.tone.symbol }
+    private var symbol: String { seat.symbol }
+    private var symbolColor: Color { seat.needsSignIn ? .orange : seat.tone.color }
     private var numberIsMuted: Bool { seat.room == nil && ![.out, .balance].contains(seat.tone) }
     private var chipLine: String {
         switch seat.tone {
@@ -415,7 +499,7 @@ private struct GaugeSegmentButton: View {
                 }
                 VStack(spacing: 1) {
                     HStack(spacing: 2) {
-                        Image(systemName: symbol).font(.system(size: 8, weight: .bold)).foregroundStyle(seat.tone.color)
+                        Image(systemName: symbol).font(.system(size: 8, weight: .bold)).foregroundStyle(symbolColor)
                         Text(seat.name).font(.system(size: 10, weight: seat.best ? .semibold : .medium)).lineLimit(1)
                     }
                     .frame(height: 13)
@@ -426,8 +510,8 @@ private struct GaugeSegmentButton: View {
                         .foregroundStyle(numberIsMuted ? PanelColor.secondaryText : Color.primary)
                         .frame(height: 18)
                     Text(chipLine).lineLimit(1).fixedSize()
-                    .font(.system(size: 9)).monospacedDigit()
-                    .foregroundStyle(seat.tone == .out ? Color.red : PanelColor.secondaryText)
+                    .font(.system(size: 9, weight: seat.needsSignIn ? .semibold : .regular)).monospacedDigit()
+                    .foregroundStyle(seat.tone == .out ? Color.red : seat.needsSignIn ? Color.orange : PanelColor.secondaryText)
                     .frame(height: 12)
                 }
                 .padding(.top, 4)
@@ -520,6 +604,7 @@ private struct ModelBar: View {
 /// One line under a gauge whose seats have a model limit: what the thin bar means, for example "Room for Fable".
 private struct GaugeLegend: View {
     let model: String
+    let spoken: String
     var body: some View {
         HStack(spacing: 5) {
             Capsule().fill(modelTint).frame(width: 10, height: 3)
@@ -528,7 +613,7 @@ private struct GaugeLegend: View {
         .font(.system(size: 9)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
         .frame(height: GaugeLayout.legend, alignment: .bottomLeading)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("The thin bar under each seat shows its " + model.lowercased() + ": the smaller of that model's own limit and the seat's room.")
+        .accessibilityLabel(spoken)
     }
 }
 
@@ -573,8 +658,12 @@ struct SeatDetailCard: View {
                 HStack(spacing: 5) {
                     Text(line.title).font(.system(size: 11)).foregroundStyle(PanelColor.secondaryText).lineLimit(1)
                         .frame(width: 86, alignment: .leading).help(line.title)
-                    MiniMeter(fraction: line.fraction, tint: line.modelLimit ? modelTint : nil).frame(width: 36)
+                    // A value too old to count has no meter and is muted, like its tile; "(too old)" takes the room.
+                    if !line.tooOld {
+                        MiniMeter(fraction: line.fraction, tint: line.modelLimit ? modelTint : nil).frame(width: 36)
+                    }
                     Text(line.value).font(.system(size: 11, weight: .semibold)).monospacedDigit().fixedSize()
+                        .foregroundStyle(line.tooOld ? PanelColor.secondaryText : Color.primary)
                     Spacer(minLength: 2)
                     Text(line.reset).font(.system(size: 10)).monospacedDigit().foregroundStyle(PanelColor.secondaryText).fixedSize()
                     Text(line.age).font(.system(size: 10)).monospacedDigit().foregroundStyle(.tertiary).fixedSize()
@@ -589,6 +678,7 @@ struct SeatDetailCard: View {
                 Label(issue, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 10)).foregroundStyle(Color.orange).lineLimit(1).frame(height: 18).help(issue)
             }
+            if let command = detail.signInCommand { SignInCommandRow(command: command) }
             if let spend = detail.spend {
                 GlanceCostLine(cost: spend).frame(height: 18)
                     .accessibilityElement(children: .ignore).accessibilityLabel(spend.spoken)

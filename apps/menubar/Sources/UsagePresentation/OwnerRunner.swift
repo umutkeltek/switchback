@@ -116,4 +116,19 @@ public enum OwnerRunner {
         }
         return true
     }
+    /// Runs `steps` in order unless a refresh is running, and calls `afterEach` as each step ends, so what a
+    /// step read is drawn at once: at launch the fast saved read shows before the slow scheduled refresh ends.
+    /// `done` runs when every step has ended or the refresh was cancelled.
+    @discardableResult
+    public func start<Step: Sendable>(_ steps: [Step], run: @escaping @MainActor (Step) async -> Void,
+                                      afterEach: @escaping @MainActor () -> Void,
+                                      done: @escaping @MainActor () -> Void = {}) -> Bool {
+        start({
+            for step in steps {
+                guard !Task.isCancelled else { break }
+                await run(step)
+                afterEach()
+            }
+        }, done: done)
+    }
 }

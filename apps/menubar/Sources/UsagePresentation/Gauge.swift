@@ -50,19 +50,31 @@ public enum GaugeLayout {
         return sectionTitle + count * rowHeight(modelBar: section.hasModelBar) + (count - 1) * rowGap
             + (section.legend == nil ? 0 : legend)
     }
+    /// The sign-in command row in a seat's details.
+    public static let commandRow = 26.0
     /// Height of the open detail card for one seat.
     public static func detailHeight(_ detail: SeatDetail) -> Double {
-        // Vertical padding 12, title 20, a line per limit, balance and issue, spend 18, pin row 28.
+        // Vertical padding 12, title 20, a line per limit, balance and issue, command 26, spend 18, pin row 28.
         var height = 12 + 20 + Double(detail.lines.count) * 22 + Double(detail.balances.count) * 20
         height += Double(detail.issues.count) * 18
+        if detail.signInCommand != nil { height += commandRow }
         if detail.spend != nil { height += 18 }
         return height + 28
+    }
+    /// The shortest panel: the header, one section of one row and the footer. A panel with little content
+    /// fits its content down to this, so no large empty space sits above the footer.
+    public static var minimumPanel: Double {
+        header + padding * 2 + sectionTitle + rowHeight(modelBar: false) + footer
+    }
+    /// A panel's height: its content, at least `minimumPanel`, at most `maximum` (the caller's cap).
+    public static func fitted(_ height: Double, maximum: Double) -> Double {
+        min(maximum, max(minimumPanel, height))
     }
     /// The whole panel: header, optional search bar, hero, sections, an open detail, footer.
     /// The caller caps it (600 points) and scrolls the rest.
     public static func height(_ data: DirectionPresentation, searching: Bool, detail: SeatDetail?, showBest: Bool) -> Double {
         var content = padding * 2
-        if showBest && (data.best != nil || data.noRoom != nil) { content += hero + sectionGap }
+        if showBest && (data.best != nil || data.noRoom != nil || data.noFresh != nil) { content += hero + sectionGap }
         for (index, section) in data.sections.enumerated() {
             if index > 0 { content += sectionGap }
             content += sectionHeight(section)
@@ -88,6 +100,8 @@ public struct SeatDetailLine: Codable, Sendable, Identifiable {
     public let age: String
     public let modelLimit: Bool
     public let spoken: String
+    /// The value is the last reading, too old to count: drawn muted, with no meter.
+    public var tooOld = false
 }
 
 /// Everything a seat's details show in place.
@@ -102,6 +116,9 @@ public struct SeatDetail: Codable, Sendable {
     public let issues: [String]
     public let spend: CostGlance?
     public let pinned: Bool
+    /// The command that signs this seat in again, for example `sb account login --provider claude --slot seat2`.
+    /// Shown with a Copy button; the app never runs it.
+    public var signInCommand: String? = nil
 }
 
 extension Presenter {
@@ -113,6 +130,8 @@ extension Presenter {
         let rest = (account.primary + account.extras).filter { !firstIDs.contains($0.id) }
         let models = rest.filter { $0.generation && $0.qualifier != nil }
         let others = rest.filter { !($0.generation && $0.qualifier != nil) }
+        // A muted old tile shows its last number; its rows say the same, marked too old.
+        let lastShown = ["Older reading", "Refresh unavailable"].contains(account.notice)
         let lines = (first + models + others).map { row -> SeatDetailLine in
             let name: String
             switch row.lane {
@@ -121,15 +140,20 @@ extension Presenter {
             case .other: name = row.title
             }
             let title = row.qualifier.map { String($0.prefix(1)).uppercased() + $0.dropFirst() + " · " + name } ?? name
-            let value = row.state == .unavailable ? "unknown" : row.valueText + " left"
+            let last = lastShown && row.state == .unavailable ? row.lastFraction : nil
+            let value = last.map { String(format: "%.0f%% left", $0 * 100) }
+                ?? (row.state == .unavailable ? "unknown" : row.valueText + " left")
             let reset: String
             if let resetIn = row.resetIn { reset = "↻ " + resetIn }
             else if row.resetText.hasPrefix("Reset passed") { reset = "reset passed" }
             else { reset = "reset unknown" }
-            let age = row.sampleText.hasPrefix("Sampled ") ? String(row.sampleText.dropFirst("Sampled ".count)) : row.sampleText
-            return SeatDetailLine(id: row.id, title: title, value: value, fraction: row.remainingFraction, reset: reset,
-                                  age: age, modelLimit: row.generation && row.qualifier != nil && ledger.note == nil,
-                                  spoken: row.accessibilityText)
+            var age = row.sampleText.hasPrefix("Sampled ") ? String(row.sampleText.dropFirst("Sampled ".count)) : row.sampleText
+            if last != nil { age += " (too old)" }
+            var line = SeatDetailLine(id: row.id, title: title, value: value, fraction: row.remainingFraction, reset: reset,
+                                      age: age, modelLimit: row.generation && row.qualifier != nil && ledger.note == nil,
+                                      spoken: row.accessibilityText)
+            line.tooOld = last != nil
+            return line
         }
         var issues: [String] = []
         if let notice = account.notice {
@@ -151,9 +175,25 @@ extension Presenter {
         }
         let identity = (["Account " + account.slot] + [account.email].compactMap { $0 }.filter { !$0.isEmpty })
             .joined(separator: " · ")
-        return SeatDetail(key: account.key, title: account.label, identity: identity, lines: lines,
-                          balances: account.balances.map { $0.title + ": " + $0.valueText },
-                          issues: issues, spend: account.glance.cost, pinned: account.pinned)
+        var detail = SeatDetail(key: account.key, title: account.label, identity: identity, lines: lines,
+                                balances: account.balances.map { $0.title + ": " + $0.valueText },
+                                issues: issues, spend: account.glance.cost, pinned: account.pinned)
+        if ["Sign in needed", "Account changed"].contains(account.notice) {
+            detail.signInCommand = signInCommand(provider: account.provider, slot: account.slot)
+        }
+        return detail
+    }
+    /// Providers whose seats Switchback signs in with `sb account login`.
+    static let signInProviders: Set<String> = ["claude", "codex"]
+    /// `sb account login --provider claude --slot seat2`, with the account's own provider and slot. A slot with
+    /// characters a shell would read is single-quoted. nil for a provider `sb account login` does not handle.
+    public static func signInCommand(provider: String, slot: String) -> String? {
+        guard signInProviders.contains(provider), !slot.isEmpty else { return nil }
+        let plain = slot.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0) && $0.isASCII || "._-@".unicodeScalars.contains($0)
+        }
+        let quoted = plain ? slot : "'" + slot.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return "sb account login --provider " + provider + " --slot " + quoted
     }
 }
 

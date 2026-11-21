@@ -315,13 +315,11 @@ import UsagePresentation
     }
     /// Starts one refresh unless one is already running. `task` is always the running refresh, so quitting
     /// cancels and waits for it; a timer tick or panel opening during a refresh starts nothing.
+    /// Each request is drawn as it ends: at launch the saved reading shows at once, not after the slow refresh.
     private func startRefresh(_ requests: [RefreshRequest]) {
-        let started = refreshSlot.start({ [weak self] in
-            for request in requests {
-                guard !Task.isCancelled, let self else { break }
-                await self.refresh(request)
-            }
-        }, done: { [weak self] in self?.rebuild() })
+        let started = refreshSlot.start(requests, run: { [weak self] request in await self?.refresh(request) },
+                                        afterEach: { [weak self] in self?.rebuild() },
+                                        done: { [weak self] in self?.rebuild() })
         if started { rebuild() }
     }
     private func refresh(_ request: RefreshRequest) async {

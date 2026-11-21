@@ -10,7 +10,7 @@ enum DirectionLayout {
     static let ringTile = 118.0, ringGap = 8.0, stripHeat = 64.0, stripRow = 30.0
 
     static func height(_ data: DirectionPresentation, style: PanelStyle) -> Double {
-        var content = padding * 2 + (data.best == nil && data.noRoom == nil ? 0 : hero + sectionGap)
+        var content = padding * 2 + (data.best == nil && data.noRoom == nil && data.noFresh == nil ? 0 : hero + sectionGap)
         if style == .strip && data.sections.contains(where: { $0.id == "claude" }) { content += stripHeat + sectionGap }
         for (index, section) in data.sections.enumerated() {
             if index > 0 { content += sectionGap }
@@ -103,7 +103,7 @@ private struct RingTile: View {
             }
             .frame(height: 58)
             HStack(spacing: 3) {
-                Image(systemName: seat.tone.symbol).font(.system(size: 9, weight: .semibold)).foregroundStyle(seat.tone.color)
+                Image(systemName: seat.symbol).font(.system(size: 9, weight: .semibold)).foregroundStyle(seat.needsSignIn ? Color.orange : seat.tone.color)
                 Text(seat.name).font(.system(size: 11, weight: .semibold)).lineLimit(1)
             }
             Text(seat.tone == .balance ? (seat.chip ?? "—") : seat.chip ?? " ")
@@ -187,7 +187,7 @@ struct GlanceStrip: View {
         VStack(spacing: 0) {
             ForEach(seats) { seat in
                 HStack(spacing: 8) {
-                    Image(systemName: seat.tone.symbol).font(.system(size: 12)).foregroundStyle(seat.tone.color).frame(width: 16)
+                    Image(systemName: seat.symbol).font(.system(size: 12)).foregroundStyle(seat.needsSignIn ? Color.orange : seat.tone.color).frame(width: 16)
                     Text(seat.name).font(.system(size: 12, weight: seat.best ? .semibold : .medium)).lineLimit(1)
                         .foregroundStyle(seat.best ? Color.accentColor : Color.primary)
                         .frame(width: 74, alignment: .leading)

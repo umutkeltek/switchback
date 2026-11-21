@@ -65,12 +65,13 @@ enum PanelMotion {
     var preferredHeight: Double {
         let groups = visibleProviders
         if style == .gauge {
-            let height = GaugeLayout.height(directionData, searching: searchOpen, detail: openDetail, showBest: true)
-            return min(maximumHeight, max(PanelMetrics.minimumHeight, height))
+            // A panel with little content fits it, down to the header, one section and the footer.
+            return GaugeLayout.fitted(GaugeLayout.height(directionData, searching: searchOpen, detail: openDetail, showBest: true),
+                                      maximum: maximumHeight)
         }
         if style.isDirection {
             let height = DirectionLayout.height(directionData, style: style) + (searchOpen ? GaugeLayout.searchBar : 0)
-            return min(maximumHeight, max(PanelMetrics.minimumHeight, height))
+            return GaugeLayout.fitted(height, maximum: maximumHeight)
         }
         if style == .ledger {
             return fitted(LedgerList.contentHeight(groups, expanded: expandedAccounts))
@@ -296,8 +297,12 @@ struct UsagePanelView: View {
     private var footer: some View {
         HStack {
             HStack(spacing: 5) {
-                Circle().fill(state.busy ? Color.orange : Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
-                Text(Presenter.footerStatus(checked: state.checkedText, busy: state.busy))
+                // Old readings say their age, with an orange dot, instead of "Checked just now".
+                let line = Presenter.footer(checked: state.checkedText,
+                                            readingsAgeSeconds: state.presentation.readingsAgeSeconds, busy: state.busy)
+                Circle().fill(state.busy || line.old ? Color.orange : Color.secondary.opacity(0.45)).frame(width: 5, height: 5)
+                    .accessibilityHidden(true)
+                Text(line.text)
                     .font(.system(size: 10)).foregroundStyle(PanelColor.secondaryText)
             }
             Spacer()

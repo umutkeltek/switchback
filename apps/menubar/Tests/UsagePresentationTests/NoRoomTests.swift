@@ -14,7 +14,7 @@ import Testing
     #expect(directions.best == nil)
     let card = try #require(directions.noRoom)
     #expect(card.title == "No seat has room")
-    #expect(card.detail == "Seat 2 back in 3h 0m")
+    #expect(card.detail == "Seat 2 is first back")
     #expect(card.backIn == "3h 0m")
     #expect(card.seat?.id == "claude:seat2")
     #expect(card.spoken == "No seat has room. Seat 2 is back in 3 hours")

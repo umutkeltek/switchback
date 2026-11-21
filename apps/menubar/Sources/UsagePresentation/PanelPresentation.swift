@@ -72,6 +72,8 @@ public struct AccountPanel: Codable, Sendable {
     public var directCheckFailed = false
     /// Seconds since the account's reading; nil when the sample time is unknown.
     public var ageSeconds: Double? = nil
+    /// The provider row this account belongs to, for example "claude".
+    public var provider: String = ""
 }
 public struct ProviderPanel: Codable, Sendable {
     public let key: String
@@ -106,6 +108,17 @@ extension Presenter {
     public static func footerStatus(checked: String?, busy: Bool) -> String {
         guard let checked else { return busy ? "Refreshing…" : "Waiting for a reading" }
         return busy ? checked + " · refreshing" : checked
+    }
+    /// Age past which the footer says the readings are old: the 15-minute trust window of `UsageTime.fresh`.
+    public static let readingsOldAfter: TimeInterval = 900
+    /// The footer when no refresh failed. A check that ran is not a reading that arrived: once the newest
+    /// reading is past the trust window it says "Readings 25m old" (with "· refreshing" while busy) and
+    /// `old` asks for the orange dot, instead of "Checked just now".
+    public static func footer(checked: String?, readingsAgeSeconds: Double?, busy: Bool) -> (text: String, old: Bool) {
+        if let age = readingsAgeSeconds, age > readingsOldAfter {
+            return ("Readings " + duration(age) + " old" + (busy ? " · refreshing" : ""), true)
+        }
+        return (footerStatus(checked: checked, busy: busy), false)
     }
     /// The footer after a failed refresh. The numbers above stay: each window is judged by its own sample time.
     /// "Couldn’t update · showing readings from 3m ago".
@@ -270,6 +283,7 @@ extension Presenter {
                     glance: accountGlance)
                 panel.directCheckFailed = account.refreshError != nil && trusted
                 panel.ageSeconds = UsageTime.parse(account.observedAt).map { now.timeIntervalSince($0) }
+                panel.provider = group.provider
                 return panel
             }
             let message = accounts.isEmpty ? group.unavailable ?? "No usage reported yet" : nil
@@ -280,9 +294,16 @@ extension Presenter {
         }
         var result = PanelPresentation(status: menu.status, accountCount: providers.reduce(0) { $0 + $1.accounts.count },
                                        pinnedCount: providers.flatMap(\.accounts).filter(\.pinned).count, providers: providers)
-        result.readingsAgeSeconds = snapshot.accounts.compactMap { UsageTime.parse($0.observedAt) }.max()
-            .map { max(0, now.timeIntervalSince($0)) }
+        result.readingsAgeSeconds = readingsAge(snapshot, now: now)
         return result
+    }
+    /// Seconds since the newest Claude reading, or since the newest reading of any provider when the snapshot
+    /// has no Claude row. `sb` can exit cleanly while every collector failed, so the footer judges the readings
+    /// themselves, not whether the last command succeeded.
+    static func readingsAge(_ snapshot: UsageSnapshot, now: Date) -> Double? {
+        let claude = snapshot.accounts.filter { canonical($0.provider) == "claude" }
+        let rows = claude.isEmpty ? snapshot.accounts : claude
+        return rows.compactMap { UsageTime.parse($0.observedAt) }.max().map { max(0, now.timeIntervalSince($0)) }
     }
     /// The notice of an account whose signed-in identity is unknown.
     public static let noReadingNotice = "No reading"

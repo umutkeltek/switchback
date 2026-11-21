@@ -73,6 +73,15 @@ public struct SeatGlyph: Codable, Sendable, Identifiable {
     /// Why a partial seat is partial, for example "weekly only" when it has no 5-hour reading.
     public var partialNote: String? = nil
 
+    /// The owner can fix this seat: it needs sign-in, or another account is signed in.
+    public var needsSignIn: Bool { tone == .unknown && (chip == "sign in" || chip == "account changed") }
+    /// The symbol beside the name. A seat that needs sign-in has its own, not the "?" of a seat with no reading.
+    public var symbol: String {
+        if needsSignIn { return Self.signInSymbol }
+        return partial ? "circle.lefthalf.filled" : tone.symbol
+    }
+    public static let signInSymbol = "person.crop.circle.badge.exclamationmark"
+
     public var roomText: String {
         switch tone {
         case .balance: chip ?? "—"
@@ -87,15 +96,23 @@ public struct DirectionSection: Codable, Sendable, Identifiable {
     public let id: String
     public let title: String
     public let seats: [SeatGlyph]
-    /// The one-line legend for the thin model bar, for example "Fable limit". nil when no seat has a model limit.
+    /// The one-line legend for the thin model bar, for example "Room for Fable". nil when no seat has a model
+    /// limit, or when no seat's thin bar has any fill: empty tracks under every seat say nothing.
     public let legend: String?
+    /// The legend for VoiceOver, for example "Room for Fable: the thin bar under each seat, …".
+    public let legendSpoken: String?
     public init(id: String, title: String, seats: [SeatGlyph]) {
         self.id = id; self.title = title; self.seats = seats
         var models: [String] = []
         for seat in seats where seat.modelLeft != nil {
             if let model = seat.modelName, !model.isEmpty, !models.contains(model) { models.append(model) }
         }
-        legend = models.isEmpty ? nil : "Room for " + models.joined(separator: " · ")
+        let filled = seats.contains { ($0.modelLeft ?? 0) > 0 }
+        let legend = models.isEmpty || !filled ? nil : "Room for " + models.joined(separator: " · ")
+        self.legend = legend
+        legendSpoken = legend.map {
+            $0 + ": the thin bar under each seat, the smaller of the model's own limit and the seat's room."
+        }
     }
     /// True when at least one seat draws the thin model bar.
     public var hasModelBar: Bool { legend != nil }
@@ -128,6 +145,8 @@ public struct DirectionPresentation: Codable, Sendable {
         /// The seat back first and how soon, for example "Seat 2" and "1d 5h"; nil when unknown.
         public var backSeat: String? = nil
         public var backIn: String? = nil
+        /// The model's best seat is the seat to use now: the card names it once, on the left.
+        public var sameAsBest = false
         public var id: String { model }
     }
     /// "No seat has room", with the seat that is back first, for example "Seat 3 back in 8h 29m".
@@ -139,6 +158,16 @@ public struct DirectionPresentation: Codable, Sendable {
         /// For example "8h 29m".
         public let backIn: String?
         /// The full sentence for the tooltip.
+        public let help: String
+        public let spoken: String
+    }
+    /// Set when there is a Claude section but no seat to use now and no "No seat has room": no Claude seat has
+    /// a fresh reading. The card keeps its place and size and offers a refresh.
+    public var noFresh: NoFresh? = nil
+    /// "No fresh reading", "Newest 25m old · click to refresh".
+    public struct NoFresh: Codable, Sendable {
+        public let title: String
+        public let detail: String
         public let help: String
         public let spoken: String
     }
@@ -223,6 +252,7 @@ extension Presenter {
         var others: [SeatGlyph] = []
         var bestSeat: SeatGlyph?
         var noRoom: DirectionPresentation.NoRoom?
+        var noFresh: DirectionPresentation.NoFresh?
         var picks: [DirectionPresentation.ModelPick] = []
         var quiet: [(id: String, name: String, title: String, reason: String)] = []
         for provider in panel.providers {
@@ -244,14 +274,30 @@ extension Presenter {
                 let back = seats.first { $0.id == advice.backKey }
                 let backIn = advice.backInSeconds.map(duration)
                 let name = back?.name ?? advice.backSlot
-                let detail = name.flatMap { name in backIn.map { name + " back in " + $0 } } ?? "Return time unknown"
+                // The big "Back in 6h 59m" on the right carries the time; the subtitle names the seat once.
+                let detail = name.flatMap { name in backIn.map { _ in name + " is first back" } } ?? "Return time unknown"
                 noRoom = .init(title: "No seat has room", detail: detail, seat: back, backIn: backIn, help: advice.detail,
                                spoken: "No seat has room. " + (name.flatMap { name in
                                    advice.backInSeconds.map { name + " is back in " + spokenDuration($0) } } ?? "Return time unknown"))
             }
+            if provider.key == "claude", !provider.accounts.isEmpty, bestKey == nil,
+               provider.advice?.noSeatHasRoom != true, noFresh == nil {
+                // No seat to use now and no "No seat has room": say so in the card's place, and offer a refresh.
+                // Old readings say how old the newest is. Recent ones that still do not count (sign-in needed, an
+                // error, marked stale) point at the seats, which say why.
+                let newest = provider.accounts.compactMap(\.ageSeconds).min().map { max(0, $0) }
+                let old = newest.map { $0 > readingsOldAfter } ?? false
+                let detail = newest == nil ? "No reading yet" : old ? "Newest " + duration(newest ?? 0) + " old" : "See the seats below"
+                let said = newest == nil ? "No reading yet." : old ? "Newest reading " + spokenDuration(newest ?? 0) + " old."
+                    : "See the seats below."
+                noFresh = .init(title: "No fresh reading", detail: detail + " · click to refresh",
+                                help: "No Claude seat has a fresh reading. Click to refresh.",
+                                spoken: "No fresh Claude reading. " + said)
+            }
             for model in provider.advice?.models ?? [] {
                 var pick = DirectionPresentation.ModelPick(model: model.model, seat: seats.first { $0.id == model.key },
                                                            roomText: model.roomPercent.map { String(format: "%.0f", $0) } ?? "—")
+                pick.sameAsBest = bestKey != nil && model.key == bestKey
                 if model.noSeatHasRoom {
                     let name = seats.first { $0.id == model.backKey }?.name ?? model.backSlot
                     pick.backText = model.backInSeconds.map { (name.map { $0 + " " } ?? "") + "back in " + duration($0) } ?? "no room"
@@ -283,6 +329,7 @@ extension Presenter {
             sections.append(DirectionSection(id: "other", title: title, seats: others))
         }
         var result = DirectionPresentation(best: bestSeat, modelBest: picks, sections: sections, noRoom: noRoom)
+        result.noFresh = noFresh
         if !quiet.isEmpty {
             let names = quiet.map(\.name).joined(separator: ", ")
             result.noReading = .init(ids: quiet.map(\.id), text: "No reading: " + names,
@@ -449,7 +496,9 @@ extension Presenter {
                               balanceEmpty: balanceEmpty, best: best, spoken: spoken, detail: lines.joined(separator: "\n"))
         glyph.lastRoom = lastRoom
         glyph.partialNote = partialNote
-        glyph.clock = balance == nil && (account.ageSeconds ?? 0) >= clockAfter && (room != nil || lastRoom != nil)
+        // One clock mark only: a muted old tile already has the clock beside its name.
+        glyph.clock = balance == nil && tone != .stale && (account.ageSeconds ?? 0) >= clockAfter
+            && (room != nil || lastRoom != nil)
         return glyph
     }
 

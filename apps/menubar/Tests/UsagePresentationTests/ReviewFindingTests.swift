@@ -124,7 +124,9 @@ import Testing
     let seats = Presenter.directions(Presenter.panel(data, now: instant)).seats
     // A 9-minute-old reading, refreshed normally every few minutes, carries no clock mark.
     #expect(seats.first { $0.id == "claude:seat1" }?.clock == false)
-    #expect(seats.first { $0.id == "claude:seat2" }?.clock == true)
+    // A 21-minute-old reading is a muted old tile: its one clock is the symbol beside its name.
+    #expect(seats.first { $0.id == "claude:seat2" }?.clock == false)
+    #expect(seats.first { $0.id == "claude:seat2" }?.symbol == SeatTone.stale.symbol)
 }
 
 @Test func plansWithNoReadingAreOneQuietLine() throws {
