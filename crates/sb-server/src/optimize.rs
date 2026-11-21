@@ -993,8 +993,7 @@ pub(crate) async fn lock_extend(
         // began, so it stops at its next safe point.
         Some(lock) => {
             let mut view = json!(lock);
-            view["quiet_window"] =
-                json!(sb_runtime::optimize::quiet_window_now(optimize, now));
+            view["quiet_window"] = json!(sb_runtime::optimize::quiet_window_now(optimize, now));
             Json(view).into_response()
         }
         None => refuse(
