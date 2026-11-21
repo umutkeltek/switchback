@@ -8,17 +8,18 @@ live gateway: measure a baseline, read the ceiling, change one load setting
 at a time from the current best, and judge each change with
 control / candidate / control runs. A change is kept only when it beats both
 neighbouring controls on its own metric and no other measured metric is
-more than 3% worse than the mean of the two controls; a win of more than
-20%, or a run whose two controls differ by more than 3% on such a metric
-(noisy), is repeated once first and must win again (by more than the noise,
-for a surprising win).
+more than 3% worse than the mean of the two controls (than the worse
+control, when the two differ by more than 3% on that metric); a win of more
+than 20%, or a run whose two controls differ by more than 3% on the judged
+metric (noisy), is repeated once first and must win again (by more than the
+noise, for a surprising win).
 Changes that claim to be lossless must give the same greedy answer; changes
 to the KV cache or context must find needles at about half and all of the
 context; a change to the slot count must survive a concurrent soak at full
 per-slot context. The run stops after three levers in a row inside the
 noise, at the end of its budget, when a quiet window begins, when its tuning
-lock is gone (the gateway restarted), or on Ctrl-C, and always leaves the
-best known settings applied.
+lock is gone (the gateway restarted), or on Ctrl-C, SIGTERM or SIGHUP, and
+always leaves the best known settings applied.
 
 Safety: the run never starts on a sleeping machine without --wake, on a lane
 with requests in flight, inside a quiet window, or when it would change a
@@ -38,9 +39,11 @@ Standard library only. The gateway client (key handling, errors) is
 import hashlib
 import json
 import random
+import signal
 import statistics
 import string
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -738,36 +741,43 @@ class Tuner:
 
     def verdict(self, metric, c1, cand, c2):
         """(accepted, gain, reason, noisy) by the skill's rules. Every other
-        metric is held to the mean of the two controls; `noisy` when the two
-        controls differ by more than 3% on one of those metrics, so the run
-        says too little and is repeated (the repeat rule)."""
+        metric is held to the mean of the two controls, or to the worse
+        control when the two differ by more than 3% on it. `noisy` when the
+        two controls differ by more than 3% on the judged metric, so the
+        run says too little and is repeated (the repeat rule)."""
         higher = HIGHER_IS_BETTER[metric]
         a, b, x = c1[metric], c2[metric], cand[metric]
         base = (a + b) / 2
         gain = (x / base - 1) if higher else (base / x - 1 if x > 0 else 0)
+        noisy = base > 0 and abs(a - b) / base > REGRESSION
         beats = x > max(a, b) if higher else x < min(a, b)
         if not beats:
             return False, gain, (f"{metric} {x:.1f} did not beat both controls ({a:.1f}, {b:.1f})"), False
-        noisy = []
         for other in ("decode", "ttft_ms", "prefill", "aggregate"):
             if other == metric or other not in cand or other not in c1 or other not in c2:
                 continue
             mean = (c1[other] + c2[other]) / 2
             if mean <= 0:
                 continue
+            reference, against = mean, "the controls' mean"
             if abs(c1[other] - c2[other]) / mean > REGRESSION:
-                noisy.append(other)
+                # The controls disagree on a side metric: hold it to the
+                # worse control, not the run's verdict to a repeat.
+                pick = min if HIGHER_IS_BETTER[other] else max
+                reference, against = pick(c1[other], c2[other]), "the worse control"
+            if reference <= 0:
+                continue
             if HIGHER_IS_BETTER[other]:
-                worse = (mean - cand[other]) / mean
+                worse = (reference - cand[other]) / reference
             else:
-                worse = (cand[other] - mean) / mean
+                worse = (cand[other] - reference) / reference
             if worse > REGRESSION:
                 return False, gain, (f"{metric} gained {gain * 100:.0f}% but {other} got "
-                                     f"{worse * 100:.0f}% worse than the controls' mean "
-                                     "(more than 3%)"), bool(noisy)
+                                     f"{worse * 100:.0f}% worse than {against} "
+                                     "(more than 3%)"), noisy
         if noisy:
             return True, gain, (f"{metric} {gain * 100:+.0f}% over both controls, but the controls "
-                                f"differ by more than 3% on {', '.join(noisy)}"), True
+                                f"differ by more than 3% on {metric}"), True
         return True, gain, f"{metric} {gain * 100:+.0f}% over both controls", False
 
     def control(self):
@@ -1147,10 +1157,36 @@ class Tuner:
         self.log("not verified: " + "; ".join(result["not_verified"]))
         self.log(f"undo with: {result['undo']}")
 
+    def _stop_signal(self, signum, _frame):
+        """SIGTERM and SIGHUP stop the run like Ctrl-C: requests in flight
+        finish, the best settings go back, the lock and hold are let go."""
+        self.signal_name = signal.Signals(signum).name
+        raise KeyboardInterrupt()
+
+    def trap_stop_signals(self):
+        """Route SIGTERM and SIGHUP into the Ctrl-C path. Answers the
+        handlers to put back."""
+        saved = {}
+        if threading.current_thread() is not threading.main_thread():
+            return saved
+        for name in ("SIGTERM", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is not None:
+                saved[signum] = signal.signal(signum, self._stop_signal)
+        return saved
+
     def run(self):
         self.preflight()
         if self.args.dry_run:
             return self.dry_run()
+        saved = self.trap_stop_signals()
+        try:
+            return self.run_trapped()
+        finally:
+            for signum, handler in saved.items():
+                signal.signal(signum, handler)
+
+    def run_trapped(self):
         code = OK
         stop = None
         try:
@@ -1161,7 +1197,8 @@ class Tuner:
             stop, final, code = halt.reason, self.baseline, halt.code
             self.log(f"sb ai tune {self.target}: {halt.reason}")
         except (Interrupted, KeyboardInterrupt):
-            stop, final, code = "interrupted (Ctrl-C)", self.baseline, INTERRUPTED
+            how = getattr(self, "signal_name", None) or "Ctrl-C"
+            stop, final, code = f"interrupted ({how})", self.baseline, INTERRUPTED
         finally:
             # Always: the best known settings applied, the lock and hold let go.
             try:

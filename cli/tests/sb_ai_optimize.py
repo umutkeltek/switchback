@@ -36,6 +36,7 @@ class Engine:
     def __init__(self, seed=11):
         self.rng = random.Random(seed)
         self.rng_lock = threading.Lock()
+        self.spread = 0.05  # decode and prefill jitter; a test may narrow it
         self.base_decode = 800.0      # tok/s; a 64-token answer takes ~80 ms
         self.base_ttft_ms = 200.0     # long enough that scheduling noise stays under 1%
         self.base_prefill = 60000.0   # tok/s
@@ -60,10 +61,11 @@ class Engine:
                 out *= effect.get(metric, 1.0)
         return out
 
-    def jitter(self, spread=0.05):
+    def jitter(self, spread=None):
         """Seeded run-to-run noise: 5% on the tuned metrics (decode, prefill),
         1% on time to first token, so the 3% rule on a metric a lever does
         not touch is tested by its own case, not by chance."""
+        spread = self.spread if spread is None else spread
         with self.rng_lock:
             return 1.0 + self.rng.uniform(-spread, spread)
 
@@ -487,6 +489,9 @@ class TuneTests(Base):
         self.assertIn("greedy output changed", self.verdicts()[-1]["reason"])
 
     def test_more_slots_need_a_concurrent_soak(self):
+        # The soak is under test here, not the noise rule: 1% jitter keeps
+        # the controls' side metrics in step.
+        self.fake.engine.spread = 0.01
         self.fake.doc = {"load": {"ctx_size": 4096}}
         run = self.tune("--levers", "parallel", "--concurrency", "1,2")
         self.assertEqual(run.returncode, 0, run.stderr)
@@ -722,6 +727,29 @@ class TuneTests(Base):
                         "a request was cut off mid-answer")
         self.assert_released()
 
+    def test_sigterm_restores_the_best_settings_and_lets_go(self):
+        self.fake.doc = {"load": {"ctx_size": 4096}}
+        self.effect("flash_attn", "on", decode=1.2)
+        proc = subprocess.Popen(["zsh", str(SB), "ai", "tune", TARGET, "--levers", "flash_attn",
+                                 "--samples", "12"],
+                                env=self.env, cwd=self.root, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if any(b.get("note", "").endswith("trial flash_attn") for m, p, b in self.fake.calls("PUT")):
+                break
+            time.sleep(0.02)
+        time.sleep(0.15)
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertIn("interrupted (SIGTERM)", out + err)
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 4096}, "the best settings were not restored")
+        self.assertIn("restore", self.fake.history[-1]["action"])
+        self.assertTrue(all(done for _, done in self.fake.engine.requests),
+                        "a request was cut off mid-answer")
+        self.assert_released()
+
     def test_rr_ctrl_c_during_a_trial_apply_restores_the_best_settings(self):
         self.fake.doc = {"load": {"ctx_size": 4096}}
         self.fake.slow_note = "trial flash_attn"
@@ -862,13 +890,36 @@ class RestoreUnitTests(unittest.TestCase):
         return tuner
 
     def test_unknown_applied_settings_always_restore(self):
+        """The real `put_doc`, cut off by a Ctrl-C while the gateway still
+        applies a trial, must leave the applied settings unknown, so
+        `restore_best` writes the best settings back."""
         ai_tune = load_tuner_module()
-        tuner = self.tuner(ai_tune, 0)
+        tuner = ai_tune.Tuner.__new__(ai_tune.Tuner)
+        tuner.best = {"load": {"ctx_size": 4096}}
+        # The engine runs the best settings, and the run knows it.
+        tuner.applied_doc = json.loads(json.dumps(tuner.best))
+        tuner.run_id, tuner.target, tuner.revision = "tune_x", TARGET, 3
+        tuner.fail_types = (RuntimeError,)
+        puts = []
+
+        class Gateway:
+            def call(self, method, path, body=None, timeout=None, headers=None):
+                puts.append(body["note"])
+                if body["note"].endswith("trial"):
+                    # The gateway applies the trial; the answer never arrives.
+                    raise KeyboardInterrupt()
+                return {"revision": 5, "apply": {"ok": True}}
+
+        tuner.gw = Gateway()
+        with self.assertRaises(KeyboardInterrupt):
+            tuner.put_doc({"load": {"ctx_size": 4096, "flash_attn": "on"}}, "tune tune_x trial")
+        self.assertIsNone(tuner.applied_doc)
         tuner.restore_best("control")
-        self.assertEqual(tuner.writes, [("ok", "tune tune_x control")])
+        self.assertEqual(puts, ["tune tune_x trial", "tune tune_x control"])
+        self.assertEqual(tuner.applied_doc, tuner.best)
         # Known and equal: nothing to write.
         tuner.restore_best("control")
-        self.assertEqual(len(tuner.writes), 1)
+        self.assertEqual(len(puts), 2)
 
     def test_ctrl_c_inside_the_final_restore_restores_again(self):
         ai_tune = load_tuner_module()
@@ -886,8 +937,10 @@ class RestoreUnitTests(unittest.TestCase):
 
 
 class VerdictUnitTests(unittest.TestCase):
-    """The keep rule: other metrics against the mean of the two controls;
-    controls that disagree by more than 3% make the run noisy (repeated)."""
+    """The keep rule: other metrics against the mean of the two controls,
+    or the worse control when the two disagree by more than 3% on that
+    metric; controls that disagree by more than 3% on the judged metric make
+    the run noisy (repeated)."""
 
     def tuner(self):
         ai_tune = load_tuner_module()
@@ -914,13 +967,35 @@ class VerdictUnitTests(unittest.TestCase):
         self.assertTrue(accepted, reason)
         self.assertFalse(noisy)
 
-    def test_controls_that_disagree_make_the_run_noisy(self):
+    def test_controls_that_disagree_on_a_side_metric_use_the_worse_control(self):
         tuner = self.tuner()
+        # Decode controls 100 and 110 (10% apart); prefill is judged and steady.
         c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 110.0}
+        # 98 is 6.7% under the mean but 2% under the worse control: kept,
+        # and the run is not noisy.
         accepted, _, reason, noisy = tuner.verdict(
-            "prefill", c1, {"prefill": 1100.0, "decode": 106.0}, c2)
+            "prefill", c1, {"prefill": 1100.0, "decode": 98.0}, c2)
+        self.assertTrue(accepted, reason)
+        self.assertFalse(noisy, reason)
+        # 96 is 4% under the worse control: rejected, not repeated.
+        accepted, _, reason, noisy = tuner.verdict(
+            "prefill", c1, {"prefill": 1100.0, "decode": 96.0}, c2)
+        self.assertFalse(accepted, reason)
+        self.assertIn("worse control", reason)
+        self.assertFalse(noisy, reason)
+        # Lower is better (time to first token): the worse control is the higher one.
+        c1, c2 = {"prefill": 1000.0, "ttft_ms": 200.0}, {"prefill": 1000.0, "ttft_ms": 220.0}
+        accepted, _, reason, noisy = tuner.verdict(
+            "prefill", c1, {"prefill": 1100.0, "ttft_ms": 224.0}, c2)
+        self.assertTrue(accepted and not noisy, reason)
+
+    def test_controls_that_disagree_on_the_judged_metric_make_the_run_noisy(self):
+        tuner = self.tuner()
+        c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1060.0, "decode": 100.0}
+        accepted, _, reason, noisy = tuner.verdict(
+            "prefill", c1, {"prefill": 1100.0, "decode": 100.0}, c2)
         self.assertTrue(accepted and noisy, reason)
-        self.assertIn("differ by more than 3%", reason)
+        self.assertIn("differ by more than 3% on prefill", reason)
 
     def run_experiment(self, tuner, controls, cand):
         controls = list(controls)
@@ -929,8 +1004,8 @@ class VerdictUnitTests(unittest.TestCase):
         return tuner.experiment({"lever": "ubatch_size", "metric": "prefill"}, {"ubatch_size": 1024})
 
     def test_a_noisy_run_is_repeated_and_noisy_twice_changes_nothing(self):
-        noisy = [{"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 110.0}]
-        steady = [{"prefill": 1000.0, "decode": 105.0}, {"prefill": 1000.0, "decode": 105.5}]
+        noisy = [{"prefill": 1000.0, "decode": 105.0}, {"prefill": 1060.0, "decode": 105.0}]
+        steady = [{"prefill": 1000.0, "decode": 105.0}, {"prefill": 1005.0, "decode": 105.5}]
         cand = {"prefill": 1100.0, "decode": 105.0}
         # Noisy, then steady: the repeat decides, kept.
         tuner = self.tuner()
