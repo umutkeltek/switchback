@@ -26,15 +26,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   one local model through the gateway (baseline, ceiling, one change at a
   time, control/candidate/control with at least 6 samples each, keep only
   what beats both controls with no other metric more than 3% worse than the
-  controls' mean, repeat a win over 20% once (the repeat must clear the 5%
-  noise) and a run whose controls differ by more than 3% (noisy),
+  controls' mean (than the worse control, when the two differ by more than
+  3% on that metric), repeat a win over 20% once (the repeat must clear the
+  5% noise) and a run whose controls differ by more than 3% on the judged
+  metric (noisy),
   greedy/needle/soak gates, plateau after three flat
   levers). The lever catalogue for `llama_cpp_router` is data. Safety:
   refuses a sleeping machine without `--wake`, a busy lane, a quiet window
   (`server.optimize.quiet_windows`) and a locked load key (`locked:
   ["load.KEY"]`); holds the machine and takes the lane's tuning lock
   (`/v1/optimize/locks`, header `x-switchback-tune-lock`; other requests go
-  elsewhere); Ctrl-C and the budget end restore the best settings without
+  elsewhere); Ctrl-C, SIGTERM, SIGHUP and the budget end restore the best settings without
   cutting a request off. Every run is a ledger row in the store
   (`/v1/optimize/experiments`, `sb ai tune --history`; SQLite migration
   22); a rejected change is skipped until the engine build or model file

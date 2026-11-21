@@ -1337,18 +1337,21 @@ The method, exactly:
    no run reads the prefix cache; the first request after a load is dropped.
 4. **Keep it only if** the candidate beats both neighbouring controls on its
    metric and no other measured metric is more than 3% worse than the mean
-   of the two controls. A win of more than 20% is repeated once first, and
-   the repeat must win again by more than the noise (5%). A run whose two
-   controls differ by more than 3% on one of those other metrics is noisy:
-   it is repeated once the same way, the repeat decides, and a repeat that
-   is noisy again changes nothing.
+   of the two controls. When the two controls differ by more than 3% on one
+   of those other metrics, that metric is held to the worse control
+   instead. A win of more than 20% is repeated once first, and the repeat
+   must win again by more than the noise (5%). A run whose two controls
+   differ by more than 3% on the judged metric itself is noisy: it is
+   repeated once the same way, the repeat decides, and a repeat that is
+   noisy again changes nothing.
 5. **Gates:** every answer must be non-empty, not looping and not failed; a
    change claimed lossless must give the same greedy answer at temperature 0;
    a change to the KV cache or the context must find two needles (at about
    50% and 100% of the context) exactly; a change to `parallel` must survive
    a concurrent soak at full per-slot context.
 6. **Stop** after three levers in a row inside the noise (a plateau), at
-   the end of `--budget`, or on Ctrl-C.
+   the end of `--budget`, or on Ctrl-C, SIGTERM or SIGHUP (all three
+   restore the best settings, then let the lock and hold go).
 
 The levers for `llama_cpp_router`, by expected payoff (the catalogue is data
 in `cli/ai_tune.py`, so other engine kinds can add their own):
