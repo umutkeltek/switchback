@@ -480,9 +480,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   refused a change it exits non-zero and prints its reason on stdout, and
   the gateway showed only `exit 2:`. The error (the apply answer of a
   settings write, `last_apply` in `/v1/engines`, and what `sb ai set ...
-  --load` prints) now carries the command's stderr, or its stdout when
-  stderr is empty: the last 300 bytes on one line, control characters
-  removed. A command that succeeds is read as before.
+  --load` prints) now carries the command's stderr, then its stdout
+  (joined by ` | `), within 300 bytes on one line with control characters
+  removed; each keeps at least half the room, so an ssh warning cannot
+  hide the script's reason. Known secret values are replaced by
+  `[redacted]` before the cut: the value of every env var the gateway
+  config names (`api_key_env`, an account's `env` and every other `*_env`),
+  and any value over 20 characters of an env var whose name holds KEY,
+  TOKEN, SECRET or PASSWORD. The command's environment is not changed. A
+  command that succeeds is read as before.
 
 - **Revert to revision 0 means "no saved settings"**: `sb ai revert MODEL 0`
   and `POST /v1/models/{model}/settings/revert {"revision": 0}` answered 404,

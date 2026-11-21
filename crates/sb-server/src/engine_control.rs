@@ -740,6 +740,22 @@ impl From<&AppState> for EngineCtx {
 pub trait SettingsCommandRunner: Send + Sync {
     /// `Ok(short stdout)` on exit 0, `Err(why)` otherwise.
     async fn run(&self, command: &str, input: &[u8], timeout: Duration) -> Result<String, String>;
+
+    /// [`Self::run`] with every one of `secrets` replaced by `[redacted]`
+    /// in the failure it answers. The default scrubs `run`'s answer; the
+    /// shell runner scrubs before it cuts the excerpt, so no part of a
+    /// secret is left at the cut.
+    async fn run_scrubbed(
+        &self,
+        command: &str,
+        input: &[u8],
+        timeout: Duration,
+        secrets: &[String],
+    ) -> Result<String, String> {
+        self.run(command, input, timeout)
+            .await
+            .map_err(|why| scrub_secrets(&why, secrets))
+    }
 }
 
 /// `sh -c COMMAND` with the overlay on stdin, killed at its timeout.
@@ -760,6 +776,17 @@ fn tail(bytes: &[u8]) -> String {
 #[async_trait]
 impl SettingsCommandRunner for ShellSettingsRunner {
     async fn run(&self, command: &str, input: &[u8], timeout: Duration) -> Result<String, String> {
+        self.run_scrubbed(command, input, timeout, &secret_values(None))
+            .await
+    }
+
+    async fn run_scrubbed(
+        &self,
+        command: &str,
+        input: &[u8],
+        timeout: Duration,
+        secrets: &[String],
+    ) -> Result<String, String> {
         use std::process::Stdio;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // Its own process group, so the timeout stops what the command
@@ -817,27 +844,46 @@ impl SettingsCommandRunner for ShellSettingsRunner {
                 .code()
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "signal".to_string());
-            Err(format!("exit {code}: {}", refusal_reason(&err, &out)))
+            Err(format!(
+                "exit {code}: {}",
+                refusal_reason(&err, &out, secrets)
+            ))
         }
     }
 }
 
 /// Why a settings command failed, for the error the API and the CLI show:
-/// its stderr, or its stdout when stderr is empty (a control script that
-/// refuses a change prints the reason there), cut to its last 300 bytes,
-/// on one line with control characters removed.
-fn refusal_reason(stderr: &[u8], stdout: &[u8]) -> String {
+/// its stderr, then its stdout (a control script that refuses a change
+/// prints the reason there), each on one line with control characters
+/// removed, joined by ` | `, with every one of `secrets` replaced by
+/// `[redacted]`, within 300 bytes. Each stream keeps at least half the room
+/// and its last bytes, so a long ssh warning on stderr cannot push out the
+/// script's reason on stdout, and the reverse.
+fn refusal_reason(stderr: &[u8], stdout: &[u8], secrets: &[String]) -> String {
     const LIMIT: usize = 300;
-    let pick = if String::from_utf8_lossy(stderr).trim().is_empty() {
-        stdout
-    } else {
-        stderr
-    };
-    let text = String::from_utf8_lossy(pick);
+    const JOIN: &str = " | ";
+    let err = scrub_secrets(&one_line(stderr), secrets);
+    let out = scrub_secrets(&one_line(stdout), secrets);
+    if err.is_empty() || out.is_empty() {
+        return last_bytes(if err.is_empty() { &out } else { &err }, LIMIT);
+    }
+    let room = LIMIT - JOIN.len();
+    let out_room = room - err.len().min(room / 2);
+    let err_room = room - out.len().min(out_room);
+    format!(
+        "{}{JOIN}{}",
+        last_bytes(&err, err_room),
+        last_bytes(&out, out_room)
+    )
+}
+
+/// The text on one line: a newline or tab ends a word; other control
+/// characters go.
+fn one_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
     let mut line = String::with_capacity(text.len());
     for c in text.chars() {
         if c.is_control() {
-            // A newline or tab ends a word; other control bytes go.
             if c.is_whitespace() && !line.ends_with(' ') {
                 line.push(' ');
             }
@@ -845,12 +891,83 @@ fn refusal_reason(stderr: &[u8], stdout: &[u8]) -> String {
             line.push(c);
         }
     }
-    let line = line.trim();
-    let mut start = line.len().saturating_sub(LIMIT);
-    while !line.is_char_boundary(start) {
+    line.trim().to_string()
+}
+
+/// The last `limit` bytes of `text`, cut on a character boundary.
+fn last_bytes(text: &str, limit: usize) -> String {
+    let mut start = text.len().saturating_sub(limit);
+    while !text.is_char_boundary(start) {
         start += 1;
     }
-    line[start..].trim_start().to_string()
+    text[start..].trim_start().to_string()
+}
+
+/// Env var values a settings command's output must never show: the value
+/// of every env var `config` names as a credential source (any `*_env`
+/// field, an account's `env`), and of any env var whose name holds KEY,
+/// TOKEN, SECRET or PASSWORD and whose value is longer than 20 characters.
+/// A named value shorter than 6 characters is left out, so a test key such
+/// as `k` does not blank every `k` of the text. The command's own
+/// environment is not touched.
+fn secret_values(config: Option<&sb_core::Config>) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(config) = config {
+        if let Ok(tree) = serde_json::to_value(config) {
+            env_names(&tree, &mut names);
+        }
+    }
+    let mut values: Vec<String> = names
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .filter(|value| value.trim().len() >= 6)
+        .collect();
+    for (name, value) in std::env::vars() {
+        let name = name.to_ascii_uppercase();
+        if value.len() > 20
+            && ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+                .iter()
+                .any(|word| name.contains(word))
+        {
+            values.push(value);
+        }
+    }
+    // Longest first, so a value that holds another is replaced whole.
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
+}
+
+/// The env var names a config tree names: string values of `*_env` and
+/// `env` fields.
+fn env_names(tree: &Value, names: &mut Vec<String>) {
+    match tree {
+        Value::Object(map) => {
+            for (key, value) in map {
+                match value {
+                    Value::String(name) if key == "env" || key.ends_with("_env") => {
+                        if !name.is_empty() {
+                            names.push(name.clone());
+                        }
+                    }
+                    other => env_names(other, names),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| env_names(item, names)),
+        _ => {}
+    }
+}
+
+/// `text` with every one of `secrets` replaced by `[redacted]`.
+fn scrub_secrets(text: &str, secrets: &[String]) -> String {
+    let mut text = text.to_string();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        if text.contains(secret.as_str()) {
+            text = text.replace(secret.as_str(), "[redacted]");
+        }
+    }
+    text
 }
 
 // ---------------------------------------------------------------- engine kinds
@@ -1554,7 +1671,12 @@ impl EngineControls {
         let mut document = overlay.clone();
         document["models"] = Value::Object(models.clone());
         let input = serde_json::to_vec(&document).unwrap_or_default();
-        if let Err(e) = self.runner.run(command, &input, lane.command_timeout).await {
+        let secrets = secret_values(Some(&state.snapshot().config));
+        if let Err(e) = self
+            .runner
+            .run_scrubbed(command, &input, lane.command_timeout, &secrets)
+            .await
+        {
             drop(held);
             result["ok"] = json!(false);
             result["error"] = json!(format!("settings_command failed: {e}"));
@@ -3482,25 +3604,108 @@ mod tests {
 
     #[test]
     fn a_refusal_reason_is_one_bounded_clean_line() {
-        // stdout when stderr is empty, stderr when it has text.
+        // stdout when stderr is empty, stderr when stdout is, both (stderr
+        // first) when both have text.
         assert_eq!(
-            refusal_reason(b"", b"refused: key X is pinned\n"),
+            refusal_reason(b"", b"refused: key X is pinned\n", &[]),
             "refused: key X is pinned"
         );
-        assert_eq!(refusal_reason(b" \n", b"out"), "out");
-        assert_eq!(refusal_reason(b"err\n", b"out"), "err");
+        assert_eq!(refusal_reason(b" \n", b"out", &[]), "out");
+        assert_eq!(refusal_reason(b"err\n", b" \n", &[]), "err");
+        assert_eq!(refusal_reason(b"err\n", b"out", &[]), "err | out");
         // One line, control characters removed.
         assert_eq!(
-            refusal_reason(b"", b"line one\r\nline\ttwo\x1b[31m red\x07\n"),
+            refusal_reason(b"", b"line one\r\nline\ttwo\x1b[31m red\x07\n", &[]),
             "line one line two[31m red"
         );
         // The last 300 bytes, cut on a character boundary.
         let long = format!("{}{}", "a".repeat(400), "\u{e9}".repeat(200));
-        let reason = refusal_reason(b"", long.as_bytes());
+        let reason = refusal_reason(b"", long.as_bytes(), &[]);
         assert!(reason.len() <= 300, "{}", reason.len());
         assert!(reason.ends_with('\u{e9}'));
         assert!(!reason.contains('a'));
-        assert_eq!(refusal_reason(b"", b""), "");
+        assert_eq!(refusal_reason(b"", b"", &[]), "");
+    }
+
+    // A long ssh warning on stderr cannot hide the script's reason on
+    // stdout, nor a long stdout the reason on stderr: each keeps its end
+    // within the same 300 bytes.
+    #[test]
+    fn a_refusal_reason_shows_stderr_then_stdout_within_one_budget() {
+        let warning = format!(
+            "Warning: {} added to the list of known hosts.",
+            "w".repeat(400)
+        );
+        let reason = refusal_reason(warning.as_bytes(), b"refused: key X is pinned\n", &[]);
+        assert!(reason.len() <= 300, "{}", reason.len());
+        assert!(reason.ends_with(" | refused: key X is pinned"), "{reason}");
+        assert!(reason.contains("known hosts."), "{reason}");
+        let noise = "n".repeat(500);
+        let reason = refusal_reason(b"fatal: no such model\n", noise.as_bytes(), &[]);
+        assert!(reason.len() <= 300, "{}", reason.len());
+        assert!(reason.starts_with("fatal: no such model | "), "{reason}");
+    }
+
+    // A command that prints a key: the excerpt shows `[redacted]` in its
+    // place, and the command still sees its environment (it printed it).
+    #[tokio::test]
+    async fn a_refusal_excerpt_never_shows_a_known_secret() {
+        let named = "SB_TEST_SCRUB_NAMED_ENV";
+        let named_value = "named-test-value-1";
+        let long = "SB_TEST_SCRUB_LONG_TOKEN";
+        let long_value = "long-test-token-abcdefghijklmnop";
+        let unrelated = "SB_TEST_SCRUB_PLAIN";
+        // Test-only variables with names no other test reads.
+        std::env::set_var(named, named_value);
+        std::env::set_var(long, long_value);
+        std::env::set_var(unrelated, "plain-value-not-a-secret-at-all");
+        let cfg = sb_core::Config::from_yaml(&format!(
+            r#"
+providers:
+  - id: text
+    type: openai_compatible
+    base_url: "http://127.0.0.1:1/v1"
+    api_key_env: {named}
+"#
+        ))
+        .unwrap();
+        let secrets = secret_values(Some(&cfg));
+        assert!(secrets.iter().any(|value| value == named_value));
+        assert!(secrets.iter().any(|value| value == long_value));
+        assert!(!secrets.iter().any(|value| value.starts_with("plain-value")));
+
+        let command = format!(
+            "cat >/dev/null; echo \"warning: key ${named}\" >&2; \
+             echo \"refused: token ${long} and ${unrelated}\"; exit 2"
+        );
+        let error = ShellSettingsRunner
+            .run_scrubbed(&command, b"{}", Duration::from_secs(10), &secrets)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "exit 2: warning: key [redacted] | refused: token [redacted] and plain-value-not-a-secret-at-all"
+        );
+        // Without the config, a long value of a KEY/TOKEN variable is still
+        // scrubbed.
+        let error = ShellSettingsRunner
+            .run(&command, b"{}", Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(!error.contains(long_value), "{error}");
+        // Any runner's failure is scrubbed too.
+        struct Echo;
+        #[async_trait]
+        impl SettingsCommandRunner for Echo {
+            async fn run(&self, _: &str, _: &[u8], _: Duration) -> Result<String, String> {
+                Err("exit 2: named-test-value-1".to_string())
+            }
+        }
+        let error = Echo
+            .run_scrubbed("x", b"{}", Duration::from_secs(1), &secrets)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "exit 2: [redacted]");
     }
 
     #[tokio::test]
