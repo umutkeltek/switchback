@@ -584,6 +584,25 @@ class NativeAccounts(unittest.TestCase):
         self.assertNotIn("quota_error", result)
         self.assertTrue(result["quota_current"])
 
+    def test_rereview_new_cooldown_with_set_time_not_cleared_by_older_reading(self):
+        # A rejection just now, written by the new code (set_at_ms present). The vendor cache is 40 s old,
+        # older than the rejection, so it says nothing about it and must not clear the cooldown.
+        self.setup_slot("one")
+        slot = self.runtime / "config/native-account-slots/claude/one/slot.json"
+        data = json.loads(slot.read_text())
+        data["cooldown"] = {"reason": "rate_limit", "reset": None, "set_at_ms": int(time.time() * 1000) - 1000}
+        slot.write_text(json.dumps(data))
+        profile = self.runtime / "config/claude/one/.claude.json"
+        native = json.loads(profile.read_text())
+        native["cachedUsageUtilization"] = {"accountUuid": "one", "fetchedAtMs": int(time.time() * 1000) - 40000,
+            "utilization": {"five_hour": {"utilization": 97, "resets_at": None},
+                            "seven_day": {"utilization": 50, "resets_at": None}}}
+        profile.write_text(json.dumps(native))
+        status = self.call("status", "--provider", "claude", "--slot", "one", "--quota-refresh", "--json",
+                           env=dict(self.env, FAKE_QUOTA="unchanged"))
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("cooldown", json.loads(slot.read_text()), "reading older than the rejection cleared its cooldown")
+
     def test_rejection_cooldown_set_time_is_stored_and_a_later_reading_clears_it(self):
         # The cooldown records when it was set; a cached reading taken after that clears it even
         # though the reading is older than the refresh.
