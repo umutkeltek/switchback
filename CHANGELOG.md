@@ -438,6 +438,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **No connection to a machine the gateway knows is off**: the supervisor
+  probed every routed lane's health endpoint every 10 s, and a lane on a
+  machine that adopts outside wakes as well, so a powered-off machine kept
+  getting connection attempts to its engine port. Once the gateway powers a
+  machine (it has a wake command) and a probe has confirmed it off (every
+  lane offline, no work, no wake running, no engine answering, a failed
+  probe of each routed lane since our last power-off), nothing but its wake
+  path connects to it: no supervisor probe, no refresh probe when routing
+  skips it, no engine-control health call, no look by an operator's
+  power-off (it answers already off). A request's, job's or hold's
+  wake and an operator's power-on still look first and wake it. Behavior
+  change: a machine with `adopt_external_wake` that someone starts by hand
+  while the gateway knows it is off is adopted at the next look of its wake
+  path, not by the supervisor. A machine whose state the gateway has not
+  seen yet (just after a start) is looked at once, as before.
+
 - **A refused settings change says why**: when a lane's `settings_command`
   refused a change it exits non-zero and prints its reason on stdout, and
   the gateway showed only `exit 2:`. The error (the apply answer of a

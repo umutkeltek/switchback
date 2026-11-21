@@ -1187,11 +1187,16 @@ impl EngineControls {
     }
 
     /// Whether the lane's machine is up. Never wakes: a lane in the
-    /// lifecycle answers from its state; one outside it gets one health GET
-    /// (a sleeping machine does not answer it).
+    /// lifecycle answers from its state; one outside it, or one whose state
+    /// the gateway has not seen yet, gets one health GET (a sleeping machine
+    /// does not answer it). A machine the gateway knows is off is never
+    /// called: it is asleep.
     async fn awake(&self, state: &EngineCtx, lane: &EngineLane) -> Awake {
         use crate::activator::LaneState;
         if let Some(executor) = state.capacity.executor(&lane.name) {
+            if executor.machine_known_off() {
+                return Awake::Asleep("asleep");
+            }
             match executor.report().state {
                 LaneState::Healthy | LaneState::Draining | LaneState::IdleCountdown => {
                     return Awake::Up
