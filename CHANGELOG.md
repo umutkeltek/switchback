@@ -446,7 +446,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   system's own items (macOS reads it only at creation, which is why writing
   it while the app ran did nothing). A place the owner chose by
   Command-dragging the item is kept; an older install whose item sits
-  further left gets the new place once. A test copy measured x=1520,
+  further left gets the new place once: an older install that the owner
+  had dragged left of 280 points is moved once too (an older install left
+  no record of who chose its place). A test copy measured x=1520,
   visible, with a browser in front.
 
 - **No connection to a machine the gateway knows is off**: the supervisor
