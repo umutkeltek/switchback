@@ -438,6 +438,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **The engine control sends the provider's key**: its calls to a local
+  engine (the model listing, `GET /models?reload=1`, `/models/load`,
+  `/models/unload`, `/props`) carry the key the provider's text requests
+  carry (`api_key_env` or `api_key`, with `auth_scheme`, bearer by default),
+  for `openai_compatible` with any `engine` and for `comfyui`. A llama.cpp
+  router started with `--api-key` answered them 401, so `GET /v1/engines`,
+  loads, unloads and applies failed. Health probes, workloads and the
+  provider doctor send what they sent before.
 - **`GET /v1/workflows` lists only the inputs a workflow accepts**: `size`
   and `seed` show where the workflow binds them (`width` and `height`,
   `seed`); an image-in workflow such as a segmentation no longer offers

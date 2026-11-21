@@ -40,6 +40,20 @@ struct Router_ {
     unmeasured: bool,
     /// How long a "slow please" chat takes (ms; 0 = 1500).
     slow_ms: u64,
+    /// Like a router started with `--api-key`: every call but `/health`
+    /// must carry this header (name, value) or gets 401.
+    require: Option<(String, String)>,
+    /// Every request the router saw, with its credential headers.
+    seen: Vec<Seen>,
+}
+
+#[derive(Clone, Debug)]
+struct Seen {
+    /// Path and query, e.g. "/models?reload=1".
+    path: String,
+    authorization: Option<String>,
+    api_key: Option<String>,
+    refused: bool,
 }
 
 #[derive(Clone)]
@@ -66,6 +80,50 @@ impl Stub {
             .status
             .insert(model.to_string(), status.to_string());
     }
+}
+
+/// Record each request's credential headers; refuse one without the
+/// required key like llama.cpp's `--api-key` (`/health` stays open).
+async fn auth_gate(
+    State(stub): State<Stub>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // A block, so nothing borrowing the request lives across the await.
+    let seen = {
+        let header = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        let required = stub.inner.lock().unwrap().require.clone();
+        Seen {
+            path: request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default(),
+            authorization: header("authorization"),
+            api_key: header("x-api-key"),
+            refused: required.is_some_and(|(name, value)| {
+                request.uri().path() != "/health"
+                    && header(&name).as_deref() != Some(value.as_str())
+            }),
+        }
+    };
+    let refused = seen.refused;
+    stub.inner.lock().unwrap().seen.push(seen);
+    if refused {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"code": 401, "message": "Invalid API Key",
+                                  "type": "authentication_error"}})),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn health(State(stub): State<Stub>) -> StatusCode {
@@ -248,7 +306,7 @@ fn temp(name: &str) -> PathBuf {
     ))
 }
 
-async fn spawn_stub(up: bool) -> (String, Stub) {
+async fn spawn_stub(up: bool, require: Option<(&str, &str)>) -> (String, Stub) {
     let marker = temp("up");
     if up {
         std::fs::write(&marker, b"up").unwrap();
@@ -259,7 +317,11 @@ async fn spawn_stub(up: bool) -> (String, Stub) {
     };
     stub.set("m", "loaded");
     stub.set("other", "unloaded");
-    stub.inner.lock().unwrap().total = 24u64 << 30;
+    {
+        let mut inner = stub.inner.lock().unwrap();
+        inner.total = 24u64 << 30;
+        inner.require = require.map(|(name, value)| (name.to_string(), value.to_string()));
+    }
     let app = Router::new()
         .route("/health", get(health))
         .route("/models", get(models))
@@ -268,6 +330,11 @@ async fn spawn_stub(up: bool) -> (String, Stub) {
         .route("/v1/chat/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(transcription))
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(axum::middleware::from_fn_with_state(
+            stub.clone(),
+            auth_gate,
+        ))
         .with_state(stub.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -301,6 +368,12 @@ struct Opts<'a> {
     wake_template: Option<&'a str>,
     /// More `server:` keys, each on its own line, indented two spaces.
     server: &'a str,
+    /// The `text` provider's credential keys, each on its own line,
+    /// indented like its keys (default: an `accounts:` entry with key "k").
+    text_auth: Option<&'a str>,
+    /// The fake router requires this header (name, value), like
+    /// llama.cpp's `--api-key`.
+    require: Option<(&'a str, &'a str)>,
 }
 
 impl Default for Opts<'_> {
@@ -314,6 +387,8 @@ impl Default for Opts<'_> {
             command_template: None,
             wake_template: None,
             server: "",
+            text_auth: None,
+            require: None,
         }
     }
 }
@@ -330,7 +405,7 @@ async fn setup(up: bool, engine_extra: &str, settings_command: Option<String>) -
 }
 
 async fn setup_with(opts: Opts<'_>) -> (Setup, sb_server::AppState) {
-    let (stub_url, stub) = spawn_stub(opts.up).await;
+    let (stub_url, stub) = spawn_stub(opts.up, opts.require).await;
     let overlay = temp("overlay.json");
     let default_command = opts.settings_command.is_none();
     let command = match (opts.settings_command, opts.command_template) {
@@ -354,9 +429,7 @@ providers:
     engine: llama_cpp
     base_url: "{stub_url}/v1"
     capabilities: {{ audio_in: true }}
-    accounts:
-      - id: a
-        auth: {{ kind: api_key, inline: "k" }}
+{text_auth}
   - id: other
     type: openai_compatible
     base_url: "{stub_url}/v1"
@@ -387,6 +460,9 @@ local_executors:
         server = opts.server,
         wait = opts.apply_wait_secs,
         extra = opts.extra,
+        text_auth = opts.text_auth.unwrap_or(
+            "    accounts:\n      - id: a\n        auth: { kind: api_key, inline: \"k\" }"
+        ),
     );
     let cfg = sb_core::Config::from_yaml(&cfg).unwrap();
     sb_runtime::Engine::validate_config(&cfg).expect("valid test config");
@@ -1579,4 +1655,202 @@ async fn a_write_on_a_waking_lane_is_re_read_when_it_comes_up() {
         json!(false),
         "{engines}"
     );
+}
+
+// ---- The engine control carries the provider's key --------------------
+//
+// A llama.cpp router started with `--api-key` refuses every call without
+// it (`/health` stays open). The engine control's calls (listing, re-read,
+// load, unload, `/props`) must carry the key the provider's text requests
+// carry; the lane's health probes keep sending none, as before.
+
+/// The key the fake routers require. A test value, not a secret.
+const ROUTER_KEY: &str = "engine-router-test-key";
+
+impl Stub {
+    fn seen(&self) -> Vec<Seen> {
+        self.inner.lock().unwrap().seen.clone()
+    }
+    /// The engine-control calls the router saw (everything but `/health`
+    /// and the text requests under `/v1/`).
+    fn seen_engine_calls(&self) -> Vec<Seen> {
+        self.seen()
+            .into_iter()
+            .filter(|seen| seen.path != "/health" && !seen.path.starts_with("/v1/"))
+            .collect()
+    }
+}
+
+fn model_ids(engines: &Value) -> Vec<String> {
+    engines["data"][0]["models"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn engine_calls_carry_the_providers_bearer_key() {
+    const ENV: &str = "SB_TEST_ENGINE_CONTROL_BEARER_KEY";
+    std::env::set_var(ENV, ROUTER_KEY);
+    let bearer = format!("Bearer {ROUTER_KEY}");
+    let (s, _) = setup_with(Opts {
+        text_auth: Some("    api_key_env: SB_TEST_ENGINE_CONTROL_BEARER_KEY"),
+        require: Some(("authorization", &bearer)),
+        ..Opts::default()
+    })
+    .await;
+
+    // The listing (and `/props`) through `GET /v1/engines`.
+    let engines = get_json(format!("{}/v1/engines", s.gw)).await;
+    let lane = &engines["data"][0];
+    assert_eq!(lane["state"], json!("up"), "{engines}");
+    assert_eq!(model_ids(&engines), vec!["m", "other"], "{engines}");
+    assert!(lane["error"].is_null(), "{lane}");
+
+    // A load.
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/unload", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+
+    // An apply now: the re-read, then the unload and load of the model.
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"ctx_size": 32768}, "apply": "now"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["ok"], json!(true), "{view}");
+    assert_eq!(view["apply"]["reloaded_model"], json!(true), "{view}");
+
+    let calls = s.stub.calls();
+    for call in [
+        "GET /models",
+        "POST /models/unload m",
+        "POST /models/load m",
+        "GET /models?reload=1",
+    ] {
+        assert!(calls.contains(&call.to_string()), "no {call}: {calls:?}");
+    }
+    let engine_calls = s.stub.seen_engine_calls();
+    for path in [
+        "/props",
+        "/models",
+        "/models?reload=1",
+        "/models/load",
+        "/models/unload",
+    ] {
+        assert!(
+            engine_calls.iter().any(|seen| seen.path == path),
+            "the engine control never called {path}: {engine_calls:?}"
+        );
+    }
+    for seen in &engine_calls {
+        assert!(!seen.refused, "the router refused {seen:?}");
+        assert_eq!(
+            seen.authorization.as_deref(),
+            Some(bearer.as_str()),
+            "{seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn engine_calls_use_the_providers_header_scheme() {
+    const ENV: &str = "SB_TEST_ENGINE_CONTROL_HEADER_KEY";
+    std::env::set_var(ENV, ROUTER_KEY);
+    let (s, _) = setup_with(Opts {
+        text_auth: Some(
+            "    api_key_env: SB_TEST_ENGINE_CONTROL_HEADER_KEY\n    auth_scheme: { kind: header, name: x-api-key }",
+        ),
+        require: Some(("x-api-key", ROUTER_KEY)),
+        ..Opts::default()
+    })
+    .await;
+
+    let engines = get_json(format!("{}/v1/engines", s.gw)).await;
+    assert_eq!(model_ids(&engines), vec!["m", "other"], "{engines}");
+    let (status, body) = post_to(&s.gw, "/v1/models/text/other/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+
+    let engine_calls = s.stub.seen_engine_calls();
+    assert!(
+        engine_calls.iter().any(|seen| seen.path == "/models/load"),
+        "{engine_calls:?}"
+    );
+    for seen in &engine_calls {
+        assert!(!seen.refused, "the router refused {seen:?}");
+        assert_eq!(seen.api_key.as_deref(), Some(ROUTER_KEY), "{seen:?}");
+        assert_eq!(seen.authorization, None, "{seen:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_provider_without_a_key_sends_no_credential_to_the_engine() {
+    let (s, _) = setup_with(Opts {
+        text_auth: Some(""),
+        ..Opts::default()
+    })
+    .await;
+
+    let engines = get_json(format!("{}/v1/engines", s.gw)).await;
+    assert_eq!(model_ids(&engines), vec!["m", "other"], "{engines}");
+    let (status, body) = post_to(&s.gw, "/v1/models/text/other/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+
+    let engine_calls = s.stub.seen_engine_calls();
+    assert!(
+        engine_calls.iter().any(|seen| seen.path == "/models/load"),
+        "{engine_calls:?}"
+    );
+    for seen in &engine_calls {
+        assert_eq!(seen.authorization, None, "{seen:?}");
+        assert_eq!(seen.api_key, None, "{seen:?}");
+    }
+}
+
+#[tokio::test]
+async fn health_probes_of_an_openai_compatible_lane_still_send_no_key() {
+    const ENV: &str = "SB_TEST_ENGINE_CONTROL_PROBE_KEY";
+    std::env::set_var(ENV, ROUTER_KEY);
+    let bearer = format!("Bearer {ROUTER_KEY}");
+    // Asleep at first: a load with `wake` wakes the lane, and the
+    // activator probes `/health` until it answers.
+    let (s, _) = setup_with(Opts {
+        up: false,
+        text_auth: Some("    api_key_env: SB_TEST_ENGINE_CONTROL_PROBE_KEY"),
+        require: Some(("authorization", &bearer)),
+        ..Opts::default()
+    })
+    .await;
+
+    let (status, body) = post_to(&s.gw, "/v1/models/text/other/load", json!({"wake": true})).await;
+    assert_eq!(status, 200, "{body}");
+    let r = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", s.gw))
+        .json(&json!({"model": "text/m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let seen = s.stub.seen();
+    let probes: Vec<&Seen> = seen.iter().filter(|seen| seen.path == "/health").collect();
+    assert!(!probes.is_empty(), "no health probe: {seen:?}");
+    for probe in probes {
+        assert_eq!(probe.authorization, None, "{probe:?}");
+        assert_eq!(probe.api_key, None, "{probe:?}");
+    }
+    // The text request itself carries the key, as before.
+    let chat = seen
+        .iter()
+        .find(|seen| seen.path == "/v1/chat/completions")
+        .expect("the chat reached the router");
+    assert_eq!(chat.authorization.as_deref(), Some(bearer.as_str()));
 }

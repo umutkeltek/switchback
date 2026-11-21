@@ -1,6 +1,7 @@
 //! A provider's simple credential (an [`AuthScheme`] and a lease) on a plain
 //! HTTP call that does not go through a text adapter: ComfyUI jobs, a
-//! managed lane's health probe, the provider doctor. The lease comes from
+//! managed lane's health probe, the provider doctor, the engine control's
+//! calls to a local engine (see [`engine_call_scheme`]). The lease comes from
 //! the [`CredentialResolver`] and the wire form from the adapters'
 //! [`SchemeSigner`], so a ComfyUI behind a token proxy is configured exactly
 //! like an `openai_compatible` provider (`api_key_env` + `auth_scheme`).
@@ -44,6 +45,22 @@ pub(crate) fn plain_call_scheme(provider: &ProviderConfig) -> Option<AuthScheme>
     }
 }
 
+/// How a provider's credential goes on an engine-control call (the model
+/// listing, load, unload, the settings re-read, `/props`): the engine is the
+/// one the provider's text requests reach, so it takes the same key. For
+/// `openai_compatible` (any `engine`) the key of `api_key_env` / `api_key`,
+/// with `auth_scheme` (bearer unless set); for `comfyui` as on its plain
+/// calls. Separate from [`plain_call_scheme`] on purpose: health probes,
+/// workloads and the provider doctor keep sending what they sent before.
+pub(crate) fn engine_call_scheme(provider: &ProviderConfig) -> Option<AuthScheme> {
+    match &provider.kind {
+        ProviderKind::OpenaiCompatible { auth_scheme, .. } => {
+            Some(auth_scheme.clone().unwrap_or(AuthScheme::Bearer))
+        }
+        _ => plain_call_scheme(provider),
+    }
+}
+
 impl SchemeCredential {
     /// Resolve `provider`'s credential for a plain call. `Ok(None)` when the
     /// provider carries none (no key configured, or a kind without plain
@@ -53,7 +70,26 @@ impl SchemeCredential {
         provider: &ProviderConfig,
         model: &str,
     ) -> Result<Option<Self>, String> {
-        let Some(scheme) = plain_call_scheme(provider) else {
+        Self::resolve_with(resolver, provider, model, plain_call_scheme(provider)).await
+    }
+
+    /// Resolve `provider`'s credential for an engine-control call (see
+    /// [`engine_call_scheme`]). `Ok(None)` when the provider has no key.
+    pub(crate) async fn resolve_for_engine(
+        resolver: &CredentialResolver,
+        provider: &ProviderConfig,
+        model: &str,
+    ) -> Result<Option<Self>, String> {
+        Self::resolve_with(resolver, provider, model, engine_call_scheme(provider)).await
+    }
+
+    async fn resolve_with(
+        resolver: &CredentialResolver,
+        provider: &ProviderConfig,
+        model: &str,
+        scheme: Option<AuthScheme>,
+    ) -> Result<Option<Self>, String> {
+        let Some(scheme) = scheme else {
             return Ok(None);
         };
         let (account_id, lease) = match resolver.resolve(&provider.id, model, &HashSet::new()) {
@@ -176,6 +212,42 @@ mod tests {
         );
         assert!(shown.contains("x-comfy-key"), "{shown}");
         assert!(!shown.contains(SECRET), "{shown}");
+    }
+
+    fn provider(yaml: &str) -> ProviderConfig {
+        let config =
+            sb_core::Config::from_yaml(&format!("providers:\n{yaml}")).expect("a valid provider");
+        config.providers[0].clone()
+    }
+
+    // Engine calls carry an `openai_compatible` provider's key; its plain
+    // calls (health probes, workloads, the doctor) still carry none.
+    #[test]
+    fn engine_calls_take_the_text_key_and_plain_calls_stay_as_before() {
+        let bearer = provider(
+            "  - id: local\n    type: openai_compatible\n    engine: llama_cpp\n    base_url: http://127.0.0.1:1/v1\n    api_key_env: SOME_ENV\n",
+        );
+        assert_eq!(plain_call_scheme(&bearer), None);
+        assert_eq!(engine_call_scheme(&bearer), Some(AuthScheme::Bearer));
+
+        let header = provider(
+            "  - id: local\n    type: openai_compatible\n    base_url: http://127.0.0.1:1/v1\n    api_key_env: SOME_ENV\n    auth_scheme: { kind: header, name: x-api-key }\n",
+        );
+        let x_api_key = AuthScheme::Header {
+            name: "x-api-key".into(),
+        };
+        assert_eq!(plain_call_scheme(&header), None);
+        assert_eq!(engine_call_scheme(&header), Some(x_api_key));
+
+        let comfy = provider(
+            "  - id: comfy\n    type: comfyui\n    base_url: http://127.0.0.1:1\n    workflows: []\n",
+        );
+        assert_eq!(plain_call_scheme(&comfy), Some(AuthScheme::Bearer));
+        assert_eq!(engine_call_scheme(&comfy), Some(AuthScheme::Bearer));
+
+        let other = provider("  - id: m\n    type: mock\n");
+        assert_eq!(plain_call_scheme(&other), None);
+        assert_eq!(engine_call_scheme(&other), None);
     }
 
     #[test]

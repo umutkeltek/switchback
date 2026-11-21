@@ -963,6 +963,13 @@ local_executors:
       load_timeout_secs: 600      # how long a load may take
 ```
 
+The engine control's calls to the engine (the model listing,
+`GET /models?reload=1`, `/models/load`, `/models/unload`, `/props`) carry the
+provider's key, exactly as its text requests do: `api_key_env` or `api_key`,
+with `auth_scheme` (bearer unless set). So a router started with `--api-key`
+needs only that key on the provider. The lane's health probe stays keyless
+(llama.cpp keeps `/health` open).
+
 The gateway never writes files on a machine. On a change it runs
 `settings_command` with the managed overlay as JSON on stdin (every managed
 load-time setting of the lane's models and their variants), then asks an

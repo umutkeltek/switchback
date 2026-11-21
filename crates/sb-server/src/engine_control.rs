@@ -1188,7 +1188,11 @@ impl EngineControls {
         }
     }
 
-    /// One call to the engine, with the lane provider's credential.
+    /// One call to the engine, with the lane provider's credential: the key
+    /// its text requests carry (`api_key_env` / `api_key` with
+    /// `auth_scheme`), see [`crate::scheme_auth::engine_call_scheme`]. Every
+    /// engine-control call (listing, re-read, load, unload, `/props`) goes
+    /// through here.
     async fn call(
         &self,
         state: &EngineCtx,
@@ -1205,12 +1209,24 @@ impl EngineControls {
             .timeout(timeout);
         let mut credential = None;
         if let Some(provider) = snap.config.providers.iter().find(|p| p.id == lane.name) {
-            if let Ok(Some(found)) =
-                crate::scheme_auth::SchemeCredential::resolve(&snap.resolver, provider, &lane.name)
-                    .await
+            match crate::scheme_auth::SchemeCredential::resolve_for_engine(
+                &snap.resolver,
+                provider,
+                &lane.name,
+            )
+            .await
             {
-                request = found.apply(request);
-                credential = Some(found);
+                Ok(Some(found)) => {
+                    request = found.apply(request);
+                    credential = Some(found);
+                }
+                Ok(None) => {}
+                // The error names the provider, never the secret.
+                Err(error) => tracing::warn!(
+                    lane = %lane.name,
+                    %error,
+                    "engine call sent without the provider's credential"
+                ),
             }
         }
         if let Some(body) = body {
