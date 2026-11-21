@@ -19,6 +19,18 @@ fn usage() -> Value {
 
 async fn chat(Json(body): Json<Value>) -> Response {
     let model = body["model"].as_str().unwrap_or("").to_string();
+    if model == "timed" {
+        // A llama.cpp-style engine: the cache shows only in its timings.
+        return Json(json!({
+            "id": "x", "object": "chat.completion", "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 40, "total_tokens": 1040},
+            "timings": {"prompt_n": 200, "prompt_ms": 20.0, "cache_n": 800,
+                        "predicted_n": 40, "predicted_ms": 400.0}
+        }))
+        .into_response();
+    }
     if body["stream"].as_bool() == Some(true) {
         let first = json!({"id": "x", "model": model, "choices": [{"index": 0,
             "delta": {"content": "hi"}, "finish_reason": null}]});
@@ -95,11 +107,17 @@ routes:
   - name: cataloged
     match: {{ model: "cataloged" }}
     targets: ["up/cataloged"]
+  - name: timed
+    match: {{ model: "timed" }}
+    targets: ["up/timed"]
 catalog:
   prices:
     - {{ model_id: cataloged, token_kind: input, unit_price_micros_per_mtok: 1000000, effective_from: "2025-01-01T00:00:00Z" }}
     - {{ model_id: cataloged, token_kind: cached_input, unit_price_micros_per_mtok: 100000, effective_from: "2025-01-01T00:00:00Z" }}
     - {{ model_id: cataloged, token_kind: output, unit_price_micros_per_mtok: 2000000, effective_from: "2025-01-01T00:00:00Z" }}
+    - {{ model_id: timed, token_kind: input, unit_price_micros_per_mtok: 1000000, effective_from: "2025-01-01T00:00:00Z" }}
+    - {{ model_id: timed, token_kind: cached_input, unit_price_micros_per_mtok: 100000, effective_from: "2025-01-01T00:00:00Z" }}
+    - {{ model_id: timed, token_kind: output, unit_price_micros_per_mtok: 2000000, effective_from: "2025-01-01T00:00:00Z" }}
 "#,
         cost_map = cost_map.display()
     );
@@ -225,4 +243,34 @@ async fn rereview_anthropic_client_sees_the_whole_prompt() {
     let input = usage["input_tokens"].as_u64().unwrap_or(0);
     let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
     assert_eq!(input + cache_read, 1000, "Anthropic client usage: {usage}");
+}
+
+// A plain answer from an engine that reports its cache only in its timings
+// is priced after the cache is filled in: the trace's cost (and the
+// scorecard's) matches the ledger's, as on a stream.
+#[tokio::test]
+async fn a_cache_known_only_from_timings_is_priced_as_cached_on_a_plain_answer() {
+    let gateway = spawn_gateway("timed").await;
+    let seen = ask(&gateway.base, "timed", false).await;
+    assert_eq!(seen["prompt_tokens"], 1000, "{seen}");
+    let timed = row(&gateway.ledger, "timed").await;
+    assert_eq!(
+        (timed.usage.input_tokens, timed.usage.cached_input_tokens),
+        (200, 800)
+    );
+    // 200 uncached at $1, 800 cached at $0.10, 40 out at $2.
+    assert_eq!(timed.cost_micros, Some(200 + 80 + 80));
+    let traces: Value = reqwest::get(format!("{}/v1/traces", gateway.base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let trace = traces["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t.to_string().contains("up/timed"))
+        .unwrap_or_else(|| panic!("no trace for up/timed: {traces}"));
+    assert_eq!(trace["cost_micros"], 360, "{trace}");
 }

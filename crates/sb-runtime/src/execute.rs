@@ -1421,7 +1421,11 @@ impl Engine {
                                 )
                                 .await
                                 {
-                                    Ok(response) => {
+                                    Ok(mut response) => {
+                                        // Before the cost, as streams do: a
+                                        // cache the engine reports only in
+                                        // its timings is priced as cached.
+                                        response.usage.fill_cached_from_timings();
                                         trace.set_ttft_ms(ttft_ms(&first_token, started));
                                         snap.resolver
                                             .report_success(&target.provider_id, &account_id);
@@ -1467,8 +1471,6 @@ impl Engine {
                                                 cost_micros: Some(cost),
                                             },
                                         );
-                                        let mut response = response;
-                                        response.usage.fill_cached_from_timings();
                                         let speed = attempt_speed(
                                             &response.usage,
                                             &first_token,
