@@ -523,6 +523,28 @@ async fn unknown_profile_and_unknown_key_are_400s() {
 }
 
 #[tokio::test]
+async fn a_name_shared_with_its_first_target_writes_that_target() {
+    // A route named like its first target (`text/m` -> text/m, other/m):
+    // settings written under that name attach to text/m; a route whose name
+    // is none of its targets stays ambiguous.
+    let (upstream, _seen) = spawn_upstream().await;
+    let extra = "  - name: text/m\n    match: {{ model: text/m }}\n    targets: [\"text/m\", \"other/m\"]\n  - name: both\n    match: {{ model: both }}\n    targets: [\"text/m\", \"other/m\"]";
+    let extra = extra.replace("{{", "{").replace("}}", "}");
+    let (gw, _) = spawn_gateway(&config(&upstream, &extra), None).await;
+    let r = put_settings(&gw, "text/m", 0, json!({"defaults": {"top_k": 20}})).await;
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    let view: Value = reqwest::get(format!("{gw}/v1/models/other/m/settings"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["targets"][0]["revision"], 0, "{view}");
+    let r = put_settings(&gw, "both", 0, json!({"defaults": {"top_k": 20}})).await;
+    assert_eq!(r.status(), 400);
+}
+
+#[tokio::test]
 async fn revisions_conflicts_patch_history_and_revert() {
     let (upstream, _) = spawn_upstream().await;
     let (gw, _) = spawn_gateway(&config(&upstream, ""), None).await;

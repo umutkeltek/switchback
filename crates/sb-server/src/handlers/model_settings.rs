@@ -149,6 +149,16 @@ pub(crate) fn resolve_one(
     name: &str,
 ) -> Result<NamedTarget, Response> {
     let mut targets = resolve_for(state, principal, name)?;
+    // A public name can share its id with one of its targets (a route `mac/x`
+    // whose first target is `mac/x`): that exact target is the one meant.
+    if targets.len() > 1 {
+        let exact: Vec<usize> = (0..targets.len())
+            .filter(|&i| targets[i].target == name)
+            .collect();
+        if let [only] = exact[..] {
+            return Ok(targets.swap_remove(only));
+        }
+    }
     if targets.len() != 1 {
         return Err(error(
             StatusCode::BAD_REQUEST,

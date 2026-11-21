@@ -438,6 +438,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **A settings name shared with its first target writes that target**: a
+  route named like one of its targets (`mac/x` -> `mac/x`, `box/y`) answered
+  `ambiguous_model` to settings writes, load and unload, and `sb ai set`
+  said "name one" although the name was already the target's own id. The
+  exact target is now used; a route whose name is none of its targets stays
+  ambiguous.
+
 - **The engine control sends the provider's key**: its calls to a local
   engine (the model listing, `GET /models?reload=1`, `/models/load`,
   `/models/unload`, `/props`) carry the key the provider's text requests
