@@ -613,6 +613,210 @@ local_executors:
     let _ = std::fs::remove_file(&marker);
 }
 
+/// A host that is really off while its marker file is absent: its port
+/// answers nothing (the front closes every connection at once, and the
+/// ones it holds when the host goes off), as a powered-off machine gives
+/// no answer at all. Counts the connections that reach it while off and
+/// every health request its engine serves.
+struct PoweredHost {
+    marker: std::path::PathBuf,
+    wakes_log: std::path::PathBuf,
+    attempts_while_off: Arc<std::sync::atomic::AtomicUsize>,
+    health_hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PoweredHost {
+    fn wakes(&self) -> usize {
+        std::fs::read_to_string(&self.wakes_log)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+    fn attempts_while_off(&self) -> usize {
+        self.attempts_while_off.load(Ordering::SeqCst)
+    }
+    fn health_hits(&self) -> usize {
+        self.health_hits.load(Ordering::SeqCst)
+    }
+}
+
+async fn spawn_powered_host(tag: &str) -> (String, PoweredHost) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let file = |what: &str| {
+        std::env::temp_dir().join(format!("sb-{tag}-{}-{nanos}.{what}", std::process::id()))
+    };
+    let host = PoweredHost {
+        marker: file("up"),
+        wakes_log: file("wakes"),
+        attempts_while_off: Arc::default(),
+        health_hits: Arc::default(),
+    };
+    let engine = WakeableLane {
+        marker: host.marker.clone(),
+    };
+    let hits = host.health_hits.clone();
+    let app = Router::new()
+        .route("/chat/completions", post(wakeable_chat))
+        .route(
+            "/health",
+            get(move |state: State<WakeableLane>| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                wakeable_health(state)
+            }),
+        )
+        .with_state(engine);
+    let back = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let back_addr = back.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(back, app).await.unwrap();
+    });
+    let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front.local_addr().unwrap();
+    let (marker, attempts) = (host.marker.clone(), host.attempts_while_off.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = front.accept().await else {
+                return;
+            };
+            if !marker.exists() {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                drop(inbound);
+                continue;
+            }
+            let marker = marker.clone();
+            tokio::spawn(async move {
+                let Ok(mut outbound) = tokio::net::TcpStream::connect(back_addr).await else {
+                    return;
+                };
+                let goes_off = async {
+                    while marker.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                    _ = goes_off => {}
+                }
+            });
+        }
+    });
+    (format!("http://{front_addr}"), host)
+}
+
+/// The whole power cycle of a machine the gateway wakes, over HTTP: a
+/// request wakes it, the idle power-off runs (its command takes the
+/// machine down), one probe confirms it off, then supervisor passes and
+/// routing leave it alone (no connection at all). The next request wakes
+/// it again and is answered by the lane; a machine started by hand is
+/// used by the next request without a wake.
+#[tokio::test]
+async fn a_machine_known_off_is_left_alone_until_a_request_wakes_it_again() {
+    let (lane_url, host) = spawn_powered_host("lane-cycle").await;
+    let cfg = format!(
+        r#"{}
+local_executors:
+  - name: lane
+    base_url: "{lane_url}"
+    health_endpoint: "{lane_url}/health"
+    route_health: true
+    wake_on_request: true
+    wake_wait_secs: 10
+    wake_command: "echo wake >> '{wakes}'; touch '{marker}'"
+    poweroff_command: "rm -f '{marker}'"
+    idle_timeout_secs: 1
+    boot_timeout_secs: 10
+    health_poll_interval_ms: 20
+"#,
+        cfg_lane_then_spare(&lane_url, false),
+        wakes = host.wakes_log.display(),
+        marker = host.marker.display(),
+    );
+    let state = build_state(&cfg);
+    let capacity = state.capacity.clone();
+    let sb = serve(state).await;
+    let hello = json!({"model":"local-text","messages":[{"role":"user","content":"hi"}]});
+    let lane = capacity.executor("lane").unwrap();
+    async fn answered_by(sb: &str, body: &Value) -> String {
+        let response = chat(sb, body.clone()).await;
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+    // The idle power-off: wait out the 1 s idle timeout, then one pass.
+    let idle = std::time::Duration::from_millis(1_200);
+
+    // 1. Off at the start; a request wakes it and the lane answers.
+    capacity.observe_all().await;
+    assert_eq!(host.attempts_while_off(), 1, "the first look");
+    assert_eq!(answered_by(&sb, &hello).await, "served=lane");
+    assert_eq!(host.wakes(), 1);
+
+    // 2. The idle power-off runs; its command takes the machine down.
+    tokio::time::sleep(idle).await;
+    capacity.tick_all().await;
+    // The host's open connections close as it goes down.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!host.marker.exists(), "the power-off command ran");
+    assert_eq!(
+        serde_json::to_value(capacity.reports()[0].state).unwrap(),
+        "offline"
+    );
+
+    // 3. One probe confirms it off.
+    let attempts = host.attempts_while_off();
+    capacity.observe_all().await;
+    assert_eq!(
+        host.attempts_while_off(),
+        attempts + 1,
+        "one confirming probe"
+    );
+    assert!(lane.machine_known_off());
+
+    // 4. Supervisor passes and routing previews: no connection at all.
+    let (attempts, hits) = (host.attempts_while_off(), host.health_hits());
+    for _ in 0..5 {
+        capacity.observe_all().await;
+        capacity.tick_all().await;
+        let preview = route_preview(&sb).await;
+        assert_eq!(
+            preview["decision"]["selected"]["target_id"], "spare/echo",
+            "known down, and a preview never wakes: {preview}"
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        host.attempts_while_off(),
+        attempts,
+        "no connection while known off"
+    );
+    assert_eq!(host.health_hits(), hits, "no health request");
+
+    // 5. A non-streaming request wakes it again and the lane answers.
+    assert_eq!(answered_by(&sb, &hello).await, "served=lane");
+    assert_eq!(host.wakes(), 2, "the second wake");
+
+    // 6. Off again; then someone starts it by hand: the next request is
+    // answered by the lane with no new wake.
+    tokio::time::sleep(idle).await;
+    capacity.tick_all().await;
+    // The host's open connections close as it goes down.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!host.marker.exists());
+    capacity.observe_all().await;
+    assert!(lane.machine_known_off());
+    std::fs::write(&host.marker, b"").unwrap();
+    assert_eq!(answered_by(&sb, &hello).await, "served=lane");
+    assert_eq!(host.wakes(), 2, "no new wake");
+
+    let _ = std::fs::remove_file(&host.marker);
+    let _ = std::fs::remove_file(&host.wakes_log);
+}
+
 /// A route whose only target is a `wake_on_request` lane that cannot come
 /// up (its host is off and its wake command fails) is refused before
 /// the first byte with a retryable 503 in the repo's error shape, on every

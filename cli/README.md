@@ -782,7 +782,9 @@ sb ai release           # let it go again (ID or --all when there are several ho
   hold is active (unless `--release-holds` ends it first), while the machine
   has work, or while the machine's guard says somebody else is using it,
   and it prints the gateway's reason. A machine that already sleeps is left
-  alone, and `off` says it is already off. `sb ai` needs an operator key for it.
+  alone, and `off` says it is already off (or, when the gateway knows it is
+  off and did not ask it, "known off, not checked; nothing to do"). `sb ai`
+  needs an operator key for it.
 - `bench` measures text models through the gateway's OpenAI-compatible API and
   reports the time to the first token, the prompt and the decode speed (tokens
   per second), the total time and the token counts. The first run of each model

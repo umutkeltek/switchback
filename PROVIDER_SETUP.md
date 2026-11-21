@@ -578,7 +578,9 @@ as they were, so the idle power-off still runs later.
 A machine none of whose lanes answers a fresh health probe is already
 off, whoever put it to sleep: the answer is 200 with `"already_off":
 true` and no command runs (one that reaches a sleeping machine fails,
-and a false failure would escalate the lane and alert).
+and a false failure would escalate the lane and alert). A machine the
+gateway already knows is off is not asked at all: the answer adds
+`"known_off": true` (known off, not checked).
 
 Every refusal and every action is written to the gateway log. A power-off
 that fails escalates the lane and fires the same `poweroff_failed` alert

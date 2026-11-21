@@ -140,6 +140,7 @@ class Fake:
         self.power_refusal = None
         self.power_on_status = "waking"  # what `on` answers: "waking" or "up"
         self.already_off = False  # what `off` answers
+        self.known_off = False  # `off` of a machine the gateway knows is off (not asked)
         self.released_holds = []
         self.jobs_delay = 0.0  # seconds POST /v1/jobs takes to answer
         self.chat_plans = []  # one plan per chat request; the last one is used again
@@ -321,7 +322,8 @@ class Fake:
                 return self.json({"host": host, "action": "on", "status": "up", "lanes": 1})
             return self.json({"host": host, "action": "on", "status": "waking", "lanes": 1}, 202)
         return self.json({"host": host, "action": request["json"].get("action"),
-                          "powered_off": True, "already_off": self.already_off, "lanes": 1,
+                          "powered_off": True, "already_off": self.already_off or self.known_off,
+                          "known_off": self.known_off, "lanes": 1,
                           "released_holds": self.released_holds})
 
     def chat_plan_for(self):
@@ -1084,6 +1086,14 @@ class SbAi(unittest.TestCase):
         run = self.sb("off")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("box is already off", run.stdout)
+        self.assertNotIn("powering off", run.stdout)
+
+    def test_off_says_when_the_machine_is_known_off_and_not_checked(self):
+        self.fake.known_off = True
+        run = self.sb("off")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("box is known off, not checked; nothing to do", run.stdout)
+        self.assertNotIn("already off", run.stdout)
         self.assertNotIn("powering off", run.stdout)
 
     def test_off_names_the_released_holds(self):
