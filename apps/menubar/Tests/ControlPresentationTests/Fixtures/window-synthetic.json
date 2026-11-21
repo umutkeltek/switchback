@@ -8,13 +8,13 @@
     "target": "text/model-b"
    }
   ],
-  "generated_at_ms": 1768478400000,
+  "generated_at_ms": 1.7684784e12,
   "hosts": [],
   "object": "optimize.report",
   "targets": [
    {
     "ceiling": {
-     "bytes_per_token": 6000000000,
+     "bytes_per_token": 6e9,
      "decode_tps": 168.0,
      "prefill_tps": null,
      "source": "sb ai fit example/model-a Q4_K_M at 1008 GB/s"
@@ -132,18 +132,18 @@
       "in_flight": 0,
       "memory": {
        "effective": {
-        "bytes": 21152713932,
-        "host_bytes": 429496729,
+        "bytes": 2.1152713932e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 32768
        },
        "max": {
-        "bytes": 35433480192,
-        "host_bytes": 429496729,
+        "bytes": 3.5433480192e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 262144
        },
        "min": {
-        "bytes": 19434727014,
-        "host_bytes": 429496729,
+        "bytes": 1.9434727014e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 4096
        },
        "status": "measured"
@@ -240,7 +240,7 @@
      }
     ],
     "pending_apply": false,
-    "seen_at_ms": 1768478396000,
+    "seen_at_ms": 1.768478396e12,
     "settings_command": true,
     "state": "up",
     "variants": []
@@ -309,7 +309,7 @@
      }
     ],
     "pending_apply": false,
-    "seen_at_ms": 1768478396000,
+    "seen_at_ms": 1.768478396e12,
     "settings_command": false,
     "state": "up",
     "variants": []
@@ -323,7 +323,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768475400000,
+     "at_ms": 1.7684754e12,
      "changed": [
       "load.cache_type_k"
      ],
@@ -335,7 +335,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768467600000,
+     "at_ms": 1.7684676e12,
      "changed": [
       "temperature",
       "top_p"
@@ -348,7 +348,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768304400000,
+     "at_ms": 1.7683044e12,
      "changed": [
       "load.ctx_size"
      ],
@@ -650,7 +650,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -665,7 +665,7 @@
      "revision": 2,
      "route_profile": null,
      "target": "text/model-b",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     },
     {
      "document": {
@@ -767,7 +767,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "mac",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "sleeping"
       },
       "engine_args": {},
@@ -782,7 +782,7 @@
      "revision": 1,
      "route_profile": null,
      "target": "mac/vision-model",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -896,25 +896,25 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "loaded"
       },
       "engine_args": {},
       "last_apply": null,
       "memory": {
        "effective": {
-        "bytes": 21152713932,
-        "host_bytes": 429496729,
+        "bytes": 2.1152713932e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 32768
        },
        "max": {
-        "bytes": 35433480192,
-        "host_bytes": 429496729,
+        "bytes": 3.5433480192e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 262144
        },
        "min": {
-        "bytes": 19434727014,
-        "host_bytes": 429496729,
+        "bytes": 1.9434727014e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 4096
        },
        "status": "measured"
@@ -946,11 +946,11 @@
        ]
       },
       "estimate": {
-       "budget_bytes": 25232932864,
+       "budget_bytes": 2.5232932864e10,
        "head_dim": 256,
        "kv_heads": 4,
        "kv_layers": 40,
-       "weights_bytes": 18468359372
+       "weights_bytes": 1.8468359372e10
       },
       "max_variants": 2,
       "variant_idle_ttl_secs": 3600
@@ -958,7 +958,7 @@
      "revision": 3,
      "route_profile": null,
      "target": "text/model-a",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     },
     {
      "document": {
@@ -1060,7 +1060,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "mac",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "sleeping"
       },
       "engine_args": {},
@@ -1075,7 +1075,7 @@
      "revision": 1,
      "route_profile": null,
      "target": "mac/vision-model",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -1189,25 +1189,25 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "loaded"
       },
       "engine_args": {},
       "last_apply": null,
       "memory": {
        "effective": {
-        "bytes": 21152713932,
-        "host_bytes": 429496729,
+        "bytes": 2.1152713932e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 32768
        },
        "max": {
-        "bytes": 35433480192,
-        "host_bytes": 429496729,
+        "bytes": 3.5433480192e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 262144
        },
        "min": {
-        "bytes": 19434727014,
-        "host_bytes": 429496729,
+        "bytes": 1.9434727014e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 4096
        },
        "status": "measured"
@@ -1239,11 +1239,11 @@
        ]
       },
       "estimate": {
-       "budget_bytes": 25232932864,
+       "budget_bytes": 2.5232932864e10,
        "head_dim": 256,
        "kv_heads": 4,
        "kv_layers": 40,
-       "weights_bytes": 18468359372
+       "weights_bytes": 1.8468359372e10
       },
       "max_variants": 2,
       "variant_idle_ttl_secs": 3600
@@ -1251,7 +1251,7 @@
      "revision": 3,
      "route_profile": null,
      "target": "text/model-a",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -1353,7 +1353,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -1368,7 +1368,7 @@
      "revision": 2,
      "route_profile": null,
      "target": "text/model-b",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -1470,7 +1470,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -1485,7 +1485,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/model-c",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -1587,7 +1587,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -1602,7 +1602,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/model-d",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -1706,7 +1706,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "mac-audio/speech-model",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -1814,7 +1814,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "mac",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "sleeping"
       },
       "engine_args": {},
@@ -1829,7 +1829,7 @@
      "revision": 1,
      "route_profile": null,
      "target": "mac/vision-model",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   }
@@ -1907,7 +1907,7 @@
     "holds": [
      {
       "expires_at": "2026-01-15T13:12:00.000Z",
-      "expires_at_ms": 1768482720000,
+      "expires_at_ms": 1.76848272e12,
       "id": "hold_0001",
       "owner": "owner",
       "reason": "nightly check",
@@ -1918,7 +1918,7 @@
     "holds_gpu": false,
     "host": "gpu-box",
     "in_flight": 0,
-    "last_wake_ms": 1768476120000,
+    "last_wake_ms": 1.76847612e12,
     "last_wake_result": "ok after 1 attempt(s)",
     "level": "ok",
     "name": "media",
@@ -1949,7 +1949,7 @@
     "holds": [
      {
       "expires_at": "2026-01-15T13:12:00.000Z",
-      "expires_at_ms": 1768482720000,
+      "expires_at_ms": 1.76848272e12,
       "id": "hold_0001",
       "owner": "owner",
       "reason": "nightly check",
@@ -1960,7 +1960,7 @@
     "holds_gpu": true,
     "host": "gpu-box",
     "in_flight": 0,
-    "last_wake_ms": 1768476120000,
+    "last_wake_ms": 1.76847612e12,
     "last_wake_result": "ok after 1 attempt(s)",
     "level": "ok",
     "name": "text",

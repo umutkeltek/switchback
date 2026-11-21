@@ -25,7 +25,7 @@
     "target": "text/extremely-long-model-name-for-truncation-checks-01"
    }
   ],
-  "generated_at_ms": 1768478400000,
+  "generated_at_ms": 1.7684784e12,
   "hosts": [],
   "object": "optimize.report",
   "targets": [
@@ -409,18 +409,18 @@
       "in_flight": 3,
       "memory": {
        "effective": {
-        "bytes": 16106127360,
-        "host_bytes": 429496729,
+        "bytes": 1.610612736e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 65536
        },
        "max": {
-        "bytes": 22548578304,
-        "host_bytes": 429496729,
+        "bytes": 2.2548578304e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 131072
        },
        "min": {
-        "bytes": 9663676416,
-        "host_bytes": 429496729,
+        "bytes": 9.663676416e9,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 4096
        },
        "status": "measured"
@@ -504,18 +504,18 @@
       "in_flight": 0,
       "memory": {
        "effective": {
-        "bytes": 19327352832,
-        "host_bytes": 429496729,
+        "bytes": 1.9327352832e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 65536
        },
        "max": {
-        "bytes": 25769803776,
-        "host_bytes": 429496729,
+        "bytes": 2.5769803776e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 131072
        },
        "min": {
-        "bytes": 12884901888,
-        "host_bytes": 429496729,
+        "bytes": 1.2884901888e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 4096
        },
        "status": "measured"
@@ -1447,7 +1447,7 @@
      }
     ],
     "pending_apply": true,
-    "seen_at_ms": 1768478396000,
+    "seen_at_ms": 1.768478396e12,
     "settings_command": true,
     "state": "up",
     "variants": []
@@ -1488,7 +1488,7 @@
      }
     ],
     "pending_apply": false,
-    "seen_at_ms": 1768478396000,
+    "seen_at_ms": 1.768478396e12,
     "settings_command": true,
     "state": "asleep",
     "variants": []
@@ -1529,7 +1529,7 @@
      }
     ],
     "pending_apply": false,
-    "seen_at_ms": 1768478396000,
+    "seen_at_ms": 1.768478396e12,
     "settings_command": false,
     "state": "asleep",
     "variants": []
@@ -1552,7 +1552,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768478100000,
+     "at_ms": 1.7684781e12,
      "changed": [
       "temperature"
      ],
@@ -1564,7 +1564,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768476300000,
+     "at_ms": 1.7684763e12,
      "changed": [
       "temperature",
       "load.ctx_size"
@@ -1577,7 +1577,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768474500000,
+     "at_ms": 1.7684745e12,
      "changed": [
       "temperature",
       "load.ctx_size",
@@ -1591,7 +1591,7 @@
     {
      "action": "revert",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768472700000,
+     "at_ms": 1.7684727e12,
      "changed": [
       "temperature",
       "load.ctx_size",
@@ -1606,7 +1606,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768470900000,
+     "at_ms": 1.7684709e12,
      "changed": [
       "temperature",
       "load.ctx_size",
@@ -1622,7 +1622,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768469100000,
+     "at_ms": 1.7684691e12,
      "changed": [
       "temperature"
      ],
@@ -1634,7 +1634,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768467300000,
+     "at_ms": 1.7684673e12,
      "changed": [
       "temperature",
       "load.ctx_size"
@@ -1647,7 +1647,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768465500000,
+     "at_ms": 1.7684655e12,
      "changed": [],
      "document": {},
      "revision": 5,
@@ -1657,7 +1657,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768463700000,
+     "at_ms": 1.7684637e12,
      "changed": [
       "temperature",
       "load.ctx_size",
@@ -1672,7 +1672,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768461900000,
+     "at_ms": 1.7684619e12,
      "changed": [
       "temperature",
       "load.ctx_size",
@@ -1688,7 +1688,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768460100000,
+     "at_ms": 1.7684601e12,
      "changed": [
       "temperature"
      ],
@@ -1700,7 +1700,7 @@
     {
      "action": "put",
      "actor": "tenant=owner project=example",
-     "at_ms": 1768458300000,
+     "at_ms": 1.7684583e12,
      "changed": [
       "temperature",
       "load.ctx_size"
@@ -2079,7 +2079,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -2094,7 +2094,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/model-00-q4_k_m-with-a-very-long-suffix-v2.1",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     },
     {
      "document": {},
@@ -2190,7 +2190,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -2205,7 +2205,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/extremely-long-model-name-for-truncation-checks-01",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     },
     {
      "document": {},
@@ -2301,7 +2301,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -2316,7 +2316,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/instruct-02",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     },
     {
      "document": {},
@@ -2412,7 +2412,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -2427,7 +2427,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/vision-language-preview-build-03-q4_k_m-with-a-very-long-suffix-v2.1",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     },
     {
      "document": {},
@@ -2523,7 +2523,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -2538,7 +2538,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/coder-04",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     },
     {
      "document": {},
@@ -2634,7 +2634,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -2649,7 +2649,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "text/reasoning-distilled-experimental-merge-05",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -2770,25 +2770,25 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "text",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "loaded"
       },
       "engine_args": {},
       "last_apply": null,
       "memory": {
        "effective": {
-        "bytes": 16106127360,
-        "host_bytes": 429496729,
+        "bytes": 1.610612736e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 65536
        },
        "max": {
-        "bytes": 22548578304,
-        "host_bytes": 429496729,
+        "bytes": 2.2548578304e10,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 131072
        },
        "min": {
-        "bytes": 9663676416,
-        "host_bytes": 429496729,
+        "bytes": 9.663676416e9,
+        "host_bytes": 4.29496729e8,
         "n_ctx": 4096
        },
        "status": "measured"
@@ -2826,11 +2826,11 @@
        ]
       },
       "estimate": {
-       "budget_bytes": 25232932864,
+       "budget_bytes": 2.5232932864e10,
        "head_dim": 128,
        "kv_heads": 8,
        "kv_layers": 48,
-       "weights_bytes": 21474836480
+       "weights_bytes": 2.147483648e10
       },
       "max_variants": 2,
       "variant_idle_ttl_secs": 3600
@@ -2838,7 +2838,7 @@
      "revision": 12,
      "route_profile": "a-very-long-profile-name",
      "target": "text/extremely-long-model-name-for-truncation-checks-01",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   },
@@ -2940,7 +2940,7 @@
       "engine": {
        "kind": "llama_cpp_router",
        "lane": "spare",
-       "seen_at_ms": 1768478396000,
+       "seen_at_ms": 1.768478396e12,
        "status": "unloaded"
       },
       "engine_args": {},
@@ -2955,7 +2955,7 @@
      "revision": 0,
      "route_profile": null,
      "target": "spare/spare-model",
-     "updated_at_ms": 1768473000000
+     "updated_at_ms": 1.768473e12
     }
    ]
   }
@@ -3001,7 +3001,7 @@
     "holds": [
      {
       "expires_at": "2026-01-15T12:03:00.000Z",
-      "expires_at_ms": 1768478580000,
+      "expires_at_ms": 1.76847858e12,
       "id": "hold_waitfailed_000000000000000000000001",
       "owner": "owner",
       "reason": "a hold reason that is much longer than anyone would ever type into the box",
@@ -3010,7 +3010,7 @@
      },
      {
       "expires_at": "2026-01-15T18:40:00.000Z",
-      "expires_at_ms": 1768502400000,
+      "expires_at_ms": 1.7685024e12,
       "id": "hold_0002",
       "owner": "owner",
       "reason": "benchmark",
@@ -3022,7 +3022,7 @@
     "host": "gpu-box",
     "in_flight": 3,
     "last_error": "engine exited with code 137 after loading reasoning-distilled-experimental-merge-13 and running out of GPU memory",
-    "last_wake_ms": 1768478220000,
+    "last_wake_ms": 1.76847822e12,
     "last_wake_result": "ok after 4 attempt(s)",
     "level": "error",
     "name": "text",
@@ -3054,7 +3054,7 @@
     "holds": [
      {
       "expires_at": "2026-01-15T12:03:00.000Z",
-      "expires_at_ms": 1768478580000,
+      "expires_at_ms": 1.76847858e12,
       "id": "hold_waitfailed_000000000000000000000001",
       "owner": "owner",
       "reason": "a hold reason that is much longer than anyone would ever type into the box",
@@ -3063,7 +3063,7 @@
      },
      {
       "expires_at": "2026-01-15T18:40:00.000Z",
-      "expires_at_ms": 1768502400000,
+      "expires_at_ms": 1.7685024e12,
       "id": "hold_0002",
       "owner": "owner",
       "reason": "benchmark",
@@ -3074,7 +3074,7 @@
     "holds_gpu": false,
     "host": "gpu-box",
     "in_flight": 0,
-    "last_wake_ms": 1768478220000,
+    "last_wake_ms": 1.76847822e12,
     "last_wake_result": "ok after 4 attempt(s)",
     "level": "ok",
     "name": "media",
@@ -3106,7 +3106,7 @@
     "holds_gpu": null,
     "host": "gpu-box-2",
     "in_flight": 0,
-    "last_wake_ms": 1768442400000,
+    "last_wake_ms": 1.7684424e12,
     "last_wake_result": "timeout",
     "level": "error",
     "name": "spare",
