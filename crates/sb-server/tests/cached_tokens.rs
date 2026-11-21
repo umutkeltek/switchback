@@ -205,3 +205,24 @@ async fn cached_tokens_are_charged_once_on_a_plain_response() {
 async fn cached_tokens_are_charged_once_on_a_streamed_response() {
     check(true).await;
 }
+
+// REREVIEW: an Anthropic Messages client in front of an OpenAI upstream.
+// On main it saw input_tokens 1000 (the whole prompt). Now it sees only
+// the uncached part and nothing for the cached 800.
+#[tokio::test]
+async fn rereview_anthropic_client_sees_the_whole_prompt() {
+    let gateway = spawn_gateway("anthropic_client").await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/messages", gateway.base))
+        .json(&json!({"model": "mapped", "max_tokens": 64,
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "{}", response.status());
+    let value: Value = response.json().await.unwrap();
+    let usage = &value["usage"];
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    assert_eq!(input + cache_read, 1000, "Anthropic client usage: {usage}");
+}

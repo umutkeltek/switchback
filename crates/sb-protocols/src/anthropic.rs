@@ -539,11 +539,27 @@ pub fn response_to_anthropic(resp: &AiResponse) -> Value {
         "content": content,
         "stop_reason": finish_to_stop_reason(resp.finish_reason),
         "stop_sequence": Value::Null,
-        "usage": {
-            "input_tokens": resp.usage.input_tokens,
-            "output_tokens": resp.usage.output_tokens,
-        }
+        "usage": anthropic_usage_json(&resp.usage),
     })
+}
+
+/// The cached part of the prompt in the Anthropic form: canonical
+/// `input_tokens` excludes the cached tokens, so a client sees the whole
+/// prompt only when `cache_read_input_tokens` carries them. Added only when
+/// non-zero, so a reply without a cache keeps its bytes.
+fn insert_cache_read(usage: &Usage, value: &mut Value) {
+    if usage.cached_input_tokens > 0 {
+        value["cache_read_input_tokens"] = json!(usage.cached_input_tokens);
+    }
+}
+
+fn anthropic_usage_json(usage: &Usage) -> Value {
+    let mut value = json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+    });
+    insert_cache_read(usage, &mut value);
+    value
 }
 
 fn index_of(data: &Value) -> u32 {
@@ -1068,6 +1084,8 @@ impl AnthropicStreamEncoder {
             return;
         }
         self.message_started = true;
+        let mut usage = json!({ "input_tokens": self.usage.input_tokens, "output_tokens": 0 });
+        insert_cache_read(&self.usage, &mut usage);
         out.push(Self::frame(
             "message_start",
             json!({
@@ -1080,7 +1098,7 @@ impl AnthropicStreamEncoder {
                     "content": [],
                     "stop_reason": Value::Null,
                     "stop_sequence": Value::Null,
-                    "usage": { "input_tokens": self.usage.input_tokens, "output_tokens": 0 },
+                    "usage": usage,
                 }
             }),
         ));
@@ -1234,6 +1252,14 @@ impl AnthropicStreamEncoder {
             AiStreamEvent::MessageEnd { finish_reason } => {
                 self.ensure_started(&mut out);
                 self.close_block(&mut out);
+                let mut usage = json!({ "output_tokens": self.usage.output_tokens });
+                if self.usage.cached_input_tokens > 0 {
+                    // With a cache, the prompt split rides here as the
+                    // Anthropic API sends it; without one, the frame keeps
+                    // its old bytes.
+                    usage["input_tokens"] = json!(self.usage.input_tokens);
+                    insert_cache_read(&self.usage, &mut usage);
+                }
                 out.push(Self::frame(
                     "message_delta",
                     json!({
@@ -1242,7 +1268,7 @@ impl AnthropicStreamEncoder {
                             "stop_reason": finish_to_stop_reason(*finish_reason),
                             "stop_sequence": Value::Null
                         },
-                        "usage": { "output_tokens": self.usage.output_tokens }
+                        "usage": usage
                     }),
                 ));
                 out.push(Self::frame(
@@ -2030,5 +2056,81 @@ mod tests {
         assert!(joined.contains("\"input_json_delta\""));
         assert!(joined.contains("\"stop_reason\":\"tool_use\""));
         assert!(joined.contains("event: message_stop"));
+    }
+
+    // Canonical `input_tokens` excludes the cached prompt, so the Anthropic
+    // client sees the cached part as `cache_read_input_tokens`. Without a
+    // cache, the reply keeps the exact bytes it had before.
+    #[test]
+    fn rendered_usage_carries_the_cached_prompt_only_when_there_is_one() {
+        let body = json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 200, "cache_read_input_tokens": 800, "output_tokens": 5}
+        });
+        let mut resp = parse_anthropic_response(&body).unwrap();
+        let usage = &response_to_anthropic(&resp)["usage"];
+        assert_eq!(
+            usage,
+            &json!({"input_tokens": 200, "cache_read_input_tokens": 800, "output_tokens": 5})
+        );
+        resp.usage.cached_input_tokens = 0;
+        assert_eq!(
+            response_to_anthropic(&resp)["usage"].to_string(),
+            r#"{"input_tokens":200,"output_tokens":5}"#
+        );
+    }
+
+    #[test]
+    fn stream_usage_carries_the_cached_prompt_only_when_there_is_one() {
+        let run = |cached: u64| {
+            let mut enc = AnthropicStreamEncoder::new("msg_3".into(), "m".into());
+            let mut frames = Vec::new();
+            frames.extend(enc.encode(&AiStreamEvent::UsageDelta {
+                usage: Usage {
+                    input_tokens: 200,
+                    cached_input_tokens: cached,
+                    output_tokens: 5,
+                    ..Usage::default()
+                },
+            }));
+            frames.extend(enc.encode(&AiStreamEvent::TextDelta { text: "hi".into() }));
+            frames.extend(enc.encode(&AiStreamEvent::MessageEnd {
+                finish_reason: FinishReason::Stop,
+            }));
+            frames
+        };
+        let usage_of = |frames: &[String], event: &str| -> Value {
+            let frame = frames
+                .iter()
+                .find(|f| f.starts_with(&format!("event: {event}\n")))
+                .unwrap();
+            let data: Value =
+                serde_json::from_str(frame.lines().nth(1).unwrap().trim_start_matches("data: "))
+                    .unwrap();
+            if event == "message_start" {
+                data["message"]["usage"].clone()
+            } else {
+                data["usage"].clone()
+            }
+        };
+        let cached = run(800);
+        assert_eq!(
+            usage_of(&cached, "message_start"),
+            json!({"input_tokens": 200, "cache_read_input_tokens": 800, "output_tokens": 0})
+        );
+        assert_eq!(
+            usage_of(&cached, "message_delta"),
+            json!({"input_tokens": 200, "cache_read_input_tokens": 800, "output_tokens": 5})
+        );
+        let plain = run(0);
+        assert_eq!(
+            usage_of(&plain, "message_start").to_string(),
+            r#"{"input_tokens":200,"output_tokens":0}"#
+        );
+        assert_eq!(
+            usage_of(&plain, "message_delta").to_string(),
+            r#"{"output_tokens":5}"#
+        );
     }
 }
