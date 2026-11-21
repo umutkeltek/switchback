@@ -935,17 +935,22 @@ pub(crate) async fn lock_extend(
     if !principal.is_operator_or_admin() {
         return crate::tenancy::forbidden();
     }
-    let expires = sb_store::now_millis() + (body.ttl_secs.clamp(1, MAX_LOCK_SECS) as i64) * 1000;
+    let now = sb_store::now_millis();
+    let snap = state.snapshot();
+    let optimize = &snap.config.server.optimize;
+    let mut expires = now + (body.ttl_secs.clamp(1, MAX_LOCK_SECS) as i64) * 1000;
+    // The same cap as a new lock: a heartbeat never carries the lock into
+    // the next quiet window.
+    if let Some(start) = sb_runtime::optimize::next_quiet_window_start(optimize, now) {
+        expires = expires.min(start);
+    }
     match state.engine.optimize().extend_lock(&id, expires) {
         // The tuner's heartbeat: it also learns whether a quiet window
         // began, so it stops at its next safe point.
         Some(lock) => {
-            let snap = state.snapshot();
             let mut view = json!(lock);
-            view["quiet_window"] = json!(sb_runtime::optimize::quiet_window_now(
-                &snap.config.server.optimize,
-                sb_store::now_millis()
-            ));
+            view["quiet_window"] =
+                json!(sb_runtime::optimize::quiet_window_now(optimize, now));
             Json(view).into_response()
         }
         None => refuse(

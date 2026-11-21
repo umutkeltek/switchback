@@ -555,6 +555,52 @@ async fn a_lock_and_its_hold_end_at_the_next_quiet_window() {
     assert_eq!(holds["data"][0]["expires_at_ms"].as_i64(), Some(hold_end));
 }
 
+// The tuner's own hold asks to end by the next quiet window's start, so a
+// run cut off before it took its lock leaves no hold reaching into the
+// window. A hold that does not ask keeps the time it asked for.
+#[tokio::test]
+async fn a_hold_that_asks_ends_at_the_next_quiet_window() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let start_ms = now / 60_000 * 60_000 + 10 * 60_000;
+    let hhmm = |ms: i64| {
+        let minute = (ms / 60_000).rem_euclid(1440);
+        format!("{:02}:{:02}", minute / 60, minute % 60)
+    };
+    let window = format!(
+        "    quiet_windows: [\"{}-{}\"]",
+        hhmm(start_ms),
+        hhmm(start_ms + 10 * 60_000)
+    );
+    let fx = fixture(true, &window).await;
+    let (status, hold) = call(
+        &fx.gw,
+        "POST",
+        "/v1/hosts/gpu-box/holds",
+        ADMIN,
+        Some(json!({"ttl_secs": 3600, "reason": "tune", "until_quiet_window": true})),
+    )
+    .await;
+    assert_eq!(status, 201, "{hold}");
+    let end = hold["expires_at_ms"].as_i64().unwrap();
+    assert!(
+        end <= start_ms + 1_000 && end > now,
+        "hold {end} vs window start {start_ms}: {hold}"
+    );
+    let (status, plain) = call(
+        &fx.gw,
+        "POST",
+        "/v1/hosts/gpu-box/holds",
+        ADMIN,
+        Some(json!({"ttl_secs": 3600, "reason": "other"})),
+    )
+    .await;
+    assert_eq!(status, 201, "{plain}");
+    assert!(plain["expires_at_ms"].as_i64().unwrap() > start_ms + 1_000);
+}
+
 // Tuning locks keep embeddings and audio off the lane too.
 #[tokio::test]
 async fn a_tuning_lock_covers_embeddings_and_audio() {
@@ -667,4 +713,51 @@ async fn the_experiment_ledger_and_settings_notes_round_trip() {
     );
     // The state is the gateway's: nothing else holds it.
     let _ = fx.state.engine.optimize().locks();
+}
+
+// REREVIEW: the tuner's heartbeat (PATCH, ttl = budget left + 900 s) must
+// keep the lock capped at the next quiet window's start, as POST does.
+#[tokio::test]
+async fn rereview_a_heartbeat_keeps_the_lock_inside_the_quiet_window_cap() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let start_ms = now / 60_000 * 60_000 + 10 * 60_000;
+    let hhmm = |ms: i64| {
+        let minute = (ms / 60_000).rem_euclid(1440);
+        format!("{:02}:{:02}", minute / 60, minute % 60)
+    };
+    let window = format!(
+        "    quiet_windows: [\"{}-{}\"]",
+        hhmm(start_ms),
+        hhmm(start_ms + 10 * 60_000)
+    );
+    let fx = fixture(true, &window).await;
+    let (status, lock) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a", "ttl_secs": 3600})),
+    )
+    .await;
+    assert_eq!(status, 201, "{lock}");
+    assert_eq!(lock["expires_at_ms"].as_i64().unwrap(), start_ms);
+    let id = lock["id"].as_str().unwrap().to_string();
+    let (status, beat) = call(
+        &fx.gw,
+        "PATCH",
+        &format!("/v1/optimize/locks/{id}"),
+        ADMIN,
+        Some(json!({"ttl_secs": 3600})),
+    )
+    .await;
+    assert_eq!(status, 200, "{beat}");
+    let expires = beat["expires_at_ms"].as_i64().unwrap();
+    assert!(
+        expires <= start_ms,
+        "heartbeat moved the lock {} s past the quiet window start: {beat}",
+        (expires - start_ms) / 1000
+    );
 }

@@ -934,7 +934,11 @@ class Tuner:
         ttl = int(self.budget + 900)
         hold = self.call("POST", f"/v1/hosts/{urllib.parse.quote(self.host)}/holds",
                          body={"ttl_secs": min(ttl, 14400), "reason": f"sb ai tune {self.target}",
-                               "wake": bool(self.args.wake and self.asleep)},
+                               "wake": bool(self.args.wake and self.asleep),
+                               # The gateway ends it by the next quiet window,
+                               # so a run cut off before its lock leaves no
+                               # hold reaching into the window.
+                               "until_quiet_window": True},
                          doing="holding the machine")
         self.hold = hold.get("id")
         if self.asleep:

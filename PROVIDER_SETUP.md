@@ -1420,7 +1420,11 @@ the run stops the same way (exit 1).
 
 A tuner that dies cannot reach into a window either. A new lock, and the
 run's hold (`hold_id`), end no later than the next window's start, whatever
-`ttl_secs` asked for; the answer's `hold` shows the hold after that cap. And
+`ttl_secs` asked for; the answer's `hold` shows the hold after that cap. A
+heartbeat (`PATCH`) keeps the same cap. The tuner takes its hold with
+`"until_quiet_window": true` (`POST /v1/hosts/{host}/holds`), so the hold
+ends by the next window's start from the moment it exists, even when the run
+is cut off before it takes its lock. And
 while a window is in force every tuning lock is set aside, so the window's
 work reaches the lane even if a lock is still on record.
 

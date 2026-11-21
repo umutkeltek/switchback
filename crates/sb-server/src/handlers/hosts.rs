@@ -28,6 +28,12 @@ pub(crate) struct HoldRequest {
     /// public name with one target). Operator and admin keys only.
     #[serde(default)]
     load: Option<String>,
+    /// End the hold no later than the next quiet window's start
+    /// (`server.optimize.quiet_windows`). `sb ai tune` asks for it, so a run
+    /// cut off before it took its lock leaves nothing that reaches into the
+    /// window.
+    #[serde(default)]
+    until_quiet_window: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,10 +119,22 @@ pub(crate) async fn create(
     Path(host): Path<String>,
     Json(body): Json<HoldRequest>,
 ) -> Response {
-    let ttl = match ttl_ms(&state, body.ttl_secs) {
+    let mut ttl = match ttl_ms(&state, body.ttl_secs) {
         Ok(ttl) => ttl,
         Err(response) => return response,
     };
+    if body.until_quiet_window {
+        let now = sb_store::now_millis();
+        if let Some(start) = sb_runtime::optimize::next_quiet_window_start(
+            &state.snapshot().config.server.optimize,
+            now,
+        ) {
+            let left_ms = u64::try_from(start.saturating_sub(now))
+                .unwrap_or(0)
+                .max(1_000);
+            ttl = ttl.min(left_ms);
+        }
+    }
     if body.reason.chars().count() > 200 {
         return error(
             StatusCode::BAD_REQUEST,

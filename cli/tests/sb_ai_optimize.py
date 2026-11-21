@@ -570,6 +570,8 @@ class TuneTests(Base):
         self.assertEqual(run.returncode, 0, run.stderr)
         holds = self.fake.calls("POST", "/v1/hosts/gpu-box/holds")
         self.assertEqual(holds[0][2]["wake"], True)
+        # The hold itself ends by the next quiet window, before any lock.
+        self.assertEqual(holds[0][2]["until_quiet_window"], True)
         self.assert_released()
 
     def test_a_busy_lane_is_refused(self):
