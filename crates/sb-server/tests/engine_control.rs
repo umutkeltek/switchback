@@ -39,6 +39,12 @@ struct Router_ {
     exiting: BTreeMap<String, std::time::Instant>,
     /// Loads refused because the model still ran.
     refused_loads: Vec<String>,
+    /// Each loaded model's command line (`status.args`): its preset
+    /// section as the router read it when it loaded the model.
+    args: BTreeMap<String, Vec<String>>,
+    /// An engine that keeps running the old settings: a load leaves the
+    /// model's command line as it was.
+    keep_old_args: bool,
     /// The overlay JSON the settings command writes; on a re-read the
     /// router compares each model's section with the one it read last and,
     /// like llama.cpp, unloads a running model whose section changed.
@@ -214,9 +220,13 @@ async fn models(
             if inner.unmeasured {
                 return json!({"id": id, "status": {"value": status}, "memory": {"status": "unmeasured"}});
             }
+            let args = inner.args.get(id).map_or_else(
+                || json!(["llama-server", "--ctx-size", "4096"]),
+                |args| json!(args),
+            );
             json!({
                 "id": id,
-                "status": {"value": status, "args": ["llama-server", "--ctx-size", "4096"]},
+                "status": {"value": status, "args": args},
                 "memory": {
                     "status": "measured",
                     "min": {"n_ctx": 4096, "devices": [
@@ -250,6 +260,24 @@ async fn load(State(stub): State<Stub>, Json(body): Json<Value>) -> Response {
             ),
         )
             .into_response();
+    }
+    if !inner.keep_old_args {
+        let mut flags = BTreeMap::from([("ctx-size".to_string(), "4096".to_string())]);
+        if let Some(settings) = inner
+            .presets
+            .get(&model)
+            .and_then(|preset| preset["settings"].as_object())
+        {
+            for (key, value) in settings {
+                flags.insert(key.clone(), value.as_str().unwrap_or_default().to_string());
+            }
+        }
+        let mut args = vec!["llama-server".to_string()];
+        for (key, value) in flags {
+            args.push(format!("--{key}"));
+            args.push(value);
+        }
+        inner.args.insert(model.clone(), args);
     }
     inner.status.insert(model, "loaded".to_string());
     Json(json!({"success": true})).into_response()
@@ -649,6 +677,7 @@ async fn apply_now_reloads_a_loaded_model() {
     let load = calls.iter().position(|c| c == "POST /models/load m");
     assert!(unload.is_some() && load > unload, "{calls:?}");
     assert_eq!(view["apply"]["reloaded_model"], json!(true), "{view}");
+    assert_eq!(view["apply"]["ok"], json!(true), "{view}");
     let engines = get_json(format!("{}/v1/engines", s.gw)).await;
     let m = engines["data"][0]["models"]
         .as_array()
@@ -702,6 +731,68 @@ async fn unload_answers_once_the_model_process_ended() {
     let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
     assert_eq!(status, 200, "{body}");
     assert!(s.stub.inner.lock().unwrap().refused_loads.is_empty());
+}
+
+#[tokio::test]
+async fn a_load_after_a_pending_apply_waits_for_the_old_process() {
+    // The settings command fails at first, so the write stays pending for
+    // the lane; `sb ai load` then runs the apply, whose re-read makes the
+    // router end the model's process in the background. A load sent
+    // before that end is refused (400 "model is already running") and the
+    // old settings would count as loaded.
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.exit_delay_ms = 400;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"flash_attn": true}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    std::fs::write(format!("{}.go", s.overlay.display()), b"go").unwrap();
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let inner = s.stub.inner.lock().unwrap();
+    assert!(
+        inner.refused_loads.is_empty(),
+        "the load reached the engine while the old process ran: {:?}",
+        inner.calls
+    );
+    assert!(inner.exiting.is_empty(), "{:?}", inner.calls);
+    assert_eq!(inner.status["m"], "loaded", "{:?}", inner.calls);
+    let args = inner.args["m"].join(" ");
+    assert!(args.contains("--flash-attn on"), "{args}");
+}
+
+#[tokio::test]
+async fn an_engine_that_keeps_the_old_settings_fails_the_apply() {
+    // The model loads again, but its command line still has the old
+    // settings: the apply says so instead of reporting them applied.
+    let s = setup(true, "", None).await;
+    s.stub.inner.lock().unwrap().keep_old_args = true;
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"ctx_size": 32768, "flash_attn": true}, "apply": "now"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["ok"], json!(false), "{view}");
+    let error = view["apply"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("the engine still runs the old settings"),
+        "{view}"
+    );
+    assert!(error.contains("ctx-size 32768 (it runs 4096)"), "{error}");
+    assert!(
+        error.contains("flash-attn on (it runs without it)"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

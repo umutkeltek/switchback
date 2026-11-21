@@ -1608,6 +1608,9 @@ impl EngineControls {
                 held.push(gate);
             }
         }
+        // The models whose section this apply writes (a load right after
+        // it must wait for the engine to end their old process).
+        result["changed"] = json!(changed.difference(&deferred).collect::<Vec<_>>());
         let Some(last) = last else {
             if !deferred.is_empty() {
                 // The first apply since the gateway started: what the engine
@@ -1970,17 +1973,22 @@ impl EngineControls {
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!("`{model}` still runs {bound} s after its unload"));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
     /// Load a model: through the lane's place and GPU group like a request
     /// (held only while loading), then wait for the engine to say loaded.
+    /// `running_is_loaded`: a model that already runs counts as loaded
+    /// (llama.cpp answers 400 "model is already running"); false where the
+    /// caller made sure the old process ended, so a model that still runs is
+    /// one whose old settings stayed.
     async fn load_model(
         &self,
         state: &EngineCtx,
         lane: &EngineLane,
         model: &str,
+        running_is_loaded: bool,
     ) -> Result<Value, String> {
         let _busy = match state.capacity.executor(&lane.name) {
             Some(executor) => match executor.acquire_for_request().await {
@@ -2006,8 +2014,9 @@ impl EngineControls {
             // llama.cpp answers 400 "model is already running" to a load of
             // a model that runs. Every unload here waits for the model's
             // process to end, so a model that runs is the loaded one: the
-            // listing below says so.
-            if !e.contains("already running") {
+            // listing below says so. Not after an apply's unload: there the
+            // process that runs is the old one, with the old settings.
+            if !running_is_loaded || !e.contains("already running") {
                 return Err(e);
             }
         }
@@ -2131,11 +2140,25 @@ impl EngineControls {
             value["error"] = json!(e);
             return value;
         }
-        match self.load_model(state, lane, model).await {
-            Ok(_) => {
-                self.mark_loaded(target, registry.revision(target));
-                value["reloaded_model"] = json!(true);
-                value["note"] = json!("reloaded with the new settings");
+        match self.load_model(state, lane, model, false).await {
+            Ok(row) => {
+                let load = registry
+                    .get(target)
+                    .map(|e| e.doc.load.clone())
+                    .unwrap_or_default();
+                let wanted = kind_ops(lane.engine.kind).preset_pairs(&load, &Map::new());
+                match args_mismatch(&wanted, &row) {
+                    Some(why) => {
+                        value["ok"] = json!(false);
+                        value["error"] =
+                            json!(format!("the engine still runs the old settings: {why}"));
+                    }
+                    None => {
+                        self.mark_loaded(target, registry.revision(target));
+                        value["reloaded_model"] = json!(true);
+                        value["note"] = json!("reloaded with the new settings");
+                    }
+                }
             }
             Err(e) => {
                 value["ok"] = json!(false);
@@ -2179,6 +2202,102 @@ fn process_running(status: Option<&str>) -> bool {
         status,
         Some("loaded" | "sleeping" | "loading" | "unloading")
     )
+}
+
+/// The load settings checked against a loaded model's argument list, by
+/// preset key, with every name llama-server takes for them. The others
+/// (`load-mode`, `fit`, file paths, ...) are not listed the same way, so
+/// they are not checked.
+const CHECKED_ARGS: &[(&str, &[&str])] = &[
+    ("ctx-size", &["--ctx-size", "-c"]),
+    ("n-gpu-layers", &["--n-gpu-layers", "--gpu-layers", "-ngl"]),
+    ("cache-type-k", &["--cache-type-k", "-ctk"]),
+    ("cache-type-v", &["--cache-type-v", "-ctv"]),
+    ("flash-attn", &["--flash-attn", "-fa"]),
+    ("batch-size", &["--batch-size", "-b"]),
+    ("ubatch-size", &["--ubatch-size", "-ub"]),
+    ("parallel", &["--parallel", "-np"]),
+    ("threads", &["--threads", "-t"]),
+    ("threads-batch", &["--threads-batch", "-tb"]),
+    ("spec-type", &["--spec-type"]),
+    (
+        "spec-draft-n-max",
+        &["--spec-draft-n-max", "--draft-max", "--draft", "--draft-n"],
+    ),
+    (
+        "spec-draft-n-min",
+        &["--spec-draft-n-min", "--draft-min", "--draft-n-min"],
+    ),
+];
+
+/// Why a loaded model's arguments (`status.args`, the router's command
+/// line for it) differ from the load settings `wanted` (preset keys to
+/// values): `None` when every checked key matches, or when the engine
+/// lists no arguments (nothing to check).
+fn args_mismatch(wanted: &BTreeMap<String, String>, row: &Value) -> Option<String> {
+    let args: Vec<&str> = row["status"]["args"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if args.is_empty() {
+        return None;
+    }
+    let wrong: Vec<String> = wanted
+        .iter()
+        .filter_map(|(key, want)| {
+            let (_, names) = CHECKED_ARGS.iter().find(|(k, _)| k == key)?;
+            let seen = arg_value(&args, names);
+            (!same_arg(want, seen.as_deref())).then(|| {
+                format!(
+                    "{key} {want} (it runs {})",
+                    seen.as_deref().unwrap_or("without it")
+                )
+            })
+        })
+        .collect();
+    (!wrong.is_empty()).then(|| wrong.join(", "))
+}
+
+/// A flag's last value in an argument list (`--name value` or
+/// `--name=value`); a flag with no value after it reads "on".
+fn arg_value(args: &[&str], names: &[&str]) -> Option<String> {
+    let mut out = None;
+    for (i, arg) in args.iter().enumerate() {
+        for name in names {
+            if arg == name {
+                out = Some(match args.get(i + 1) {
+                    Some(v) if !v.starts_with('-') || v.parse::<f64>().is_ok() => v.to_string(),
+                    _ => "on".to_string(),
+                });
+            } else if let Some(v) = arg.strip_prefix(&format!("{name}=")) {
+                out = Some(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A wanted value and the one an argument list shows mean the same:
+/// equal numbers, the same switch word (on/true/enabled), or "auto"/"all"
+/// that a number may stand for. Absent is the same only as "auto".
+fn same_arg(want: &str, seen: Option<&str>) -> bool {
+    let want = want.trim().to_ascii_lowercase();
+    let Some(seen) = seen.map(|v| v.trim().to_ascii_lowercase()) else {
+        return want == "auto";
+    };
+    if let (Ok(a), Ok(b)) = (want.parse::<f64>(), seen.parse::<f64>()) {
+        return a == b;
+    }
+    let switch = |v: &str| match v {
+        "true" | "on" | "enabled" => "on".to_string(),
+        "false" | "off" | "disabled" => "off".to_string(),
+        other => other.to_string(),
+    };
+    let (want, seen) = (switch(&want), switch(&seen));
+    want == seen
+        || (matches!(want.as_str(), "auto" | "all") && seen.parse::<f64>().is_ok())
+        || (matches!(seen.as_str(), "auto" | "all") && want.parse::<f64>().is_ok())
 }
 
 /// A model's status in an engine listing.
@@ -3233,9 +3352,34 @@ pub(crate) async fn load_target(
         },
     };
     if controls.pending_apply(&lane.name) {
-        controls.apply_lane(state, &lane).await;
+        let applied = controls.apply_lane(state, &lane).await;
+        // The re-read unloads a running model whose preset changed, and
+        // llama.cpp ends its process only after answering. A load before
+        // then meets the old process (400 "model is already running"), and
+        // the old settings would count as loaded: end it first.
+        let rewrote = applied["reloaded"] == json!(true)
+            && applied["changed"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|m| m == model));
+        if rewrote {
+            let ended = match controls.models(state, &lane).await {
+                Ok(models) => match model_status(&models, model).as_deref() {
+                    Some("loaded" | "sleeping" | "loading") => {
+                        controls.unload_model(state, &lane, model).await
+                    }
+                    status if process_running(status) => {
+                        controls.wait_unloaded(state, &lane, model).await
+                    }
+                    _ => Ok(()),
+                },
+                Err(e) => Err(e),
+            };
+            if let Err(e) = ended {
+                return Err(error(StatusCode::BAD_GATEWAY, "engine_error", e));
+            }
+        }
     }
-    match controls.load_model(state, &lane, model).await {
+    match controls.load_model(state, &lane, model, true).await {
         Ok(row) => {
             controls.mark_loaded(target, state.engine.model_settings().revision(target));
             Ok(json!({
