@@ -69,6 +69,15 @@ const SQLITE_BUSY_TIMEOUT_MS: u64 = 250;
 /// `sb body reclaim` died mid-run with "database is locked" on a busy host.
 /// Background maintenance can afford to wait its turn for the writer instead.
 const SQLITE_MAINTENANCE_BUSY_TIMEOUT_MS: u64 = 5_000;
+/// Longest stretch a maintenance pass (drain, recovery, reclaim, restore) keeps
+/// writing the shared index before it stops for [`MAINTENANCE_WRITER_TURN`].
+const MAINTENANCE_WRITE_BURST: Duration = Duration::from_millis(100);
+/// Pause that gives the live capture writer the index. The live writer waits at
+/// most 250 ms per attempt and polls at least every 50 ms while it waits, so a
+/// free window this long is always seen by a writer that is waiting.
+const MAINTENANCE_WRITER_TURN: Duration = Duration::from_millis(100);
+/// Recovered frames written per maintenance transaction.
+const MAINTENANCE_REPLAY_CHUNK: usize = 64;
 const ZSTD_LEVEL: i32 = 3;
 const DAY_MS: i64 = 86_400_000;
 const CAPTURE_SEGMENT_SCHEMA: &str = "switchback/capture-segment@1";
@@ -1668,6 +1677,12 @@ impl BodyLogger {
         let mut segments = Vec::new();
         collect_segment_files(&self.spool_dir.join("segments"), &mut segments)?;
         segments.sort();
+        let spool_blobs = if segments.is_empty() {
+            Default::default()
+        } else {
+            spool_blob_hashes_by_segment(conn)?
+        };
+        let mut turns = LiveWriterTurns::new();
         for src in segments {
             let Some(manifest) = read_verified_segment_manifest(&src)? else {
                 continue;
@@ -1722,24 +1737,16 @@ impl BodyLogger {
 
             let src_str = src.to_string_lossy().into_owned();
             let dest_str = dest.to_string_lossy().into_owned();
+            // Every statement here is an index lookup: this transaction holds the
+            // write lock the live capture writer needs.
             let transaction = begin_write_transaction(conn)?;
+            for hash in spool_blobs.get(&src_str).into_iter().flatten() {
+                transaction.execute(DRAIN_BLOB_BY_HASH_SQL, params![dest_str, src_str, hash])?;
+            }
+            transaction.execute(DRAIN_BLOBS_OF_EVENTS_SQL, params![dest_str, src_str])?;
+            transaction.execute(DRAIN_EVENTS_SQL, params![dest_str, src_str])?;
             transaction.execute(
-                "UPDATE body_blobs
-                 SET storage = 'archive_segment', archive_path = ?1
-                 WHERE storage = 'spool_segment' AND archive_path = ?2",
-                params![dest_str, src_str],
-            )?;
-            transaction.execute(
-                "UPDATE body_events
-                 SET storage = 'archive_segment', archive_path = ?1
-                 WHERE storage = 'spool_segment' AND archive_path = ?2",
-                params![dest_str, src_str],
-            )?;
-            transaction.execute(
-                "UPDATE body_segments
-                 SET segment_path = ?1, storage = 'archive_segment',
-                     segment_bytes = ?2, record_count = ?3, sealed = 1
-                 WHERE segment_path = ?4",
+                DRAIN_SEGMENT_SQL,
                 params![
                     dest_str,
                     manifest.segment_bytes as i64,
@@ -1748,6 +1755,7 @@ impl BodyLogger {
                 ],
             )?;
             transaction.commit()?;
+            turns.after_write();
 
             // Publish custody coordinates before the source disappears. A crash
             // after the index commit is recoverable from its exact sealed projection.
@@ -1791,6 +1799,7 @@ impl BodyLogger {
                          WHERE body_sha256 = ?2",
                         params![dest_str, sha],
                     )?;
+                    turns.after_write();
                     report.spool_blobs_drained += 1;
                 }
             }
@@ -3514,6 +3523,77 @@ pub(crate) fn begin_write_transaction(conn: &mut Connection) -> Result<Transacti
     Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
 }
 
+/// Gives the live capture writer a real turn between maintenance writes.
+///
+/// The live writer (sb-server tap) tries the index for 250 ms, backs off, and
+/// after 10 s of "database is locked" switches the whole store to metadata-only.
+/// Back-to-back maintenance transactions with only a few milliseconds between
+/// them can keep it out that long, because its polls miss the short gaps: live
+/// 2026-11-17..21, four backup runs lost 78 bodies this way. Call
+/// [`Self::after_write`] after every maintenance commit; once the pass has been
+/// writing for [`MAINTENANCE_WRITE_BURST`] it leaves the index free for
+/// [`MAINTENANCE_WRITER_TURN`].
+pub(crate) struct LiveWriterTurns {
+    burst_started: std::time::Instant,
+}
+
+impl LiveWriterTurns {
+    pub(crate) fn new() -> Self {
+        Self {
+            burst_started: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn after_write(&mut self) {
+        if self.burst_started.elapsed() >= MAINTENANCE_WRITE_BURST {
+            std::thread::sleep(MAINTENANCE_WRITER_TURN);
+            self.burst_started = std::time::Instant::now();
+        }
+    }
+}
+
+/// Drain: move one segment's blob row. Keyed by primary key: `body_blobs` has no
+/// `archive_path` index, and a path lookup scanned the whole table while holding
+/// the write lock, once per drained segment.
+const DRAIN_BLOB_BY_HASH_SQL: &str = "UPDATE body_blobs
+     SET storage = 'archive_segment', archive_path = ?1
+     WHERE body_sha256 = ?3 AND storage = 'spool_segment' AND archive_path = ?2";
+/// Drain: move the blob rows of this segment's events (index on event path + key).
+const DRAIN_BLOBS_OF_EVENTS_SQL: &str = "UPDATE body_blobs
+     SET storage = 'archive_segment', archive_path = ?1
+     WHERE body_sha256 IN (SELECT body_sha256 FROM body_events WHERE archive_path = ?2)
+       AND storage = 'spool_segment' AND archive_path = ?2";
+/// Drain: move one segment's events. `+storage` keeps the planner on the
+/// `archive_path` index; on `idx_body_events_storage` it walked every pending
+/// spool row of every segment inside the write lock.
+const DRAIN_EVENTS_SQL: &str = "UPDATE body_events
+     SET storage = 'archive_segment', archive_path = ?1
+     WHERE archive_path = ?2 AND +storage = 'spool_segment'";
+const DRAIN_SEGMENT_SQL: &str = "UPDATE body_segments
+     SET segment_path = ?1, storage = 'archive_segment',
+         segment_bytes = ?2, record_count = ?3, sealed = 1
+     WHERE segment_path = ?4";
+
+/// Spool blob rows by segment path, read once per drain outside any write
+/// transaction (a read does not block the live writer).
+fn spool_blob_hashes_by_segment(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut statement = conn.prepare(
+        "SELECT archive_path, body_sha256 FROM body_blobs WHERE storage = 'spool_segment'",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut by_segment: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (path, hash) = row?;
+        by_segment.entry(path).or_default().push(hash);
+    }
+    Ok(by_segment)
+}
+
 fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3674,6 +3754,40 @@ mod tests {
         drop(held);
         drop(logger);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drain_writes_are_index_lookups_never_table_walks() {
+        // Each drain transaction holds the write lock the live writer needs;
+        // a scan there grows with the whole store, not with the segment.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INDEX_SCHEMA_SQL).unwrap();
+        for sql in [
+            DRAIN_BLOB_BY_HASH_SQL,
+            DRAIN_BLOBS_OF_EVENTS_SQL,
+            DRAIN_EVENTS_SQL,
+            DRAIN_SEGMENT_SQL,
+        ] {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let nulls = vec![rusqlite::types::Null; statement.parameter_count()];
+            let plan: Vec<String> = statement
+                .query_map(rusqlite::params_from_iter(nulls), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect();
+            assert!(
+                plan.iter()
+                    .all(|step| !step.starts_with("SCAN")
+                        && !step.contains("idx_body_events_storage")),
+                "drain statement walks a table: {plan:?}\n{sql}"
+            );
+            assert!(
+                plan.iter().any(|step| step.starts_with("SEARCH")),
+                "{plan:?}"
+            );
+        }
     }
 
     #[test]

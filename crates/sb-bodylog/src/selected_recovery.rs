@@ -247,21 +247,36 @@ impl BodyLogger {
         if already_sealed {
             owned_regular(&manifest_path)?;
         }
-        let mut conn = open_index_connection_with_busy_timeout(&self.index_path, 1)?;
+        // Same leash as the live writer: maintenance transactions are short, so
+        // waiting out one live write is cheaper than failing the recovery.
+        let mut conn = open_index_connection(&self.index_path)?;
         if !already_sealed {
             tracing::info!(stage="validate_immutable_segment",segment=%path.display(),"selected recovery progress");
             let mut summary = streaming::SegmentSummary::default();
+            // Decode the whole segment BEFORE taking the index write lock. Live
+            // 2026-11-19: replaying a 14.5 MB segment inside one transaction kept
+            // the live writer out for over 10 s and the store fell to metadata-only.
+            let storage = if path.starts_with(self.spool_dir.join("segments")) {
+                "spool_segment"
+            } else {
+                "archive_segment"
+            };
+            let mut replay = Vec::new();
             streaming::visit_segment_checked(
                 path,
                 false,
                 |file| selected.check_file(file),
-                |record, _| {
+                |captured, _| {
                     summary.record_count += 1;
-                    summary.body_bytes = summary.body_bytes.saturating_add(record.body_bytes);
+                    summary.body_bytes = summary.body_bytes.saturating_add(captured.body_bytes);
                     summary
                         .first_observed_at_unix_ms
-                        .get_or_insert(record.observed_at_unix_ms);
-                    summary.last_observed_at_unix_ms = Some(record.observed_at_unix_ms);
+                        .get_or_insert(captured.observed_at_unix_ms);
+                    summary.last_observed_at_unix_ms = Some(captured.observed_at_unix_ms);
+                    let mut record = captured.clone();
+                    record.archive_path = path.to_string_lossy().into_owned();
+                    record.storage = storage.into();
+                    replay.push(record);
                     Ok(())
                 },
             )?;
@@ -281,25 +296,19 @@ impl BodyLogger {
                 records = summary.record_count,
                 "selected recovery progress"
             );
-            let transaction = begin_write_transaction(&mut conn)?;
-            streaming::visit_segment_checked(
-                path,
-                false,
-                |file| selected.check_file(file),
-                |captured, _| {
-                    let mut record = captured.clone();
-                    record.archive_path = path.to_string_lossy().into_owned();
-                    record.storage = if path.starts_with(self.spool_dir.join("segments")) {
-                        "spool_segment"
-                    } else {
-                        "archive_segment"
-                    }
-                    .into();
-                    insert_recovered_record_on(&transaction, &record)
-                },
-            )?;
-            selected.check()?;
-            transaction.commit()?;
+            // Short transactions with turns for the live writer. Replay is
+            // idempotent (an identical indexed frame is a no-op) and the seal is
+            // written only after every chunk, so an interrupted replay resumes.
+            let mut turns = LiveWriterTurns::new();
+            for chunk in replay.chunks(MAINTENANCE_REPLAY_CHUNK) {
+                let transaction = begin_write_transaction(&mut conn)?;
+                for record in chunk {
+                    insert_recovered_record_on(&transaction, record)?;
+                }
+                selected.check()?;
+                transaction.commit()?;
+                turns.after_write();
+            }
             // Existing owners retain resumable native progress: rows, seal, projection.
             write_segment_manifest_checked(path, &summary, true, |file| selected.check_file(file))?;
         }
@@ -425,6 +434,105 @@ mod tests {
             drop(self.logger.segment_writer.lock().unwrap().active.take());
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// One write shaped like the live capture writer (sb-server tap.rs): fresh
+    /// connection, BEGIN IMMEDIATE with a 250 ms busy timeout, 25 ms backoff per
+    /// failed attempt. Returns (waited, attempts).
+    fn live_like_write(index: &Path, n: u64) -> (Duration, u64) {
+        let started = Instant::now();
+        let mut attempts = 0u64;
+        loop {
+            attempts += 1;
+            let written = (|| -> rusqlite::Result<()> {
+                let mut conn = Connection::open(index)?;
+                conn.busy_timeout(Duration::from_millis(250))?;
+                let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "INSERT INTO body_events VALUES (?1, ?1, 0, 'client_inbound', 'http', NULL,
+                     NULL, 200, NULL, 'live', 1, 1, '/live/segment', 'archive_segment', 1,
+                     'raw_local', 0, '{}')",
+                    params![format!("live-{n}")],
+                )?;
+                transaction.commit()
+            })();
+            if written.is_ok() || started.elapsed() >= Duration::from_secs(10) {
+                return (started.elapsed(), attempts);
+            }
+            std::thread::sleep(Duration::from_millis((attempts * 25).min(1_000)));
+        }
+    }
+
+    #[test]
+    fn selected_recovery_of_a_large_segment_leaves_the_live_writer_a_turn() {
+        // Live 2026-11-19 23:10Z: recovering one abandoned 14.5 MB segment in a
+        // single transaction kept the live writer out past its 10 s limit.
+        let f = Fixture::new(false);
+        for n in 0..6_000u64 {
+            f.logger
+                .record_segmented_at(
+                    BodyEventInput {
+                        request_id: format!("selected-bulk-{n}"),
+                        capture_stage: CaptureStage::ClientInbound,
+                        protocol: "fixture".into(),
+                        upstream: None,
+                        model: None,
+                        status: None,
+                        content_type: None,
+                        metadata: serde_json::json!({"n": n}),
+                        body: format!("bulk body {n}").into_bytes(),
+                    },
+                    f.record.observed_at_unix_ms,
+                )
+                .unwrap();
+        }
+        drop(f.logger.segment_writer.lock().unwrap().active.take());
+        // Recovery replays an abandoned segment whose rows the index lost.
+        let conn = Connection::open(&f.logger.index_path).unwrap();
+        conn.execute(
+            "DELETE FROM body_events WHERE archive_path = ?1",
+            params![f.record.archive_path],
+        )
+        .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            let index = f.logger.index_path.clone();
+            std::thread::spawn(move || {
+                let (mut longest, mut most_attempts, mut writes) = (Duration::ZERO, 0, 0);
+                while !stop.load(Ordering::Relaxed) {
+                    writes += 1;
+                    let (waited, attempts) = live_like_write(&index, writes);
+                    longest = longest.max(waited);
+                    most_attempts = most_attempts.max(attempts);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                (longest, most_attempts, writes)
+            })
+        };
+        let started = Instant::now();
+        let report = f.recover().unwrap();
+        let recovery_time = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        let (longest, most_attempts, writes) = writer.join().unwrap();
+        eprintln!(
+            "recovery of {} frames took {recovery_time:?}; live-like writer: {writes} writes, \
+             longest wait {longest:?}, most attempts {most_attempts}",
+            report.record_count
+        );
+        assert_eq!(report.record_count, 6_001);
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM body_events WHERE archive_path = ?1",
+                params![f.record.archive_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 6_001);
+        assert!(
+            most_attempts == 1 && longest < Duration::from_millis(250),
+            "the live writer waited {longest:?} over {most_attempts} attempts during recovery"
+        );
     }
 
     #[test]

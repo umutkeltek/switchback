@@ -5476,3 +5476,170 @@ fn status_reports_unsealed_activity_from_metadata_even_with_approximate_event_co
     assert_eq!(sealed.unsealed_segment_count, 0);
     assert_eq!(sealed.oldest_unsealed_last_event_at_unix_ms, None);
 }
+
+// ---------------------------------------------------------------------------
+// Maintenance must leave the live capture writer a turn.
+// ---------------------------------------------------------------------------
+
+/// One write the way the live capture writer does it (sb-server tap.rs
+/// `persist_capture_job_within` over `BodyLogger::record`): a fresh connection,
+/// BEGIN IMMEDIATE with a 250 ms busy timeout, back off 25 ms per failed attempt
+/// (at most 1 s), and give up after 10 s, when the live store falls to
+/// metadata-only. Returns how long the write waited, its attempts, and whether
+/// it gave up.
+fn live_like_write(index: &Path, n: u64) -> (Duration, u64, bool) {
+    let started = Instant::now();
+    let mut attempts = 0u64;
+    loop {
+        attempts += 1;
+        let written = (|| -> rusqlite::Result<()> {
+            let mut conn = rusqlite::Connection::open(index)?;
+            conn.busy_timeout(Duration::from_millis(250))?;
+            let transaction =
+                conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let hash = format!("{:064x}", 0xfeed_0000_0000u64 + n);
+            transaction.execute(
+                "INSERT OR IGNORE INTO body_blobs VALUES (?1, 10, 10, 'archive_segment', '/live/segment', 1, 0)",
+                [&hash],
+            )?;
+            transaction.execute(
+                "INSERT INTO body_events VALUES (?1, ?1, 0, 'client_inbound', 'http', NULL, NULL,
+                 200, NULL, ?2, 10, 10, '/live/segment', 'archive_segment', 1, 'raw_local', 0, '{}')",
+                rusqlite::params![format!("live-{n}"), hash],
+            )?;
+            transaction.commit()
+        })();
+        match written {
+            Ok(()) => return (started.elapsed(), attempts, false),
+            Err(_) if started.elapsed() >= Duration::from_secs(10) => {
+                return (started.elapsed(), attempts, true)
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis((attempts * 25).min(1_000))),
+        }
+    }
+}
+
+#[test]
+fn a_long_drain_leaves_the_live_writer_a_turn() {
+    // Live 2026-11-17..21: during four backup runs the drain kept the index
+    // write lock nearly without a break; the live writer waited past its 10 s
+    // limit and the store dropped 78 bodies. The store here has the live
+    // shape that made each drain transaction slow: many blob rows (no
+    // archive_path index) and many spool rows of other pending segments. Sized
+    // so the old per-segment transaction takes about 0.5 s, as the live drains
+    // did (532 segments in 247 s on 11-20 05:11Z, 41 in 67 s at 23:11Z).
+    const SEGMENTS: i64 = 30;
+    let root = temp_root("drain-live-writer-turn");
+    let archive = offline_shared_archive(&root);
+    let state_dir = root.join("state");
+    let logger = BodyLogger::new(BodyLoggerConfig {
+        state_dir: state_dir.clone(),
+        archive_root: archive.clone(),
+        legacy_jsonl: None,
+        inline_threshold_bytes: 16,
+    })
+    .unwrap();
+    let base = (now_ms() - 20 * DAY_MS) / DAY_MS * DAY_MS;
+    for segment in 0..SEGMENTS {
+        let request = format!("drain-turn-{segment}");
+        let record = logger
+            .record_at(
+                input(&request, request.as_bytes()),
+                base + segment * 16 * 60_000,
+            )
+            .unwrap();
+        assert_eq!(record.storage, "spool_segment");
+    }
+    accept_receipt_for_present_segments(&logger, archive.clone());
+    let index = state_dir.join("body/index-v2.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&index).unwrap();
+        let transaction = conn.transaction().unwrap();
+        transaction
+            .execute_batch(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n LIMIT 3000000)
+                 INSERT INTO body_blobs
+                 SELECT printf('%064x', x), 100, 50, 'archive_segment',
+                        '/archive/2026/10/01/segments/filler-' || (x % 5000) || '.sbcap', 1, 0
+                 FROM n;
+                 WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n LIMIT 200000)
+                 INSERT INTO body_events
+                 SELECT 'pending-' || x, 'pending-' || x, 0, 'client_inbound', 'http', NULL, NULL,
+                        200, NULL, printf('%064x', x), 100, 50,
+                        '/spool/segments/pending-' || (x % 600) || '.sbcap', 'spool_segment', 1,
+                        'raw_local', 0, '{}'
+                 FROM n;",
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    bring_archive_online(&archive);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = std::sync::Arc::clone(&stop);
+        let index = index.clone();
+        std::thread::spawn(move || {
+            let mut waits = Vec::new();
+            let mut gave_up = 0u64;
+            let mut most_attempts = 0u64;
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                n += 1;
+                let (waited, attempts, failed) = live_like_write(&index, n);
+                waits.push(waited);
+                most_attempts = most_attempts.max(attempts);
+                gave_up += u64::from(failed);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (waits, most_attempts, gave_up)
+        })
+    };
+    let drain_started = Instant::now();
+    let run = logger.gc(drain_only()).unwrap();
+    let drain_time = drain_started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    let (waits, most_attempts, gave_up) = writer.join().unwrap();
+    let longest = waits.iter().max().copied().unwrap_or_default();
+    eprintln!(
+        "drain of {} segments took {:?}; live-like writer: {} writes, longest wait {:?}, \
+         most attempts {}, gave up {}",
+        run.spool_segments_drained,
+        drain_time,
+        waits.len(),
+        longest,
+        most_attempts,
+        gave_up
+    );
+    assert_eq!(run.spool_segments_drained, SEGMENTS as u64);
+    assert!(waits.len() >= 5, "the writer kept writing during the drain");
+    assert_eq!(gave_up, 0, "no live write may hit the 10 s limit");
+    // Far under the 10 s limit: every live write gets the index within its
+    // first 250 ms attempt, so the live writer never even starts backing off.
+    assert!(
+        most_attempts == 1 && longest < Duration::from_millis(250),
+        "the live writer waited {longest:?} over {most_attempts} attempts; a drain must leave \
+         it the index within its first 250 ms attempt (the store degrades at 10 s)"
+    );
+    for segment in 0..SEGMENTS {
+        let events = logger
+            .events_for_request(&format!("drain-turn-{segment}"))
+            .unwrap();
+        assert_eq!(events[0].storage, "archive_segment");
+        let blob: (String, String) = rusqlite::Connection::open(&index)
+            .unwrap()
+            .query_row(
+                "SELECT storage, archive_path FROM body_blobs WHERE body_sha256 = ?1",
+                [&events[0].body_sha256],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            blob,
+            (
+                "archive_segment".to_string(),
+                events[0].archive_path.clone()
+            )
+        );
+    }
+}

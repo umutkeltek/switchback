@@ -15,7 +15,7 @@ use super::{
     open_index_connection, open_index_connection_for_maintenance, read_verified_segment_manifest,
     retention_cutoff_ms, segment_manifest_path, sha256_hex, streaming, sync_directory,
     try_acquire_segment_lock, upsert_segment_manifest_projection_on, BodyLogError, BodyLogger,
-    Result,
+    LiveWriterTurns, Result,
 };
 
 const RECLAIM_PLAN_SCHEMA: &str = "switchback/capture-reclaim-plan@1";
@@ -227,8 +227,11 @@ impl BodyLogger {
         if !options.confirm {
             return Ok(report);
         }
+        let mut turns = LiveWriterTurns::new();
         for candidate in plan.segments {
-            if self.reclaim_one(&candidate, &proof)? {
+            let reclaimed = self.reclaim_one(&candidate, &proof)?;
+            turns.after_write();
+            if reclaimed {
                 report.reclaimed_segments += 1;
                 report.reclaimed_bytes = report
                     .reclaimed_bytes
@@ -304,23 +307,28 @@ impl BodyLogger {
             ));
         }
         let summary = streaming::segment_summary(&target_segment, false)?;
-        let mut conn = open_index_connection_for_maintenance(&self.index_path)?;
-        let transaction = begin_write_transaction(&mut conn)?;
         let storage = if target_segment.starts_with(&self.spool_dir) {
             "spool_segment"
         } else {
             "archive_segment"
         };
         let body_bytes = summary.body_bytes;
+        // Decode before taking the index write lock; the transaction only writes.
+        let mut restored = Vec::new();
+        streaming::visit_segment(&target_segment, false, |captured, _| {
+            let mut record = captured.clone();
+            record.archive_path = target_segment.to_string_lossy().into_owned();
+            record.storage = storage.to_string();
+            restored.push(record);
+            Ok(())
+        })?;
+        let mut conn = open_index_connection_for_maintenance(&self.index_path)?;
+        let transaction = begin_write_transaction(&mut conn)?;
         // A peer's retirement or a crashed restore can leave this owner's rows intact.
         if !validate_sealed_projection_on(&transaction, &entry, true)? {
-            streaming::visit_segment(&target_segment, false, |captured, _| {
-                let mut record = captured.clone();
-                record.archive_path = target_segment.to_string_lossy().into_owned();
-                record.storage = storage.to_string();
-                insert_record_on(&transaction, &record)?;
-                Ok(())
-            })?;
+            for record in &restored {
+                insert_record_on(&transaction, record)?;
+            }
         }
         upsert_segment_manifest_projection_on(
             &transaction,
