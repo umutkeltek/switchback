@@ -1132,6 +1132,14 @@ impl EngineKindOps for LlamaCppRouter {
     }
 }
 
+/// A model's preset section as the overlay writes it: its load settings,
+/// then its raw engine arguments (which win on the same name). The one
+/// function behind both the overlay and the check of a reloaded model's
+/// arguments, so the check expects what the engine was given.
+fn model_preset(ops: &dyn EngineKindOps, doc: &ModelSettingsDoc) -> BTreeMap<String, String> {
+    ops.preset_pairs(&doc.load, &doc.engine_args)
+}
+
 pub(crate) fn kind_ops(kind: EngineControlKind) -> &'static dyn EngineKindOps {
     match kind {
         EngineControlKind::LlamaCppRouter => &LlamaCppRouter,
@@ -1266,6 +1274,14 @@ enum Reached {
 }
 
 /// The engine controls of every lane: shared state plus the seams.
+/// The request path's part of an apply: the models a request waits to
+/// reach, and when the apply began (the holds' bound counts from then).
+#[derive(Clone, Copy)]
+struct Settle<'a> {
+    models: &'a BTreeSet<String>,
+    started: tokio::time::Instant,
+}
+
 pub struct EngineControls {
     runner: Arc<dyn SettingsCommandRunner>,
     client: reqwest::Client,
@@ -1495,7 +1511,7 @@ impl EngineControls {
             if provider != lane.name {
                 continue;
             }
-            let pairs = ops.preset_pairs(&entry.doc.load, &entry.doc.engine_args);
+            let pairs = model_preset(ops, &entry.doc);
             if !pairs.is_empty() {
                 models.insert(model.to_string(), json!({"settings": pairs}));
             }
@@ -1527,7 +1543,7 @@ impl EngineControls {
     pub(crate) async fn apply_lane(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
         let lock = self.apply_lock(&lane.name);
         let _guard = lock.lock().await;
-        self.apply_locked(state, lane).await
+        self.apply_locked(state, lane, &BTreeSet::new()).await
     }
 
     /// Write the lane's overlay through its `settings_command`, then ask an
@@ -1538,8 +1554,17 @@ impl EngineControls {
     /// it), and one with a request dispatched keeps its old section until
     /// it is idle (`deferred`; retried when its last request ends). The
     /// caller holds the lane's apply lock.
-    async fn apply_locked(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
-        let result = self.apply_locked_once(state, lane).await;
+    /// `settle`: models a request waits to reach (the request path's
+    /// applies). Each one whose section this apply rewrites keeps its gate
+    /// closed until its old process is gone (bounded), so the request never
+    /// meets a process the re-read is ending.
+    async fn apply_locked(
+        &self,
+        state: &EngineCtx,
+        lane: &EngineLane,
+        settle: &BTreeSet<String>,
+    ) -> Value {
+        let result = self.apply_locked_once(state, lane, settle).await;
         // The engine re-read its presets (and unloaded models whose preset
         // changed): the loaded-model view follows at once.
         if result["reloaded"] == json!(true) {
@@ -1560,8 +1585,14 @@ impl EngineControls {
         result
     }
 
-    async fn apply_locked_once(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
+    async fn apply_locked_once(
+        &self,
+        state: &EngineCtx,
+        lane: &EngineLane,
+        settle: &BTreeSet<String>,
+    ) -> Value {
         use sb_runtime::model_settings::GateKind;
+        let started = tokio::time::Instant::now();
         self.gc_variants(state, lane);
         let overlay = self.overlay(state, lane);
         let desired = overlay["models"].as_object().cloned().unwrap_or_default();
@@ -1626,9 +1657,13 @@ impl EngineControls {
                 self.finish_apply(lane, &mut result, Reached::Yes, deferred);
                 return result;
             }
+            let settle = Settle {
+                models: settle,
+                started,
+            };
             return self
                 .write_and_reread(
-                    state, lane, &command, &overlay, desired, held, awake, result, deferred,
+                    state, lane, &command, &overlay, desired, held, awake, result, deferred, settle,
                 )
                 .await;
         };
@@ -1654,8 +1689,12 @@ impl EngineControls {
             self.finish_apply(lane, &mut result, Reached::Yes, deferred);
             return result;
         }
+        let settle = Settle {
+            models: settle,
+            started,
+        };
         self.write_and_reread(
-            state, lane, &command, &overlay, applied, held, awake, result, deferred,
+            state, lane, &command, &overlay, applied, held, awake, result, deferred, settle,
         )
         .await
     }
@@ -1675,6 +1714,7 @@ impl EngineControls {
         awake: Awake,
         mut result: Value,
         deferred: BTreeSet<String>,
+        settle: Settle<'_>,
     ) -> Value {
         let mut document = overlay.clone();
         document["models"] = Value::Object(models.clone());
@@ -1707,6 +1747,16 @@ impl EngineControls {
                     result["ok"] = json!(true);
                     result["reloaded"] = json!(true);
                     self.lock().applied.insert(lane.name.clone(), models);
+                    // Still under the holds: a waiting request reaches a
+                    // model only once its old process is gone.
+                    let rewritten: BTreeSet<String> = held
+                        .iter()
+                        .filter_map(|gate| split_target(gate.key()).map(|(_, m)| m.to_string()))
+                        .filter(|model| settle.models.contains(model))
+                        .collect();
+                    if let Some(note) = self.settle_models(state, lane, &rewritten, settle).await {
+                        result["settle"] = json!(note);
+                    }
                     Reached::Yes
                 }
                 Err(e) => {
@@ -1746,6 +1796,81 @@ impl EngineControls {
         drop(held);
         self.finish_apply(lane, &mut result, reached, deferred);
         result
+    }
+
+    /// End the old process of each of `models` (just rewritten by a
+    /// re-read; their gates still held) and wait until the engine no longer
+    /// lists it running, like an unload does, but within what a request
+    /// waiting at the gate is allowed to wait: the lane's gate wait from the
+    /// apply's start, less a second, and never longer than the lane's
+    /// `load_timeout_secs`. `Some` says what did not end in time (the gates
+    /// open anyway, so no request waits past its bound).
+    async fn settle_models(
+        &self,
+        state: &EngineCtx,
+        lane: &EngineLane,
+        models: &BTreeSet<String>,
+        settle: Settle<'_>,
+    ) -> Option<String> {
+        if models.is_empty() {
+            return None;
+        }
+        let gate_wait = sb_runtime::model_settings::gate_wait(&state.snapshot(), &lane.name)
+            .unwrap_or(Duration::from_secs(1));
+        let bound = gate_wait
+            .saturating_sub(Duration::from_secs(1))
+            .min(Duration::from_secs(lane.engine.load_timeout_secs));
+        let deadline = settle.started + bound;
+        let left = |deadline: tokio::time::Instant| {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        };
+        let mut running: BTreeSet<String> = BTreeSet::new();
+        match tokio::time::timeout(left(deadline), self.models(state, lane)).await {
+            Ok(Ok(listing)) => {
+                for model in models {
+                    let status = model_status(&listing, model);
+                    if matches!(status.as_deref(), Some("loaded" | "sleeping" | "loading")) {
+                        // The re-read may end it or keep it (an engine that
+                        // saw no change): unload it, so it surely loads again
+                        // with its new section.
+                        let unload = self.call(
+                            state,
+                            lane,
+                            reqwest::Method::POST,
+                            "/models/unload",
+                            Some(json!({"model": model})),
+                            left(deadline).max(Duration::from_millis(1)),
+                        );
+                        if let Err(e) = unload.await {
+                            tracing::warn!(lane = %lane.name, model = %model, error = %e, "engine control: unload after a re-read failed");
+                        }
+                    }
+                    if process_running(status.as_deref()) {
+                        running.insert(model.clone());
+                    }
+                }
+            }
+            Ok(Err(e)) => return Some(format!("could not list the engine's models: {e}")),
+            Err(_) => return Some("the engine's listing did not answer in time".to_string()),
+        }
+        while !running.is_empty() {
+            if tokio::time::Instant::now() >= deadline {
+                let names = running.into_iter().collect::<Vec<_>>().join(", ");
+                tracing::warn!(lane = %lane.name, models = %names, "engine control: old process still runs after a re-read; reopening its gate");
+                return Some(format!(
+                    "the old process of {names} still ran {} s after the re-read",
+                    bound.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100).min(left(deadline))).await;
+            let Ok(Ok(listing)) =
+                tokio::time::timeout(left(deadline), self.models(state, lane)).await
+            else {
+                continue;
+            };
+            running.retain(|model| process_running(model_status(&listing, model).as_deref()));
+        }
+        None
     }
 
     fn finish_apply(
@@ -1842,11 +1967,12 @@ impl EngineControls {
             return;
         };
         let lock = self.apply_lock(&lane.name);
+        // Requests may wait for these models' new sections.
+        let pending = self.pending_models(&state, &lane);
         let (guard, held) = match lock.clone().try_lock_owned() {
             Ok(guard) => {
                 let registry = state.engine.model_settings();
-                let held: Vec<_> = self
-                    .pending_models(&state, &lane)
+                let held: Vec<_> = pending
                     .iter()
                     .map(|model| registry.close(&format!("{}/{model}", lane.name), GateKind::Hold))
                     .collect();
@@ -1861,7 +1987,7 @@ impl EngineControls {
                 None => lock.lock_owned().await,
             };
             if controls.pending_apply(&lane.name) {
-                let result = controls.apply_locked(&state, &lane).await;
+                let result = controls.apply_locked(&state, &lane, &pending).await;
                 tracing::info!(lane = %lane.name, ok = %result["ok"], pending = %result["pending"], "engine control: pending apply retried");
             }
             drop(held);
@@ -1889,7 +2015,8 @@ impl EngineControls {
             return;
         };
         if self.failed_apply_due(&lane.name) && self.pending_models(state, &lane).contains(model) {
-            self.apply_locked(state, &lane).await;
+            let settle = BTreeSet::from([model.to_string()]);
+            self.apply_locked(state, &lane, &settle).await;
         }
     }
 
@@ -2142,14 +2269,14 @@ impl EngineControls {
         }
         match self.load_model(state, lane, model, false).await {
             Ok(row) => {
-                let load = registry
+                let wanted = registry
                     .get(target)
-                    .map(|e| e.doc.load.clone())
+                    .map(|e| model_preset(kind_ops(lane.engine.kind), &e.doc))
                     .unwrap_or_default();
-                let wanted = kind_ops(lane.engine.kind).preset_pairs(&load, &Map::new());
                 match args_mismatch(&wanted, &row) {
                     Some(why) => {
                         value["ok"] = json!(false);
+                        value["reason"] = json!("old_settings");
                         value["error"] =
                             json!(format!("the engine still runs the old settings: {why}"));
                     }
@@ -2243,10 +2370,31 @@ fn args_mismatch(wanted: &BTreeMap<String, String>, row: &Value) -> Option<Strin
     if args.is_empty() {
         return None;
     }
-    let wrong: Vec<String> = wanted
+    // Each wanted key under the checked argument it is: its preset key, or
+    // another long name of it (`gpu-layers` for `n-gpu-layers`, as raw
+    // engine arguments may spell it).
+    let mut checked: BTreeMap<&str, (&String, &String, &[&str])> = BTreeMap::new();
+    let mut unsure = BTreeSet::new();
+    for (key, want) in wanted {
+        let long = format!("--{key}");
+        let Some((name, names)) = CHECKED_ARGS
+            .iter()
+            .find(|(name, names)| name == key || names.contains(&long.as_str()))
+        else {
+            continue;
+        };
+        if let Some((_, other, _)) = checked.insert(name, (key, want, names)) {
+            // Two spellings of one argument with different values: which
+            // one the engine keeps is its own choice, so neither is checked.
+            if !same_arg(other, Some(want)) {
+                unsure.insert(*name);
+            }
+        }
+    }
+    let wrong: Vec<String> = checked
         .iter()
-        .filter_map(|(key, want)| {
-            let (_, names) = CHECKED_ARGS.iter().find(|(k, _)| k == key)?;
+        .filter(|(name, _)| !unsure.contains(**name))
+        .filter_map(|(_, (key, want, names))| {
             let seen = arg_value(&args, names);
             (!same_arg(want, seen.as_deref())).then(|| {
                 format!(
@@ -3236,7 +3384,17 @@ pub(crate) async fn after_settings_write(
     let held_back = value["deferred"]
         .as_array()
         .is_some_and(|models| models.iter().any(|m| m == model));
-    let message = if value["ok"] != json!(true) {
+    let message = if value["reason"] == "old_settings" {
+        // The apply reached the engine and the model loaded again, so
+        // nothing is pending to retry: the engine's own presets or the
+        // settings command kept the old values.
+        format!(
+            "revision {} written and `{target}` reloaded, but {}; check what the settings \
+             command writes and the engine's base presets",
+            entry.revision,
+            value["error"].as_str().unwrap_or("its arguments differ")
+        )
+    } else if value["ok"] != json!(true) {
         format!(
             "revision {} written; applying it failed ({}); it is retried when the lane comes up, \
              before the next load and before a request reaches the engine",
@@ -3351,6 +3509,27 @@ pub(crate) async fn load_target(
             Err(e) => return Err(error(StatusCode::SERVICE_UNAVAILABLE, "wake_failed", e)),
         },
     };
+    use sb_runtime::model_settings::GateKind;
+    let registry = state.engine.model_settings();
+    let key = format!("{}/{model}", lane.name);
+    // A pending apply about to rewrite this model's section: drain the
+    // model first, as `apply: now` does, and keep it drained through the
+    // end of its old process and the load. A request that waited for the
+    // apply's hold would otherwise be admitted the moment the re-read
+    // ends, start loading the model, and have that load ended under it.
+    let mut gate = None;
+    if controls.pending_apply(&lane.name) && controls.pending_models(state, &lane).contains(model) {
+        let drain = registry.close(&key, GateKind::Drain);
+        // Still busy at the bound: the apply holds this model's section back
+        // (it is not rewritten), so the load below finds it running.
+        if drain
+            .wait_idle(Duration::from_secs(lane.engine.apply_wait_secs))
+            .await
+            .is_ok()
+        {
+            gate = Some(drain);
+        }
+    }
     if controls.pending_apply(&lane.name) {
         let applied = controls.apply_lane(state, &lane).await;
         // The re-read unloads a running model whose preset changed, and
@@ -3379,9 +3558,16 @@ pub(crate) async fn load_target(
             }
         }
     }
-    match controls.load_model(state, &lane, model, true).await {
+    let outcome = controls.load_model(state, &lane, model, true).await;
+    drop(gate);
+    match outcome {
         Ok(row) => {
-            controls.mark_loaded(target, state.engine.model_settings().revision(target));
+            // Loaded with the current settings only when the engine has this
+            // model's section: an apply that failed again, or held it back,
+            // leaves it loaded with the old ones (still pending).
+            if !controls.pending_models(state, &lane).contains(model) {
+                controls.mark_loaded(target, registry.revision(target));
+            }
             Ok(json!({
                 "target": target,
                 "model": model,
@@ -4283,6 +4469,112 @@ local_executors:
             sidecar_names(&json!(["/models/q/mtp-head.gguf", {"path": "C:\\m\\mmproj.gguf"}, 3]));
         assert_eq!(names, json!(["mtp-head.gguf", "mmproj.gguf"]));
         assert_eq!(sidecar_names(&Value::Null), json!([]));
+    }
+
+    fn args_row(args: &[&str]) -> Value {
+        json!({"status": {"value": "loaded", "args": args}})
+    }
+
+    fn doc_of(value: Value) -> ModelSettingsDoc {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn the_args_check_expects_the_preset_the_overlay_writes() {
+        // A raw engine argument wins over the load setting for the same flag.
+        let doc = doc_of(json!({"load": {"ctx_size": 8192}, "engine_args": {"ctx-size": 16384}}));
+        let wanted = model_preset(&LlamaCppRouter, &doc);
+        assert_eq!(wanted["ctx-size"], "16384");
+        let row = args_row(&["llama-server", "--ctx-size", "16384"]);
+        assert_eq!(args_mismatch(&wanted, &row), None);
+        let row = args_row(&["llama-server", "--ctx-size", "8192"]);
+        assert_eq!(
+            args_mismatch(&wanted, &row).as_deref(),
+            Some("ctx-size 16384 (it runs 8192)")
+        );
+    }
+
+    #[test]
+    fn the_args_check_reads_short_flags_and_equals_forms() {
+        let wanted = model_preset(
+            &LlamaCppRouter,
+            &doc_of(json!({"load": {"ctx_size": 16384, "n_gpu_layers": 99,
+                                    "flash_attn": true, "cache_type_k": "q8_0"},
+                           "engine_args": {"ubatch-size": 512}})),
+        );
+        for args in [
+            vec![
+                "llama-server",
+                "-c",
+                "16384",
+                "-ngl",
+                "99",
+                "-fa",
+                "on",
+                "-ctk",
+                "q8_0",
+                "-ub",
+                "512",
+            ],
+            vec![
+                "llama-server",
+                "--ctx-size=16384",
+                "--n-gpu-layers=99",
+                "--flash-attn=on",
+                "--cache-type-k=q8_0",
+                "--ubatch-size=512",
+            ],
+            vec![
+                "llama-server",
+                "-c",
+                "4096",
+                "--ctx-size=16384",
+                "--gpu-layers",
+                "99",
+                "--flash-attn",
+                "--cache-type-k",
+                "q8_0",
+                "-ub=512",
+            ],
+        ] {
+            assert_eq!(args_mismatch(&wanted, &args_row(&args)), None, "{args:?}");
+        }
+        let row = args_row(&[
+            "llama-server",
+            "-c=4096",
+            "-ngl",
+            "99",
+            "-fa",
+            "on",
+            "-ctk",
+            "q8_0",
+            "-ub",
+            "256",
+        ]);
+        assert_eq!(
+            args_mismatch(&wanted, &row).as_deref(),
+            Some("ctx-size 16384 (it runs 4096), ubatch-size 512 (it runs 256)")
+        );
+    }
+
+    #[test]
+    fn the_args_check_knows_raw_arguments_by_their_other_long_names() {
+        // `gpu-layers` is `n-gpu-layers`; `draft-max` is `spec-draft-n-max`.
+        let doc = doc_of(json!({"engine_args": {"gpu-layers": 40, "draft-max": 8}}));
+        let wanted = model_preset(&LlamaCppRouter, &doc);
+        let row = args_row(&["llama-server", "-ngl", "40", "--spec-draft-n-max", "8"]);
+        assert_eq!(args_mismatch(&wanted, &row), None);
+        let row = args_row(&["llama-server", "-ngl", "20", "--draft-max", "8"]);
+        assert_eq!(
+            args_mismatch(&wanted, &row).as_deref(),
+            Some("gpu-layers 40 (it runs 20)")
+        );
+        // Two spellings with different values: the engine picks, so neither
+        // is checked.
+        let doc = doc_of(json!({"load": {"n_gpu_layers": 99}, "engine_args": {"gpu-layers": 40}}));
+        let wanted = model_preset(&LlamaCppRouter, &doc);
+        let row = args_row(&["llama-server", "-ngl", "40"]);
+        assert_eq!(args_mismatch(&wanted, &row), None);
     }
 
     #[test]

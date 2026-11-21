@@ -59,6 +59,15 @@ struct Router_ {
     require: Option<(String, String)>,
     /// Every request the router saw, with its credential headers.
     seen: Vec<Seen>,
+    /// Like llama.cpp's router (0 = off): a chat for a model that is not
+    /// running loads it first (`loading` for this long), and fails when
+    /// that load is ended under it; a chat that meets a process that is
+    /// exiting fails too.
+    autoload_ms: u64,
+    /// Chats that failed for one of those reasons.
+    failed_chats: Vec<String>,
+    /// A plain `GET /models` (not a re-read) answers this much later.
+    listing_delay_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +187,10 @@ async fn models(
     State(stub): State<Stub>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
+    let delay = stub.inner.lock().unwrap().listing_delay_ms;
+    if delay > 0 && !query.contains_key("reload") {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
     let mut inner = stub.inner.lock().unwrap();
     settle(&mut inner);
     let call = match query.get("reload") {
@@ -261,26 +274,90 @@ async fn load(State(stub): State<Stub>, Json(body): Json<Value>) -> Response {
         )
             .into_response();
     }
-    if !inner.keep_old_args {
-        let mut flags = BTreeMap::from([("ctx-size".to_string(), "4096".to_string())]);
-        if let Some(settings) = inner
-            .presets
-            .get(&model)
-            .and_then(|preset| preset["settings"].as_object())
-        {
-            for (key, value) in settings {
-                flags.insert(key.clone(), value.as_str().unwrap_or_default().to_string());
-            }
-        }
-        let mut args = vec!["llama-server".to_string()];
-        for (key, value) in flags {
-            args.push(format!("--{key}"));
-            args.push(value);
-        }
-        inner.args.insert(model.clone(), args);
-    }
+    start_process(&mut inner, &model);
     inner.status.insert(model, "loaded".to_string());
     Json(json!({"success": true})).into_response()
+}
+
+/// A model's new process: its command line from the preset the router
+/// read last.
+fn start_process(inner: &mut Router_, model: &str) {
+    if inner.keep_old_args {
+        return;
+    }
+    let mut flags = BTreeMap::from([("ctx-size".to_string(), "4096".to_string())]);
+    if let Some(settings) = inner
+        .presets
+        .get(model)
+        .and_then(|preset| preset["settings"].as_object())
+    {
+        for (key, value) in settings {
+            flags.insert(key.clone(), value.as_str().unwrap_or_default().to_string());
+        }
+    }
+    let mut args = vec!["llama-server".to_string()];
+    for (key, value) in flags {
+        args.push(format!("--{key}"));
+        args.push(value);
+    }
+    inner.args.insert(model.to_string(), args);
+}
+
+/// With `autoload_ms`: make sure the chat's model runs, as llama.cpp's
+/// router does: load it when it does not, fail when its process is exiting
+/// or its load is ended under it. `Err` is the failure answered.
+async fn autoload(stub: &Stub, model: &str) -> Result<(), Box<Response>> {
+    let fail = |stub: &Stub, why: &str| {
+        stub.inner
+            .lock()
+            .unwrap()
+            .failed_chats
+            .push(format!("{model}: {why}"));
+        Err(Box::new(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": {"code": 500, "message": why, "type": "server_error"}})),
+            )
+                .into_response(),
+        ))
+    };
+    let ms = {
+        let mut inner = stub.inner.lock().unwrap();
+        settle(&mut inner);
+        if inner.autoload_ms == 0 {
+            return Ok(());
+        }
+        if inner.exiting.contains_key(model) {
+            drop(inner);
+            return fail(stub, "the model's process is exiting");
+        }
+        match inner.status.get(model).map(String::as_str) {
+            Some("loaded" | "sleeping") => return Ok(()),
+            Some("loading") => {}
+            _ => {
+                inner
+                    .status
+                    .insert(model.to_string(), "loading".to_string());
+                inner.calls.push(format!("autoload {model}"));
+            }
+        }
+        inner.autoload_ms
+    };
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    let mut inner = stub.inner.lock().unwrap();
+    settle(&mut inner);
+    match inner.status.get(model).map(String::as_str) {
+        Some("loading") if !inner.exiting.contains_key(model) => {
+            start_process(&mut inner, model);
+            inner.status.insert(model.to_string(), "loaded".to_string());
+            Ok(())
+        }
+        Some("loaded") if !inner.exiting.contains_key(model) => Ok(()),
+        _ => {
+            drop(inner);
+            fail(stub, "the model's load was ended")
+        }
+    }
 }
 
 async fn unload(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value> {
@@ -301,6 +378,9 @@ async fn unload(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value
 async fn chat(State(stub): State<Stub>, body: Bytes) -> Response {
     let body: Value = serde_json::from_slice(&body).unwrap();
     let slow = body.to_string().contains("slow please");
+    if let Err(failed) = autoload(&stub, body["model"].as_str().unwrap_or_default()).await {
+        return *failed;
+    }
     if body["stream"] == json!(true) {
         // A streamed answer: 40 chunks, 50 ms apart.
         stub.inner
@@ -2157,4 +2237,229 @@ async fn health_probes_of_an_openai_compatible_lane_still_send_no_key() {
         .find(|seen| seen.path == "/v1/chat/completions")
         .expect("the chat reached the router");
     assert_eq!(chat.authorization.as_deref(), Some(bearer.as_str()));
+}
+
+// ---------------------------------------------------------------- reviewer follow-ups
+
+/// The preset section has both a load setting and a raw engine argument
+/// for one flag; the raw one wins (the overlay writes it last), and the
+/// check of the reloaded model expects that value, not the load setting's.
+#[tokio::test]
+async fn an_apply_checks_the_arguments_the_preset_was_given() {
+    let s = setup(true, "", None).await;
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"ctx_size": 8192}, "engine_args": {"ctx-size": 16384}, "apply": "now"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(
+        overlay_of(&s)["models"]["m"]["settings"]["ctx-size"],
+        json!("16384")
+    );
+    assert_eq!(view["apply"]["ok"], json!(true), "{view}");
+    assert_eq!(view["apply"]["reloaded_model"], json!(true), "{view}");
+    let args = s.stub.inner.lock().unwrap().args["m"].join(" ");
+    assert!(args.contains("--ctx-size 16384"), "{args}");
+}
+
+/// An engine that keeps the old settings after a reload: the message says
+/// so and does not promise a retry (nothing is pending to retry).
+#[tokio::test]
+async fn kept_old_settings_get_their_own_message() {
+    let s = setup(true, "", None).await;
+    s.stub.inner.lock().unwrap().keep_old_args = true;
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"ctx_size": 32768}, "apply": "now"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["ok"], json!(false), "{view}");
+    assert_eq!(view["apply"]["reason"], json!("old_settings"), "{view}");
+    let message = view["apply"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("reloaded, but"), "{message}");
+    assert!(
+        message.contains("ctx-size 32768 (it runs 4096)"),
+        "{message}"
+    );
+    assert!(!message.contains("retried"), "{message}");
+}
+
+/// A hold's preload runs a pending apply that rewrites the model while a
+/// request waits for it. The request must not be admitted between the
+/// re-read and the preload's own load: it would start loading the model
+/// and the preload would end that load under it.
+#[tokio::test]
+async fn a_request_racing_a_hold_preload_through_a_pending_apply_is_served() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && sleep 0.4 && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.autoload_ms = 600;
+        inner.listing_delay_ms = 150;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    std::fs::write(format!("{}.go", s.overlay.display()), b"go").unwrap();
+    let (status, body) = post_to(
+        &s.gw,
+        "/v1/hosts/text/holds",
+        json!({"ttl_secs": 600, "reason": "eval run", "load": "text/m"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    // The preload's apply runs its settings command (0.4 s): the request
+    // comes in meanwhile.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let chat = spawn_chat(&s.gw, "hi");
+    assert_eq!(chat.await.unwrap(), 200, "{:?}", s.stub.calls());
+    wait_for(&s, |calls| {
+        calls.contains(&"POST /models/load m".to_string())
+    })
+    .await;
+    let inner = s.stub.inner.lock().unwrap();
+    assert!(
+        inner.failed_chats.is_empty(),
+        "{:?} {:?}",
+        inner.failed_chats,
+        inner.calls
+    );
+    assert!(
+        inner.args["m"].join(" ").contains("--ctx-size 8192"),
+        "{:?}",
+        inner.args
+    );
+}
+
+/// A load whose pending apply fails again leaves the model running with
+/// its old settings: it is not counted as loaded with the new revision.
+#[tokio::test]
+async fn a_load_whose_apply_failed_again_stays_pending() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    s.stub.inner.lock().unwrap().overlay_path = Some(s.overlay.clone());
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;
+    assert_eq!(view["targets"][0]["load"]["pending"], json!(true), "{view}");
+    let engines = get_json(format!("{}/v1/engines", s.gw)).await;
+    let m = engines["data"][0]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "m")
+        .unwrap()
+        .clone();
+    assert_eq!(m["pending"], json!(true), "{engines}");
+}
+
+/// Shared by the two tests below: a model held back while busy (its new
+/// section pending), then a request that arrives while the apply that runs
+/// once it is idle holds it. Returns the request's status and how long it
+/// took.
+async fn request_behind_a_held_back_apply(s: &Setup) -> (u16, Duration) {
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    // That re-read ended `m`'s process: let it exit before the slow
+    // request loads it again.
+    let exit = s.stub.inner.lock().unwrap().exit_delay_ms;
+    tokio::time::sleep(Duration::from_millis(exit + 100)).await;
+    let slow = spawn_slow(&s.gw);
+    wait_for_chat(s).await;
+    let (status, view) = put(&s.gw, "text/m", 1, json!({"load": {"ctx_size": 16384}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["deferred"], json!(["m"]), "{view}");
+    assert_eq!(slow.await.unwrap(), 200);
+    // Idle: the held-back apply runs (its command takes 0.4 s) and holds
+    // `m`; this request waits at that hold.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    let status = spawn_chat(&s.gw, "hi").await.unwrap();
+    (status, started.elapsed())
+}
+
+/// The request path's apply rewrites the model a request waits for: the
+/// gate opens only once the old process is gone, so the request loads the
+/// model with its new settings instead of meeting the exiting process.
+#[tokio::test]
+async fn a_request_behind_an_apply_waits_for_the_old_process_to_end() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("sleep 0.4 && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.exit_delay_ms = 300;
+        inner.autoload_ms = 300;
+    }
+    let (status, _) = request_behind_a_held_back_apply(&s).await;
+    let inner = s.stub.inner.lock().unwrap();
+    assert_eq!(status, 200, "{:?} {:?}", inner.failed_chats, inner.calls);
+    assert!(inner.failed_chats.is_empty(), "{:?}", inner.failed_chats);
+    assert!(
+        inner.args["m"].join(" ").contains("--ctx-size 16384"),
+        "{:?}",
+        inner.args
+    );
+}
+
+/// An old process that does not end: the gate still opens within the
+/// lane's `load_timeout_secs` (5 s here), well inside the request's own
+/// gate wait, so the request is answered instead of 503 `model_paused`.
+#[tokio::test]
+async fn the_wait_for_an_old_process_is_bounded() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("sleep 0.4 && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    s.stub.inner.lock().unwrap().overlay_path = Some(s.overlay.clone());
+    // The first apply's re-read must not leave `m` exiting: the slow
+    // request loads it again first.
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.exit_delay_ms = 20_000;
+        inner.autoload_ms = 100;
+    }
+    let slow = spawn_slow(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, view) = put(&s.gw, "text/m", 1, json!({"load": {"ctx_size": 16384}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["deferred"], json!(["m"]), "{view}");
+    assert_eq!(slow.await.unwrap(), 200);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    let status = spawn_chat(&s.gw, "hi").await.unwrap();
+    let took = started.elapsed();
+    assert_ne!(status, 503, "the request was answered model_paused");
+    assert!(
+        took >= Duration::from_secs(4) && took < Duration::from_secs(10),
+        "{took:?}"
+    );
+    let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;
+    let note = view["targets"][0]["load"]["last_apply"]["settle"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(note.contains("still ran"), "{view}");
 }
