@@ -70,7 +70,8 @@ final class ControlWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// The app menu, Edit (so copy and paste work in the window's fields) and Window.
+    /// The app menu, Edit (so copy and paste work in the window's fields) and Window. There is no Quit here:
+    /// ⌘Q closes the window, and the app keeps running in the menu bar.
     private func installMenus() {
         let main = NSMenu()
         let app = NSMenuItem()
@@ -78,8 +79,11 @@ final class ControlWindowController: NSObject, NSWindowDelegate {
         appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Switchback", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit Switchback", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        // ⌘Q in the window closes the window only: the app keeps running in the menu bar, and Quit stays in the
+        // panel. The item is hidden so the menu shows one way to close.
+        let quit = appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "q")
+        quit.isHidden = true
+        quit.allowsKeyEquivalentWhenHidden = true
         app.submenu = appMenu
         main.addItem(app)
         let edit = NSMenuItem()
