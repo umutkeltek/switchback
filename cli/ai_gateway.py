@@ -201,7 +201,8 @@ default) leaves a loaded model on its old settings until it loads again;
 --apply now reloads it once nothing is in flight on it (exit 1 when it stays
 busy). Neither wakes a sleeping machine unless --wake. load preloads a model
 (exit 3 when the machine sleeps and --wake is not given); unload never powers
-anything off. engines never wakes anything: a sleeping lane shows what it had
+anything off and waits up to --timeout SECS (default 600) while the gateway
+lets the model's requests end and its process exit. engines never wakes anything: a sleeping lane shows what it had
 loaded when it was last seen. hold --load MODEL loads the model once the
 machine is up.
 
@@ -233,6 +234,7 @@ SPEECH_FORMATS = {".mp3": "mp3", ".wav": "wav", ".opus": "opus", ".ogg": "opus",
 VIDEO_FPS = 24
 # How long `sb ai on` keeps the machine on when no duration is given.
 DEFAULT_HOLD_DURATION = "1h"
+UNLOAD_TIMEOUT = 600  # s: an unload waits for requests to end and the process to exit
 POLL_SECS = float(os.environ.get("SB_AI_POLL_SECS") or 2.0)  # tests shorten it
 VIDEO_MP = 0.4
 LANE_WORDS = {"offline": "off", "waking": "waking", "healthy": "idle", "draining": "busy",
@@ -2197,7 +2199,10 @@ def cmd_load(gw, args):
 
 def cmd_unload(gw, args):
     try:
-        answer = gw.post(model_path(args.model, "unload"), {})
+        # The gateway answers once the model's requests ended and its
+        # process exited (bounded by the lane's apply wait and load
+        # timeout, which the CLI cannot read): 10 minutes by default.
+        answer = gw.post(model_path(args.model, "unload"), {}, timeout=args.timeout)
     except GatewayError as error:
         raise gateway_fail(error, f"unloading {args.model}") from None
     print(f"{answer.get('target')}: {answer.get('message') or answer.get('status')}")
@@ -2422,6 +2427,7 @@ def parser():
     load.add_argument("--timeout", type=float, default=900)
     unload_cmd = sub.add_parser("unload", add_help=False, allow_abbrev=False)
     unload_cmd.add_argument("model")
+    unload_cmd.add_argument("--timeout", type=float, default=UNLOAD_TIMEOUT)
     sub.add_parser("engines", add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
     chat = sub.add_parser("chat", add_help=False, allow_abbrev=False)
     chat.add_argument("model")

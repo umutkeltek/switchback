@@ -1526,6 +1526,28 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("box: off", run.stdout)
 
+    def test_unload_waits_for_the_gateway_longer_than_a_plain_call(self):
+        # The gateway answers an unload once the model's requests ended and
+        # its process exited: the client waits for that (10 minutes by
+        # default, --timeout), not the 30 s of a plain call.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ai_gateway_under_test", CLI / "ai_gateway.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.UNLOAD_TIMEOUT, 600)
+        answer = self.fake.routes[("POST", "/v1/models/text/m/unload")]
+
+        def later(request):
+            time.sleep(1.5)
+            return answer(request)
+        self.fake.routes[("POST", "/v1/models/text/m/unload")] = later
+        run = self.sb("unload", "text/m", "--timeout", "0.5")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("no answer from the gateway after", run.stderr)
+        run = self.sb("unload", "text/m")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("text/m: unloaded", run.stdout)
+
     def test_help_and_bad_usage(self):
         run = self.sb("help")
         self.assertEqual(run.returncode, 0)
