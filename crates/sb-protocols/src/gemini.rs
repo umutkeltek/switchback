@@ -342,16 +342,17 @@ fn usage_from_gemini(meta: Option<&Value>) -> Usage {
     let meta = meta.and_then(Value::as_object);
     // `promptTokenCount` includes the cached content; the canonical
     // `input_tokens` excludes it so it is not charged twice.
+    let prompt = meta
+        .and_then(|m| m.get("promptTokenCount"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cached = meta
         .and_then(|m| m.get("cachedContentTokenCount"))
         .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(prompt);
     Usage {
-        input_tokens: meta
-            .and_then(|m| m.get("promptTokenCount"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .saturating_sub(cached),
+        input_tokens: prompt - cached,
         output_tokens: meta
             .and_then(|m| m.get("candidatesTokenCount"))
             .and_then(Value::as_u64)
@@ -895,5 +896,12 @@ mod tests {
             gen.get("responseSchema").is_none(),
             "json_object carries no schema"
         );
+    }
+
+    #[test]
+    fn cached_content_never_exceeds_the_prompt() {
+        let usage = usage_from_gemini(Some(&json!({"promptTokenCount": 100,
+            "cachedContentTokenCount": 900, "candidatesTokenCount": 1})));
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (0, 100));
     }
 }

@@ -932,16 +932,17 @@ fn parse_usage(value: Option<&Value>, energy_value: Option<&Value>) -> Usage {
     };
     // `input_tokens` counts the cached tokens too; the canonical
     // `input_tokens` excludes them so they are not charged twice.
+    let prompt = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
     let cached = value
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .min(prompt);
     Usage {
-        input_tokens: value
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-            .saturating_sub(cached),
+        input_tokens: prompt - cached,
         cached_input_tokens: cached,
         output_tokens: value
             .get("output_tokens")
@@ -1768,5 +1769,15 @@ mod tests {
             .unwrap_or("");
         assert!(completed.contains("\"type\":\"reasoning\""));
         assert!(completed.contains("\"summary_text\""));
+    }
+
+    #[test]
+    fn cached_tokens_never_exceed_the_prompt() {
+        let usage = parse_usage(
+            Some(&json!({"input_tokens": 100, "output_tokens": 1,
+                         "input_tokens_details": {"cached_tokens": 900}})),
+            None,
+        );
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (0, 100));
     }
 }

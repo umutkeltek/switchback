@@ -92,8 +92,8 @@ fn openai_prompt_split(usage: Option<&serde_json::Map<String, Value>>) -> (u64, 
         .and_then(|usage| usage.get("prompt_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cached = openai_cached_tokens(usage);
-    (prompt.saturating_sub(cached), cached)
+    let cached = openai_cached_tokens(usage).min(prompt);
+    (prompt - cached, cached)
 }
 
 fn energy_usage_json(energy: &EnergyUsage) -> Value {
@@ -1693,5 +1693,19 @@ mod tests {
             parse_engine_timings(&json!({"timings": {"unknown_n": 3}})),
             None
         );
+    }
+
+    // A cached count above the prompt count is clamped to it, so the
+    // client never sees more prompt tokens than the upstream reported.
+    #[test]
+    fn cached_tokens_never_exceed_the_prompt() {
+        let usage = json!({"prompt_tokens": 100, "completion_tokens": 1,
+                           "prompt_tokens_details": {"cached_tokens": 900}});
+        assert_eq!(openai_prompt_split(usage.as_object()), (0, 100));
+        let body = json!({"choices": [{"index": 0, "finish_reason": "stop",
+                          "message": {"role": "assistant", "content": "hi"}}],
+                          "usage": usage});
+        let response = parse_openai_chat_response(&body).unwrap();
+        assert_eq!(response.usage.prompt_tokens(), 100);
     }
 }
