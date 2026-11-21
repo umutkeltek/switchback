@@ -12,10 +12,14 @@ public struct CommandResult: Sendable, Equatable {
     public var succeeded: Bool { status == 0 }
 }
 
-/// A command that could not run to its end (no `sb`, a timeout, too much output).
+/// A command that could not run to its end (no `sb`, a timeout, too much output, or it was stopped).
 public struct CommandFailure: Error, Sendable, Equatable {
     public let message: String
-    public init(_ message: String) { self.message = message }
+    /// The command was stopped because what asked for it went away (the window hid, another model was picked):
+    /// it says nothing about the gateway.
+    public let cancelled: Bool
+    public init(_ message: String, cancelled: Bool = false) { self.message = message; self.cancelled = cancelled }
+    public static let stopped = CommandFailure("Stopped", cancelled: true)
 }
 
 /// Runs `sb` commands. The window holds a fake one in tests and a real one in the app.
@@ -36,11 +40,12 @@ public struct ProcessCommandRunner: CommandRunning {
             .map { ProcessCommandRunner(executable: URL(fileURLWithPath: $0)) }
     }
 
+    /// Starts `sb` and waits for it without polling: the pipes report output as it comes and the process reports
+    /// its end. Cancelling the calling task stops the process at once.
     @concurrent public func run(_ command: ControlCommand) async throws -> CommandResult {
         guard command.isAllowed else { throw CommandFailure("The window does not run this command") }
-        guard !Task.isCancelled else { throw CommandFailure("Stopped") }
+        guard !Task.isCancelled else { throw CommandFailure.stopped }
         let process = Process()
-        let out = Pipe(), err = Pipe()
         process.executableURL = executable
         process.arguments = command.arguments
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -49,44 +54,139 @@ public struct ProcessCommandRunner: CommandRunning {
                                "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
+        let running = RunningCommand(process: process)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                running.start(continuation, timeout: command.timeout)
+            }
+        } onCancel: {
+            running.stop(CommandFailure.stopped)
+        }
+    }
+}
+
+/// One running `sb`. It ends when the process has exited and both pipes are closed, or at once when it is stopped
+/// (cancelled, too slow, too much output); a stopped process gets SIGTERM, then SIGKILL 0.3 s later.
+final class RunningCommand: @unchecked Sendable {
+    static let stdoutCeiling = 8_388_608
+    static let stderrCeiling = 262_144
+    private let lock = NSLock()
+    private let process: Process
+    private let out = Pipe(), err = Pipe()
+    private var stdout = Data(), stderr = Data()
+    private var outOpen = true, errOpen = true, exited = false, launched = false, closed = false
+    private var failure: CommandFailure?
+    private var continuation: CheckedContinuation<CommandResult, any Error>?
+    private var deadline: DispatchWorkItem?
+
+    init(process: Process) {
+        self.process = process
         process.standardOutput = out
         process.standardError = err
-        do { try process.run() } catch { throw CommandFailure("Could not start sb") }
-        out.fileHandleForWriting.closeFile(); err.fileHandleForWriting.closeFile()
-        let descriptors = [out.fileHandleForReading.fileDescriptor, err.fileHandleForReading.fileDescriptor]
-        for descriptor in descriptors { _ = fcntl(descriptor, F_SETFL, O_NONBLOCK) }
-        defer { out.fileHandleForReading.closeFile(); err.fileHandleForReading.closeFile() }
-        let deadline = ProcessInfo.processInfo.systemUptime + command.timeout
-        var stdout = Data(), stderr = Data()
-        var open = [true, true]
-        var buffer = [UInt8](repeating: 0, count: 16_384)
-        func stop() {
-            if process.isRunning { process.terminate() }
-            let grace = Date().addingTimeInterval(0.3)
-            while process.isRunning && Date() < grace { usleep(10_000) }
-            if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
-            process.waitUntilExit()
+    }
+
+    func start(_ continuation: CheckedContinuation<CommandResult, any Error>, timeout: TimeInterval) {
+        lock.lock()
+        if let failure {
+            // Stopped before it started: it never runs.
+            lock.unlock()
+            continuation.resume(throwing: failure)
+            return
         }
-        while open.contains(true) {
-            if Task.isCancelled { stop(); throw CommandFailure("Stopped") }
-            if ProcessInfo.processInfo.systemUptime >= deadline { stop(); throw CommandFailure("sb took too long to answer") }
-            var progressed = false
-            for (index, descriptor) in descriptors.enumerated() where open[index] {
-                let count = read(descriptor, &buffer, buffer.count)
-                if count > 0 {
-                    progressed = true
-                    if index == 0 { stdout.append(contentsOf: buffer.prefix(count)) } else { stderr.append(contentsOf: buffer.prefix(count)) }
-                    if stdout.count > 8_388_608 || stderr.count > 262_144 { stop(); throw CommandFailure("sb answered with too much output") }
-                } else if count == 0 {
-                    open[index] = false
-                } else if errno != EAGAIN && errno != EWOULDBLOCK {
-                    open[index] = false
-                }
+        self.continuation = continuation
+        lock.unlock()
+        out.fileHandleForReading.readabilityHandler = { [self] handle in collect(handle, stdout: true) }
+        err.fileHandleForReading.readabilityHandler = { [self] handle in collect(handle, stdout: false) }
+        process.terminationHandler = { [self] process in
+            process.terminationHandler = nil
+            lock.withLock { exited = true }
+            finishIfDone()
+        }
+        do {
+            try process.run()
+        } catch {
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
+            process.terminationHandler = nil
+            let waiting = lock.withLock { () -> CheckedContinuation<CommandResult, any Error>? in
+                defer { self.continuation = nil }
+                return self.continuation
             }
-            if !progressed { usleep(10_000) }
+            waiting?.resume(throwing: CommandFailure("Could not start sb"))
+            return
         }
-        process.waitUntilExit()
-        return CommandResult(status: process.terminationStatus, stdout: stdout, stderr: String(decoding: stderr, as: UTF8.self))
+        // The process holds the write ends now; the pipes close when it (and anything it started) is done.
+        out.fileHandleForWriting.closeFile()
+        err.fileHandleForWriting.closeFile()
+        let pending = lock.withLock { () -> CommandFailure? in
+            launched = true
+            return failure
+        }
+        if let pending { stop(pending); return }
+        let item = DispatchWorkItem { [weak self] in self?.stop(CommandFailure("sb took too long to answer")) }
+        lock.withLock { deadline = item }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: item)
+    }
+
+    /// Stops the process and ends the wait with `reason`. Before the process has started it only records the
+    /// reason, and `start` stops it (or never starts it).
+    func stop(_ reason: CommandFailure) {
+        lock.lock()
+        if failure == nil { failure = reason }
+        guard launched else { lock.unlock(); return }
+        let waiting = continuation
+        continuation = nil
+        let item = deadline
+        lock.unlock()
+        item?.cancel()
+        out.fileHandleForReading.readabilityHandler = nil
+        err.fileHandleForReading.readabilityHandler = nil
+        if process.isRunning { process.terminate() }
+        let process = self.process
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) {
+            if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+        }
+        closeReaders()
+        waiting?.resume(throwing: reason)
+    }
+
+    private func collect(_ handle: FileHandle, stdout isOut: Bool) {
+        let data = handle.availableData
+        if data.isEmpty { handle.readabilityHandler = nil }
+        let tooMuch = lock.withLock { () -> Bool in
+            if data.isEmpty {
+                if isOut { outOpen = false } else { errOpen = false }
+            } else if isOut {
+                stdout.append(data)
+            } else {
+                stderr.append(data)
+            }
+            return stdout.count > Self.stdoutCeiling || stderr.count > Self.stderrCeiling
+        }
+        if tooMuch { stop(CommandFailure("sb answered with too much output")) } else { finishIfDone() }
+    }
+
+    private func finishIfDone() {
+        lock.lock()
+        guard exited, !outOpen, !errOpen, let waiting = continuation else { lock.unlock(); return }
+        continuation = nil
+        let item = deadline
+        let result = CommandResult(status: process.terminationStatus, stdout: stdout,
+                                   stderr: String(decoding: stderr, as: UTF8.self))
+        lock.unlock()
+        item?.cancel()
+        closeReaders()
+        waiting.resume(returning: result)
+    }
+
+    private func closeReaders() {
+        let first = lock.withLock { () -> Bool in
+            defer { closed = true }
+            return !closed
+        }
+        guard first else { return }
+        out.fileHandleForReading.closeFile()
+        err.fileHandleForReading.closeFile()
     }
 }
 
