@@ -269,8 +269,8 @@ pub(crate) async fn delete(
 /// idle check runs on it, and when the machine has no power-off command
 /// at all. A machine none of whose lanes answers is already off: 200 with
 /// `"already_off": true`, and no command runs. A machine the gateway
-/// knows is off is not asked: 200 with `"already_off": true` and
-/// `"known_off": true` (known off, not checked). A failed command is 502.
+/// knows is off is asked too (one probe per lane): someone may have
+/// started it by hand. A failed command is 502.
 ///
 /// `on` wakes the machine through the same wake path a hold with
 /// `wake: true` uses and answers at once (202, `"status": "waking"`): the
@@ -339,7 +339,6 @@ async fn power_off(state: &AppState, host: &str, release_holds: bool) -> Respons
             "action": "off",
             "powered_off": true,
             "already_off": outcome.already_off,
-            "known_off": outcome.known_off,
             "lanes": outcome.lanes,
             "released_holds": outcome.released_holds,
         }))

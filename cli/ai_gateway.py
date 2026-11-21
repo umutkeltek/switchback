@@ -1456,10 +1456,7 @@ def cmd_off(gw, args):
     released = [str(i) for i in answer.get("released_holds") or []]
     if released:
         print(f"released {'hold' if len(released) == 1 else 'holds'} {', '.join(released)} on {host}")
-    if answer.get("known_off"):
-        # The gateway knows the machine is off and did not ask it.
-        print(f"{host} is known off, not checked; nothing to do")
-    elif answer.get("already_off"):
+    if answer.get("already_off"):
         print(f"{host} is already off")
     else:
         print(f"{host} is powering off")

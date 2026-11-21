@@ -549,7 +549,8 @@ impl LaneRuntime {
 
 /// How often the supervisor looks at a machine the gateway knows is off,
 /// when the machine adopts outside wakes (`adopt_external_wake`): one plain
-/// health probe of one lane every 15 minutes, never a wake. A machine
+/// health probe of each of its lanes every 15 minutes (an engine that is
+/// down does not hide another that answers), never a wake. A machine
 /// started by hand is so adopted within 15 minutes and its idle power-off
 /// countdown starts; a request, job or hold finds it at once. A machine
 /// that does not adopt outside wakes is not looked at while known off.
@@ -853,6 +854,7 @@ impl LocalExecutor {
         }
         let answered = answer != ProbeAnswer::Down;
         let adopts = self.host().adopts();
+        let guarded = self.host().poweroff_guard_command().is_some();
         let mut rt = self.lock();
         if ticket > rt.seen_seq {
             rt.seen_seq = ticket;
@@ -913,9 +915,13 @@ impl LocalExecutor {
             self.mark_up_locked(&mut rt);
         }
         // Up after our own wake ran out of its boot timeout: the machine
-        // booted slower than that. It is ours, so it is taken up (on any
-        // machine, adopting or not) and powers off when idle.
+        // booted slower than that, or someone started it by hand meanwhile.
+        // It is taken up and powers off when idle only where a power-off
+        // cannot take a machine from under a person: the machine adopts
+        // outside wakes, or a power-off guard checks it first. Elsewhere
+        // only `answered_up` notes it (it reads healthy and stays on).
         if healthy
+            && (adopts || guarded)
             && rt.state == LaneState::Offline
             && rt.last_wake_result.as_deref() == Some("timeout")
             && rt.wake_may_still_land(self.clock.now_ms(), self.boot_timeout_ms())
@@ -1012,10 +1018,17 @@ impl LocalExecutor {
     /// [`Self::tick`]. The supervisor calls it on every tick. A machine the
     /// gateway knows is off ([`Host::known_off`]) is not probed: only its
     /// wake path connects to it, and on a machine that adopts outside wakes
-    /// one look every [`KNOWN_OFF_RECHECK_MS`].
+    /// one look every [`KNOWN_OFF_RECHECK_MS`]. That look probes every lane
+    /// of the machine once, whichever lane's pass finds it due: the other
+    /// lanes' passes then find it not due.
     pub async fn observe(&self) {
         let host = self.host();
-        if host.known_off() && !host.known_off_recheck_due(self.clock.now_ms()) {
+        if host.known_off() {
+            if host.known_off_recheck_due(self.clock.now_ms()) {
+                for lane in host.lanes() {
+                    lane.probe_health().await;
+                }
+            }
             return;
         }
         self.probe_health().await;
@@ -2437,10 +2450,6 @@ pub struct PowerOffOutcome {
     /// No lane of the machine answered: it was already off, and no
     /// command ran.
     pub already_off: bool,
-    /// The gateway knows the machine is off and did not ask it (no
-    /// connection to a machine known off): nothing was done. Implies
-    /// `already_off`.
-    pub known_off: bool,
 }
 
 /// What a manual wake did. The wake itself runs in the background: the
@@ -2757,9 +2766,10 @@ impl Host {
     }
 
     /// The gateway knows the machine is off, so nothing but its wake path
-    /// (a request's or job's wake, a hold's, an operator's power-on)
-    /// connects to it: no supervisor probe, no refresh probe for routing, no
-    /// engine-control health call. A machine that adopts outside wakes
+    /// (a request's or job's wake, a hold's, an operator's power-on) and an
+    /// operator's power-off (one probe per lane) connects to it: no
+    /// supervisor probe, no refresh probe for routing, no engine-control
+    /// health call. A machine that adopts outside wakes
     /// (`adopt_external_wake`) is still looked at once every
     /// [`KNOWN_OFF_RECHECK_MS`] (see [`Self::known_off_recheck_due`]), so
     /// one started by hand is adopted and powered off when idle; any other
@@ -2770,7 +2780,8 @@ impl Host {
     /// running, no lane's engine answering, no wake of ours that may still
     /// land (one ran less than twice its lane's boot timeout ago and no
     /// power-off followed it: a machine that boots slower than its boot
-    /// timeout is still looked at, and taken up when it answers), and the
+    /// timeout is still looked at, and taken up when it answers where the
+    /// machine adopts outside wakes or has a power-off guard), and the
     /// latest probe of every lane routing reads (and of at least one lane)
     /// got no answer at all since our last power-off, with routing reading
     /// that lane as down. Anything else (a machine just started on, one
@@ -3537,16 +3548,15 @@ impl Host {
         }
 
         // A machine none of whose lanes answers is already off, whoever
-        // powered it off: the request is a no-op. A machine the gateway
-        // knows is off is not asked again.
+        // powered it off: the request is a no-op. An operator asks on
+        // purpose, so even a machine the gateway knows is off gets one
+        // probe per lane: someone may have started it by hand, and then it
+        // goes through the whole power-off below, guard included.
         let mut answering = false;
-        let known_off = self.known_off();
-        if !known_off {
-            for lane in &lanes {
-                if lane.probe_answer().await != ProbeAnswer::Down {
-                    answering = true;
-                    break;
-                }
+        for lane in &lanes {
+            if lane.probe_answer().await != ProbeAnswer::Down {
+                answering = true;
+                break;
             }
         }
         if !answering {
@@ -3568,14 +3578,12 @@ impl Host {
             let released_holds = self.release_seen_holds(holds, &seen_holds, clock.now_ms());
             tracing::info!(
                 host = %self.id,
-                known_off,
                 "power-off asked for on a machine that is already off; nothing to do"
             );
             return Ok(PowerOffOutcome {
                 released_holds,
                 lanes: lanes.len(),
                 already_off: true,
-                known_off,
             });
         }
 
@@ -3643,7 +3651,6 @@ impl Host {
                     released_holds,
                     lanes: lanes.len(),
                     already_off: false,
-                    known_off: false,
                 })
             }
             Err(error) => {
@@ -4239,7 +4246,6 @@ impl CapacityActivator {
                 host = %host,
                 lanes = outcome.lanes,
                 already_off = outcome.already_off,
-                known_off = outcome.known_off,
                 released_holds = outcome.released_holds.len(),
                 "machine powered off on an operator's request"
             ),
@@ -6483,23 +6489,57 @@ local_executors:
         assert_eq!(host.sim().wake, 2);
     }
 
-    // An operator's power-off of a machine known off answers "already off"
-    // without connecting to it.
+    // An operator's power-off of a machine known off asks it once (one
+    // probe per lane): nothing answers, so it is "already off", with no
+    // wake and no command.
     #[tokio::test]
-    async fn powering_off_a_machine_known_off_does_not_connect() {
+    async fn powering_off_a_machine_known_off_probes_each_lane_once() {
         let host = FakeHost::new(Sim::default());
         let clock = ManualClock::new();
         let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
         activator.observe_all().await; // off: confirmed
+        assert!(activator.executor("text").unwrap().machine_known_off());
         let probes = host.sim().probes;
         let outcome = activator
             .power_off("gpu-box", false)
             .await
             .expect("already off");
         assert!(outcome.already_off, "{outcome:?}");
-        assert!(outcome.known_off, "known off, not checked: {outcome:?}");
-        assert_eq!(host.sim().probes, probes, "no connection");
+        assert_eq!(host.sim().probes, probes + 2, "one probe per lane");
         assert_eq!(host.sim().poweroff, 0);
+        assert_eq!(host.sim().wake, 0);
+    }
+
+    // A machine known off that someone started by hand answers the
+    // power-off's probe: it is up, so the whole power-off runs, guard
+    // included (busy refuses, free powers it off).
+    #[tokio::test]
+    async fn powering_off_a_machine_known_off_that_answers_runs_the_guarded_power_off() {
+        let host = FakeHost::new(Sim {
+            guard: GuardAnswer::Busy,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = shared_activator(&shared_host_config(WITH_GUARD), &host, clock.clone());
+        activator.observe_all().await; // off: confirmed
+        assert!(activator.executor("text").unwrap().machine_known_off());
+        host.sim().healthy = true; // started by hand
+        let refused = activator.power_off("gpu-box", false).await;
+        assert!(
+            matches!(
+                refused,
+                Err(PowerOffError::Refused(PowerOffRefusal::GuardBusy))
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(host.sim().guard_runs, 1, "the guard was asked");
+        assert_eq!(host.sim().poweroff, 0);
+        host.sim().guard = GuardAnswer::Free;
+        let outcome = activator.power_off("gpu-box", false).await.expect("off");
+        assert!(!outcome.already_off, "{outcome:?}");
+        assert_eq!(host.sim().guard_runs, 2);
+        assert_eq!(host.sim().poweroff, 1);
+        assert_eq!(host.sim().wake, 0);
     }
 
     // A machine that is off when the gateway starts: the first pass looks
@@ -6599,10 +6639,12 @@ local_executors:
     // A machine that boots slower than its boot timeout: the wake gives up,
     // but the machine is not known off while that wake may still land
     // (twice the boot timeout), so the supervisor sees it come up, takes it
-    // up (adopting outside wakes or not) and powers it off when idle.
+    // up and powers it off when idle, where a power-off cannot take it from
+    // under a person: it has a power-off guard (adopting outside wakes or
+    // not).
     #[tokio::test]
     async fn a_machine_that_boots_slower_than_its_boot_timeout_is_taken_up_and_powered_off() {
-        for extra in ["", ADOPT_WITH_GUARD] {
+        for extra in [WITH_GUARD, ADOPT_WITH_GUARD] {
             let host = FakeHost::new(Sim {
                 poweroff_makes_unhealthy: true,
                 ..Default::default()
@@ -6634,8 +6676,40 @@ local_executors:
         }
     }
 
+    // The same late boot on a machine with no power-off guard that does not
+    // adopt outside wakes: it may be someone who started it by hand, so it
+    // is only noted as answering (it reads healthy) and stays on.
+    #[tokio::test]
+    async fn a_late_boot_without_a_guard_or_adoption_is_not_taken_up() {
+        let host = FakeHost::new(Sim {
+            poweroff_makes_unhealthy: true,
+            ..Default::default()
+        });
+        let clock = FakeClock::new();
+        let activator = shared_activator(&shared_host_config(""), &host, clock.clone());
+        activator.observe_all().await; // off
+        let text = activator.executor("text").unwrap();
+        assert!(matches!(
+            text.ensure_ready().await,
+            Err(EnsureError::BootTimeout { .. })
+        ));
+        assert!(!text.machine_known_off(), "the wake may still land");
+        clock.advance(60_000);
+        host.sim().healthy = true; // it boots late, or a person started it
+        activator.observe_all().await;
+        assert_eq!(text.lock().state, LaneState::Offline, "not taken up");
+        assert!(text.lock().answered_up, "noted as answering");
+        assert_eq!(report_of(&activator, "text").poweroff_in_secs, None);
+        for _ in 0..60 {
+            clock.advance(60_000);
+            activator.observe_all().await;
+            activator.tick_all().await;
+        }
+        assert_eq!(host.sim().poweroff, 0, "never powered off");
+    }
+
     // A machine known off that adopts outside wakes is looked at once every
-    // 15 minutes, a plain probe of one lane, never a wake. Started by hand,
+    // 15 minutes, a plain probe of each lane, never a wake. Started by hand,
     // it is adopted at the next look and powered off when idle.
     #[tokio::test]
     async fn a_machine_known_off_that_adopts_outside_wakes_is_looked_at_every_15_minutes() {
@@ -6667,20 +6741,105 @@ local_executors:
         assert_eq!(host.sim().probes, probes, "no look before 15 minutes");
         clock.advance(10_000); // 15 minutes since the last look
         activator.observe_all().await;
-        assert_eq!(host.sim().probes, probes + 1, "one look, one lane");
+        assert_eq!(
+            host.sim().probes,
+            probes + 2,
+            "one look: one probe per lane"
+        );
         assert!(text.machine_known_off(), "still off");
 
         host.sim().healthy = true; // started by hand
         pass(14).await;
-        assert_eq!(host.sim().probes, probes + 1, "no look before 15 minutes");
+        assert_eq!(host.sim().probes, probes + 2, "no look before 15 minutes");
         assert_eq!(report_of(&activator, "text").state, LaneState::Offline);
         pass(1).await;
-        assert!(host.sim().probes > probes + 1, "looked at");
+        assert!(host.sim().probes > probes + 2, "looked at");
         assert_eq!(host.sim().wake, 0, "never a wake");
         assert_ne!(report_of(&activator, "text").state, LaneState::Offline);
         clock.advance(5_000);
         activator.tick_all().await;
         assert_eq!(host.sim().poweroff, 1, "adopted, then the idle power-off");
+    }
+
+    // The 15-minute look probes every lane of the machine, not only the
+    // one whose pass comes first (`comfy` before `text`): started by hand
+    // with its media engine refusing connections, the machine is still
+    // adopted through its text lane at that look.
+    #[tokio::test]
+    async fn the_15_minute_look_probes_every_lane_of_the_machine() {
+        let host = FakeHost::new(Sim::default());
+        let clock = FakeClock::new();
+        let activator =
+            shared_activator(&shared_host_config(ADOPT_WITH_GUARD), &host, clock.clone());
+        activator.observe_all().await;
+        let text = activator.executor("text").unwrap();
+        assert!(text.machine_known_off());
+        {
+            let mut sim = host.sim();
+            sim.healthy = true; // started by hand
+            sim.fail_probes.insert(
+                "http://executor-1.example:8188/system_stats".to_string(),
+                u32::MAX,
+            ); // the media engine refuses connections
+        }
+        clock.advance(KNOWN_OFF_RECHECK_MS);
+        activator.observe_all().await;
+        assert_eq!(
+            report_of(&activator, "text").state,
+            LaneState::IdleCountdown,
+            "adopted through the lane that answers"
+        );
+        assert!(!text.machine_known_off());
+        assert_eq!(host.sim().wake, 0, "never a wake");
+    }
+
+    // A slow probe that began before a newer one and gets no answer after
+    // the newer one saw the machine up does not make it known off: only
+    // the latest probe's ticket writes "no answer".
+    #[tokio::test]
+    async fn a_slow_no_answer_does_not_overwrite_a_newer_up() {
+        struct SlowFirst {
+            gate: Arc<tokio::sync::Semaphore>,
+            calls: AtomicU64,
+        }
+        #[async_trait]
+        impl HealthProbe for SlowFirst {
+            async fn healthy(&self, _: &str) -> bool {
+                true
+            }
+            async fn check(&self, _: &str, _: Option<&SchemeCredential>) -> ProbeAnswer {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.gate.acquire().await.unwrap().forget();
+                    ProbeAnswer::Unreachable
+                } else {
+                    ProbeAnswer::Up
+                }
+            }
+        }
+        let host = FakeHost::new(Sim::default());
+        let clock = FakeClock::new();
+        let cfg = (*build(&host, clock.clone(), Legs::default()).cfg()).clone();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let probe = Arc::new(SlowFirst {
+            gate: gate.clone(),
+            calls: AtomicU64::new(0),
+        });
+        // Not routed: only "no answer" can make its machine known off.
+        let lane = LocalExecutor::new(cfg, clock, Arc::new(host.clone()), probe, false);
+        let slow = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.probe_answer().await }
+        });
+        settle().await; // the slow probe has its ticket and waits
+        assert_eq!(
+            lane.probe_answer().await,
+            ProbeAnswer::Up,
+            "the newer probe"
+        );
+        gate.add_permits(1);
+        assert_eq!(slow.await.unwrap(), ProbeAnswer::Down, "the slow one");
+        assert!(!lane.lock().seen_down, "the stale no-answer is dropped");
+        assert!(!lane.machine_known_off(), "the machine is not known off");
     }
 
     // A machine that does not adopt outside wakes is not looked at at all
@@ -6726,7 +6885,7 @@ local_executors:
         }
         let probes = host.sim().probes;
         let outcome = activator.power_off("gpu-box", false).await.expect("off");
-        assert!(!outcome.known_off, "asked, not known off: {outcome:?}");
+        assert!(outcome.already_off, "{outcome:?}");
         assert!(host.sim().probes > probes, "the power-off asks it");
     }
 
@@ -8746,6 +8905,9 @@ local_executors:
     /// of the fake host answers free unless a test says otherwise).
     const ADOPT_WITH_GUARD: &str =
         "    adopt_external_wake: true\n    poweroff_guard_command: \"ssh gateway check-idle executor-1\"\n";
+
+    /// A power-off guard alone (no adoption).
+    const WITH_GUARD: &str = "    poweroff_guard_command: \"ssh gateway check-idle executor-1\"\n";
 
     // A lane whose engine answers although Switchback never woke its
     // machine reads `healthy` (it read `offline`), and so does the media

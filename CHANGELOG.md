@@ -460,19 +460,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   each routed lane since our last power-off that got no answer at all and
   that routing reads as down), nothing but its wake path connects to it:
   no supervisor probe, no refresh probe when routing skips it, no
-  engine-control health call, no look by an operator's power-off (it
-  answers `"known_off": true`, and `sb ai off` prints "known off, not
-  checked; nothing to do"). A request's, job's or hold's wake and an
-  operator's power-on still look first and wake it. Only no answer
+  engine-control health call. A request's, job's or hold's wake and an
+  operator's power-on still look first and wake it; an operator's
+  power-off asks each lane once, so a machine someone started by hand goes
+  through the whole power-off, guard included, and one where nothing
+  answers is "already off" with no wake. Only no answer
   (connection failed or timed out) counts: an engine that answers 503, or
   any other status, never makes its machine known off. A lane probed before
   a reload routed it is probed again before its machine is known off. A
   wake of ours that ran less than twice the lane's boot timeout ago, with
   no power-off since, keeps the machine looked at: a machine that boots
-  slower than its boot timeout is taken up when it answers (on any
-  machine) and powered off when idle. A machine with `adopt_external_wake`
-  that is known off gets one plain health probe every 15 minutes, never a
-  wake, so one started by hand is adopted and powered off when idle; it is
+  slower than its boot timeout is taken up when it answers and powered off
+  when idle, where the machine adopts outside wakes or has a
+  `poweroff_guard_command`; elsewhere it may be someone who started it by
+  hand, so it only reads as answering and stays on. A machine with
+  `adopt_external_wake` that is known off gets one plain health probe of
+  each lane every 15 minutes, never a wake, so one started by hand is
+  adopted (through any lane that answers) and powered off when idle; it is
   also adopted at the next look of its wake path. A machine without
   `adopt_external_wake` gets no look at all while known off. A machine
   whose state the gateway has not seen yet (just after a start) is looked
