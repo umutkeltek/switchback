@@ -31,6 +31,14 @@ struct Router_ {
     busy_at_reload: Vec<usize>,
     busy_at_unload: Vec<usize>,
     unload_delay_ms: u64,
+    /// Like llama.cpp's router: an unload is answered at once and the
+    /// model's process exits this much later; until then the listing says
+    /// `loaded` and a load gets 400 "model is already running".
+    exit_delay_ms: u64,
+    /// Models whose process is exiting, and when it is gone.
+    exiting: BTreeMap<String, std::time::Instant>,
+    /// Loads refused because the model still ran.
+    refused_loads: Vec<String>,
     /// The overlay JSON the settings command writes; on a re-read the
     /// router compares each model's section with the one it read last and,
     /// like llama.cpp, unloads a running model whose section changed.
@@ -79,6 +87,32 @@ impl Stub {
             .unwrap()
             .status
             .insert(model.to_string(), status.to_string());
+    }
+}
+
+/// Processes whose exit time passed are gone.
+fn settle(inner: &mut Router_) {
+    let now = std::time::Instant::now();
+    let gone: Vec<String> = inner
+        .exiting
+        .iter()
+        .filter(|(_, at)| **at <= now)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in gone {
+        inner.exiting.remove(&id);
+        inner.status.insert(id, "unloaded".to_string());
+    }
+}
+
+/// Stop a model's process: at once, or after `exit_delay_ms` (the
+/// listing says `loaded` until then).
+fn stop(inner: &mut Router_, id: &str) {
+    if inner.exit_delay_ms == 0 {
+        inner.status.insert(id.to_string(), "unloaded".to_string());
+    } else if !inner.exiting.contains_key(id) {
+        let at = std::time::Instant::now() + Duration::from_millis(inner.exit_delay_ms);
+        inner.exiting.insert(id.to_string(), at);
     }
 }
 
@@ -139,6 +173,7 @@ async fn models(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
     let mut inner = stub.inner.lock().unwrap();
+    settle(&mut inner);
     let call = match query.get("reload") {
         Some(_) => {
             let busy = inner.busy;
@@ -162,7 +197,7 @@ async fn models(
                     inner.status.get(&id).map(String::as_str),
                     Some("loaded" | "loading")
                 ) {
-                    inner.status.insert(id.clone(), "unloaded".to_string());
+                    stop(&mut inner, &id);
                     inner.calls.push(format!("reload unloaded {id}"));
                 }
             }
@@ -196,12 +231,28 @@ async fn models(
     Json(json!({"data": data}))
 }
 
-async fn load(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value> {
+async fn load(State(stub): State<Stub>, Json(body): Json<Value>) -> Response {
     let model = body["model"].as_str().unwrap_or("").to_string();
     let mut inner = stub.inner.lock().unwrap();
+    settle(&mut inner);
     inner.calls.push(format!("POST /models/load {model}"));
+    let running = matches!(
+        inner.status.get(&model).map(String::as_str),
+        Some("loaded" | "loading")
+    );
+    if running {
+        inner.refused_loads.push(model);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": {"code": 400, "message": "model is already running",
+                                  "type": "invalid_request_error"}}),
+            ),
+        )
+            .into_response();
+    }
     inner.status.insert(model, "loaded".to_string());
-    Json(json!({"success": true}))
+    Json(json!({"success": true})).into_response()
 }
 
 async fn unload(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value> {
@@ -214,7 +265,8 @@ async fn unload(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value
     let busy = inner.busy;
     inner.busy_at_unload.push(busy);
     inner.calls.push(format!("POST /models/unload {model}"));
-    inner.status.insert(model, "unloaded".to_string());
+    settle(&mut inner);
+    stop(&mut inner, &model);
     Json(json!({"success": true}))
 }
 
@@ -606,6 +658,58 @@ async fn apply_now_reloads_a_loaded_model() {
         .unwrap()
         .clone();
     assert_eq!(m["pending"], json!(false));
+}
+
+#[tokio::test]
+async fn apply_now_loads_only_after_the_old_process_ended() {
+    // A real router answers the unload at once and ends the model's process
+    // later; a load before then is refused (400 "model is already running")
+    // and the new load setting never takes effect.
+    let s = setup(true, "", None).await;
+    s.stub.inner.lock().unwrap().exit_delay_ms = 400;
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"flash_attn": true}, "apply": "now"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["ok"], json!(true), "{view}");
+    assert_eq!(view["apply"]["reloaded_model"], json!(true), "{view}");
+    let inner = s.stub.inner.lock().unwrap();
+    assert!(
+        inner.refused_loads.is_empty(),
+        "a load reached the engine while the old process ran: {:?}",
+        inner.calls
+    );
+    assert_eq!(inner.status["m"], "loaded", "{:?}", inner.calls);
+    assert!(inner.exiting.is_empty(), "{:?}", inner.calls);
+}
+
+#[tokio::test]
+async fn unload_answers_once_the_model_process_ended() {
+    let s = setup(true, "", None).await;
+    s.stub.inner.lock().unwrap().exit_delay_ms = 300;
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/unload", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        s.stub.inner.lock().unwrap().status["m"],
+        "unloaded",
+        "the unload answered while the model's process still ran"
+    );
+    // So a load right after it is not refused.
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(s.stub.inner.lock().unwrap().refused_loads.is_empty());
+}
+
+#[tokio::test]
+async fn loading_a_model_that_runs_is_not_an_error() {
+    let s = setup(true, "", None).await;
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], json!("loaded"));
 }
 
 #[tokio::test]

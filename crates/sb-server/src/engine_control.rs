@@ -1931,6 +1931,49 @@ impl EngineControls {
         }
     }
 
+    /// Unload a model and wait until the engine says its process ended.
+    async fn unload_model(
+        &self,
+        state: &EngineCtx,
+        lane: &EngineLane,
+        model: &str,
+    ) -> Result<(), String> {
+        self.call(
+            state,
+            lane,
+            reqwest::Method::POST,
+            "/models/unload",
+            Some(json!({"model": model})),
+            Duration::from_secs(60),
+        )
+        .await?;
+        self.wait_unloaded(state, lane, model).await
+    }
+
+    /// Wait (at most the lane's `load_timeout_secs`) until the engine's
+    /// listing no longer shows `model` running. llama.cpp's router answers
+    /// an unload at once and ends the model's process after it; a load sent
+    /// before the process exits gets 400 "model is already running".
+    async fn wait_unloaded(
+        &self,
+        state: &EngineCtx,
+        lane: &EngineLane,
+        model: &str,
+    ) -> Result<(), String> {
+        let bound = lane.engine.load_timeout_secs;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(bound);
+        loop {
+            let models = self.models(state, lane).await?;
+            if !process_running(model_status(&models, model).as_deref()) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("`{model}` still runs {bound} s after its unload"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Load a model: through the lane's place and GPU group like a request
     /// (held only while loading), then wait for the engine to say loaded.
     async fn load_model(
@@ -1949,15 +1992,25 @@ impl EngineControls {
             },
             None => None,
         };
-        self.call(
-            state,
-            lane,
-            reqwest::Method::POST,
-            "/models/load",
-            Some(json!({"model": model})),
-            Duration::from_secs(30),
-        )
-        .await?;
+        if let Err(e) = self
+            .call(
+                state,
+                lane,
+                reqwest::Method::POST,
+                "/models/load",
+                Some(json!({"model": model})),
+                Duration::from_secs(30),
+            )
+            .await
+        {
+            // llama.cpp answers 400 "model is already running" to a load of
+            // a model that runs. Every unload here waits for the model's
+            // process to end, so a model that runs is the loaded one: the
+            // listing below says so.
+            if !e.contains("already running") {
+                return Err(e);
+            }
+        }
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(lane.engine.load_timeout_secs);
         loop {
@@ -2053,8 +2106,11 @@ impl EngineControls {
                 json!("the model is not loaded; it loads with the new settings next time");
             return value;
         }
-        // The re-read unloads a running model whose preset changed; unload
-        // it here only if it still runs.
+        // The re-read unloads a running model whose preset changed. llama.cpp's
+        // router answers an unload at once and ends the model's process after
+        // it; until then it lists the model as running and refuses a load (400
+        // "model is already running"). So unload here only a model that still
+        // runs, and load only once its process ended.
         let still = match self.models(state, lane).await {
             Ok(models) => model_status(&models, model),
             Err(e) => {
@@ -2063,22 +2119,17 @@ impl EngineControls {
                 return value;
             }
         };
-        if matches!(still.as_deref(), Some("loaded" | "sleeping" | "loading")) {
-            if let Err(e) = self
-                .call(
-                    state,
-                    lane,
-                    reqwest::Method::POST,
-                    "/models/unload",
-                    Some(json!({"model": model})),
-                    Duration::from_secs(60),
-                )
-                .await
-            {
-                value["ok"] = json!(false);
-                value["error"] = json!(e);
-                return value;
-            }
+        let ended = if matches!(still.as_deref(), Some("loaded" | "sleeping" | "loading")) {
+            self.unload_model(state, lane, model).await
+        } else if process_running(still.as_deref()) {
+            self.wait_unloaded(state, lane, model).await
+        } else {
+            Ok(())
+        };
+        if let Err(e) = ended {
+            value["ok"] = json!(false);
+            value["error"] = json!(e);
+            return value;
         }
         match self.load_model(state, lane, model).await {
             Ok(_) => {
@@ -2118,6 +2169,16 @@ impl EngineControls {
             crate::activator::EnsureError::Refused(detail) => detail,
         })
     }
+}
+
+/// Whether a listing status means the engine still runs the model's
+/// process (`unloading`: a router that names the time between an unload and
+/// the process's exit).
+fn process_running(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("loaded" | "sleeping" | "loading" | "unloading")
+    )
 }
 
 /// A model's status in an engine listing.
@@ -3235,16 +3296,7 @@ pub(crate) async fn unload_endpoint(app: &AppState, principal: &Principal, name:
             ),
         );
     }
-    let outcome = controls
-        .call(
-            state,
-            &lane,
-            reqwest::Method::POST,
-            "/models/unload",
-            Some(json!({"model": model})),
-            Duration::from_secs(60),
-        )
-        .await;
+    let outcome = controls.unload_model(state, &lane, model).await;
     drop(gate);
     match outcome {
         Ok(_) => {

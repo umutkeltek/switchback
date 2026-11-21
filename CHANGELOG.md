@@ -511,6 +511,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   document itself, against the revision it read first: a write that landed
   in between makes it a conflict ("the settings changed meanwhile"), never
   wiped.
+- **A new load setting reaches a loaded model**: `apply: now` (and
+  `sb ai set ... --load --apply now`) unloaded the model and loaded it again
+  at once, but a llama.cpp router answers an unload before the model's
+  process exits and refuses a load until then (400 "model is already
+  running"); the setting was written and never took effect. The gateway now
+  waits (at most the lane's `load_timeout_secs`) until the engine lists the
+  model as no longer running before it loads it, and
+  `POST /v1/models/{model}/unload` answers only once the process ended. A
+  load of a model that already runs is no longer an error.
 
 - **A settings name shared with its first target writes that target**: a
   route named like one of its targets (`mac/x` -> `mac/x`, `box/y`) answered
