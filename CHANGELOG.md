@@ -521,6 +521,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
   `POST /v1/models/{model}/unload` answers only once the process ended. A
   load of a model that already runs is no longer an error.
 
+- **`sb ai tune`: a trial that does not load is a failed trial**: a
+  candidate whose settings did not apply or load was recorded as a rejected
+  change with no gain, counted as a lever inside the noise, and could end
+  the run as a plateau (the first real run stopped after 90 s of 30 min
+  this way, before four levers were tried). It is now a `failed` verdict in
+  the ledger and the summary (`failed` in `--json`), does not count toward
+  the plateau, and the run goes on with the next lever; a later run tries
+  it again.
+
+- **`sb ai tune` measures the noise instead of assuming ±5%**: real
+  machines spread far more than that between runs of the same settings
+  (8% and 22% on the first real run), so almost every trial was judged
+  noisy or repeated against a fixed 3% rule. The baseline is now three runs
+  of the same settings (five, with more samples per run when the budget
+  allows, when those spread wider than 5%); their corrected spread, never
+  under ±5%, is the band a win must clear and the line for "controls too
+  far apart". Side metrics are held to their own measured band too (never
+  under ±5%) instead of a fixed 3%, which clock jitter alone crossed on a
+  busy machine (the soak test failed that way).
+  On a machine noisier than ±5% every win must win twice. A band wider than
+  ±40% stops the run with `too noisy to tune: ±N%` and changes nothing.
+  The summary and `--json` (`noise`) report the band. The tests' fake
+  engine can drift between runs, seeded, so noisy cases are reproducible.
+
 - **A settings name shared with its first target writes that target**: a
   route named like one of its targets (`mac/x` -> `mac/x`, `box/y`) answered
   `ambiguous_model` to settings writes, load and unload, and `sb ai set`

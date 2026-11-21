@@ -1339,27 +1339,41 @@ sb ai tune gpu-box/qwen [--levers LIST] [--budget 30m] [--wake]
 
 The method, exactly:
 
-1. **Baseline**, then the **ceiling** (from the speed report).
+1. **Baseline and noise**, then the **ceiling** (from the speed report).
+   The baseline is three runs of the same settings; how far they spread
+   (their range over their median, doubled for three runs because a few
+   runs never show the whole spread) is the **noise band**, never under
+   ±5%. When the three spread wider than 5%, the tuner takes more samples
+   per run when the budget allows (up to twice `--samples`, at most 24) and
+   runs two more, measuring the band again over all five (the range then
+   taken 1.5 times). A band wider than ±40% stops the run at once with
+   `too noisy to tune: ±N%`, and nothing is changed. The summary and
+   `--json` (`noise`) report the band.
 2. **One change per experiment**, derived from the current best settings,
    applied with `apply: now` (the model reloads once nothing is in flight).
+   Settings that do not apply or load make a **failed** trial: shown as
+   failed, written to the ledger as `failed`, never counted as a lever
+   inside the noise, and the run goes on with the next lever.
 3. **Control, candidate, control.** Each run is at least 6 samples, and
    the median counts; prompts are fresh (a new first line every request), so
    no run reads the prefix cache; the first request after a load is dropped.
 4. **Keep it only if** the candidate beats both neighbouring controls on its
-   metric and no other measured metric is more than 3% worse than the mean
-   of the two controls. When the two controls differ by more than 3% on one
-   of those other metrics, that metric is held to the worse control
-   instead. A win of more than 20% is repeated once first, and the repeat
-   must win again by more than the noise (5%). A run whose two controls
-   differ by more than 3% on the judged metric itself is noisy: it is
-   repeated once the same way, the repeat decides, and a repeat that is
-   noisy again changes nothing.
+   metric by more than the noise band and no other measured metric is
+   worse than the mean of the two controls by more than that metric's own
+   band (also measured, also never under ±5%). When the two controls differ by
+   more than that on one of those other metrics, that metric is held to the
+   worse control instead. A win of more than 20%, and any win when the band
+   is wider than ±5%, is repeated once first and must win again. A run
+   whose two controls differ by more than the band on the judged metric
+   itself is noisy: it is repeated once the same way, the repeat decides,
+   and a repeat that is noisy again changes nothing.
 5. **Gates:** every answer must be non-empty, not looping and not failed; a
    change claimed lossless must give the same greedy answer at temperature 0;
    a change to the KV cache or the context must find two needles (at about
    50% and 100% of the context) exactly; a change to `parallel` must survive
    a concurrent soak at full per-slot context.
-6. **Stop** after three levers in a row inside the noise (a plateau), at
+6. **Stop** after three measured levers in a row inside the noise (a
+   plateau; a failed trial does not count), when the noise is too wide, at
    the end of `--budget`, or on Ctrl-C, SIGTERM or SIGHUP (all three
    restore the best settings, then let the lock and hold go).
 
@@ -1468,6 +1482,7 @@ An example session:
 ```
 $ sb ai tune gpu-box/qwen --concurrency 1,2 --budget 45m
 sb ai tune gpu-box/qwen: run tune_3f9a0c21d4, engine b12464, 6 samples per run, budget 45 min
+  noise: ±5% on decode between 3 runs of the same settings (6 samples per run); a win must clear it
   spec_type {"spec_type": "draft-mtp"}: +48%, a surprising win; repeating it once
   spec_type {"spec_type": "draft-mtp"}: kept (decode +48% over both controls; repeated: decode +44% over both controls)
   draft_max {"draft_max": 2}: kept (weighted +7% over both controls)
@@ -1484,7 +1499,8 @@ draft_max by concurrency (aggregate tok/s):
   {"draft_max": 3}: c1 322, c2 431
   {"draft_max": 4}: c1 309, c2 398
 kept: spec_type {"spec_type": "draft-mtp"} (+44%); draft_max {"draft_max": 2} (+7%)
-stopped: plateau: 3 levers in a row inside the noise
+noise: ±5% on decode between 3 runs of the same settings, 6 samples per run (a win must clear it; floor ±5%)
+stopped: plateau: 3 levers in a row inside the noise (±5%)
 not verified: greedy equality on one fixed prompt only; needle checks at two depths, not a full long-context evaluation; quality beyond these checks (reasoning, tools) was not measured; numbers include the network and the gateway between this machine and the engine
 undo with: sb ai revert gpu-box/qwen 12
 ```

@@ -5,7 +5,8 @@ against a fake gateway on a local port.
 The fake's engine is fast and deterministic enough to tune: its decode and
 prompt speed follow the load settings it was loaded with (each setting has
 an effect factor), with a seeded jitter of 2% on decode and 1% on time to
-first token; it keeps the slot count
+first token, and, when a test sets it, a seeded drift of decode speed
+between runs (`run_noise`); it keeps the slot count
 (concurrent requests beyond it wait), answers needles unless a setting
 breaks them, changes its greedy answer when a setting is lossy, and fails
 loads it is told to fail. Every run goes through the real `sb` dispatcher
@@ -37,12 +38,23 @@ class Engine:
     def __init__(self, seed=11):
         self.rng = random.Random(seed)
         self.rng_lock = threading.Lock()
-        # Decode jitter. Under 3% between two controls' medians, so a run
-        # judged on decode is noisy only when a test makes it so.
+        # Decode jitter. Well under the 5% noise floor between two
+        # controls' medians, so a run judged on decode is noisy only when a
+        # test makes it so (`run_noise`).
         self.spread = 0.02
         self.base_decode = 400.0      # tok/s; a 64-token answer takes ~160 ms, so scheduling noise stays near 1%
         self.base_ttft_ms = 200.0     # long enough that scheduling noise stays under 1%
         self.base_prefill = 60000.0   # tok/s
+        # Run-to-run drift, off unless a test sets it: a real machine's
+        # speed moves between runs (heat, other work) more than within one,
+        # and a run's median does not narrow it. The tuner opens every run
+        # with one 64-token warm-up request; there the fake draws a new
+        # decode factor within +-run_noise/2, so two runs of the same
+        # settings differ by up to `run_noise`. Seeded: a test sees the same
+        # draws every time.
+        self.run_noise = 0.0
+        self.drift = 1.0
+        self.drift_rng = random.Random(seed + 1)
         self.effects = {}             # (key, json value) -> {"decode": f, "ttft": f, "prefill": f}
         self.repeat_effects = {}      # (key, json value) -> [decode factor per apply]
         self.apply_factor = 1.0
@@ -50,6 +62,7 @@ class Engine:
         self.needle_breaks = set()    # (key, json value) that lose needles
         self.greedy_breaks = set()    # (key, json value) that change the greedy answer
         self.load_fails = set()       # (key, json value) that fail to load
+        self.load_error = None        # the message of a failed load (default: generic)
         self.soak_breaks = False      # concurrent long requests fail at parallel > 1
         self.slots = threading.Semaphore(1)
         self.slot_count = 1
@@ -57,18 +70,23 @@ class Engine:
         self.applies = []             # the load of every apply
 
     def factor(self, metric):
-        out = self.apply_factor if metric == "decode" else 1.0
+        out = self.apply_factor * self.drift if metric == "decode" else 1.0
         for key, value in self.loaded.items():
             effect = self.effects.get((key, json.dumps(value)))
             if effect:
                 out *= effect.get(metric, 1.0)
         return out
 
+    def new_run(self):
+        if self.run_noise:
+            with self.rng_lock:
+                self.drift = 1.0 + self.drift_rng.uniform(-self.run_noise / 2, self.run_noise / 2)
+
     def jitter(self, spread=None):
         """Seeded run-to-run noise: `spread` (2%) on decode, 1% on time to
-        first token, so the 3% rules (a side metric against the controls, a
-        run noisy on its judged metric) are tested by their own cases, not
-        by chance."""
+        first token, so the noise rules (a side metric against the
+        controls, a run noisy on its judged metric) are tested by their own
+        cases, not by chance."""
         spread = self.spread if spread is None else spread
         with self.rng_lock:
             return 1.0 + self.rng.uniform(-spread, spread)
@@ -76,7 +94,7 @@ class Engine:
     def apply(self, load):
         for key, value in load.items():
             if (key, json.dumps(value)) in self.load_fails:
-                return f"could not load with {key}={value}"
+                return self.load_error or f"could not load with {key}={value}"
         self.loaded = dict(load)
         self.applies.append(dict(load))
         self.apply_factor = 1.0
@@ -195,6 +213,8 @@ class Fake:
                 self.engine.requests.append(("paused", False))
             return
         prompt = body["messages"][0]["content"]
+        if body.get("max_tokens") == 64 and "You are a careful assistant" in prompt:
+            engine.new_run()  # a run's warm-up request
         long_request = len(prompt) > 4000
         completed = False
         with self.lock:
@@ -388,8 +408,8 @@ class Base(unittest.TestCase):
 
 class TuneTests(Base):
     def tune(self, *args):
-        # Eight samples a run: the 3% rule on the other metrics must not trip
-        # on the fake's own jitter.
+        # Eight samples a run: the noise rule on the other metrics must not
+        # trip on the fake's own jitter.
         return self.sb("tune", TARGET, "--budget", "10m", "--json", "--samples", "8", *args)
 
     def effect(self, key, value, **factors):
@@ -440,7 +460,7 @@ class TuneTests(Base):
         self.assertIn("did not beat both controls", verdict["reason"])
         self.assert_released()
 
-    def test_a_win_that_costs_another_metric_more_than_three_percent_is_rejected(self):
+    def test_a_win_that_costs_another_metric_more_than_its_noise_is_rejected(self):
         # Decode +15%, but the first token comes 30% later.
         self.effect("flash_attn", "on", decode=1.15, ttft=0.70)
         run = self.tune("--levers", "flash_attn")
@@ -448,7 +468,7 @@ class TuneTests(Base):
         verdict = self.verdicts()[-1]
         self.assertEqual(verdict["verdict"], "rejected", verdict)
         self.assertIn("ttft_ms got", verdict["reason"])
-        self.assertIn("more than 3%", verdict["reason"])
+        self.assertIn("more than 5%", verdict["reason"])
         self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
 
     def test_a_surprising_win_is_repeated_and_a_fluke_is_dropped(self):
@@ -494,7 +514,9 @@ class TuneTests(Base):
 
     def test_more_slots_need_a_concurrent_soak(self):
         # The soak is under test here, not the noise rule: 1% jitter keeps
-        # the controls' side metrics in step.
+        # the controls' side metrics in step (and a side metric may move by
+        # its noise band, never under 5%, so clock jitter on a busy machine
+        # does not reject the change).
         self.fake.engine.spread = 0.01
         self.fake.doc = {"load": {"ctx_size": 4096}}
         run = self.tune("--levers", "parallel", "--concurrency", "1,2")
@@ -519,8 +541,8 @@ class TuneTests(Base):
     def test_draft_length_is_swept_per_concurrency(self):
         self.fake.doc = {"load": {"spec_type": "draft-mtp", "draft_max": 1}}
         self.effect("draft_max", 3, decode=1.35)
-        # Twelve samples: the 3% rule on time to first token, a metric this
-        # lever does not touch, must not trip on the fake's jitter.
+        # Twelve samples: the noise rule on time to first token, a metric
+        # this lever does not touch, must not trip on the fake's jitter.
         run = self.tune("--levers", "draft_max", "--concurrency", "1,2", "--samples", "12")
         self.assertEqual(run.returncode, 0, run.stderr)
         result = json.loads(run.stdout)
@@ -529,11 +551,96 @@ class TuneTests(Base):
         self.assertTrue(all(set(per) == {"1", "2"} for per in table.values()), table)
         self.assertEqual(self.fake.doc["load"]["draft_max"], 3, self.verdicts())
 
-    def test_a_failed_load_is_a_rejection_not_a_crash(self):
+    def test_a_failed_load_is_a_failed_trial_not_a_crash(self):
         self.fake.engine.load_fails.add(("flash_attn", json.dumps("on")))
         run = self.tune("--levers", "flash_attn")
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.verdicts()[-1]["verdict"], "failed")
         self.assertIn("did not load", self.verdicts()[-1]["reason"])
+        self.assert_released()
+
+    def test_a_failed_apply_is_a_failed_trial_and_the_run_goes_on(self):
+        # The engine refuses the new load setting, as a router does when it
+        # is told to load a model whose old process still runs (400 "model
+        # is already running"). The trial fails: shown as failed, not as a
+        # rejection, not counted as a lever inside the noise, and the run
+        # goes on to the next lever.
+        self.fake.doc = {"load": {"spec_type": "draft-mtp"}}
+        self.fake.engine.load_fails.add(("flash_attn", json.dumps("on")))
+        self.fake.engine.load_error = "the engine answered 400 Bad Request: model is already running"
+        run = self.tune("--levers", "spec_type,flash_attn,ubatch_size,mmap")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        failed = [row for row in self.verdicts() if row["verdict"] == "failed"]
+        self.assertEqual([row["lever"] for row in failed], ["flash_attn"], self.verdicts())
+        self.assertIn("model is already running", failed[0]["reason"])
+        self.assertEqual([row["lever"] for row in result["failed"]], ["flash_attn"])
+        levers = [row["lever"] for row in self.verdicts()]
+        self.assertIn("mmap", levers, "the failed trial ended the run early")
+        self.assertIn("plateau", result["stopped"])
+        self.assertEqual(self.fake.doc["load"], {"spec_type": "draft-mtp"})
+        self.assertEqual(self.fake.engine.loaded, {"spec_type": "draft-mtp"})
+        self.assert_released()
+
+    def test_text_output_shows_the_noise_and_a_failed_trial(self):
+        self.fake.engine.load_fails.add(("flash_attn", json.dumps("on")))
+        run = self.sb("tune", TARGET, "--budget", "10m", "--samples", "8", "--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("noise: ±5% on decode between 3 runs", run.stdout)
+        self.assertIn('failed (not measured): flash_attn {"flash_attn": "on"}', run.stdout)
+
+    # ------------------------------------------------------------ measured noise
+
+    def test_with_15_percent_noise_a_40_percent_win_is_kept(self):
+        self.fake.engine.run_noise = 0.15
+        self.effect("flash_attn", "on", decode=1.40)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([g["lever"] for g in result["gains"]], ["flash_attn"], self.verdicts())
+        self.assertEqual(self.fake.doc["load"]["flash_attn"], "on")
+        noise = result["noise"]
+        # Wider than the floor: two more runs, with more samples each.
+        self.assertGreater(noise["band_pct"], 5.0, noise)
+        self.assertEqual(noise["runs"], 5, noise)
+        self.assertGreater(noise["samples_per_run"], 8, noise)
+        self.assert_released()
+
+    def test_with_15_percent_noise_a_5_percent_win_is_rejected(self):
+        self.fake.engine.run_noise = 0.15
+        self.effect("flash_attn", "on", decode=1.05)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(result["gains"], [], self.verdicts())
+        self.assertEqual(self.verdicts()[-1]["verdict"], "rejected")
+        self.assertNotIn("flash_attn", self.fake.doc.get("load") or {})
+        self.assert_released()
+
+    def test_with_2_percent_noise_a_10_percent_win_is_kept(self):
+        self.fake.engine.run_noise = 0.02
+        self.effect("flash_attn", "on", decode=1.10)
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([g["lever"] for g in result["gains"]], ["flash_attn"], self.verdicts())
+        # Inside the floor: three runs, the floor as the band.
+        self.assertEqual((result["noise"]["band_pct"], result["noise"]["runs"]), (5.0, 3),
+                         result["noise"])
+
+    def test_with_60_percent_noise_the_run_stops_and_changes_nothing(self):
+        self.fake.engine.run_noise = 0.60
+        self.effect("flash_attn", "on", decode=1.40)
+        self.fake.doc = {"load": {"ctx_size": 4096}}
+        run = self.tune("--levers", "flash_attn,ubatch_size")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertIn("too noisy to tune: ±", result["stopped"])
+        self.assertGreater(result["noise"]["band_pct"], 40.0, result["noise"])
+        self.assertEqual(self.fake.calls("PUT"), [], "a setting was written")
+        self.assertEqual(self.fake.doc, {"load": {"ctx_size": 4096}})
+        self.assertEqual(self.fake.engine.applies, [])
+        self.assertEqual(self.verdicts(), [])
         self.assert_released()
 
     # ------------------------------------------------------------ ledger
@@ -941,10 +1048,11 @@ class RestoreUnitTests(unittest.TestCase):
 
 
 class VerdictUnitTests(unittest.TestCase):
-    """The keep rule: other metrics against the mean of the two controls,
-    or the worse control when the two disagree by more than 3% on that
-    metric; controls that disagree by more than 3% on the judged metric make
-    the run noisy (repeated)."""
+    """The keep rule: a win must clear the noise band; other metrics against
+    the mean of the two controls, or the worse control when the two disagree
+    by more than that metric's band; controls that disagree by more than the
+    band on the judged metric make the run noisy (repeated). Bands are the
+    measured spread, never under 5%."""
 
     def tuner(self):
         ai_tune = load_tuner_module()
@@ -955,18 +1063,19 @@ class VerdictUnitTests(unittest.TestCase):
         tuner.restore_best = lambda why: None
         tuner.samples = 6
         tuner.last_control = None
+        tuner.noise = {}
         return tuner
 
     def test_other_metrics_are_held_to_the_mean_of_the_controls(self):
         tuner = self.tuner()
         c1, c2 = {"prefill": 1000.0, "decode": 100.0}, {"prefill": 1000.0, "decode": 102.5}
-        cand = {"prefill": 1200.0, "decode": 98.0}
-        # 2% under the worse control but 3.2% under the mean: rejected.
+        cand = {"prefill": 1200.0, "decode": 96.0}
+        # 4% under the worse control but 5.2% under the mean: rejected.
         accepted, _, reason, noisy = tuner.verdict("prefill", c1, cand, c2)
         self.assertFalse(accepted, reason)
         self.assertIn("mean", reason)
         self.assertFalse(noisy)
-        cand["decode"] = 99.5
+        cand["decode"] = 97.5
         accepted, _, reason, noisy = tuner.verdict("prefill", c1, cand, c2)
         self.assertTrue(accepted, reason)
         self.assertFalse(noisy)
@@ -981,9 +1090,9 @@ class VerdictUnitTests(unittest.TestCase):
             "prefill", c1, {"prefill": 1100.0, "decode": 98.0}, c2)
         self.assertTrue(accepted, reason)
         self.assertFalse(noisy, reason)
-        # 96 is 4% under the worse control: rejected, not repeated.
+        # 94 is 6% under the worse control: rejected, not repeated.
         accepted, _, reason, noisy = tuner.verdict(
-            "prefill", c1, {"prefill": 1100.0, "decode": 96.0}, c2)
+            "prefill", c1, {"prefill": 1100.0, "decode": 94.0}, c2)
         self.assertFalse(accepted, reason)
         self.assertIn("worse control", reason)
         self.assertFalse(noisy, reason)
@@ -999,13 +1108,72 @@ class VerdictUnitTests(unittest.TestCase):
         accepted, _, reason, noisy = tuner.verdict(
             "prefill", c1, {"prefill": 1100.0, "decode": 100.0}, c2)
         self.assertTrue(accepted and noisy, reason)
-        self.assertIn("differ by more than 3% on prefill", reason)
+        self.assertIn("differ by more than the noise (±5%) on prefill", reason)
+
+    def test_a_win_must_clear_the_measured_noise(self):
+        tuner = self.tuner()
+        tuner.noise = {"decode": 0.15, "ttft_ms": 0.01}
+        c1, c2 = {"decode": 100.0, "ttft_ms": 200.0}, {"decode": 101.0, "ttft_ms": 200.0}
+        # +10% beats both controls but is inside +-15%: rejected, not repeated.
+        accepted, _, reason, noisy = tuner.verdict(
+            "decode", c1, {"decode": 111.0, "ttft_ms": 200.0}, c2)
+        self.assertFalse(accepted or noisy, reason)
+        self.assertIn("inside the noise (±15%)", reason)
+        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 130.0, "ttft_ms": 200.0}, c2)
+        self.assertTrue(accepted, reason)
+        # Controls 12% apart are normal at +-15%, not noisy.
+        accepted, _, reason, noisy = tuner.verdict(
+            "decode", c1, {"decode": 140.0, "ttft_ms": 200.0}, {"decode": 113.0, "ttft_ms": 200.0})
+        self.assertTrue(accepted and not noisy, reason)
+        # The floor: without a measurement the band is +-5%.
+        tuner.noise = {}
+        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 104.0, "ttft_ms": 200.0}, c2)
+        self.assertFalse(accepted, reason)
+        self.assertIn("inside the noise (±5%)", reason)
+
+    def test_a_side_metric_is_held_to_its_own_noise_band(self):
+        tuner = self.tuner()
+        tuner.noise = {"decode": 0.02, "ttft_ms": 0.08}
+        c1, c2 = {"decode": 100.0, "ttft_ms": 200.0}, {"decode": 100.0, "ttft_ms": 200.0}
+        # Time to first token 6% later: inside its own +-8%, kept.
+        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 120.0, "ttft_ms": 212.0}, c2)
+        self.assertTrue(accepted, reason)
+        accepted, _, reason, _ = tuner.verdict("decode", c1, {"decode": 120.0, "ttft_ms": 220.0}, c2)
+        self.assertFalse(accepted, reason)
+        self.assertIn("more than 8%", reason)
+
+    def test_spread_is_the_corrected_range_of_the_runs(self):
+        ai_tune = load_tuner_module()
+        runs = [{"decode": 100.0, "ttft_ms": 200.0}, {"decode": 110.0, "ttft_ms": 200.0},
+                {"decode": 105.0, "ttft_ms": 202.0}]
+        out = ai_tune.spreads(runs)
+        # Range 10 over median 105, doubled for three runs.
+        self.assertAlmostEqual(out["decode"], 10 / 105 * 2)
+        self.assertAlmostEqual(out["ttft_ms"], 2 / 200 * 2)
+        five = runs + [{"decode": 100.0, "ttft_ms": 200.0}, {"decode": 105.0, "ttft_ms": 200.0}]
+        self.assertAlmostEqual(ai_tune.spreads(five)["decode"], 10 / 105 * 1.5)
+        self.assertEqual(ai_tune.spreads(runs[:1]), {})
 
     def run_experiment(self, tuner, controls, cand):
         controls = list(controls)
         tuner.control = lambda: controls.pop(0)
         tuner.trial = lambda entry, change: (dict(cand), None)
         return tuner.experiment({"lever": "ubatch_size", "metric": "prefill"}, {"ubatch_size": 1024})
+
+    def test_a_trial_that_does_not_load_is_failed_not_rejected(self):
+        ai_tune = load_tuner_module()
+        tuner = self.tuner()
+        tuner.control = lambda: {"prefill": 1000.0, "decode": 105.0}
+
+        def trial(entry, change):
+            raise ai_tune.ApplyFailed("the engine answered 400: model is already running")
+        tuner.trial = trial
+        accepted, gain, reason = tuner.experiment({"lever": "ubatch_size", "metric": "prefill"},
+                                                  {"ubatch_size": 1024})
+        self.assertIsNone(accepted)
+        self.assertEqual(gain, 0.0)
+        self.assertIn("model is already running", reason)
+        self.assertEqual([(r["role"], r["verdict"]) for r in tuner.records], [("verdict", "failed")])
 
     def test_a_noisy_run_is_repeated_and_noisy_twice_changes_nothing(self):
         noisy = [{"prefill": 1000.0, "decode": 105.0}, {"prefill": 1060.0, "decode": 105.0}]
