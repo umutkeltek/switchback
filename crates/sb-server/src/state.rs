@@ -123,6 +123,13 @@ impl AppState {
         crate::engine_control::spawn_listing_poller(self, every)
     }
 
+    /// Prune the experiment ledger now and start its daily pruner when an
+    /// optimizer feature is configured or rows are left. Returns whether
+    /// the daily task started; `serve` calls it at start-up.
+    pub fn spawn_experiment_pruner(&self) -> bool {
+        crate::optimize::spawn_experiment_pruner(self)
+    }
+
     /// One pass of the engine listing poller (tests and tools).
     pub async fn poll_engine_listings(&self) {
         let ctx = crate::engine_control::EngineCtx::from(self);

@@ -895,11 +895,54 @@ pub(crate) fn prune_experiments(state: &AppState, now_ms: i64) -> usize {
     removed
 }
 
-/// Prune the experiment ledger now and then once a day.
-pub(crate) fn spawn_experiment_pruner(state: &AppState) {
+/// Whether any optimizer feature is configured: a non-default
+/// `server.optimize`, a route's `optimize`, or a lane with an engine
+/// control (what `sb ai tune` runs on).
+fn optimizer_configured(config: &sb_core::Config) -> bool {
+    config.server.optimize != sb_core::OptimizeConfig::default()
+        || config.routes.iter().any(|route| route.optimize.is_some())
+        || config
+            .local_executors
+            .iter()
+            .any(|lane| lane.engine.is_some())
+}
+
+/// Whether the experiment ledger (store or memory) has a row.
+fn experiment_rows_left(state: &AppState) -> bool {
+    if !state
+        .engine
+        .optimize()
+        .remembered_experiments(None, 1)
+        .is_empty()
+    {
+        return true;
+    }
+    state.engine.store().is_some_and(|store| {
+        store
+            .optimize_experiment_list(None, 1)
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(true)
+    })
+}
+
+/// Prune the experiment ledger now. Then, when an optimizer feature is
+/// configured or rows are left, once a day; answers whether that daily
+/// task started. With neither there is nothing to prune later, so no task
+/// stays running (a reload that adds the first feature is pruned daily
+/// after a restart).
+pub(crate) fn spawn_experiment_pruner(state: &AppState) -> bool {
+    let removed = prune_experiments(state, sb_store::now_millis());
+    if removed > 0 {
+        tracing::info!(removed, "experiment ledger pruned");
+    }
+    if !optimizer_configured(&state.snapshot().config) && !experiment_rows_left(state) {
+        tracing::debug!("no optimizer feature and no experiment rows: no daily pruner");
+        return false;
+    }
     let state = state.clone();
     tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(86_400));
+        let day = std::time::Duration::from_secs(86_400);
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + day, day);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
@@ -909,6 +952,7 @@ pub(crate) fn spawn_experiment_pruner(state: &AppState) {
             }
         }
     });
+    true
 }
 
 /// `GET /v1/optimize/locks` (operator): the live tuning locks.
@@ -1152,6 +1196,53 @@ mod tests {
         assert!(!ids.contains(&id));
         // Memory is one over the cap again; the store is not.
         assert_eq!(prune_experiments(&state, NOW), 1);
+    }
+
+    fn state_with(yaml: &str, store: Option<Arc<dyn sb_store::StateStore>>) -> AppState {
+        let cfg = sb_core::Config::from_yaml(yaml).unwrap();
+        let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+        let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+        let mut engine = sb_runtime::Engine::new(
+            Arc::new(cfg),
+            Arc::new(registry),
+            Arc::new(resolver),
+            Arc::new(sb_ledger::UsageLedger::in_memory()),
+        );
+        if let Some(store) = store {
+            engine = engine.with_store(store);
+        }
+        AppState::from_engine(engine)
+    }
+
+    // No optimizer config and an empty ledger: pruned once at start-up, no
+    // daily task. A feature configured, or rows left, keeps the daily one.
+    #[tokio::test]
+    async fn the_daily_pruner_runs_only_when_there_is_something_to_prune() {
+        let plain = "server:\n  bind: \"127.0.0.1:0\"\n";
+        assert!(!spawn_experiment_pruner(&state_with(plain, None)));
+        let store: Arc<dyn sb_store::StateStore> =
+            Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+        assert!(!spawn_experiment_pruner(&state_with(
+            plain,
+            Some(store.clone())
+        )));
+        // A row older than the keep time goes at start-up; with nothing
+        // left, still no daily task.
+        let old = sb_store::now_millis() - (EXPERIMENT_KEEP_DAYS + 1) * 86_400_000;
+        store.optimize_experiment_append(&experiment(old)).unwrap();
+        assert!(!spawn_experiment_pruner(&state_with(
+            plain,
+            Some(store.clone())
+        )));
+        assert!(store.optimize_experiment_list(None, 1).unwrap().is_empty());
+        // A row that stays: the daily task starts.
+        store
+            .optimize_experiment_append(&experiment(sb_store::now_millis()))
+            .unwrap();
+        assert!(spawn_experiment_pruner(&state_with(plain, Some(store))));
+        // An optimizer feature configured: the daily task starts.
+        let configured = "server:\n  bind: \"127.0.0.1:0\"\n  optimize:\n    loaded_aware: true\n";
+        assert!(spawn_experiment_pruner(&state_with(configured, None)));
     }
 
     const NOW: i64 = 1_800_000_000_000;
