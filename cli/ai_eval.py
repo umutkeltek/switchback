@@ -295,7 +295,12 @@ class Suite:
         self.repeats = self.int_setting("repeats", 2, 1, 10)
         self.concurrency = self.int_setting("concurrency", 1, 1, 64)
         self.seed = self.int_setting("seed", 1, 0, 2**31 - 1)
-        self.min_effect = float(self.meta.get("min_effect", MIN_EFFECT))
+        min_effect = self.meta.get("min_effect", MIN_EFFECT)
+        if isinstance(min_effect, bool) or not isinstance(min_effect, (int, float)) \
+                or not 0 <= min_effect <= 1:
+            raise EvalError(USAGE, f"suite {name}: min_effect must be a number from 0 to 1 "
+                                   "(a share of the score: 0.02 is 2 points)")
+        self.min_effect = float(min_effect)
         self.plugin = None
         if self.scorer == "plugin":
             self.plugin = self.load_plugin()

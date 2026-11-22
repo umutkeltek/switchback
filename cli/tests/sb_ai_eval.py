@@ -945,6 +945,20 @@ class SuiteUnitTests(unittest.TestCase):
             with self.assertRaises(ai_eval.EvalError):
                 ai_eval.suite_version(path)
 
+    def test_min_effect_must_be_a_share_from_0_to_1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s"
+            path.mkdir()
+            (path / "cases.jsonl").write_text(json.dumps(case("c00")) + "\n")
+            for bad in (-0.01, "0.02", True, 2):
+                (path / "suite.json").write_text(json.dumps({"name": "s", "min_effect": bad}))
+                with self.assertRaises(ai_eval.EvalError, msg=repr(bad)) as raised:
+                    ai_eval.Suite("s", path, [tmp])
+                self.assertIn("min_effect", raised.exception.message)
+            for good in (0, 0.05):
+                (path / "suite.json").write_text(json.dumps({"name": "s", "min_effect": good}))
+                self.assertEqual(ai_eval.Suite("s", path, [tmp]).min_effect, good)
+
     def test_list_needs_no_gateway(self):
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tempfile.gettempdir(),
                "XDG_CONFIG_HOME": "/nonexistent", "SB_AI_SUITES": "/nonexistent"}
