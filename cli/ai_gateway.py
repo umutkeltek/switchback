@@ -2213,7 +2213,6 @@ def unload_wait(gw, model):
     return ai_tune.lane_unload_timeout((target.get("load") or {}).get("engine") or {})
 
 
-
 def cmd_unload(gw, args):
     try:
         # The gateway answers once the model's requests ended and its
