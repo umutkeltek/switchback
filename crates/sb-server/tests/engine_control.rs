@@ -2685,3 +2685,160 @@ async fn the_settings_view_names_what_an_unload_may_take() {
     assert_eq!(engine["apply_wait_secs"], json!(1), "{view}");
     assert_eq!(engine["load_timeout_secs"], json!(5), "{view}");
 }
+
+/// A load drains a busy model whose section is pending; a chat comes in
+/// during the drain. The drain, the wait for the apply lock, the settings
+/// command and the re-read all count against one deadline, so the chat is
+/// admitted before its gate wait (35 s = max(apply_wait_secs 35,
+/// command_timeout_secs 5 + 30)) runs out.
+#[tokio::test]
+async fn a_load_drain_and_its_apply_stay_within_a_waiting_chats_wait() {
+    let (s, _state) = setup_with(Opts {
+        lane: "    command_timeout_secs: 5",
+        apply_wait_secs: 35,
+        command_template: Some("test -e {overlay}.go && sleep 4 && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.slow_ms = 32_500;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    std::fs::write(format!("{}.go", s.overlay.display()), b"go").unwrap();
+    let slow = spawn_slow(&s.gw);
+    wait_for_chat(&s).await;
+    let gw = s.gw.clone();
+    let load = tokio::spawn(async move { post_to(&gw, "/v1/models/text/m/load", json!({})).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, took) = timed_chat(&s.gw, "m").await;
+    let slow_status = slow.await.unwrap();
+    let (load_status, load_body) = load.await.unwrap();
+    assert_eq!(
+        status,
+        200,
+        "chat took {took:?}; slow {slow_status}; load {load_status} {load_body}; calls {:?}",
+        s.stub.calls()
+    );
+    assert_eq!(slow_status, 200);
+}
+
+/// An operator load that comes in after a held-back apply's retry ended
+/// (its lock let go) but before that retry's settle took its first
+/// listing waits for the settle: the settle's first pass unloads a model
+/// it finds loaded, and would end the fresh load.
+#[tokio::test]
+async fn a_load_waits_for_a_settle_that_holds_its_model() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("sleep 0.4 && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    s.stub.inner.lock().unwrap().overlay_path = Some(s.overlay.clone());
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    let slow = spawn_slow(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, view) = put(&s.gw, "text/m", 1, json!({"load": {"ctx_size": 16384}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["deferred"], json!(["m"]), "{view}");
+    // The settle's first listing answers late: the load below comes in
+    // before it.
+    s.stub.inner.lock().unwrap().listing_delay_ms = 1_500;
+    let rereads = |calls: &[String]| {
+        calls
+            .iter()
+            .filter(|call| *call == "GET /models?reload=1")
+            .count()
+    };
+    let before = rereads(&s.stub.calls());
+    assert_eq!(slow.await.unwrap(), 200);
+    // Idle: the held-back apply runs (its command takes 0.4 s), re-reads
+    // and leaves a settle holding `m`.
+    wait_for(&s, |calls| rereads(calls) > before).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}; {:?}", s.stub.calls());
+    let calls = s.stub.calls();
+    let loaded_at = calls
+        .iter()
+        .rposition(|call| call == "POST /models/load m")
+        .unwrap_or_else(|| panic!("never loaded: {calls:?}"));
+    assert!(
+        !calls[loaded_at..].contains(&"POST /models/unload m".to_string()),
+        "the settle unloaded the fresh load: {calls:?}"
+    );
+    let inner = s.stub.inner.lock().unwrap();
+    assert_eq!(
+        inner.status.get("m").map(String::as_str),
+        Some("loaded"),
+        "{:?}",
+        inner.calls
+    );
+    assert!(
+        inner.args["m"].join(" ").contains("--ctx-size 16384"),
+        "{:?}",
+        inner.args
+    );
+}
+
+/// A load drains a busy model whose section is held back while another
+/// apply holds the lane's apply lock (its settings command takes 6 s).
+/// Once the model is idle the load lets its drain go instead of keeping it
+/// while it waits for that lock: a chat that came in during the drain is
+/// served then, not after the other apply.
+#[tokio::test]
+async fn a_load_lets_its_drain_go_while_another_apply_runs() {
+    let (s, _state) = setup_with(Opts {
+        lane: "    command_timeout_secs: 7",
+        apply_wait_secs: 45,
+        command_template: Some("if test -e {overlay}.slow; then sleep 6; fi; cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.slow_ms = 1_500;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    let slow = spawn_slow(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, view) = put(&s.gw, "text/m", 1, json!({"load": {"ctx_size": 16384}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["deferred"], json!(["m"]), "{view}");
+    // Another apply (a settings write for `other`) takes the lock first.
+    let slow_marker = format!("{}.slow", s.overlay.display());
+    std::fs::write(&slow_marker, b"slow").unwrap();
+    let gw = s.gw.clone();
+    let other = tokio::spawn(async move {
+        put(&gw, "text/other", 0, json!({"load": {"ctx_size": 8192}})).await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let gw = s.gw.clone();
+    let load = tokio::spawn(async move { post_to(&gw, "/v1/models/text/m/load", json!({})).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::remove_file(&slow_marker).unwrap();
+    let (status, took) = timed_chat(&s.gw, "m").await;
+    assert_eq!(
+        status,
+        200,
+        "chat took {took:?}; calls {:?}",
+        s.stub.calls()
+    );
+    assert!(
+        took < Duration::from_secs(3),
+        "chat took {took:?}; calls {:?}",
+        s.stub.calls()
+    );
+    assert_eq!(slow.await.unwrap(), 200);
+    let (status, view) = other.await.unwrap();
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["changed"], json!(["other"]), "{view}");
+    let (status, body) = load.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+}
