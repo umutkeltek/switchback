@@ -1611,7 +1611,9 @@ most 32 characters, and not named like text: `prompt`, `answer`, `quote`,
 at most four parts joined by `- _ . :`), and any string outside the
 identity fields (`run_id`, `target`, `suite`, `suite_version`,
 `model_file`, `engine_build`, `settings_hash`, `status`, `rescored_from`,
-`stop_reason`), an array of strings included. A plug-in's `hard_fail`
+`stop_reason`), an array of strings included. Those identity fields hold
+ids, never free text: no spaces, at most 128 characters for `target` and 80
+for a model file, engine build, suite version or settings hash. A plug-in's `hard_fail`
 reasons and `detail` keys must be short names too, or the run stops before
 anything is stored. A score is
 **current** while the target's model file and engine build

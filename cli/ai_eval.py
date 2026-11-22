@@ -109,7 +109,11 @@ FORBIDDEN_KEYS = ("prompt", "response", "text", "content", "message", "answer", 
                   "body", "secret", "token", "key")
 STRING_FIELDS = ("run_id", "target", "suite", "suite_version", "model_file", "engine_build",
                  "settings_hash", "status", "rescored_from", "stop_reason")
-MAX_STRING = 200
+MAX_STRING = 200          # the longest error note kept in an answer file
+RUN_ID = re.compile(r"[a-z][a-z0-9_]{0,63}")
+TARGET_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
+SUITE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+TOKEN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,79}")
 MAX_ROW = 64 * 1024
 ID_MAPS = ("per_case", "case_detail", "case_fail")
 NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -354,13 +358,23 @@ class Suite:
 def is_name(key):
     """A name a row may use for a count, a hard-fail reason or a field:
     [a-z][a-z0-9_], at most 32, not named like text."""
-    return (isinstance(key, str) and NAME.match(key) is not None
+    return (isinstance(key, str) and NAME.fullmatch(key) is not None
             and not key.startswith(FORBIDDEN_KEYS)
             and not any(part in FORBIDDEN_KEYS for part in key.split("_")))
 
 
 def is_case_id(key):
-    return isinstance(key, str) and len(key) <= 64 and CASE_ID.match(key) is not None
+    return isinstance(key, str) and len(key) <= 64 and CASE_ID.fullmatch(key) is not None
+
+
+def identity_ok(field, value):
+    """Whether an identity field's value is shaped like an id (the gateway's
+    rule): no spaces and a short cap, never free text."""
+    if field in ("status", "stop_reason"):
+        return is_name(value)
+    pattern = {"run_id": RUN_ID, "rescored_from": RUN_ID, "target": TARGET_ID,
+               "suite": SUITE_ID}.get(field, TOKEN_ID)
+    return pattern.fullmatch(value) is not None
 
 
 def valid_result(result, suite, case_id):
@@ -637,7 +651,7 @@ def text_problem(value, path=""):
     if isinstance(value, str):
         if path not in STRING_FIELDS:
             return f"`{path}` is a string; only identity fields may be"
-        return f"`{path}` is longer than {MAX_STRING} characters" if len(value) > MAX_STRING else None
+        return None if identity_ok(path, value) else f"`{path}` is not shaped like an id (no spaces, a short cap)"
     if isinstance(value, list):
         for i, item in enumerate(value):
             problem = text_problem(item, f"{path}[{i}]")
@@ -819,7 +833,11 @@ class Evaluator:
             build = str(row.get("build") or UNKNOWN)
             for loaded in row.get("models") or []:
                 if loaded.get("id") == model:
-                    model_file = str(loaded.get("file") or ai_tune.short_hash(json.dumps(loaded.get("args"))))
+                    # No file and no args: nothing tells this model apart.
+                    if loaded.get("file"):
+                        model_file = str(loaded["file"])
+                    elif loaded.get("args"):
+                        model_file = ai_tune.short_hash(json.dumps(loaded["args"]))
         return {"engine_build": build, "model_file": model_file}
 
     def loaded_identity(self, ident):

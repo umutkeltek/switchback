@@ -434,7 +434,8 @@ run in `quality_runs` (migration 23, `StateStore::quality_run_*`; newest 50
 per target and suite plus 365 days, pruned with the experiments). The row is
 scores, case ids and counts only; `POST /v1/optimize/quality` walks it and
 refuses any key that is not a short name or a case id and any string
-outside the identity fields, so the metadata-only rule holds.
+outside the identity fields (which must be shaped like ids: no spaces, a
+short cap), so the metadata-only rule holds.
 Its staleness key, `settings_hash` (`sb_core::answer_settings_hash`), is
 computed by the gateway over the settings document without `ceiling`.
 A lane's `experiments: false` refuses the tuning lock first. The tuning lock is runtime state on `OptimizeState`: after

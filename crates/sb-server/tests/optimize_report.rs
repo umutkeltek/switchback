@@ -913,8 +913,36 @@ async fn the_quality_ledger_refuses_text_and_round_trips_scores() {
         (400, Some("text_not_allowed")),
         "{body}"
     );
+    // An identity field holds an id, never a sentence: the server refuses
+    // free text in every one of them, and a too-long token too.
+    let sentence = "I stopped the pills on Monday because I felt dizzy and my doctor said so";
+    for field in [
+        "model_file",
+        "engine_build",
+        "target",
+        "suite",
+        "run_id",
+        "stop_reason",
+        "rescored_from",
+        "suite_version",
+        "settings_hash",
+    ] {
+        let mut row = quality_row(&format!("q_id_{}", field.len()));
+        row[field] = json!(sentence);
+        let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(row)).await;
+        assert_eq!(
+            (status, body["error"]["reason"].as_str()),
+            (400, Some("text_not_allowed")),
+            "{field}: {body}"
+        );
+    }
+    let mut long = quality_row("q_long");
+    long["model_file"] = json!("n".repeat(81));
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(long)).await;
+    assert_eq!(status, 400, "{body}");
     let mut edge = quality_row("q_edge");
-    edge["model_file"] = json!("n".repeat(200));
+    edge["model_file"] = json!("n".repeat(80));
+    edge["engine_build"] = json!("b12464-d3c3e242c");
     edge["case_fail"] = json!({"c02": [null, {"cut": 1}]});
     edge["stop_reason"] = json!("gateway_error");
     let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(edge)).await;

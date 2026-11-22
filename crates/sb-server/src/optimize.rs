@@ -1180,8 +1180,6 @@ const QUALITY_STRING_FIELDS: &[&str] = &[
     "rescored_from",
     "stop_reason",
 ];
-/// The longest identity string a quality row may hold.
-const QUALITY_MAX_STRING: usize = 200;
 /// The largest quality row.
 const QUALITY_MAX_ROW: usize = 64 * 1024;
 
@@ -1205,6 +1203,34 @@ pub(crate) fn is_case_id(key: &str) -> bool {
         && parts <= 4
 }
 
+/// Whether `s` is a well-formed value for the identity field `field`: an
+/// id-shaped token with no spaces and a short cap, never free text. Run ids
+/// are names of up to 64 (`eval_0123456789ab`); `status` and `stop_reason`
+/// are [`is_quality_name`]s; a target is up to 128 of letters, digits and
+/// `. _ : / @ + -` (`gpu-box/a`); a suite up to 64 of letters, digits and
+/// `_ . -`; a model file, engine build, suite version or settings hash up to
+/// 80 of letters, digits and `. _ : + -` (`sha256:aa`, `b12464-d3c3e242c`).
+fn quality_identity_ok(field: &str, s: &str) -> bool {
+    let token = |max: usize, first_alnum: bool, extra: &str| {
+        (1..=max).contains(&s.len())
+            && (!first_alnum || s.starts_with(|c: char| c.is_ascii_alphanumeric()))
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+    };
+    match field {
+        "run_id" | "rescored_from" => {
+            (1..=64).contains(&s.len())
+                && s.starts_with(|c: char| c.is_ascii_lowercase())
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }
+        "status" | "stop_reason" => is_quality_name(s),
+        "target" => token(128, true, "._:/@+-"),
+        "suite" => token(64, false, "_.-"),
+        _ => token(80, true, "._:+-"),
+    }
+}
+
 /// Whether `key` is a name a quality row may use for a count, a hard-fail
 /// reason or a field: `^[a-z][a-z0-9_]{0,31}$`, not named like text.
 pub(crate) fn is_quality_name(key: &str) -> bool {
@@ -1220,17 +1246,17 @@ pub(crate) fn is_quality_name(key: &str) -> bool {
 /// The first place in a quality row that could carry text, or `None`. Keys
 /// are names ([`is_quality_name`]), or case ids ([`is_case_id`]) inside the
 /// case-id maps ([`QUALITY_ID_MAPS`]). A string is allowed only as one of
-/// the top-level [`QUALITY_STRING_FIELDS`], at most
-/// [`QUALITY_MAX_STRING`] characters; any other string, an array of
-/// strings included, is refused. `path` is where `value` sits.
+/// the top-level [`QUALITY_STRING_FIELDS`], shaped like an id
+/// ([`quality_identity_ok`]: no spaces, a short cap); any other string, an
+/// array of strings included, is refused. `path` is where `value` sits.
 fn quality_text_at(value: &Value, path: &str) -> Option<String> {
     match value {
         Value::String(s) => {
             if !QUALITY_STRING_FIELDS.contains(&path) {
                 Some(format!("`{path}` is a string; only identity fields may be"))
-            } else if s.chars().count() > QUALITY_MAX_STRING {
+            } else if !quality_identity_ok(path, s) {
                 Some(format!(
-                    "`{path}` is a string of more than {QUALITY_MAX_STRING} characters"
+                    "`{path}` is not shaped like an id (no spaces, a short cap)"
                 ))
             } else {
                 None

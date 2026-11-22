@@ -714,8 +714,16 @@ class NoTextTests(Base):
                       {"speed": {"median_s": "fast"}}):
             self.assertIsNotNone(ai_eval.text_problem(dict(base, **extra)), extra)
         self.assertIsNone(ai_eval.text_problem(dict(base, stop_reason="gateway_error",
-                                                    model_file="m" * 200)))
-        self.assertIsNotNone(ai_eval.text_problem(dict(base, model_file="m" * 201)))
+                                                    model_file="m" * 80,
+                                                    engine_build="b12464-d3c3e242c")))
+        self.assertIsNotNone(ai_eval.text_problem(dict(base, model_file="m" * 81)))
+        sentence = "I stopped the pills on Monday because I felt dizzy and my doctor said so"
+        for field in ("model_file", "engine_build", "target", "suite", "run_id", "stop_reason",
+                      "rescored_from", "suite_version", "settings_hash"):
+            self.assertIsNotNone(ai_eval.text_problem(dict(base, **{field: sentence})), field)
+        # A trailing newline is not a name (the gateway refuses it too).
+        self.assertIsNotNone(ai_eval.text_problem(dict(base, stop_reason="cut\n")))
+        self.assertFalse(ai_eval.is_case_id("c00\n"))
 
     def test_a_sentence_as_case_id_is_refused_when_the_suite_loads(self):
         self.suite("s", [case("I_stopped_the_pills_on_Monday_because_dizzy")])
