@@ -91,15 +91,21 @@ READY_STATES = ("healthy", "idle_countdown")
 ON_STATES = ("healthy", "draining", "idle_countdown", "degraded")
 
 # The gateway's no-text rule for quality rows, checked here too so a row is
-# never sent that it would refuse: no key named like text (whole key or its
-# start, any case, any depth), no string longer than 200 characters. The
-# keys of the case-id maps are case ids, checked as ids.
+# never sent that it would refuse. Every key is a name (NAME, and no text
+# word as its start or as one of its `_` parts), except the keys of the
+# case-id maps, which are case ids (CASE_ID: lower-case letters and digits in
+# at most four parts). A string may sit only in the top-level identity
+# fields (STRING_FIELDS), at most 200 characters; any other string, an array
+# of strings included, is refused.
 FORBIDDEN_KEYS = ("prompt", "response", "text", "content", "message", "answer", "quote", "raw",
                   "body", "secret", "token", "key")
+STRING_FIELDS = ("run_id", "target", "suite", "suite_version", "model_file", "engine_build",
+                 "settings_hash", "status", "rescored_from", "stop_reason")
 MAX_STRING = 200
 MAX_ROW = 64 * 1024
 ID_MAPS = ("per_case", "case_detail", "case_fail")
-CASE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+CASE_ID = re.compile(r"^[a-z0-9]+(?:[-_.:][a-z0-9]+){0,3}$")
 SUITE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -261,9 +267,9 @@ class Suite:
         seen = set()
         for case in self.cases:
             case_id = case.get("id")
-            if not isinstance(case_id, str) or not CASE_ID.match(case_id):
-                raise EvalError(USAGE, f"suite {name}: case id {case_id!r} must be 1-64 of "
-                                       "letters, digits, _ . : -")
+            if not is_case_id(case_id):
+                raise EvalError(USAGE, f"suite {name}: case id {case_id!r} must be 1-64 lower-case "
+                                       "letters and digits, in at most four parts joined by - _ . :")
             if case_id in seen:
                 raise EvalError(USAGE, f"suite {name}: case id {case_id} appears twice")
             seen.add(case_id)
@@ -330,19 +336,38 @@ class Suite:
         return mean_of_cases(results)
 
 
+def is_name(key):
+    """A name a row may use for a count, a hard-fail reason or a field:
+    [a-z][a-z0-9_], at most 32, not named like text."""
+    return (isinstance(key, str) and NAME.match(key) is not None
+            and not key.startswith(FORBIDDEN_KEYS)
+            and not any(part in FORBIDDEN_KEYS for part in key.split("_")))
+
+
+def is_case_id(key):
+    return isinstance(key, str) and len(key) <= 64 and CASE_ID.match(key) is not None
+
+
 def valid_result(result, suite, case_id):
+    """A plug-in's result, checked: a score in 0..1, a hard-fail reason that
+    is a name (or null) and a detail that maps names to numbers. A reason or
+    a name that could carry text stops the run before anything is stored."""
     if not isinstance(result, dict):
         raise EvalError(FAIL, f"suite {suite}: score() on {case_id} did not answer an object")
     score = result.get("score")
     if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
         raise EvalError(FAIL, f"suite {suite}: score() on {case_id} must answer a score in 0..1")
     hard = result.get("hard_fail")
-    if hard is not None and not isinstance(hard, str):
-        raise EvalError(FAIL, f"suite {suite}: hard_fail on {case_id} must be a short reason or null")
+    if hard is not None and not is_name(hard):
+        raise EvalError(FAIL, f"suite {suite}: hard_fail on {case_id} must be a short name "
+                              "([a-z][a-z0-9_], at most 32, not named like text) or null")
     detail = result.get("detail") or {}
     if not isinstance(detail, dict) or not all(
             isinstance(v, (int, float)) and not isinstance(v, bool) for v in detail.values()):
         raise EvalError(FAIL, f"suite {suite}: detail on {case_id} must map names to numbers")
+    if not all(is_name(k) for k in detail):
+        raise EvalError(FAIL, f"suite {suite}: a detail key on {case_id} is not a short name "
+                              "([a-z][a-z0-9_], at most 32, not named like text)")
     return {"score": float(score), "hard_fail": hard, "detail": dict(detail)}
 
 
@@ -592,9 +617,11 @@ def verdict(a_name, a_cases, b_name, b_cases, aggregate, min_effect):
 
 # ---------------------------------------------------------------- rows
 
-def text_problem(value, path="", ids=False):
+def text_problem(value, path=""):
     """Where a row breaks the no-text rule, or None (the gateway's rule)."""
     if isinstance(value, str):
+        if path not in STRING_FIELDS:
+            return f"`{path}` is a string; only identity fields may be"
         return f"`{path}` is longer than {MAX_STRING} characters" if len(value) > MAX_STRING else None
     if isinstance(value, list):
         for i, item in enumerate(value):
@@ -603,14 +630,13 @@ def text_problem(value, path="", ids=False):
                 return problem
         return None
     if isinstance(value, dict):
+        ids = path in ID_MAPS
         for key, item in value.items():
-            at = f"{path}.{key}" if path else key
-            if ids:
-                if not CASE_ID.match(key):
-                    return f"`{at}` is not a case id"
-            elif len(key) > MAX_STRING or key.lower().startswith(FORBIDDEN_KEYS):
-                return f"`{at}` is a key name that carries text"
-            problem = text_problem(item, at, ids=not path and key in ID_MAPS)
+            if ids and not is_case_id(key):
+                return f"a key under `{path}` is not a case id"
+            if not ids and not is_name(key):
+                return f"a key under `{path or 'the row'}` is not a name"
+            problem = text_problem(item, f"{path}.{key}" if path else key)
             if problem:
                 return problem
     return None
@@ -659,7 +685,9 @@ def build_row(suite, results, answers, identity, status, extra_repeat, rescored_
                                   for r in sorted(rs, key=lambda r: r["repeat"])]
                         for case_id, rs in sorted(cases.items())
                         if any(v for r in rs for v in r["detail"].values())},
-        "case_fail": {case_id: [r["hard_fail"] for r in sorted(rs, key=lambda r: r["repeat"])]
+        # Per repeat {reason: 1} or null: a reason is stored as a name, never as a string.
+        "case_fail": {case_id: [{r["hard_fail"]: 1} if r["hard_fail"] else None
+                                for r in sorted(rs, key=lambda r: r["repeat"])]
                       for case_id, rs in sorted(cases.items()) if any(r["hard_fail"] for r in rs)},
         "hard_fails": hard,
         "nondeterministic_share": round(differ / len(multi), 4) if multi else None,
@@ -686,9 +714,12 @@ def results_of_row(row):
         for repeat, score in enumerate(scores):
             detail = (details.get(case_id) or [])
             fail = (fails.get(case_id) or [])
+            reason = fail[repeat] if repeat < len(fail) else None
+            if isinstance(reason, dict):
+                reason = next(iter(reason), None)
             out.append({"case_id": case_id, "repeat": repeat, "score": float(score),
                         "detail": detail[repeat] if repeat < len(detail) and isinstance(detail[repeat], dict) else {},
-                        "hard_fail": fail[repeat] if repeat < len(fail) else None})
+                        "hard_fail": reason if isinstance(reason, str) else None})
     return out
 
 

@@ -812,15 +812,84 @@ async fn the_quality_ledger_refuses_text_and_round_trips_scores() {
             "row {i}: {body}"
         );
     }
-    // A string value over 200 characters is refused; exactly 200 is fine.
+    // A string sits only in the identity fields: a short one elsewhere is
+    // refused too, and an identity string over 200 characters is refused.
     let mut long = quality_row("q_long");
-    long["note"] = json!("n".repeat(201));
+    long["model_file"] = json!("n".repeat(201));
     let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(long)).await;
     assert_eq!(
         (status, body["error"]["reason"].as_str()),
         (400, Some("text_not_allowed")),
         "{body}"
     );
+    // Text in every other shape is refused: a key that ends in a text
+    // word, a key in other letters, a neutral key holding a sentence, an
+    // array of short strings, a sentence as a hard-fail reason, a sentence
+    // written as a case id, a sentence as a count's name.
+    for (name, field, value) in [
+        ("suffix key", "user_prompt", json!(3)),
+        (
+            "suffix key with text",
+            "user_prompt",
+            json!("take the blue pills twice a day"),
+        ),
+        (
+            "full-width key",
+            "\u{ff50}\u{ff52}\u{ff4f}\u{ff4d}\u{ff50}\u{ff54}",
+            json!(1),
+        ),
+        (
+            "neutral key",
+            "excerpt",
+            json!("I stopped the pills on Monday because of dizziness"),
+        ),
+        ("short string", "note", json!("ok")),
+        (
+            "array of strings",
+            "notes",
+            json!(["I stopped", "the pills", "on Monday"]),
+        ),
+        (
+            "hard_fails key",
+            "hard_fails",
+            json!({"The patient said I stopped the pills on Monday": 1}),
+        ),
+        (
+            "hard_fails long name",
+            "hard_fails",
+            json!({"i_stopped_the_pills_on_monday_because": 1}),
+        ),
+        (
+            "per_case key",
+            "per_case",
+            json!({"I_stopped_the_pills_on_Monday_because_dizzy": [1.0]}),
+        ),
+        (
+            "per_case lower-case sentence",
+            "per_case",
+            json!({"i_stopped_the_pills_on_monday": [1.0]}),
+        ),
+        (
+            "case_fail reason as a string",
+            "case_fail",
+            json!({"c01": ["cut", null]}),
+        ),
+        (
+            "detail key",
+            "detail_totals",
+            json!({"Dr Smith prescribed 20 mg": 1}),
+        ),
+        ("nested string", "speed", json!({"median_s": "fast"})),
+    ] {
+        let mut row = quality_row(&format!("q_probe_{}", name.replace(' ', "_")));
+        row[field] = value;
+        let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(row)).await;
+        assert_eq!(
+            (status, body["error"]["reason"].as_str()),
+            (400, Some("text_not_allowed")),
+            "{name}: {body}"
+        );
+    }
     // Case ids are ids, whatever word they start with; anything else
     // under a case-id map is refused.
     let mut ids = quality_row("q_ids");
@@ -845,7 +914,9 @@ async fn the_quality_ledger_refuses_text_and_round_trips_scores() {
         "{body}"
     );
     let mut edge = quality_row("q_edge");
-    edge["note"] = json!("n".repeat(200));
+    edge["model_file"] = json!("n".repeat(200));
+    edge["case_fail"] = json!({"c02": [null, {"cut": 1}]});
+    edge["stop_reason"] = json!("gateway_error");
     let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(edge)).await;
     assert_eq!(status, 201, "{body}");
     // A malformed row is refused: score out of range, no per_case.

@@ -433,7 +433,8 @@ answers and scoring stay on the client, and the gateway keeps one row per
 run in `quality_runs` (migration 23, `StateStore::quality_run_*`; newest 50
 per target and suite plus 365 days, pruned with the experiments). The row is
 scores, case ids and counts only; `POST /v1/optimize/quality` walks it and
-refuses text-like keys and long strings, so the metadata-only rule holds.
+refuses any key that is not a short name or a case id and any string
+outside the identity fields, so the metadata-only rule holds.
 Its staleness key, `settings_hash` (`sb_core::answer_settings_hash`), is
 computed by the gateway over the settings document without `ceiling`.
 A lane's `experiments: false` refuses the tuning lock first. The tuning lock is runtime state on `OptimizeState`: after

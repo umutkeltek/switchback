@@ -1158,14 +1158,29 @@ pub(crate) async fn experiment_list(
     Json(json!({"object": "list", "durable": durable, "data": data})).into_response()
 }
 
-/// Key names a quality row may never carry, at any depth (compared
-/// lower-case, as the whole key or its start): the ledger keeps scores, ids
-/// and counts, never prompt or answer text, and never a credential.
+/// Words a quality row's key names may never use (the whole key may not
+/// start with one, and no `_`-separated part may be one): the ledger keeps
+/// scores, ids and counts, never prompt or answer text, and never a
+/// credential.
 const QUALITY_FORBIDDEN_KEYS: &[&str] = &[
     "prompt", "response", "text", "content", "message", "answer", "quote", "raw", "body", "secret",
     "token", "key",
 ];
-/// The longest string (value or key) a quality row may hold.
+/// The only fields that may hold a string, all at the top level: the run's
+/// identity, its status and the typed reason it stopped.
+const QUALITY_STRING_FIELDS: &[&str] = &[
+    "run_id",
+    "target",
+    "suite",
+    "suite_version",
+    "model_file",
+    "engine_build",
+    "settings_hash",
+    "status",
+    "rescored_from",
+    "stop_reason",
+];
+/// The longest identity string a quality row may hold.
 const QUALITY_MAX_STRING: usize = 200;
 /// The largest quality row.
 const QUALITY_MAX_ROW: usize = 64 * 1024;
@@ -1174,55 +1189,81 @@ const QUALITY_MAX_ROW: usize = 64 * 1024;
 /// names).
 const QUALITY_ID_MAPS: &[&str] = &["per_case", "case_detail", "case_fail"];
 
-/// Whether `key` is a case id: 1-64 of letters, digits, `_ . : -`.
-fn is_case_id(key: &str) -> bool {
+/// Whether `key` is a case id: 1-64 characters, lower-case letters and
+/// digits in at most four parts joined by one of `- _ . :` (`n001`,
+/// `invoice-no-extra`). A sentence written as an id has more parts.
+pub(crate) fn is_case_id(key: &str) -> bool {
+    let mut parts = 0;
     (1..=64).contains(&key.len())
-        && key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+        && key.split(['-', '_', '.', ':']).all(|part| {
+            parts += 1;
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+        && parts <= 4
 }
 
-/// The first place in `value` that looks like text: a forbidden key name
-/// or a string longer than [`QUALITY_MAX_STRING`] characters. `path` is
-/// where `value` sits (for the error). The keys of a case-id map
-/// ([`QUALITY_ID_MAPS`]) must be case ids instead.
+/// Whether `key` is a name a quality row may use for a count, a hard-fail
+/// reason or a field: `^[a-z][a-z0-9_]{0,31}$`, not named like text.
+pub(crate) fn is_quality_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && key.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !QUALITY_FORBIDDEN_KEYS
+            .iter()
+            .any(|word| key.starts_with(word) || key.split('_').any(|part| part == *word))
+}
+
+/// The first place in a quality row that could carry text, or `None`. Keys
+/// are names ([`is_quality_name`]), or case ids ([`is_case_id`]) inside the
+/// case-id maps ([`QUALITY_ID_MAPS`]). A string is allowed only as one of
+/// the top-level [`QUALITY_STRING_FIELDS`], at most
+/// [`QUALITY_MAX_STRING`] characters; any other string, an array of
+/// strings included, is refused. `path` is where `value` sits.
 fn quality_text_at(value: &Value, path: &str) -> Option<String> {
     match value {
-        Value::String(s) if s.chars().count() > QUALITY_MAX_STRING => Some(format!(
-            "`{path}` is a string of more than {QUALITY_MAX_STRING} characters"
-        )),
+        Value::String(s) => {
+            if !QUALITY_STRING_FIELDS.contains(&path) {
+                Some(format!("`{path}` is a string; only identity fields may be"))
+            } else if s.chars().count() > QUALITY_MAX_STRING {
+                Some(format!(
+                    "`{path}` is a string of more than {QUALITY_MAX_STRING} characters"
+                ))
+            } else {
+                None
+            }
+        }
         Value::Array(items) => items
             .iter()
             .enumerate()
             .find_map(|(i, item)| quality_text_at(item, &format!("{path}[{i}]"))),
-        Value::Object(map) if QUALITY_ID_MAPS.contains(&path) => {
+        Value::Object(map) => {
+            let ids = QUALITY_ID_MAPS.contains(&path);
             map.iter().find_map(|(key, item)| {
-                if !is_case_id(key) {
-                    return Some(format!("`{path}` has a key that is not a case id"));
+                if ids && !is_case_id(key) {
+                    return Some(format!(
+                        "`{path}` has a key that is not a case id (1-64 lower-case letters and \
+                         digits, at most four parts joined by - _ . :)"
+                    ));
                 }
-                quality_text_at(item, &format!("{path}.{key}"))
+                if !ids && !is_quality_name(key) {
+                    return Some(format!(
+                        "a key under `{}` is not a name ([a-z][a-z0-9_], at most 32, \
+                         not named like text)",
+                        if path.is_empty() { "the row" } else { path }
+                    ));
+                }
+                let at = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                quality_text_at(item, &at)
             })
         }
-        Value::Object(map) => map.iter().find_map(|(key, item)| {
-            let at = if path.is_empty() {
-                key.clone()
-            } else {
-                format!("{path}.{key}")
-            };
-            if key.chars().count() > QUALITY_MAX_STRING {
-                return Some(format!(
-                    "a key under `{path}` is longer than {QUALITY_MAX_STRING} characters"
-                ));
-            }
-            let lower = key.to_lowercase();
-            if QUALITY_FORBIDDEN_KEYS
-                .iter()
-                .any(|word| lower.starts_with(word))
-            {
-                return Some(format!("`{at}` is a key name that carries text"));
-            }
-            quality_text_at(item, &at)
-        }),
         _ => None,
     }
 }
@@ -1304,9 +1345,10 @@ fn quality_record_view(record: sb_store::QualityRunRecord) -> Value {
 /// `model_file`, `engine_build`, `settings_hash`, `settings_revision`),
 /// `status`, `score` and `se` (0..1 or null), and `per_case` (case id ->
 /// numbers). The gateway keeps metadata only, so the row is refused (400
-/// `text_not_allowed`) when any key at any depth is named like text
-/// (`prompt`, `answer`, `quote`, ...) or any string is longer than 200
-/// characters; at most 64 KiB.
+/// `text_not_allowed`) when a key is not a name (`[a-z][a-z0-9_]`, at most
+/// 32, not named like text: `prompt`, `answer`, `quote`, ...), a case-id
+/// key is not a case id, or a string sits anywhere but the identity fields
+/// (an array of strings included); at most 64 KiB.
 pub(crate) async fn quality_append(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1593,6 +1635,48 @@ mod tests {
             engine = engine.with_store(store);
         }
         AppState::from_engine(engine)
+    }
+
+    #[test]
+    fn quality_names_and_case_ids_are_strict() {
+        for name in ["cut", "too_many", "gold_useful", "input_tokens", "p90_s"] {
+            assert!(is_quality_name(name), "{name}");
+        }
+        for name in [
+            "user_prompt",
+            "prompt_tokens",
+            "answer",
+            "my_text_len",
+            "Cut",
+            "a b",
+            "excerpt\u{2028}",
+            "i_stopped_the_pills_on_monday_because",
+            "",
+            "_x",
+        ] {
+            assert!(!is_quality_name(name), "{name}");
+        }
+        for id in [
+            "c01",
+            "n001",
+            "invoice-no-extra",
+            "text01",
+            "answer-2",
+            "a.b:c_d",
+        ] {
+            assert!(is_case_id(id), "{id}");
+        }
+        for id in [
+            "C01",
+            "a case",
+            "a--b",
+            "a-b-c-d-e",
+            "I_stopped_the_pills_on_Monday_because_dizzy",
+            "",
+            &"x".repeat(65),
+        ] {
+            assert!(!is_case_id(id), "{id}");
+        }
     }
 
     // No optimizer config and an empty ledger: pruned once at start-up, no

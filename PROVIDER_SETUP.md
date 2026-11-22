@@ -1552,7 +1552,8 @@ my-suite/
   suite.json     {"name", "kind": "chat", "scorer": "checks" | "plugin",
                   "concurrency": 1, "repeats": 2, "min_effect": 0.02, "seed": 1,
                   "roles": [], "gate_cases": [], "version_inputs": []}
-  cases.jsonl    {"id": "c01", "request": {...the exact body, no "model"...},
+  cases.jsonl    {"id": "c01" (lower-case id, at most four parts: "invoice-no-extra"),
+                  "request": {...the exact body, no "model"...},
                   "expect": {...}, "tags": [...]}
   labels.jsonl   optional gold labels a plug-in reads
   score.py       optional plug-in: score(case, answer) -> {"score", "hard_fail",
@@ -1603,9 +1604,16 @@ with no model call.
 (`POST/GET /v1/optimize/quality`, operator; store table `quality_runs`; in
 memory without a store; the newest 50 per target and suite and everything
 younger than 365 days, pruned with the experiment ledger). A row holds
-scores, case ids and counts only: the gateway refuses (400
-`text_not_allowed`) any key named like text (`prompt`, `answer`, `quote`,
-...) and any string longer than 200 characters, at any depth. A score is
+scores, case ids and counts only. The gateway refuses (400
+`text_not_allowed`) a key that is not a short name (`[a-z][a-z0-9_]`, at
+most 32 characters, and not named like text: `prompt`, `answer`, `quote`,
+...), a case id that is not an id (1-64 lower-case letters and digits in
+at most four parts joined by `- _ . :`), and any string outside the
+identity fields (`run_id`, `target`, `suite`, `suite_version`,
+`model_file`, `engine_build`, `settings_hash`, `status`, `rescored_from`,
+`stop_reason`), an array of strings included. A plug-in's `hard_fail`
+reasons and `detail` keys must be short names too, or the run stops before
+anything is stored. A score is
 **current** while the target's model file and engine build
 (`/v1/engines`), its answer-settings hash (`settings_hash` in the operator
 settings view: SHA-256 over the settings document without `ceiling`, so

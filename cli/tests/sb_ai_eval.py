@@ -336,7 +336,8 @@ class RunTests(Base):
         self.assertEqual(row["per_case"]["c00"], [0.0, 0.0])
         self.assertEqual(row["per_case"]["c01"], [1.0, 1.0])
         self.assertEqual(row["hard_fails"], {"cut": 2})
-        self.assertEqual(row["case_fail"], {"c00": ["cut", "cut"]})
+        self.assertEqual(row["case_fail"], {"c00": [{"cut": 1}, {"cut": 1}]})
+        self.assertIsNone(ai_eval.text_problem(self.fake.quality[-1]))
         self.assertAlmostEqual(row["score"], 0.5)
 
     def test_loop_and_empty_are_hard_fails(self):
@@ -491,6 +492,69 @@ class SafetyTests(Base):
         self.fake.answers[("box/m", "c00")] = ("anything", "stop")
         report = self.eval_json("box/m", "--suite", "p")
         self.assertEqual(report["runs"][0]["score"], 1.0)
+
+
+class NoTextTests(Base):
+    def plugin_suite(self, result):
+        cases = [case(f"c{i:02d}") for i in range(3)]
+        path = self.suite("p", cases, scorer="plugin")
+        (path / "score.py").write_text("def score(case, answer):\n    return " + repr(result) + "\n")
+        os.chmod(path / "score.py", 0o644)
+        for c in cases:
+            self.fake.answers[("box/m", c["id"])] = (codes(10), "stop")
+
+    def test_a_plugin_sentence_as_hard_fail_is_refused(self):
+        self.plugin_suite({"score": 0.0, "hard_fail": "The patient said: I stopped the pills on Monday",
+                           "detail": {}})
+        run = self.sb("eval", "box/m", "--suite", "p")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("hard_fail on c00 must be a short name", run.stderr)
+        self.assertEqual(self.fake.quality, [])
+        self.assertNotIn("stopped the pills", run.stdout + run.stderr)
+        self.assert_released()
+
+    def test_a_plugin_sentence_as_detail_key_is_refused(self):
+        self.plugin_suite({"score": 1.0, "hard_fail": None, "detail": {"Dr Smith prescribed 20 mg": 1}})
+        run = self.sb("eval", "box/m", "--suite", "p")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("detail key on c00 is not a short name", run.stderr)
+        self.assertEqual(self.fake.quality, [])
+        self.assertNotIn("Dr Smith", run.stdout + run.stderr)
+
+    def test_a_plugin_with_name_reasons_and_counts_is_stored(self):
+        self.plugin_suite({"score": 0.0, "hard_fail": "too_many", "detail": {"gold_useful": 2}})
+        row = self.eval_json("box/m", "--suite", "p")["runs"][0]
+        stored = self.fake.quality[-1]
+        self.assertEqual(stored["hard_fails"], {"too_many": 6})
+        self.assertEqual(stored["case_fail"]["c00"], [{"too_many": 1}, {"too_many": 1}])
+        self.assertIsNone(ai_eval.text_problem(stored))
+        self.assertEqual(row["detail_totals"], {"gold_useful": 12})
+
+    def test_the_row_check_refuses_text_in_every_shape(self):
+        base = {"run_id": "eval_1", "target": "box/m", "suite": "s", "status": "complete",
+                "per_case": {"c00": [1.0]}, "hard_fails": {}, "speed": {"input_tokens": 3}}
+        self.assertIsNone(ai_eval.text_problem(base))
+        for extra in ({"user_prompt": 3}, {"user_prompt": "take the blue pills"},
+                      {"\uff50\uff52\uff4f\uff4d\uff50\uff54": 1},
+                      {"excerpt": "I stopped the pills on Monday"}, {"note": "ok"},
+                      {"notes": ["I stopped", "the pills"]},
+                      {"hard_fails": {"The patient said I stopped the pills": 1}},
+                      {"per_case": {"I_stopped_the_pills_on_Monday_because_dizzy": [1.0]}},
+                      {"per_case": {"i_stopped_the_pills_on_monday": [1.0]}},
+                      {"case_fail": {"c00": ["cut"]}},
+                      {"detail_totals": {"Dr Smith prescribed 20 mg": 1}},
+                      {"speed": {"median_s": "fast"}}):
+            self.assertIsNotNone(ai_eval.text_problem(dict(base, **extra)), extra)
+        self.assertIsNone(ai_eval.text_problem(dict(base, stop_reason="gateway_error",
+                                                    model_file="m" * 200)))
+        self.assertIsNotNone(ai_eval.text_problem(dict(base, model_file="m" * 201)))
+
+    def test_a_sentence_as_case_id_is_refused_when_the_suite_loads(self):
+        self.suite("s", [case("I_stopped_the_pills_on_Monday_because_dizzy")])
+        run = self.sb("eval", "box/m", "--suite", "s")
+        self.assertEqual(run.returncode, 2, run.stderr)
+        self.assertIn("lower-case letters and digits", run.stderr)
+        self.assertEqual(self.fake.calls("POST"), [])
 
 
 class VerdictTests(Base):
