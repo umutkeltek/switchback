@@ -27,10 +27,12 @@ import urllib.request
 import uuid
 
 try:
+    import ai_eval
     import ai_fit
     import ai_tune
 except ImportError:  # the module sits next to this file
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ai_eval
     import ai_fit
     import ai_tune
 
@@ -75,6 +77,15 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                   [--concurrency 1,2,3] [--samples N] [--dry-run] [--history] [--json]
                                   controlled A/B/A speed experiments on one local model;
                                   keeps only what measurably wins (`sb ai revert` undoes it)
+  sb ai eval MODEL... --suite NAME [--repeats N] [--cases N] [--budget 30m] [--wake]
+                  [--json] [--no-store] [-o FILE]
+                                  answer quality on a suite of real requests: score,
+                                  +-2 SE, hard fails, speed; a verdict between 2+ models
+  sb ai eval A --compare B --suite NAME [--any] [--json]
+                                  does A beat B on stored scores (current ones; --any: stale too)
+  sb ai eval --list [--json]       the suites found, with version, kind and case count
+  sb ai eval --rescore RUN_ID [--no-store] [--json]
+                                  score a run's kept answers again (new labels), no model call
                                  where a model fits and which file to take
   sb ai settings MODEL [--profile NAME] [--history] [--json]
                                  a model's settings: each key, its value and where it comes from
@@ -208,10 +219,27 @@ not name them). engines never wakes anything: a sleeping lane shows what it had
 loaded when it was last seen. hold --load MODEL loads the model once the
 machine is up.
 
+eval replays a suite's cases through the gateway, each case exactly as its
+caller sent it, `repeats` times at the suite's concurrency, and scores every
+answer: hard checks first (error, empty, cut at the token limit, a loop,
+invalid JSON when JSON is expected: 0), then the case's checks, or the suite's
+own score.py. Suites are folders (suite.json, cases.jsonl, labels.jsonl,
+score.py) under SB_AI_SUITES (`:`-separated), else
+${XDG_DATA_HOME:-~/.local/share}/switchback/suites, plus the examples that come
+with sb. Answers stay in SB_AI_EVAL_RUNS, else
+${XDG_STATE_HOME:-~/.local/state}/switchback/eval-runs (never inside a git work
+tree); the gateway stores scores and case ids only, keyed by model file, engine
+build, answer-settings hash and suite version. "A beats B" needs at least 30
+shared cases and a lead larger than 2 points and two standard errors of the
+paired difference. eval holds the machine and takes the lane's tuning lock like
+tune: never on a sleeping machine without --wake (exit 3), never on a lane with
+experiments: false, never inside a quiet window.
+
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
 SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL, SWITCHBACK_AI_SEGMENT_MODEL,
-SWITCHBACK_AI_SPEECH_MODEL (defaults), SWITCHBACK_AI_OUT_DIR.
+SWITCHBACK_AI_SPEECH_MODEL (defaults), SWITCHBACK_AI_OUT_DIR, SB_AI_SUITES,
+SB_AI_EVAL_RUNS.
 Exit codes: 0 ok, 1 the gateway reported an error, 2 usage error, 3 the gateway does
 not answer, or the machine is off. fit answers 3 when the model index cannot be
 reached and 1 when it answers with an error.
@@ -219,7 +247,10 @@ reached and 1 when it answers with an error.
 
 CONFIG_KEYS = ("SWITCHBACK_AI_URL", "SWITCHBACK_AI_KEY", "SWITCHBACK_AI_IMAGE_MODEL",
                "SWITCHBACK_AI_VIDEO_MODEL", "SWITCHBACK_AI_SEGMENT_MODEL",
-               "SWITCHBACK_AI_SPEECH_MODEL", "SWITCHBACK_AI_OUT_DIR")
+               "SWITCHBACK_AI_SPEECH_MODEL", "SWITCHBACK_AI_OUT_DIR",
+               "SB_AI_SUITES", "SB_AI_EVAL_RUNS")
+# `sb ai eval`: where suites are found and where answers are kept.
+EVAL_PATH_KEYS = ("SB_AI_SUITES", "SB_AI_EVAL_RUNS")
 IMAGE_KIND, VIDEO_KIND = "image_generation", "video_generation"
 SEGMENT_KIND = "workflow_execution"
 # The kinds of work the gateway offers, each with its own models.
@@ -302,6 +333,12 @@ def read_env_file(path):
             value = value[1:-1]
         values[name] = value
     return values
+
+
+def eval_paths(environ):
+    """SB_AI_SUITES and SB_AI_EVAL_RUNS: the environment, else ai.env."""
+    values = read_env_file(config_path(environ))
+    return {name: environ.get(name) or values.get(name, "") for name in EVAL_PATH_KEYS}
 
 
 def load_config(environ):
@@ -2417,6 +2454,7 @@ def parser():
     doctor.add_argument("model", nargs="?", default="")
     doctor.add_argument("--json", action="store_true")
     ai_tune.add_arguments(sub.add_parser("tune", add_help=False, allow_abbrev=False))
+    ai_eval.add_arguments(sub.add_parser("eval", add_help=False, allow_abbrev=False))
     settings = sub.add_parser("settings", add_help=False, allow_abbrev=False)
     settings.add_argument("model")
     settings.add_argument("--profile")
@@ -2471,6 +2509,9 @@ def main(argv=None, environ=None):
     if args.command == "fit" and not args.store:
         # fit reads the model index, not the gateway: it needs no key.
         return ai_fit.run(args)
+    if args.command == "eval" and not ai_eval.needs_gateway(args):
+        # eval --list (and --rescore --no-store) read local files only.
+        return ai_eval.run(None, args, (Fail, GatewayError), eval_paths(environ), environ)
     gw = None
     try:
         config = load_config(environ)
@@ -2521,6 +2562,9 @@ def main(argv=None, environ=None):
             return cmd_doctor(gw, args)
         if args.command == "tune":
             return ai_tune.run(gw, args, (Fail, GatewayError),
+                               poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
+        if args.command == "eval":
+            return ai_eval.run(gw, args, (Fail, GatewayError), eval_paths(environ), environ,
                                poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
