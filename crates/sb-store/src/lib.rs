@@ -75,6 +75,31 @@ pub struct ExperimentRecord {
     pub row: String,
 }
 
+/// One answer-quality run (`sb ai eval`): one target scored on one suite.
+/// The identity fields (`model_file`, `engine_build`, `settings_hash`,
+/// `suite_version`) decide whether the score is still current; `row` is
+/// the rest as JSON (per-case scores by case id, hard-fail counts,
+/// interval, speed). Scores, ids and counts only: never prompt or answer
+/// text. `id` is the store's own (0 before it is stored).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QualityRunRecord {
+    pub id: u64,
+    pub run_id: String,
+    pub target: String,
+    pub suite: String,
+    pub suite_version: String,
+    pub model_file: String,
+    pub engine_build: String,
+    pub settings_hash: String,
+    pub settings_revision: i64,
+    /// `complete`, `partial` or `failed`.
+    pub status: String,
+    pub score: Option<f64>,
+    pub se: Option<f64>,
+    pub at_ms: i64,
+    pub row: String,
+}
+
 /// One target model's settings document as stored (`provider/model`).
 /// `doc` is the document's JSON text; `revision` counts writes to this
 /// target from 1.
@@ -804,6 +829,33 @@ pub trait StateStore: Send + Sync {
     fn optimize_experiment_prune(&self, _before_ms: i64, _keep: usize) -> Result<usize> {
         Ok(0)
     }
+
+    // ---- answer-quality runs (`sb ai eval`) ----------------------------
+
+    /// Append one quality run; answers its id. A second row with the same
+    /// `run_id` is refused.
+    fn quality_run_append(&self, _record: &QualityRunRecord) -> Result<u64> {
+        Err(StoreError(
+            "quality run persistence is not supported".to_string(),
+        ))
+    }
+
+    /// Quality runs, newest first, filtered by target and/or suite.
+    fn quality_run_list(
+        &self,
+        _target: Option<&str>,
+        _suite: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<QualityRunRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Drop quality runs older than `before_ms` that are not among the
+    /// newest `keep_per_key` of their (target, suite); answers how many
+    /// went.
+    fn quality_run_prune(&self, _before_ms: i64, _keep_per_key: usize) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// SQLite-backed store (bundled SQLite — no system dependency). One connection
@@ -1436,6 +1488,32 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
                 );
                 CREATE INDEX IF NOT EXISTS optimize_experiments_target
                     ON optimize_experiments (target, id);",
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 23, "quality_runs", |tx| {
+            // The quality ledger (`sb ai eval`): one row per (target,
+            // suite) run, scores and case ids only. A new table only: an
+            // older binary never reads it.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS quality_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL UNIQUE,
+                    target TEXT NOT NULL,
+                    suite TEXT NOT NULL,
+                    suite_version TEXT NOT NULL,
+                    model_file TEXT NOT NULL,
+                    engine_build TEXT NOT NULL,
+                    settings_hash TEXT NOT NULL,
+                    settings_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('complete','partial','failed')),
+                    score REAL,
+                    se REAL,
+                    at_ms INTEGER NOT NULL,
+                    row TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS quality_runs_target_suite
+                    ON quality_runs (target, suite, at_ms);",
             )?;
             Ok(())
         })?;
@@ -3463,6 +3541,85 @@ impl StateStore for SqliteStore {
         )?;
         Ok(old + over)
     }
+
+    fn quality_run_append(&self, record: &QualityRunRecord) -> Result<u64> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO quality_runs (run_id, target, suite, suite_version, model_file,
+                engine_build, settings_hash, settings_revision, status, score, se, at_ms, row)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                record.run_id,
+                record.target,
+                record.suite,
+                record.suite_version,
+                record.model_file,
+                record.engine_build,
+                record.settings_hash,
+                record.settings_revision,
+                record.status,
+                record.score,
+                record.se,
+                record.at_ms,
+                record.row
+            ],
+        )?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    fn quality_run_list(
+        &self,
+        target: Option<&str>,
+        suite: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<QualityRunRecord>> {
+        let conn = self.conn()?;
+        let limit = limit.clamp(1, 10_000) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, target, suite, suite_version, model_file, engine_build,
+                    settings_hash, settings_revision, status, score, se, at_ms, row
+             FROM quality_runs
+             WHERE (?1 IS NULL OR target = ?1) AND (?2 IS NULL OR suite = ?2)
+             ORDER BY at_ms DESC, id DESC LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![target, suite, limit], |row| {
+                Ok(QualityRunRecord {
+                    id: row.get::<_, i64>(0)? as u64,
+                    run_id: row.get(1)?,
+                    target: row.get(2)?,
+                    suite: row.get(3)?,
+                    suite_version: row.get(4)?,
+                    model_file: row.get(5)?,
+                    engine_build: row.get(6)?,
+                    settings_hash: row.get(7)?,
+                    settings_revision: row.get(8)?,
+                    status: row.get(9)?,
+                    score: row.get(10)?,
+                    se: row.get(11)?,
+                    at_ms: row.get(12)?,
+                    row: row.get(13)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn quality_run_prune(&self, before_ms: i64, keep_per_key: usize) -> Result<usize> {
+        let conn = self.conn()?;
+        let removed = conn.execute(
+            "DELETE FROM quality_runs WHERE at_ms < ?1 AND id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY target, suite ORDER BY at_ms DESC, id DESC
+                    ) AS rank
+                    FROM quality_runs
+                ) WHERE rank > ?2
+            )",
+            params![before_ms, keep_per_key.min(i64::MAX as usize) as i64],
+        )?;
+        Ok(removed)
+    }
 }
 
 const QUALITY_JUDGMENT_SELECT: &str =
@@ -3824,13 +3981,13 @@ mod tests {
         #[cfg(feature = "eval")]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             ]
         }
         #[cfg(not(feature = "eval"))]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             ]
         }
     }
@@ -5672,5 +5829,165 @@ mod model_settings_tests {
             [10_000, 9000, 8000, 7000, 6000]
         );
         assert_eq!(store.optimize_experiment_prune(0, 100).unwrap(), 0);
+    }
+
+    fn quality(run: &str, target: &str, suite: &str, at_ms: i64) -> QualityRunRecord {
+        QualityRunRecord {
+            id: 0,
+            run_id: run.to_string(),
+            target: target.to_string(),
+            suite: suite.to_string(),
+            suite_version: "v1".to_string(),
+            model_file: "sha256:aa".to_string(),
+            engine_build: "b1".to_string(),
+            settings_hash: "0123456789abcdef".to_string(),
+            settings_revision: 3,
+            status: "complete".to_string(),
+            score: Some(0.75),
+            se: Some(0.04),
+            at_ms,
+            row: "{\"per_case\":{\"c01\":[1.0]}}".to_string(),
+        }
+    }
+
+    #[test]
+    fn quality_runs_round_trip_and_filter_newest_first() {
+        let store = SqliteStore::in_memory().unwrap();
+        assert!(store.schema_versions().unwrap().contains(&23));
+        store
+            .quality_run_append(&quality("q1", "box/a", "s1", 1))
+            .unwrap();
+        store
+            .quality_run_append(&quality("q2", "box/b", "s1", 2))
+            .unwrap();
+        let mut partial = quality("q3", "box/a", "s2", 3);
+        partial.status = "partial".to_string();
+        partial.score = None;
+        partial.se = None;
+        store.quality_run_append(&partial).unwrap();
+        // run_id is unique.
+        assert!(store
+            .quality_run_append(&quality("q1", "box/a", "s1", 4))
+            .is_err());
+        // status is checked.
+        let mut bad = quality("q5", "box/a", "s1", 5);
+        bad.status = "great".to_string();
+        assert!(store.quality_run_append(&bad).is_err());
+
+        let all = store.quality_run_list(None, None, 10).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            ["q3", "q2", "q1"]
+        );
+        let a = store.quality_run_list(Some("box/a"), None, 10).unwrap();
+        assert_eq!(a.len(), 2);
+        let a_s1 = store
+            .quality_run_list(Some("box/a"), Some("s1"), 10)
+            .unwrap();
+        assert_eq!(a_s1.len(), 1);
+        let got = &a_s1[0];
+        let mut want = quality("q1", "box/a", "s1", 1);
+        want.id = got.id;
+        assert_eq!(got, &want);
+        let s2 = store.quality_run_list(None, Some("s2"), 10).unwrap();
+        assert_eq!(s2[0].score, None);
+        assert_eq!(s2[0].status, "partial");
+    }
+
+    #[test]
+    fn quality_runs_prune_keeps_newest_per_key_and_recent_rows() {
+        let store = SqliteStore::in_memory().unwrap();
+        for at in 1..=60 {
+            store
+                .quality_run_append(&quality(&format!("a{at}"), "box/a", "s1", at * 1000))
+                .unwrap();
+        }
+        for at in 1..=3 {
+            store
+                .quality_run_append(&quality(&format!("b{at}"), "box/b", "s1", at * 1000))
+                .unwrap();
+        }
+        // Everything is "old" (before 100 s): keep the newest 50 per key.
+        assert_eq!(store.quality_run_prune(100_000, 50).unwrap(), 10);
+        let a = store.quality_run_list(Some("box/a"), None, 1000).unwrap();
+        assert_eq!(a.len(), 50);
+        assert_eq!(a.last().unwrap().at_ms, 11_000);
+        // The small key keeps all its rows.
+        assert_eq!(
+            store
+                .quality_run_list(Some("box/b"), None, 1000)
+                .unwrap()
+                .len(),
+            3
+        );
+        // Rows newer than the cut stay even beyond the per-key count.
+        assert_eq!(store.quality_run_prune(30_000, 5).unwrap(), 19);
+        let a = store.quality_run_list(Some("box/a"), None, 1000).unwrap();
+        assert_eq!(a.len(), 31);
+        assert_eq!(a.last().unwrap().at_ms, 30_000);
+        assert_eq!(store.quality_run_prune(30_000, 5).unwrap(), 0);
+    }
+
+    #[test]
+    fn store_at_migration_22_opens_migrates_and_old_tables_keep_working() {
+        let dir = std::env::temp_dir().join(format!("sb-q23-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let path = path.to_str().unwrap().to_string();
+        // A store as the previous binary left it: no migration 23.
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .optimize_experiment_append(&ExperimentRecord {
+                    id: 0,
+                    target: "box/a".to_string(),
+                    run_id: "tune_1".to_string(),
+                    at_ms: 1,
+                    row: "{}".to_string(),
+                })
+                .unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE quality_runs; DELETE FROM schema_migrations WHERE version = 23;",
+            )
+            .unwrap();
+            assert!(!SqliteStore::table_exists(&conn, "quality_runs").unwrap());
+        }
+        // The new binary opens it: migration 23 runs, old rows survive.
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            assert!(store.schema_versions().unwrap().contains(&23));
+            assert_eq!(store.optimize_experiment_list(None, 10).unwrap().len(), 1);
+            store
+                .quality_run_append(&quality("q1", "box/a", "s1", 1))
+                .unwrap();
+        }
+        // The previous binary's statements still run against the migrated
+        // file: its tables are untouched and the extra table is ignored.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO optimize_experiments (target, run_id, at_ms, row) VALUES ('box/a','tune_2',2,'{}')",
+                [],
+            )
+            .unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM optimize_experiments", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(n, 2);
+            let max: i64 = conn
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(max, 23);
+        }
+        // And reopening is a no-op (idempotent migrations).
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.quality_run_list(None, None, 10).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
