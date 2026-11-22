@@ -845,25 +845,40 @@ class Evaluator:
 
     def take_hold_and_lock(self, ident, run_id):
         ttl = min(int(self.budget + 900), MAX_LOCK_S)
-        host = urllib.parse.quote(ident["host"])
-        hold = self.call("POST", f"/v1/hosts/{host}/holds",
-                         body={"ttl_secs": ttl, "reason": f"sb ai eval {run_id}",
-                               "wake": bool(self.args.wake and ident["asleep"]),
-                               # The gateway ends it by the next quiet window.
-                               "until_quiet_window": True},
-                         doing="holding the machine")
-        self.hold = (ident["host"], hold.get("id"))
         if ident["asleep"]:
+            # The lock never wakes anything and refuses a quiet window and a
+            # lane with experiments off: on a sleeping machine it comes
+            # first, so a refusal leaves the machine asleep.
+            self.take_lock(ident, run_id, ttl, None)
+            self.take_hold(ident, run_id, ttl, wake=bool(self.args.wake))
             self.wait_awake(ident)
-        try:
-            lock = self.call("POST", "/v1/optimize/locks",
-                             body={"target": ident["target"], "ttl_secs": ttl,
-                                   "reason": f"sb ai eval {run_id}", "hold_id": hold.get("id")},
-                             doing="taking the lane's tuning lock")
-        except EvalError as error:
-            raise EvalError(FAIL, error.message.replace("taking the lane's tuning lock: ", "")) from None
-        self.lock_id = lock.get("id")
+        else:
+            self.take_hold(ident, run_id, ttl, wake=False)
+            self.take_lock(ident, run_id, ttl, self.hold[1])
         self.last_beat = self.clock()
+
+    def take_hold(self, ident, run_id, ttl, wake):
+        # A stop signal waits until the hold's id is recorded, so the
+        # release always knows what to let go.
+        with ai_tune.stop_signals_deferred():
+            hold = self.call("POST", f"/v1/hosts/{urllib.parse.quote(ident['host'])}/holds",
+                             body={"ttl_secs": ttl, "reason": f"sb ai eval {run_id}", "wake": wake,
+                                   # The gateway ends it by the next quiet window.
+                                   "until_quiet_window": True},
+                             doing="holding the machine")
+            self.hold = (ident["host"], hold.get("id"))
+
+    def take_lock(self, ident, run_id, ttl, hold_id):
+        body = {"target": ident["target"], "ttl_secs": ttl, "reason": f"sb ai eval {run_id}"}
+        if hold_id:
+            body["hold_id"] = hold_id
+        with ai_tune.stop_signals_deferred():
+            try:
+                lock = self.call("POST", "/v1/optimize/locks", body=body,
+                                 doing="taking the lane's tuning lock")
+            except EvalError as error:
+                raise EvalError(FAIL, error.message.replace("taking the lane's tuning lock: ", "")) from None
+            self.lock_id = lock.get("id")
 
     def wait_awake(self, ident):
         deadline = self.clock() + WAKE_TIMEOUT_S * self.scale

@@ -48,9 +48,11 @@ Standard library only. The gateway client (key handling, errors) is
 `ai_gateway.Gateway`.
 """
 
+import contextlib
 import hashlib
 import json
 import math
+import os
 import random
 import signal
 import statistics
@@ -210,6 +212,39 @@ class Interrupted(Exception):
 class ApplyFailed(Exception):
     """A trial's settings did not apply or load: the trial failed, nothing
     was measured, so it says nothing about the lever."""
+
+
+@contextlib.contextmanager
+def stop_signals_deferred():
+    """Hold back Ctrl-C, SIGTERM and SIGHUP while a hold or a lock is taken
+    and its id recorded: a stop that arrives meanwhile is only noted, and
+    replayed to the handler it was meant for once the id is known, so the
+    release can let it go. Main thread only (where Python runs handlers)."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending = []
+    saved = {}
+
+    def note(signum, _frame):
+        pending.append(signum)
+
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            saved[signum] = signal.signal(signum, note)
+    try:
+        yield
+    finally:
+        for signum, handler in saved.items():
+            signal.signal(signum, handler)
+        if pending:
+            signum = pending[0]
+            handler = saved[signum]
+            if callable(handler):
+                handler(signum, None)
+            elif handler == signal.SIG_DFL:
+                os.kill(os.getpid(), signum)
 
 
 def parse_budget(text):
@@ -1193,27 +1228,41 @@ class Tuner:
         return OK
 
     def take_hold_and_lock(self):
-        ttl = int(self.budget + 900)
-        hold = self.call("POST", f"/v1/hosts/{urllib.parse.quote(self.host)}/holds",
-                         body={"ttl_secs": min(ttl, 14400), "reason": f"sb ai tune {self.target}",
-                               "wake": bool(self.args.wake and self.asleep),
-                               # The gateway ends it by the next quiet window,
-                               # so a run cut off before its lock leaves no
-                               # hold reaching into the window.
-                               "until_quiet_window": True},
-                         doing="holding the machine")
-        self.hold = hold.get("id")
+        ttl = min(int(self.budget + 900), 14400)
         if self.asleep:
+            # The lock never wakes anything and refuses a quiet window and a
+            # lane with experiments off: on a sleeping machine it comes
+            # first, so a refusal leaves the machine asleep.
+            self.take_lock(ttl, None)
+            self.take_hold(ttl, wake=bool(self.args.wake))
             self.wait_awake()
-        try:
-            lock = self.call("POST", "/v1/optimize/locks",
-                             body={"target": self.target, "ttl_secs": min(ttl, 14400),
-                                   "reason": self.run_id, "hold_id": self.hold},
-                             doing="taking the lane's tuning lock")
-        except TuneError as error:
-            raise TuneError(FAIL, error.message.replace("taking the lane's tuning lock: ", "")) from None
-        self.lock_id = lock.get("id")
+        else:
+            self.take_hold(ttl, wake=False)
+            self.take_lock(ttl, self.hold)
         self.last_beat = time.monotonic()
+
+    def take_hold(self, ttl, wake):
+        with stop_signals_deferred():
+            hold = self.call("POST", f"/v1/hosts/{urllib.parse.quote(self.host)}/holds",
+                             body={"ttl_secs": ttl, "reason": f"sb ai tune {self.target}", "wake": wake,
+                                   # The gateway ends it by the next quiet
+                                   # window, so a run cut off before its lock
+                                   # leaves no hold reaching into the window.
+                                   "until_quiet_window": True},
+                             doing="holding the machine")
+            self.hold = hold.get("id")
+
+    def take_lock(self, ttl, hold_id):
+        body = {"target": self.target, "ttl_secs": ttl, "reason": self.run_id}
+        if hold_id:
+            body["hold_id"] = hold_id
+        with stop_signals_deferred():
+            try:
+                lock = self.call("POST", "/v1/optimize/locks", body=body,
+                                 doing="taking the lane's tuning lock")
+            except TuneError as error:
+                raise TuneError(FAIL, error.message.replace("taking the lane's tuning lock: ", "")) from None
+            self.lock_id = lock.get("id")
 
     def wait_awake(self, timeout=600):
         deadline = time.monotonic() + timeout

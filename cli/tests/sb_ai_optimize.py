@@ -782,6 +782,19 @@ class TuneTests(Base):
         self.assertIn("quiet window", run.stderr)
         self.assertEqual(self.fake.calls("POST", "/v1/chat/completions"), [])
 
+    def test_wake_inside_a_quiet_window_never_wakes_the_machine(self):
+        self.fake.lane_state = "offline"
+        self.fake.lock_refusal = ("quiet_window", "inside quiet window 00:30-03:00 (UTC)")
+        run = self.tune("--levers", "flash_attn", "--wake")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("quiet window", run.stderr)
+        holds = self.fake.calls("POST", "/v1/hosts/")
+        self.assertFalse(any(body.get("wake") for _, _, body, *_ in holds), holds)
+        self.assertEqual(self.fake.lane_state, "offline")
+        self.assertEqual(self.fake.calls("PUT"), [])
+        self.assertEqual(self.fake.calls("POST", "/v1/chat/completions"), [])
+        self.assert_released()
+
     def test_a_locked_load_key_is_refused(self):
         self.fake.doc = {"load": {"flash_attn": "off"}, "locked": ["load.flash_attn"]}
         run = self.sb("tune", TARGET, "--levers", "flash_attn")

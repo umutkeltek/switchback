@@ -57,6 +57,8 @@ class Fake:
         # model file for a lane until a model is loaded there.
         self.engines_until_load = False
         self.engines_never = False   # a gateway that never names them
+        self.hold_delay = 0.0
+        self.hold_started = threading.Event()
         self.loaded = set()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
@@ -121,6 +123,9 @@ class Fake:
             return 200, {"object": "list", "data": data}
         m = re.match(r"^/v1/hosts/([^/]+)/holds$", path)
         if method == "POST" and m:
+            self.hold_started.set()
+            if self.hold_delay:
+                time.sleep(self.hold_delay)
             hold_id = f"hold-{len(self.holds) + 1}-{m.group(1)}"
             self.holds[hold_id] = body
             if body.get("wake"):
@@ -420,6 +425,57 @@ class SafetyTests(Base):
         self.assertEqual(len(self.fake.calls("DELETE", "/v1/hosts/gpu-box/holds/")), 1)
         self.assert_released()
         self.assertEqual(self.fake.quality, [])
+
+    def test_wake_inside_the_quiet_window_never_wakes_the_machine(self):
+        self.suite("s", [case("c00")])
+        self.fake.lanes["box"]["state"] = "offline"
+        self.fake.lock_refusal = ("quiet_window", "inside the quiet window 00:30-03:00")
+        run = self.sb("eval", "box/m", "--suite", "s", "--wake")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("quiet window", run.stderr)
+        holds = self.fake.calls("POST", "/v1/hosts/")
+        self.assertFalse(any(body.get("wake") for _, _, body, _ in holds), holds)
+        self.assertEqual(self.fake.lanes["box"]["state"], "offline")
+        self.assertEqual(self.fake.chats(), [])
+        self.assert_released()
+
+    def test_a_sleeping_machine_is_locked_before_it_is_held_and_woken(self):
+        self.suite("s", [case("c00")])
+        self.fake.answers[("box/m", "c00")] = (codes(10), "stop")
+        self.fake.lanes["box"]["state"] = "offline"
+        self.eval_json("box/m", "--suite", "s", "--wake")
+        order = [p for m, p, _, _ in self.fake.calls("POST")
+                 if p.startswith(("/v1/optimize/locks", "/v1/hosts/"))]
+        self.assertEqual(order, ["/v1/optimize/locks", "/v1/hosts/gpu-box/holds"])
+        self.assert_released()
+
+    def test_sigterm_while_the_hold_is_taken_still_releases_it(self):
+        self.suite("s", [case("c00")])
+        self.fake.hold_delay = 0.6
+        proc = subprocess.Popen(["zsh", str(SB), "ai", "eval", "box/m", "--suite", "s"],
+                                env=self.env, cwd=self.root, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        self.assertTrue(self.fake.hold_started.wait(60))
+        time.sleep(0.1)
+        proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertEqual(len(self.fake.calls("DELETE", "/v1/hosts/gpu-box/holds/")), 1)
+        self.assert_released()
+        self.assertEqual(self.fake.chats(), [])
+
+    def test_a_stop_signal_waits_until_the_id_is_recorded(self):
+        def stop(_signum, _frame):
+            raise KeyboardInterrupt()
+        before = signal.signal(signal.SIGTERM, stop)
+        self.addCleanup(signal.signal, signal.SIGTERM, before)
+        recorded = None
+        with self.assertRaises(KeyboardInterrupt):
+            with ai_eval.ai_tune.stop_signals_deferred():
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)
+                recorded = "hold-1"
+        self.assertEqual(recorded, "hold-1")
 
     def test_experiments_off_lane_is_refused_before_any_hold(self):
         self.suite("s", [case("c00")])
