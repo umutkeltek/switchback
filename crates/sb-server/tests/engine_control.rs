@@ -71,6 +71,8 @@ struct Router_ {
     /// How often each model's process was stopped: a chat's own load fails
     /// when this changed while it loaded.
     stops: BTreeMap<String, u64>,
+    /// How long a load takes (the model says `loading` meanwhile).
+    load_delay_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -260,24 +262,34 @@ async fn models(
 
 async fn load(State(stub): State<Stub>, Json(body): Json<Value>) -> Response {
     let model = body["model"].as_str().unwrap_or("").to_string();
-    let mut inner = stub.inner.lock().unwrap();
-    settle(&mut inner);
-    inner.calls.push(format!("POST /models/load {model}"));
-    let running = matches!(
-        inner.status.get(&model).map(String::as_str),
-        Some("loaded" | "loading")
-    );
-    if running {
-        inner.refused_loads.push(model);
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({"error": {"code": 400, "message": "model is already running",
-                                  "type": "invalid_request_error"}}),
-            ),
-        )
-            .into_response();
+    let delay = {
+        let mut inner = stub.inner.lock().unwrap();
+        settle(&mut inner);
+        inner.calls.push(format!("POST /models/load {model}"));
+        let running = matches!(
+            inner.status.get(&model).map(String::as_str),
+            Some("loaded" | "loading")
+        );
+        if running {
+            inner.refused_loads.push(model);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error": {"code": 400, "message": "model is already running",
+                                      "type": "invalid_request_error"}}),
+                ),
+            )
+                .into_response();
+        }
+        if inner.load_delay_ms > 0 {
+            inner.status.insert(model.clone(), "loading".to_string());
+        }
+        inner.load_delay_ms
+    };
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
+    let mut inner = stub.inner.lock().unwrap();
     start_process(&mut inner, &model);
     inner.status.insert(model, "loaded".to_string());
     Json(json!({"success": true})).into_response()
@@ -527,9 +539,11 @@ struct Opts<'a> {
     extra: &'a str,
     settings_command: Option<String>,
     /// More keys of the lane (`max_in_flight: 1`, ...), each on its own
-    /// line, indented like the lane's keys.
+    /// line, indented like the lane's keys. `{marker}` is the machine-up marker.
     lane: &'a str,
     apply_wait_secs: u64,
+    /// The engine's `load_timeout_secs` (default 5).
+    load_timeout_secs: u64,
     /// A settings command writing the overlay JSON, with `{marker}` (the
     /// machine-up marker) and `{overlay}` filled in.
     command_template: Option<&'a str>,
@@ -553,6 +567,7 @@ impl Default for Opts<'_> {
             settings_command: None,
             lane: "",
             apply_wait_secs: 1,
+            load_timeout_secs: 5,
             command_template: None,
             wake_template: None,
             server: "",
@@ -617,7 +632,7 @@ local_executors:
       kind: llama_cpp_router
       settings_command: "{command}"
       apply_wait_secs: {wait}
-      load_timeout_secs: 5
+      load_timeout_secs: {load_timeout}
 {extra}
 "#,
         wake = opts
@@ -625,9 +640,10 @@ local_executors:
             .unwrap_or("touch {marker}")
             .replace("{marker}", &quoted(&stub.up_marker)),
         command = command.replace('"', "\\\""),
-        lane = opts.lane,
+        lane = opts.lane.replace("{marker}", &quoted(&stub.up_marker)),
         server = opts.server,
         wait = opts.apply_wait_secs,
+        load_timeout = opts.load_timeout_secs,
         extra = opts.extra,
         text_auth = opts.text_auth.unwrap_or(
             "    accounts:\n      - id: a\n        auth: { kind: api_key, inline: \"k\" }"
@@ -2471,4 +2487,188 @@ async fn the_wait_for_an_old_process_is_bounded() {
         .unwrap_or_default()
         .to_string();
     assert!(note.contains("still ran"), "{view}");
+}
+
+/// A chat for `model` on the `text` lane: its status and how long it took.
+async fn timed_chat(gw: &str, model: &str) -> (u16, Duration) {
+    let started = std::time::Instant::now();
+    let status = reqwest::Client::new()
+        .post(format!("{gw}/v1/chat/completions"))
+        .json(&json!({"model": format!("text/{model}"),
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    (status, started.elapsed())
+}
+
+/// The note a settle left on the lane's last apply.
+async fn settle_note(s: &Setup) -> String {
+    let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;
+    view["targets"][0]["load"]["last_apply"]["settle"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The lane-up retry's apply holds `m` while its old process runs past
+/// every bound. The gate wait (33 s: `command_timeout_secs` 3 + 30) is
+/// shorter than `load_timeout_secs` (60 s), so the gate wait less a second
+/// bounds the hold, counted from the first hold: the settings command
+/// (2 s) is inside it. The retry's own hold opens with the apply's, before
+/// the slow listing (2.5 s) is taken again. The chat that woke the lane is
+/// served, never 503 `model_paused`.
+#[tokio::test]
+async fn a_lane_up_retry_opens_the_gate_within_the_requests_wait() {
+    let (s, state) = setup_with(Opts {
+        up: false,
+        lane: "    route_health: true\n    wake_on_request: true\n    wake_wait_secs: 10\n    command_timeout_secs: 3",
+        command_template: Some("test -e {marker} && sleep 2 && cat > {overlay}"),
+        load_timeout_secs: 60,
+        ..Opts::default()
+    })
+    .await;
+    state.capacity.observe_all().await;
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 32768}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.exit_delay_ms = 120_000;
+        inner.listing_delay_ms = 2_500;
+    }
+    let (status, took) = timed_chat(&s.gw, "m").await;
+    assert_eq!(status, 200, "took {took:?}: {:?}", s.stub.calls());
+    // The gate opened at the bound (32 s from the first hold), not before.
+    assert!(
+        took >= Duration::from_secs(30) && took < Duration::from_secs(33),
+        "{took:?}"
+    );
+    let calls = s.stub.calls();
+    assert!(
+        calls.contains(&"POST /models/unload m".to_string()),
+        "{calls:?}"
+    );
+    let note = settle_note(&s).await;
+    assert!(note.contains("still ran 32 s"), "{note}");
+}
+
+/// One model's settle never holds back another: the lane-up retry holds
+/// both pending models; `m`'s old process takes 3 s to exit, and `other`,
+/// which does not run, opens at the first listing.
+#[tokio::test]
+async fn a_model_that_does_not_run_never_waits_for_anothers_exit() {
+    let (s, state) = setup_with(Opts {
+        up: false,
+        lane: "    route_health: true\n    wake_on_request: true\n    wake_wait_secs: 10",
+        command_template: Some("test -e {marker} && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    state.capacity.observe_all().await;
+    for model in ["text/m", "text/other"] {
+        let (status, view) = put(&s.gw, model, 0, json!({"load": {"ctx_size": 8192}})).await;
+        assert_eq!(status, 200, "{view}");
+        assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    }
+    s.stub.inner.lock().unwrap().exit_delay_ms = 3_000;
+    let (status, took) = timed_chat(&s.gw, "other").await;
+    assert_eq!(status, 200, "{:?}", s.stub.calls());
+    assert!(took < Duration::from_millis(2_000), "{took:?}");
+    let calls = s.stub.calls();
+    assert!(
+        calls.contains(&"POST /models/unload m".to_string()),
+        "{calls:?}"
+    );
+    // `m` itself still waits for its old process.
+    let inner = s.stub.inner.lock().unwrap();
+    assert!(inner.exiting.contains_key("m"), "{:?}", inner.calls);
+}
+
+/// A load after a pending apply drains the model only until its old
+/// process has ended: chats that come in during the (long) load are
+/// admitted at once, not held until the load ends.
+#[tokio::test]
+async fn chats_during_a_load_after_a_pending_apply_are_served() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.exit_delay_ms = 300;
+        inner.load_delay_ms = 3_000;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"flash_attn": true}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    std::fs::write(format!("{}.go", s.overlay.display()), b"go").unwrap();
+    let gw = s.gw.clone();
+    let load = tokio::spawn(async move { post_to(&gw, "/v1/models/text/m/load", json!({})).await });
+    wait_for(&s, |calls| {
+        calls.contains(&"POST /models/load m".to_string())
+    })
+    .await;
+    let (status, took) = timed_chat(&s.gw, "m").await;
+    assert_eq!(status, 200, "{:?}", s.stub.calls());
+    assert!(took < Duration::from_millis(1_500), "{took:?}");
+    let (status, body) = load.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let inner = s.stub.inner.lock().unwrap();
+    assert!(inner.refused_loads.is_empty(), "{:?}", inner.calls);
+    assert!(
+        inner.args["m"].join(" ").contains("--flash-attn on"),
+        "{:?}",
+        inner.args
+    );
+}
+
+/// A power-off that lands while a settle waits for an old process ends
+/// the settle at once: no listing reaches the machine after it, and the
+/// apply's record says why the settle stopped.
+#[tokio::test]
+async fn a_power_off_ends_a_settle_without_another_listing() {
+    let (s, _state) = setup_with(Opts {
+        lane: "    poweroff_command: \"sleep 1 && rm -f {marker}\"",
+        load_timeout_secs: 30,
+        ..Opts::default()
+    })
+    .await;
+    s.stub.inner.lock().unwrap().overlay_path = Some(s.overlay.clone());
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.exit_delay_ms = 60_000;
+        inner.autoload_ms = 100;
+    }
+    let slow = spawn_slow(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, view) = put(&s.gw, "text/m", 1, json!({"load": {"ctx_size": 16384}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["deferred"], json!(["m"]), "{view}");
+    assert_eq!(slow.await.unwrap(), 200);
+    // Idle: the held-back apply runs, and its settle waits for `m`.
+    wait_for(&s, |calls| {
+        calls.contains(&"POST /models/unload m".to_string())
+    })
+    .await;
+    let (status, body) = post_to(&s.gw, "/v1/hosts/text/power", json!({"action": "off"})).await;
+    assert_eq!(status, 200, "{body}");
+    let listings = |s: &Setup| {
+        s.stub
+            .calls()
+            .iter()
+            .filter(|call| *call == "GET /models")
+            .count()
+    };
+    let after = listings(&s);
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(listings(&s), after, "{:?}", s.stub.calls());
+    let note = settle_note(&s).await;
+    assert!(note.contains("powering off"), "{note}");
 }

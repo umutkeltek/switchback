@@ -1273,15 +1273,95 @@ enum Reached {
     WhenUp,
 }
 
-/// The engine controls of every lane: shared state plus the seams.
 /// The request path's part of an apply: the models a request waits to
-/// reach, and when the apply began (the holds' bound counts from then).
-#[derive(Clone, Copy)]
-struct Settle<'a> {
-    models: &'a BTreeSet<String>,
+/// reach, when the first gate such a request may wait at closed (the
+/// holds' bound counts from then), and the caller's own holds on them
+/// (a retry takes them before the apply). Each of those holds opens with
+/// the apply's own hold of the same model.
+struct Settle {
+    models: BTreeSet<String>,
     started: tokio::time::Instant,
+    holds: Vec<sb_runtime::model_settings::ModelGate>,
 }
 
+impl Settle {
+    /// An apply no request waits for (a settings write, a load).
+    fn none() -> Self {
+        Settle {
+            models: BTreeSet::new(),
+            started: tokio::time::Instant::now(),
+            holds: Vec::new(),
+        }
+    }
+}
+
+/// What is left of a request-path apply once the lane's apply lock is let
+/// go: the holds of the rewritten models that still run their old
+/// process, kept until it is gone (see [`EngineControls::settle`]).
+struct Settling {
+    gates: BTreeMap<String, Vec<sb_runtime::model_settings::ModelGate>>,
+    started: tokio::time::Instant,
+    /// The apply's `at_ms`: the settle's note goes on this apply's record
+    /// only, never on a later one.
+    at_ms: Value,
+}
+
+/// How long a request-path apply may keep a model's gate closed after its
+/// first hold: the lane's gate wait (what a waiting request allows) less
+/// a second, and never longer than the lane's `load_timeout_secs`.
+fn settle_bound(gate_wait: Duration, load_timeout: Duration) -> Duration {
+    gate_bound(gate_wait).min(load_timeout)
+}
+
+/// The longest the gateway keeps a model's gate closed for a request that
+/// waits at it: the lane's gate wait less a second, so the gate is open
+/// before the request's own wait (which began a moment after the gate
+/// closed) runs out.
+fn gate_bound(gate_wait: Duration) -> Duration {
+    gate_wait.saturating_sub(Duration::from_secs(1))
+}
+
+/// The lane's gate wait (see [`sb_runtime::model_settings::gate_wait`]).
+fn lane_gate_wait(state: &EngineCtx, lane: &EngineLane) -> Duration {
+    sb_runtime::model_settings::gate_wait(&state.snapshot(), &lane.name)
+        .unwrap_or(Duration::from_secs(1))
+}
+
+/// How often a settle lists the engine's models.
+const SETTLE_POLL: Duration = Duration::from_millis(100);
+
+/// Whether the lane's lifecycle state is offline (`false` for a lane
+/// outside the lifecycle).
+fn lane_offline(state: &EngineCtx, lane: &EngineLane) -> bool {
+    use crate::activator::LaneState;
+    state
+        .capacity
+        .executor(&lane.name)
+        .is_some_and(|executor| matches!(executor.report().state, LaneState::Offline))
+}
+
+/// Why the lane's machine is going away, if it is: the gateway knows it is
+/// off, a power-off runs on it, or the lane went offline since
+/// `was_offline` was read (a lane that routing probes may read offline
+/// while its engine answers). Nothing but a wake may connect to it then.
+fn machine_going_off(
+    state: &EngineCtx,
+    lane: &EngineLane,
+    was_offline: bool,
+) -> Option<&'static str> {
+    use crate::activator::LaneState;
+    let executor = state.capacity.executor(&lane.name)?;
+    if executor.machine_known_off() {
+        return Some("off");
+    }
+    match executor.report().state {
+        LaneState::PoweringOff => Some("powering off"),
+        LaneState::Offline if !was_offline => Some("off"),
+        _ => None,
+    }
+}
+
+/// The engine controls of every lane: shared state plus the seams.
 pub struct EngineControls {
     runner: Arc<dyn SettingsCommandRunner>,
     client: reqwest::Client,
@@ -1543,7 +1623,9 @@ impl EngineControls {
     pub(crate) async fn apply_lane(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
         let lock = self.apply_lock(&lane.name);
         let _guard = lock.lock().await;
-        self.apply_locked(state, lane, &BTreeSet::new()).await
+        // No request waits at a gate for this apply: nothing settles.
+        let (result, _) = self.apply_locked(state, lane, Settle::none()).await;
+        result
     }
 
     /// Write the lane's overlay through its `settings_command`, then ask an
@@ -1554,20 +1636,25 @@ impl EngineControls {
     /// it), and one with a request dispatched keeps its old section until
     /// it is idle (`deferred`; retried when its last request ends). The
     /// caller holds the lane's apply lock.
-    /// `settle`: models a request waits to reach (the request path's
-    /// applies). Each one whose section this apply rewrites keeps its gate
-    /// closed until its old process is gone (bounded), so the request never
-    /// meets a process the re-read is ending.
+    ///
+    /// `settle`: the request path's part (see [`Settle`]). Every hold it
+    /// carries opens here, together with the apply's own holds, except
+    /// those of the models this apply rewrote that may still run their old
+    /// process: they come back as [`Settling`], for the caller to pass to
+    /// [`Self::settle`] once it has let go of the apply lock.
     async fn apply_locked(
         &self,
         state: &EngineCtx,
         lane: &EngineLane,
-        settle: &BTreeSet<String>,
-    ) -> Value {
-        let result = self.apply_locked_once(state, lane, settle).await;
+        settle: Settle,
+    ) -> (Value, Option<Settling>) {
+        let (result, settling) = self.apply_locked_once(state, lane, settle).await;
         // The engine re-read its presets (and unloaded models whose preset
-        // changed): the loaded-model view follows at once.
-        if result["reloaded"] == json!(true) {
+        // changed): the loaded-model view follows at once. Every hold but
+        // the settling ones is open by now, so this listing delays no
+        // waiting request; a settle takes the listing again itself, once
+        // its own gates are open.
+        if result["reloaded"] == json!(true) && settling.is_none() {
             self.refresh_listing(state, lane).await;
         }
         // A held-back model whose last request ended while this apply ran
@@ -1582,17 +1669,16 @@ impl EngineControls {
         if idle_now {
             state.engines.retry_in_background(state.clone(), &lane.name);
         }
-        result
+        (result, settling)
     }
 
     async fn apply_locked_once(
         &self,
         state: &EngineCtx,
         lane: &EngineLane,
-        settle: &BTreeSet<String>,
-    ) -> Value {
+        settle: Settle,
+    ) -> (Value, Option<Settling>) {
         use sb_runtime::model_settings::GateKind;
-        let started = tokio::time::Instant::now();
         self.gc_variants(state, lane);
         let overlay = self.overlay(state, lane);
         let desired = overlay["models"].as_object().cloned().unwrap_or_default();
@@ -1607,7 +1693,7 @@ impl EngineControls {
             result["ok"] = json!(false);
             result["error"] = json!("the lane has no engine.settings_command");
             self.finish_apply(lane, &mut result, Reached::Failed, BTreeSet::new());
-            return result;
+            return (result, None);
         };
         let last = self.lock().applied.get(&lane.name).cloned();
         let changed: BTreeSet<String> = match &last {
@@ -1624,7 +1710,7 @@ impl EngineControls {
             result["reloaded"] = json!(false);
             result["note"] = json!("nothing changed for the engine");
             self.finish_apply(lane, &mut result, Reached::Yes, BTreeSet::new());
-            return result;
+            return (result, None);
         }
         // Hold every model whose section changes. A model with a request
         // dispatched on it keeps its old section until it is idle.
@@ -1655,12 +1741,8 @@ impl EngineControls {
                     deferred.iter().cloned().collect::<Vec<_>>().join(", ")
                 ));
                 self.finish_apply(lane, &mut result, Reached::Yes, deferred);
-                return result;
+                return (result, None);
             }
-            let settle = Settle {
-                models: settle,
-                started,
-            };
             return self
                 .write_and_reread(
                     state, lane, &command, &overlay, desired, held, awake, result, deferred, settle,
@@ -1687,12 +1769,8 @@ impl EngineControls {
                 deferred.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
             self.finish_apply(lane, &mut result, Reached::Yes, deferred);
-            return result;
+            return (result, None);
         }
-        let settle = Settle {
-            models: settle,
-            started,
-        };
         self.write_and_reread(
             state, lane, &command, &overlay, applied, held, awake, result, deferred, settle,
         )
@@ -1714,8 +1792,8 @@ impl EngineControls {
         awake: Awake,
         mut result: Value,
         deferred: BTreeSet<String>,
-        settle: Settle<'_>,
-    ) -> Value {
+        settle: Settle,
+    ) -> (Value, Option<Settling>) {
         let mut document = overlay.clone();
         document["models"] = Value::Object(models.clone());
         let input = serde_json::to_vec(&document).unwrap_or_default();
@@ -1729,7 +1807,7 @@ impl EngineControls {
             result["ok"] = json!(false);
             result["error"] = json!(format!("settings_command failed: {e}"));
             self.finish_apply(lane, &mut result, Reached::Failed, deferred);
-            return result;
+            return (result, None);
         }
         let reached = match awake {
             Awake::Up => match self
@@ -1747,16 +1825,6 @@ impl EngineControls {
                     result["ok"] = json!(true);
                     result["reloaded"] = json!(true);
                     self.lock().applied.insert(lane.name.clone(), models);
-                    // Still under the holds: a waiting request reaches a
-                    // model only once its old process is gone.
-                    let rewritten: BTreeSet<String> = held
-                        .iter()
-                        .filter_map(|gate| split_target(gate.key()).map(|(_, m)| m.to_string()))
-                        .filter(|model| settle.models.contains(model))
-                        .collect();
-                    if let Some(note) = self.settle_models(state, lane, &rewritten, settle).await {
-                        result["settle"] = json!(note);
-                    }
                     Reached::Yes
                 }
                 Err(e) => {
@@ -1793,84 +1861,188 @@ impl EngineControls {
                 Reached::Yes
             }
         };
-        drop(held);
+        // Every hold opens now, the caller's included, but those of the
+        // rewritten models a request waits for: they stay closed until the
+        // model's old process is gone (`Self::settle`, run by the caller
+        // once it lets go of the apply lock).
+        let mut settling = None;
+        if result["reloaded"] == json!(true) {
+            let rewritten: BTreeSet<String> = held
+                .iter()
+                .filter_map(|gate| split_target(gate.key()).map(|(_, m)| m.to_string()))
+                .filter(|model| settle.models.contains(model))
+                .collect();
+            let mut gates: BTreeMap<String, Vec<sb_runtime::model_settings::ModelGate>> =
+                BTreeMap::new();
+            for gate in held.into_iter().chain(settle.holds) {
+                match split_target(gate.key()).map(|(_, m)| m.to_string()) {
+                    Some(model) if rewritten.contains(&model) => {
+                        gates.entry(model).or_default().push(gate);
+                    }
+                    _ => drop(gate),
+                }
+            }
+            if !gates.is_empty() {
+                settling = Some(Settling {
+                    gates,
+                    started: settle.started,
+                    at_ms: result["at_ms"].clone(),
+                });
+            }
+        } else {
+            drop(held);
+            drop(settle);
+        }
         self.finish_apply(lane, &mut result, reached, deferred);
-        result
+        (result, settling)
     }
 
-    /// End the old process of each of `models` (just rewritten by a
-    /// re-read; their gates still held) and wait until the engine no longer
-    /// lists it running, like an unload does, but within what a request
-    /// waiting at the gate is allowed to wait: the lane's gate wait from the
-    /// apply's start, less a second, and never longer than the lane's
-    /// `load_timeout_secs`. `Some` says what did not end in time (the gates
-    /// open anyway, so no request waits past its bound).
+    /// The rest of a request-path apply, run once the caller has let go of
+    /// the lane's apply lock: end the old process of each settling model and
+    /// open its gate as soon as the engine no longer lists that process
+    /// running. Each model opens on its own, so a model that does not run
+    /// never waits for another's exit. Bounded by what a request waiting at
+    /// the gate allows ([`settle_bound`], counted from the first hold), and
+    /// ended at once by a machine that is going off. What did not settle is
+    /// noted on the apply's record (`last_apply.settle`).
+    ///
+    /// It runs outside the apply lock, so a settings write or a request with
+    /// its own load settings (`ensure_variant`) never waits for an old
+    /// process to exit, as on an apply with no settle. That is safe: the
+    /// settle changes no apply state (what the engine read and the apply's
+    /// record are written before it), and it unloads only models whose
+    /// gates it holds; a later apply that rewrites one of them closes its
+    /// own hold on it.
+    async fn settle(&self, state: &EngineCtx, lane: &EngineLane, settling: Settling) {
+        let Settling {
+            mut gates,
+            started,
+            at_ms,
+        } = settling;
+        let bound = settle_bound(
+            lane_gate_wait(state, lane),
+            Duration::from_secs(lane.engine.load_timeout_secs),
+        );
+        let was_offline = lane_offline(state, lane);
+        let (note, off) = self
+            .settle_models(state, lane, &mut gates, started + bound, bound, was_offline)
+            .await;
+        // Every gate is open from here: nothing below delays a request.
+        drop(gates);
+        if let Some(note) = note {
+            let mut st = self.lock();
+            if let Some(record) = st.last_apply.get_mut(&lane.name) {
+                if record["at_ms"] == at_ms {
+                    record["settle"] = json!(note);
+                }
+            }
+        }
+        if !off {
+            self.refresh_listing(state, lane).await;
+        }
+    }
+
+    /// The settle's loop (see [`Self::settle`]): each pass first checks the
+    /// machine is not going off, then the deadline, then lists the engine's
+    /// models and opens the gate of every model that no longer runs. The
+    /// first pass unloads each model that is still loaded. The `bool` is
+    /// whether it stopped for a machine going off.
     async fn settle_models(
         &self,
         state: &EngineCtx,
         lane: &EngineLane,
-        models: &BTreeSet<String>,
-        settle: Settle<'_>,
-    ) -> Option<String> {
-        if models.is_empty() {
-            return None;
-        }
-        let gate_wait = sb_runtime::model_settings::gate_wait(&state.snapshot(), &lane.name)
-            .unwrap_or(Duration::from_secs(1));
-        let bound = gate_wait
-            .saturating_sub(Duration::from_secs(1))
-            .min(Duration::from_secs(lane.engine.load_timeout_secs));
-        let deadline = settle.started + bound;
-        let left = |deadline: tokio::time::Instant| {
-            deadline.saturating_duration_since(tokio::time::Instant::now())
-        };
-        let mut running: BTreeSet<String> = BTreeSet::new();
-        match tokio::time::timeout(left(deadline), self.models(state, lane)).await {
-            Ok(Ok(listing)) => {
-                for model in models {
+        gates: &mut BTreeMap<String, Vec<sb_runtime::model_settings::ModelGate>>,
+        deadline: tokio::time::Instant,
+        bound: Duration,
+        was_offline: bool,
+    ) -> (Option<String>, bool) {
+        let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+        let names =
+            |gates: &BTreeMap<String, _>| gates.keys().cloned().collect::<Vec<_>>().join(", ");
+        let mut first = true;
+        loop {
+            if gates.is_empty() {
+                return (None, false);
+            }
+            // Checked before every engine call: a machine that is going
+            // away is never connected to.
+            if let Some(why) = machine_going_off(state, lane, was_offline) {
+                let names = names(gates);
+                tracing::info!(lane = %lane.name, models = %names, "engine control: the machine is {why}; reopening the gate without waiting for the old process");
+                return (
+                    Some(format!(
+                        "the machine is {why}: stopped waiting for the old process of {names}"
+                    )),
+                    true,
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let names = names(gates);
+                tracing::warn!(lane = %lane.name, models = %names, "engine control: old process still runs after a re-read; reopening its gate");
+                return (
+                    Some(format!(
+                        "the old process of {names} still ran {} s after the re-read",
+                        bound.as_secs()
+                    )),
+                    false,
+                );
+            }
+            let listing = match tokio::time::timeout(left(), self.models(state, lane)).await {
+                Ok(Ok(listing)) => listing,
+                Ok(Err(e)) if first => {
+                    return (
+                        Some(format!("could not list the engine's models: {e}")),
+                        false,
+                    )
+                }
+                Err(_) if first => {
+                    return (
+                        Some("the engine's listing did not answer in time".to_string()),
+                        false,
+                    )
+                }
+                _ => {
+                    tokio::time::sleep(SETTLE_POLL.min(left())).await;
+                    continue;
+                }
+            };
+            if std::mem::take(&mut first) {
+                for model in gates.keys() {
                     let status = model_status(&listing, model);
-                    if matches!(status.as_deref(), Some("loaded" | "sleeping" | "loading")) {
-                        // The re-read may end it or keep it (an engine that
-                        // saw no change): unload it, so it surely loads again
-                        // with its new section.
-                        let unload = self.call(
-                            state,
-                            lane,
-                            reqwest::Method::POST,
-                            "/models/unload",
-                            Some(json!({"model": model})),
-                            left(deadline).max(Duration::from_millis(1)),
-                        );
-                        if let Err(e) = unload.await {
-                            tracing::warn!(lane = %lane.name, model = %model, error = %e, "engine control: unload after a re-read failed");
-                        }
+                    if !matches!(status.as_deref(), Some("loaded" | "sleeping" | "loading")) {
+                        continue;
                     }
-                    if process_running(status.as_deref()) {
-                        running.insert(model.clone());
+                    if machine_going_off(state, lane, was_offline).is_some() {
+                        break;
+                    }
+                    // The re-read may end it or keep it (an engine that saw
+                    // no change): unload it, so it surely loads again with
+                    // its new section. After a gateway restart and a failed
+                    // apply (what the engine read is unknown) this unloads
+                    // every loaded model the apply held, changed or not: the
+                    // gateway cannot tell which section changed, since the
+                    // listing shows only the checked arguments, and a change
+                    // outside them (or a key taken out) ends the process
+                    // just the same.
+                    let unload = self.call(
+                        state,
+                        lane,
+                        reqwest::Method::POST,
+                        "/models/unload",
+                        Some(json!({"model": model})),
+                        left().max(Duration::from_millis(1)),
+                    );
+                    if let Err(e) = unload.await {
+                        tracing::warn!(lane = %lane.name, model = %model, error = %e, "engine control: unload after a re-read failed");
                     }
                 }
             }
-            Ok(Err(e)) => return Some(format!("could not list the engine's models: {e}")),
-            Err(_) => return Some("the engine's listing did not answer in time".to_string()),
-        }
-        while !running.is_empty() {
-            if tokio::time::Instant::now() >= deadline {
-                let names = running.into_iter().collect::<Vec<_>>().join(", ");
-                tracing::warn!(lane = %lane.name, models = %names, "engine control: old process still runs after a re-read; reopening its gate");
-                return Some(format!(
-                    "the old process of {names} still ran {} s after the re-read",
-                    bound.as_secs()
-                ));
+            // A model whose process no longer runs opens now.
+            gates.retain(|model, _| process_running(model_status(&listing, model).as_deref()));
+            if !gates.is_empty() {
+                tokio::time::sleep(SETTLE_POLL.min(left())).await;
             }
-            tokio::time::sleep(Duration::from_millis(100).min(left(deadline))).await;
-            let Ok(Ok(listing)) =
-                tokio::time::timeout(left(deadline), self.models(state, lane)).await
-            else {
-                continue;
-            };
-            running.retain(|model| process_running(model_status(&listing, model).as_deref()));
         }
-        None
     }
 
     fn finish_apply(
@@ -1954,7 +2126,9 @@ impl EngineControls {
     /// running, the lane's apply lock and a hold on every pending model are
     /// taken here, before this returns: a request for one of them that
     /// reaches the lane first waits (bounded) for its new section instead of
-    /// being served with the old one.
+    /// being served with the old one. The pending models are read once the
+    /// lock is taken (an apply that just ended may have changed them). The
+    /// lock is let go before the settle (see [`Self::settle`]).
     pub(crate) fn retry_in_background(self: &Arc<Self>, state: EngineCtx, lane_name: &str) {
         use sb_runtime::model_settings::GateKind;
         if !self.pending_apply(lane_name) {
@@ -1967,30 +2141,52 @@ impl EngineControls {
             return;
         };
         let lock = self.apply_lock(&lane.name);
-        // Requests may wait for these models' new sections.
-        let pending = self.pending_models(&state, &lane);
-        let (guard, held) = match lock.clone().try_lock_owned() {
+        let taken = match lock.clone().try_lock_owned() {
             Ok(guard) => {
+                let started = tokio::time::Instant::now();
+                // Requests may wait for these models' new sections.
+                let models = self.pending_models(&state, &lane);
                 let registry = state.engine.model_settings();
-                let held: Vec<_> = pending
+                let holds: Vec<_> = models
                     .iter()
                     .map(|model| registry.close(&format!("{}/{model}", lane.name), GateKind::Hold))
                     .collect();
-                (Some(guard), held)
+                Some((
+                    guard,
+                    Settle {
+                        models,
+                        started,
+                        holds,
+                    },
+                ))
             }
-            Err(_) => (None, Vec::new()),
+            Err(_) => None,
         };
         let controls = self.clone();
         runtime.spawn(async move {
-            let _guard = match guard {
-                Some(guard) => guard,
-                None => lock.lock_owned().await,
+            let (guard, settle) = match taken {
+                Some(taken) => taken,
+                None => {
+                    let guard = lock.lock_owned().await;
+                    // No hold was taken here: the apply's own holds are the
+                    // first a request may meet.
+                    let settle = Settle {
+                        models: controls.pending_models(&state, &lane),
+                        started: tokio::time::Instant::now(),
+                        holds: Vec::new(),
+                    };
+                    (guard, settle)
+                }
             };
-            if controls.pending_apply(&lane.name) {
-                let result = controls.apply_locked(&state, &lane, &pending).await;
-                tracing::info!(lane = %lane.name, ok = %result["ok"], pending = %result["pending"], "engine control: pending apply retried");
+            if !controls.pending_apply(&lane.name) {
+                return;
             }
-            drop(held);
+            let (result, settling) = controls.apply_locked(&state, &lane, settle).await;
+            drop(guard);
+            tracing::info!(lane = %lane.name, ok = %result["ok"], pending = %result["pending"], "engine control: pending apply retried");
+            if let Some(settling) = settling {
+                controls.settle(&state, &lane, settling).await;
+            }
         });
     }
 
@@ -1998,8 +2194,9 @@ impl EngineControls {
     /// failed to reach the engine, `model`'s own section is among what it
     /// did not deliver, its backoff has passed and no apply is running (the
     /// lock is never waited for), run it now, so the model loads with its
-    /// current settings. A model whose section the engine has is never
-    /// delayed.
+    /// current settings, and let the model's old process end before the
+    /// request goes on (the settle, after the lock is let go). A model whose
+    /// section the engine has is never delayed.
     pub(crate) async fn before_dispatch(&self, state: &EngineCtx, provider_id: &str, model: &str) {
         if !self.failed_apply_due(provider_id) {
             return;
@@ -2011,12 +2208,22 @@ impl EngineControls {
             return;
         }
         let lock = self.apply_lock(&lane.name);
-        let Ok(_guard) = lock.try_lock() else {
+        let Ok(guard) = lock.try_lock() else {
             return;
         };
-        if self.failed_apply_due(&lane.name) && self.pending_models(state, &lane).contains(model) {
-            let settle = BTreeSet::from([model.to_string()]);
-            self.apply_locked(state, &lane, &settle).await;
+        if !self.failed_apply_due(&lane.name) || !self.pending_models(state, &lane).contains(model)
+        {
+            return;
+        }
+        let settle = Settle {
+            models: BTreeSet::from([model.to_string()]),
+            started: tokio::time::Instant::now(),
+            holds: Vec::new(),
+        };
+        let (_, settling) = self.apply_locked(state, &lane, settle).await;
+        drop(guard);
+        if let Some(settling) = settling {
+            self.settle(state, &lane, settling).await;
         }
     }
 
@@ -3476,6 +3683,27 @@ pub(crate) async fn load_endpoint(
     }
 }
 
+/// Run `work` while `gate` (a closed gate, and when it must open at the
+/// latest) stays closed: at its deadline the gate opens and the work goes
+/// on, so a request waiting at it is never failed for this work's length.
+async fn open_at<T>(
+    gate: &mut Option<(sb_runtime::model_settings::ModelGate, tokio::time::Instant)>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(work);
+    if let Some(deadline) = gate.as_ref().map(|(_, deadline)| *deadline) {
+        tokio::select! {
+            out = &mut work => return out,
+            () = tokio::time::sleep_until(deadline) => {
+                if let Some((closed, _)) = gate.take() {
+                    tracing::warn!(model = %closed.key(), "engine control: the old process has not ended within the gate's bound; reopening the gate");
+                }
+            }
+        }
+    }
+    work.await
+}
+
 /// Load a target's model (waking only when `wake`). A pending apply of
 /// the lane runs first, so the model loads with its current settings.
 /// `Err` is the response.
@@ -3513,24 +3741,28 @@ pub(crate) async fn load_target(
     let registry = state.engine.model_settings();
     let key = format!("{}/{model}", lane.name);
     // A pending apply about to rewrite this model's section: drain the
-    // model first, as `apply: now` does, and keep it drained through the
-    // end of its old process and the load. A request that waited for the
-    // apply's hold would otherwise be admitted the moment the re-read
-    // ends, start loading the model, and have that load ended under it.
+    // model first, as `apply: now` does, and keep it drained until its old
+    // process has ended. A request that waited for the apply's hold would
+    // otherwise be admitted the moment the re-read ends, start loading the
+    // model, and have that load ended under it. The drain opens before the
+    // load (a request admitted then loads the new section, as the load
+    // does), and never later than a waiting request allows.
     let mut gate = None;
     if controls.pending_apply(&lane.name) && controls.pending_models(state, &lane).contains(model) {
+        let deadline = tokio::time::Instant::now() + gate_bound(lane_gate_wait(state, &lane));
         let drain = registry.close(&key, GateKind::Drain);
         // Still busy at the bound: the apply holds this model's section back
         // (it is not rewritten), so the load below finds it running.
-        if drain
-            .wait_idle(Duration::from_secs(lane.engine.apply_wait_secs))
-            .await
-            .is_ok()
-        {
-            gate = Some(drain);
+        let wait = Duration::from_secs(lane.engine.apply_wait_secs)
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if drain.wait_idle(wait).await.is_ok() {
+            gate = Some((drain, deadline));
         }
     }
-    if controls.pending_apply(&lane.name) {
+    let ended = open_at(&mut gate, async {
+        if !controls.pending_apply(&lane.name) {
+            return Ok(());
+        }
         let applied = controls.apply_lane(state, &lane).await;
         // The re-read unloads a running model whose preset changed, and
         // llama.cpp ends its process only after answering. A load before
@@ -3540,26 +3772,29 @@ pub(crate) async fn load_target(
             && applied["changed"]
                 .as_array()
                 .is_some_and(|models| models.iter().any(|m| m == model));
-        if rewrote {
-            let ended = match controls.models(state, &lane).await {
-                Ok(models) => match model_status(&models, model).as_deref() {
-                    Some("loaded" | "sleeping" | "loading") => {
-                        controls.unload_model(state, &lane, model).await
-                    }
-                    status if process_running(status) => {
-                        controls.wait_unloaded(state, &lane, model).await
-                    }
-                    _ => Ok(()),
-                },
-                Err(e) => Err(e),
-            };
-            if let Err(e) = ended {
-                return Err(error(StatusCode::BAD_GATEWAY, "engine_error", e));
-            }
+        if !rewrote {
+            return Ok(());
         }
+        match controls.models(state, &lane).await {
+            Ok(models) => match model_status(&models, model).as_deref() {
+                Some("loaded" | "sleeping" | "loading") => {
+                    controls.unload_model(state, &lane, model).await
+                }
+                status if process_running(status) => {
+                    controls.wait_unloaded(state, &lane, model).await
+                }
+                _ => Ok(()),
+            },
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    // The old process has ended: requests may come in while the model loads.
+    drop(gate);
+    if let Err(e) = ended {
+        return Err(error(StatusCode::BAD_GATEWAY, "engine_error", e));
     }
     let outcome = controls.load_model(state, &lane, model, true).await;
-    drop(gate);
     match outcome {
         Ok(row) => {
             // Loaded with the current settings only when the engine has this
@@ -4469,6 +4704,19 @@ local_executors:
             sidecar_names(&json!(["/models/q/mtp-head.gguf", {"path": "C:\\m\\mmproj.gguf"}, 3]));
         assert_eq!(names, json!(["mtp-head.gguf", "mmproj.gguf"]));
         assert_eq!(sidecar_names(&Value::Null), json!([]));
+    }
+
+    #[test]
+    fn a_settle_is_bounded_by_the_gate_wait_less_a_second_and_the_load_timeout() {
+        let s = Duration::from_secs;
+        // `load_timeout_secs` above the gate wait: the gate wait less a
+        // second, so the gate opens before a waiting request gives up.
+        assert_eq!(settle_bound(s(31), s(60)), s(30));
+        assert_eq!(settle_bound(s(33), s(33)), s(32));
+        // Below it: the load timeout.
+        assert_eq!(settle_bound(s(90), s(5)), s(5));
+        assert_eq!(settle_bound(s(1), s(5)), s(0));
+        assert_eq!(gate_bound(s(31)), s(30));
     }
 
     fn args_row(args: &[&str]) -> Value {
