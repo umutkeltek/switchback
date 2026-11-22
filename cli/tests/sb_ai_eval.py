@@ -766,6 +766,25 @@ class VerdictTests(Base):
         self.assertGreater(v["difference"], 0.02)
         self.assertGreater(v["two_se"], v["difference"])
 
+    def test_a_steady_lead_over_cases_of_every_difficulty_is_a_beat(self):
+        # Every case: A leads by 5 points; case difficulty runs from 5 to 90.
+        # Paired, the difference never moves and A beats B. Resampling B's
+        # cases on their own would mix the difficulty spread into the error
+        # and say "cannot separate".
+        path = self.suite("s", [case("c00")])
+        b = {f"c{i:02d}": [round(0.05 + 0.85 * i / 39, 6)] for i in range(40)}
+        a = {k: [round(v[0] + 0.05, 6)] for k, v in b.items()}
+        self.store_row("lane/a", path, a)
+        self.store_row("lane/b", path, b)
+        v = self.eval_json("lane/a", "--compare", "lane/b", "--suite", "s")["verdict"]
+        self.assertEqual(v["verdict"], "a_beats_b", v)
+        self.assertAlmostEqual(v["difference"], 0.05, places=6)
+        self.assertLess(v["two_se"], 0.001)
+        # The unpaired error on the same rows, for contrast.
+        unpaired = ai_eval.bootstrap(ai_eval.by_case(ai_eval.results_of_row({"per_case": b})),
+                                     ai_eval.mean_of_cases)[0]
+        self.assertGreater(2 * unpaired * 2 ** 0.5, 0.05)
+
     def test_too_few_cases_say_add_cases(self):
         path = self.suite("s", [case("c00")])
         rng = random.Random(5)
