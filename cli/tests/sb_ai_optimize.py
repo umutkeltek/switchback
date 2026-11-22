@@ -128,6 +128,7 @@ class Fake:
         self.history = []
         self.lane_state = "healthy"
         self.lane_in_flight = 0
+        self.lane_experiments = True
         self.woken_state = "idle_countdown"
         self.lock_refusal = None       # ("lane_busy" | "quiet_window", message)
         self.locks = {}
@@ -290,7 +291,8 @@ class Fake:
         if method == "GET" and path == "/v1/workloads/capacity":
             return 200, {"object": "list", "data": [
                 {"name": "box", "host": "gpu-box", "state": self.lane_state, "level": "ok",
-                 "queue_depth": 0, "in_flight": self.lane_in_flight}]}
+                 "queue_depth": 0, "in_flight": self.lane_in_flight,
+                 "experiments": self.lane_experiments}]}
         if method == "POST" and path == "/v1/hosts/gpu-box/holds":
             hold_id = f"hold-{len(self.holds) + 1}"
             self.holds[hold_id] = body
@@ -760,6 +762,18 @@ class TuneTests(Base):
         self.assertIn("in flight", run.stderr)
         self.assertEqual(self.fake.calls("PUT"), [])
         self.assertEqual(self.fake.holds, {}, "the hold outlived the refusal")
+
+    def test_an_experiments_off_lane_is_refused_before_any_hold(self):
+        self.fake.lane_experiments = False
+        self.fake.lane_state = "offline"
+        for extra in (["--wake"], ["--dry-run"]):
+            run = self.tune("--levers", "flash_attn", *extra)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertIn("experiments: false", run.stderr)
+        self.assertEqual(self.fake.calls("POST", "/v1/hosts"), [])
+        self.assertEqual(self.fake.calls("POST", "/v1/optimize/locks"), [])
+        self.assertEqual(self.fake.calls("PUT"), [])
+        self.assertEqual(self.fake.lane_state, "offline")
 
     def test_a_quiet_window_is_refused(self):
         self.fake.lock_refusal = ("quiet_window", "inside the quiet window 00:30-03:00 (UTC)")

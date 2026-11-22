@@ -1158,6 +1158,9 @@ class Tuner:
         self.build, self.model_file, self.listing_row = self.engine_identity()
         self.plan = self.levers()
         lane = self.lane_state()
+        if lane and lane.get("experiments") is False:
+            raise TuneError(FAIL, f"lane `{self.lane}` does not allow experiments "
+                                  "(local_executors[].experiments: false); nothing was held or woken")
         state = (lane or {}).get("state", "unknown")
         self.asleep = state not in ("healthy", "draining", "idle_countdown")
         if self.asleep and not self.args.wake and not self.args.dry_run:
