@@ -1,0 +1,16 @@
+{
+  "name": "example-short-answers",
+  "kind": "chat",
+  "scorer": "checks",
+  "concurrency": 1,
+  "repeats": 2,
+  "min_effect": 0.02,
+  "seed": 1,
+  "roles": [],
+  "gate_cases": [
+    "invoice-fields",
+    "sum",
+    "sort-alpha"
+  ],
+  "note": "Made-up cases that show the suite format; too small for a verdict (30 shared cases needed)."
+}
