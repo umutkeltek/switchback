@@ -1295,7 +1295,9 @@ class Tuner:
         sd = self.noise.get(metric, 0.0)
         want = math.ceil(self.samples * (sd / NOISE_FLOOR) ** 2)
         levers = max(1, len([entry for entry in self.plan if entry.get("kind") != "advice"]))
-        runs = NOISE_MORE + (9 if sd > REPEAT_ABOVE else 3) * levers
+        # Rounds per lever as the judge counts them: two on a machine
+        # noisier than REPEAT_ABOVE by its own (widened) SD.
+        runs = NOISE_MORE + (9 if self.noise_sd(metric) > REPEAT_ABOVE else 3) * levers
         remaining = max(0.0, self.budget - self.elapsed())
         fits = int(remaining * 0.5 / (runs * per_sample)) if per_sample > 0 else want
         new = min(want, fits, 2 * self.requested_samples, MAX_SAMPLES)
@@ -1319,7 +1321,9 @@ class Tuner:
         self.measure_noise(baseline_metric)
         if self.untuned_reason:
             return self.untuned_reason
-        sd = self.noise.get(baseline_metric, 0.0)
+        # The SD the judge uses (floored, and widened for what a few runs
+        # cannot pin down): a run stops where no win could clear it.
+        sd = self.noise_sd(baseline_metric)
         if sd > TOO_NOISY:
             # A kept win would have to clear about 1.7 times this noise
             # with room to spare: nothing the levers do could show.

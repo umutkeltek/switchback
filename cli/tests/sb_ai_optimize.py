@@ -654,11 +654,31 @@ class TuneTests(Base):
         self.assertIn("too noisy to tune: noise ±", result["stopped"])
         self.assertFalse(result["tuned"])
         self.assertIn("too noisy to tune", result["reason"])
-        self.assertAlmostEqual(result["noise"]["sd_pct"], 30.0, delta=1.5)
+        # Five runs only pin the SD down so far: anything clearly over the
+        # limit (about 30% here) is the right reading.
+        self.assertGreater(result["noise"]["sd_pct"], result["noise"]["too_noisy_above_pct"])
         self.assertEqual(self.fake.calls("PUT"), [], "a setting was written")
         self.assertEqual(self.fake.doc, {"load": {"ctx_size": 4096}})
         self.assertEqual(self.fake.engine.applies, [])
         self.assertEqual(self.verdicts(), [])
+        self.assert_released()
+
+    def test_noise_widened_over_the_limit_stops_the_run(self):
+        # Five noise runs whose SD is about 17%: under the 20% limit as
+        # measured, over it once widened for what five runs cannot pin down
+        # (about 1.35 times), which is the SD the judge would use.
+        self.fake.engine.drift_plan = [1.0, 1.17, 0.83, 1.17, 0.83]
+        self.effect("flash_attn", "on", decode=1.40)
+        self.fake.doc = {"load": {"ctx_size": 4096}}
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        noise = result["noise"]
+        self.assertLess(noise["sd_pct"], noise["too_noisy_above_pct"], noise)
+        self.assertIn("too noisy to tune", result["reason"])
+        self.assertFalse(result["tuned"])
+        self.assertEqual(self.fake.calls("PUT"), [], "a setting was written")
+        self.assertEqual(self.fake.doc, {"load": {"ctx_size": 4096}})
         self.assert_released()
 
     def test_the_printed_noise_is_the_sd_of_one_run(self):
