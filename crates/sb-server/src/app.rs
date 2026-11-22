@@ -70,6 +70,10 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/optimize/experiments",
             get(crate::optimize::experiment_list).post(crate::optimize::experiment_append),
         )
+        .route(
+            "/v1/optimize/quality",
+            get(crate::optimize::quality_list).post(crate::optimize::quality_append),
+        )
         .route("/v1/admin/alerts/test", post(handlers::hosts::alerts_test))
         .route(
             "/v1/hosts/{host}/holds",

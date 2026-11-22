@@ -122,6 +122,11 @@ const ADMIN: &str = "sk-admin-test";
 const CLIENT: &str = "sk-client-test";
 
 async fn fixture(gpu_up: bool, optimize: &str) -> Fixture {
+    fixture_with(gpu_up, optimize, "").await
+}
+
+/// `gpu_lane` is extra YAML for the gpu box's lane (indented 4 spaces).
+async fn fixture_with(gpu_up: bool, optimize: &str, gpu_lane: &str) -> Fixture {
     let gpu = Machine::new("gpu-box", gpu_up);
     let small = Machine::new("small-host", true);
     let gpu_url = serve(&gpu).await;
@@ -165,6 +170,7 @@ local_executors:
     wake_command: "echo wake >> '{wakes}'"
     boot_timeout_secs: 5
     max_in_flight: 4
+{gpu_lane}
     engine:
       kind: llama_cpp_router
       settings_command: "cat > /dev/null"
@@ -760,4 +766,227 @@ async fn rereview_a_heartbeat_keeps_the_lock_inside_the_quiet_window_cap() {
         "heartbeat moved the lock {} s past the quiet window start: {beat}",
         (expires - start_ms) / 1000
     );
+}
+
+fn quality_row(run_id: &str) -> Value {
+    json!({
+        "run_id": run_id, "target": "gpu-box/a", "suite": "s1", "suite_version": "abc123def456",
+        "model_file": "sha256:aa", "engine_build": "b1", "settings_hash": "0123456789abcdef",
+        "settings_revision": 2, "status": "complete", "score": 0.8, "se": 0.03,
+        "per_case": {"c01": [1.0, 1.0], "c02": [0.5, 0.0]},
+        "hard_fails": {"cut": 1}, "interval": [0.74, 0.86],
+        "speed": {"median_s": 1.2, "p90_s": 2.5}
+    })
+}
+
+// Test 19: the quality ledger keeps scores and ids, never text; client
+// keys may neither write nor read it.
+#[tokio::test]
+async fn the_quality_ledger_refuses_text_and_round_trips_scores() {
+    let fx = fixture(true, "    stickiness: false").await;
+    // A key named like text, at any depth, is refused.
+    for (i, row) in [
+        {
+            let mut row = quality_row("q_text1");
+            row["answer"] = json!("x");
+            row
+        },
+        {
+            let mut row = quality_row("q_text2");
+            row["detail"] = json!({"cases": [{"id": "c01", "Answer_text": "x"}]});
+            row
+        },
+        {
+            let mut row = quality_row("q_text3");
+            row["speed"]["prompt_tokens"] = json!(10);
+            row
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(row)).await;
+        assert_eq!(
+            (status, body["error"]["reason"].as_str()),
+            (400, Some("text_not_allowed")),
+            "row {i}: {body}"
+        );
+    }
+    // A string value over 200 characters is refused; exactly 200 is fine.
+    let mut long = quality_row("q_long");
+    long["note"] = json!("n".repeat(201));
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(long)).await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (400, Some("text_not_allowed")),
+        "{body}"
+    );
+    let mut edge = quality_row("q_edge");
+    edge["note"] = json!("n".repeat(200));
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(edge)).await;
+    assert_eq!(status, 201, "{body}");
+    // A malformed row is refused: score out of range, no per_case.
+    let mut bad = quality_row("q_bad");
+    bad["score"] = json!(1.5);
+    let (status, _) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(bad)).await;
+    assert_eq!(status, 400);
+    let mut bad = quality_row("q_bad2");
+    bad.as_object_mut().unwrap().remove("per_case");
+    let (status, _) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(bad)).await;
+    assert_eq!(status, 400);
+    // A valid row round-trips; a second one with its run id is refused.
+    let (status, body) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/quality",
+        ADMIN,
+        Some(quality_row("q_ok")),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["durable"], false);
+    let (status, _) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/quality",
+        ADMIN,
+        Some(quality_row("q_ok")),
+    )
+    .await;
+    assert_eq!(status, 409);
+    let mut partial = quality_row("q_partial");
+    partial["suite"] = json!("s2");
+    partial["status"] = json!("partial");
+    partial["score"] = Value::Null;
+    partial["se"] = Value::Null;
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(partial)).await;
+    assert_eq!(status, 201, "{body}");
+    let (status, list) = call(
+        &fx.gw,
+        "GET",
+        "/v1/optimize/quality?model=gpu-box/a&suite=s1",
+        ADMIN,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{list}");
+    let rows = list["data"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["run_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["q_ok", "q_edge"]
+    );
+    assert_eq!(rows[0]["per_case"]["c02"], json!([0.5, 0.0]));
+    assert_eq!(rows[0]["score"], json!(0.8));
+    assert!(rows[0]["at_ms"].as_i64().unwrap() > 0);
+    let (_, all) = call(&fx.gw, "GET", "/v1/optimize/quality", ADMIN, None).await;
+    assert_eq!(all["data"].as_array().unwrap().len(), 3);
+    // Client keys: 403 both ways.
+    let (status, _) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/quality",
+        CLIENT,
+        Some(quality_row("q_client")),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _) = call(&fx.gw, "GET", "/v1/optimize/quality", CLIENT, None).await;
+    assert_eq!(status, 403);
+}
+
+// Test 20: a lane with `experiments: false` refuses the tuning lock before
+// anything else, and the capacity view says so.
+#[tokio::test]
+async fn a_lane_without_experiments_refuses_the_lock_and_shows_the_flag() {
+    let fx = fixture_with(
+        true,
+        "    quiet_windows: [\"00:00-23:59\", \"23:59-00:00\"]",
+        "    experiments: false",
+    )
+    .await;
+    // Even inside a quiet window, `experiments_off` is the answer.
+    let (status, body) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (409, Some("experiments_off")),
+        "{body}"
+    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("local_executors[].experiments: false"));
+    let (status, capacity) = call(&fx.gw, "GET", "/v1/workloads/capacity", ADMIN, None).await;
+    assert_eq!(status, 200);
+    let lane = |name: &str| {
+        capacity["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(lane("gpu-box")["experiments"], json!(false));
+    assert_eq!(lane("small-host")["experiments"], json!(true));
+    // The default lane still takes a lock.
+    let fx = fixture(true, "    stickiness: false").await;
+    let (status, body) = call(
+        &fx.gw,
+        "POST",
+        "/v1/optimize/locks",
+        ADMIN,
+        Some(json!({"target": "gpu-box/a"})),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+}
+
+// The settings view names the answer-settings hash for operators only, and
+// a stored ceiling leaves it alone while a temperature change moves it.
+#[tokio::test]
+async fn the_settings_view_carries_the_answer_settings_hash_for_operators() {
+    let fx = fixture(true, "    stickiness: false").await;
+    let hash = |view: &Value| view["targets"][0]["settings_hash"].clone();
+    let (status, view) = call(&fx.gw, "GET", "/v1/models/gpu-box/a/settings", ADMIN, None).await;
+    assert_eq!(status, 200, "{view}");
+    let empty = hash(&view);
+    assert_eq!(empty.as_str().unwrap().len(), 16);
+    let (status, body) = call(
+        &fx.gw,
+        "PUT",
+        "/v1/models/gpu-box/a/settings",
+        ADMIN,
+        Some(json!({"revision": 0, "defaults": {"temperature": 0.2}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, view) = call(&fx.gw, "GET", "/v1/models/gpu-box/a/settings", ADMIN, None).await;
+    let warm = hash(&view);
+    assert_ne!(warm, empty);
+    let (status, body) = call(
+        &fx.gw,
+        "PUT",
+        "/v1/models/gpu-box/a/settings",
+        ADMIN,
+        Some(json!({"revision": 1, "defaults": {"temperature": 0.2},
+                    "ceiling": {"decode_tps": 40.0}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, view) = call(&fx.gw, "GET", "/v1/models/gpu-box/a/settings", ADMIN, None).await;
+    assert_eq!(view["targets"][0]["revision"], json!(2));
+    assert_eq!(hash(&view), warm);
+    let (status, view) = call(&fx.gw, "GET", "/v1/models/gpu-box/a/settings", CLIENT, None).await;
+    if status == 200 {
+        assert!(view["targets"][0].get("settings_hash").is_none(), "{view}");
+    }
 }

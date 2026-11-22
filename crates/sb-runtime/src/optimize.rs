@@ -178,6 +178,9 @@ pub struct OptimizeState {
     tuning_spans: Mutex<VecDeque<(String, i64, i64)>>,
     /// The tuning ledger when there is no state store (process lifetime).
     experiments: Mutex<Vec<sb_store::ExperimentRecord>>,
+    /// The quality ledger (`sb ai eval`) when there is no state store
+    /// (process lifetime).
+    quality_runs: Mutex<Vec<sb_store::QualityRunRecord>>,
 }
 
 fn now_ms() -> i64 {
@@ -584,6 +587,64 @@ impl OptimizeState {
             .take(limit)
             .cloned()
             .collect()
+    }
+
+    /// Keep a quality run in memory (no state store); answers its id, or
+    /// `None` when a row with the same `run_id` is already kept.
+    pub fn remember_quality_run(&self, mut record: sb_store::QualityRunRecord) -> Option<u64> {
+        let mut rows = self.quality_runs.lock().unwrap_or_else(|e| e.into_inner());
+        if rows.iter().any(|row| row.run_id == record.run_id) {
+            return None;
+        }
+        record.id = rows.last().map_or(0, |last| last.id) + 1;
+        let id = record.id;
+        rows.push(record);
+        Some(id)
+    }
+
+    /// Drop remembered quality runs older than `before_ms` that are not
+    /// among the newest `keep_per_key` of their (target, suite); answers
+    /// how many went.
+    pub fn prune_quality_runs(&self, before_ms: i64, keep_per_key: usize) -> usize {
+        let mut rows = self.quality_runs.lock().unwrap_or_else(|e| e.into_inner());
+        let before = rows.len();
+        let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut keep = vec![true; rows.len()];
+        // Rank each (target, suite) newest first.
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by_key(|i| std::cmp::Reverse((rows[*i].at_ms, rows[*i].id)));
+        for i in order {
+            let row = &rows[i];
+            let rank = seen
+                .entry((row.target.clone(), row.suite.clone()))
+                .or_insert(0);
+            *rank += 1;
+            if row.at_ms < before_ms && *rank > keep_per_key {
+                keep[i] = false;
+            }
+        }
+        let mut flags = keep.into_iter();
+        rows.retain(|_| flags.next().unwrap_or(true));
+        before - rows.len()
+    }
+
+    /// Remembered quality runs, newest first.
+    pub fn remembered_quality_runs(
+        &self,
+        target: Option<&str>,
+        suite: Option<&str>,
+        limit: usize,
+    ) -> Vec<sb_store::QualityRunRecord> {
+        let rows = self.quality_runs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = rows
+            .iter()
+            .filter(|row| target.is_none_or(|target| row.target == target))
+            .filter(|row| suite.is_none_or(|suite| row.suite == suite))
+            .cloned()
+            .collect();
+        out.sort_by_key(|row| std::cmp::Reverse((row.at_ms, row.id)));
+        out.truncate(limit);
+        out
     }
 
     /// The measured prompt speed of a target (EWMA), if any.

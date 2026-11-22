@@ -738,8 +738,10 @@ pub(crate) struct ExtendBody {
 const MAX_LOCK_SECS: u64 = 4 * 3600;
 
 /// `POST /v1/optimize/locks {"target", "ttl_secs", "reason", "hold_id"}`
-/// (operator): take a lane's tuning lock for `sb ai tune`. Refused (409,
-/// typed `reason`) inside a quiet window (`quiet_window`), while the lane
+/// (operator): take a lane's tuning lock for `sb ai tune` and `sb ai eval`.
+/// Refused (409, typed `reason`) on a lane with `experiments: false`
+/// (`experiments_off`, checked first), inside a quiet window
+/// (`quiet_window`), while the lane
 /// has a request in flight or queued (`lane_busy`), or while another run
 /// holds it (`locked`). Never wakes anything.
 ///
@@ -774,6 +776,22 @@ pub(crate) async fn lock_create(
             ),
         );
     };
+    let experiments = snap
+        .config
+        .local_executors
+        .iter()
+        .find(|l| l.name == lane.name)
+        .is_none_or(|l| l.experiments);
+    if !experiments {
+        return refuse(
+            StatusCode::CONFLICT,
+            "experiments_off",
+            format!(
+                "lane `{}` does not allow experiments (local_executors[].experiments: false)",
+                lane.name
+            ),
+        );
+    }
     let now = sb_store::now_millis();
     let optimize = &snap.config.server.optimize;
     if let Some(window) = sb_runtime::optimize::quiet_window_now(optimize, now) {
@@ -877,19 +895,29 @@ fn cap_hold(
 pub(crate) const EXPERIMENT_KEEP_DAYS: i64 = 180;
 pub(crate) const EXPERIMENT_KEEP_ROWS: usize = 20_000;
 
+/// How long quality runs are kept beyond the newest
+/// [`QUALITY_KEEP_PER_KEY`] of each (target, suite).
+pub(crate) const QUALITY_KEEP_DAYS: i64 = 365;
+pub(crate) const QUALITY_KEEP_PER_KEY: usize = 50;
+
 /// Prune the experiment ledger (store and memory) to
-/// [`EXPERIMENT_KEEP_DAYS`] and [`EXPERIMENT_KEEP_ROWS`]; answers how many
-/// rows went.
+/// [`EXPERIMENT_KEEP_DAYS`] and [`EXPERIMENT_KEEP_ROWS`], and the quality
+/// ledger to [`QUALITY_KEEP_DAYS`] beyond [`QUALITY_KEEP_PER_KEY`] per
+/// (target, suite); answers how many rows went.
 pub(crate) fn prune_experiments(state: &AppState, now_ms: i64) -> usize {
     let before = now_ms - EXPERIMENT_KEEP_DAYS * 86_400_000;
-    let mut removed = state
-        .engine
-        .optimize()
-        .prune_experiments(before, EXPERIMENT_KEEP_ROWS);
+    let quality_before = now_ms - QUALITY_KEEP_DAYS * 86_400_000;
+    let optimize = state.engine.optimize();
+    let mut removed = optimize.prune_experiments(before, EXPERIMENT_KEEP_ROWS)
+        + optimize.prune_quality_runs(quality_before, QUALITY_KEEP_PER_KEY);
     if let Some(store) = state.engine.store() {
         match store.optimize_experiment_prune(before, EXPERIMENT_KEEP_ROWS) {
             Ok(count) => removed += count,
             Err(e) => tracing::warn!(error = %e.0, "pruning the experiment ledger failed"),
+        }
+        match store.quality_run_prune(quality_before, QUALITY_KEEP_PER_KEY) {
+            Ok(count) => removed += count,
+            Err(e) => tracing::warn!(error = %e.0, "pruning the quality ledger failed"),
         }
     }
     removed
@@ -907,21 +935,24 @@ fn optimizer_configured(config: &sb_core::Config) -> bool {
             .any(|lane| lane.engine.is_some())
 }
 
-/// Whether the experiment ledger (store or memory) has a row.
+/// Whether the experiment or quality ledger (store or memory) has a row.
 fn experiment_rows_left(state: &AppState) -> bool {
-    if !state
-        .engine
-        .optimize()
-        .remembered_experiments(None, 1)
-        .is_empty()
+    let optimize = state.engine.optimize();
+    if !optimize.remembered_experiments(None, 1).is_empty()
+        || !optimize.remembered_quality_runs(None, None, 1).is_empty()
     {
         return true;
     }
     state.engine.store().is_some_and(|store| {
-        store
+        let experiments = store
             .optimize_experiment_list(None, 1)
             .map(|rows| !rows.is_empty())
-            .unwrap_or(true)
+            .unwrap_or(true);
+        let quality = store
+            .quality_run_list(None, None, 1)
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(true);
+        experiments || quality
     })
 }
 
@@ -1127,6 +1158,257 @@ pub(crate) async fn experiment_list(
     Json(json!({"object": "list", "durable": durable, "data": data})).into_response()
 }
 
+/// Key names a quality row may never carry, at any depth (compared
+/// lower-case, as the whole key or its start): the ledger keeps scores, ids
+/// and counts, never prompt or answer text, and never a credential.
+const QUALITY_FORBIDDEN_KEYS: &[&str] = &[
+    "prompt", "response", "text", "content", "message", "answer", "quote", "raw", "body", "secret",
+    "token", "key",
+];
+/// The longest string (value or key) a quality row may hold.
+const QUALITY_MAX_STRING: usize = 200;
+/// The largest quality row.
+const QUALITY_MAX_ROW: usize = 64 * 1024;
+
+/// The first place in `value` that looks like text: a forbidden key name
+/// or a string longer than [`QUALITY_MAX_STRING`] characters. `path` is
+/// where `value` sits (for the error).
+fn quality_text_at(value: &Value, path: &str) -> Option<String> {
+    match value {
+        Value::String(s) if s.chars().count() > QUALITY_MAX_STRING => Some(format!(
+            "`{path}` is a string of more than {QUALITY_MAX_STRING} characters"
+        )),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, item)| quality_text_at(item, &format!("{path}[{i}]"))),
+        Value::Object(map) => map.iter().find_map(|(key, item)| {
+            let at = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            if key.chars().count() > QUALITY_MAX_STRING {
+                return Some(format!(
+                    "a key under `{path}` is longer than {QUALITY_MAX_STRING} characters"
+                ));
+            }
+            let lower = key.to_lowercase();
+            if QUALITY_FORBIDDEN_KEYS
+                .iter()
+                .any(|word| lower.starts_with(word))
+            {
+                return Some(format!("`{at}` is a key name that carries text"));
+            }
+            quality_text_at(item, &at)
+        }),
+        _ => None,
+    }
+}
+
+/// What is wrong with a quality row's shape (required fields and types),
+/// or `None` when it is well formed.
+fn quality_shape_error(row: &Value) -> Option<String> {
+    let Some(map) = row.as_object() else {
+        return Some("a quality row is a JSON object".to_string());
+    };
+    for field in [
+        "run_id",
+        "target",
+        "suite",
+        "suite_version",
+        "model_file",
+        "engine_build",
+        "settings_hash",
+    ] {
+        if map
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Some(format!("`{field}` must be a non-empty string"));
+        }
+    }
+    if map
+        .get("settings_revision")
+        .and_then(Value::as_i64)
+        .is_none()
+    {
+        return Some("`settings_revision` must be an integer".to_string());
+    }
+    let status = map.get("status").and_then(Value::as_str).unwrap_or("");
+    if !matches!(status, "complete" | "partial" | "failed") {
+        return Some("`status` must be complete, partial or failed".to_string());
+    }
+    for field in ["score", "se"] {
+        match map.get(field) {
+            None | Some(Value::Null) => {}
+            Some(value) => match value.as_f64() {
+                Some(x) if (0.0..=1.0).contains(&x) => {
+                    if status != "complete" {
+                        return Some(format!("`{field}` is null unless `status` is complete"));
+                    }
+                }
+                _ => return Some(format!("`{field}` must be a number in 0..1 or null")),
+            },
+        }
+    }
+    match map.get("per_case") {
+        Some(Value::Object(cases)) => {
+            for (id, scores) in cases {
+                let numbers = scores
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_number));
+                if id.is_empty() || !numbers {
+                    return Some(format!(
+                        "`per_case` maps case ids to arrays of numbers (`{id}` does not)"
+                    ));
+                }
+            }
+        }
+        _ => return Some("`per_case` must be an object of case id -> [numbers]".to_string()),
+    }
+    None
+}
+
+fn quality_record_view(record: sb_store::QualityRunRecord) -> Value {
+    let mut row: Value = serde_json::from_str(&record.row).unwrap_or(json!({}));
+    row["id"] = json!(record.id);
+    row["at_ms"] = json!(record.at_ms);
+    row
+}
+
+/// `POST /v1/optimize/quality` (operator): append one answer-quality run
+/// (`sb ai eval`): identity (`run_id`, `target`, `suite`, `suite_version`,
+/// `model_file`, `engine_build`, `settings_hash`, `settings_revision`),
+/// `status`, `score` and `se` (0..1 or null), and `per_case` (case id ->
+/// numbers). The gateway keeps metadata only, so the row is refused (400
+/// `text_not_allowed`) when any key at any depth is named like text
+/// (`prompt`, `answer`, `quote`, ...) or any string is longer than 200
+/// characters; at most 64 KiB.
+pub(crate) async fn quality_append(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(row): Json<Value>,
+) -> Response {
+    use axum::http::StatusCode;
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    let text = row.to_string();
+    if text.len() > QUALITY_MAX_ROW {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "a quality row is at most 64 KiB".to_string(),
+        );
+    }
+    if let Some(at) = quality_text_at(&row, "") {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "text_not_allowed",
+            format!("{at}: the quality ledger keeps scores, ids and counts, never text"),
+        );
+    }
+    if let Some(problem) = quality_shape_error(&row) {
+        return refuse(StatusCode::BAD_REQUEST, "invalid_request_error", problem);
+    }
+    let field = |name: &str| row[name].as_str().unwrap_or_default().to_string();
+    let record = sb_store::QualityRunRecord {
+        id: 0,
+        run_id: field("run_id"),
+        target: field("target"),
+        suite: field("suite"),
+        suite_version: field("suite_version"),
+        model_file: field("model_file"),
+        engine_build: field("engine_build"),
+        settings_hash: field("settings_hash"),
+        settings_revision: row["settings_revision"].as_i64().unwrap_or_default(),
+        status: field("status"),
+        score: row["score"].as_f64(),
+        se: row["se"].as_f64(),
+        at_ms: sb_store::now_millis(),
+        row: text,
+    };
+    let duplicate = || {
+        refuse(
+            StatusCode::CONFLICT,
+            "duplicate_run",
+            format!("quality run `{}` is already stored", record.run_id),
+        )
+    };
+    let (id, durable) = match state.engine.store() {
+        Some(store) => {
+            if !store
+                .quality_run_list(Some(&record.target), Some(&record.suite), 10_000)
+                .unwrap_or_default()
+                .iter()
+                .all(|r| r.run_id != record.run_id)
+            {
+                return duplicate();
+            }
+            match store.quality_run_append(&record) {
+                Ok(id) => (id, true),
+                Err(e) => {
+                    return refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "store_error",
+                        format!("state store: {}", e.0),
+                    )
+                }
+            }
+        }
+        None => match state.engine.optimize().remember_quality_run(record.clone()) {
+            Some(id) => (id, false),
+            None => return duplicate(),
+        },
+    };
+    (
+        StatusCode::CREATED,
+        Json(json!({"id": id, "durable": durable})),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct QualityQuery {
+    model: Option<String>,
+    suite: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /v1/optimize/quality?model=TARGET&suite=NAME&limit=N` (operator):
+/// the quality ledger, newest first.
+pub(crate) async fn quality_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<QualityQuery>,
+) -> Response {
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    let limit = query.limit.unwrap_or(200).clamp(1, 10_000);
+    let target = query.model.as_deref();
+    let suite = query.suite.as_deref();
+    let (records, durable) = match state.engine.store() {
+        Some(store) => (
+            store
+                .quality_run_list(target, suite, limit)
+                .unwrap_or_default(),
+            true,
+        ),
+        None => (
+            state
+                .engine
+                .optimize()
+                .remembered_quality_runs(target, suite, limit),
+            false,
+        ),
+    };
+    let data: Vec<Value> = records.into_iter().map(quality_record_view).collect();
+    Json(json!({"object": "list", "durable": durable, "data": data})).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,6 +1477,85 @@ mod tests {
         assert!(!ids.contains(&id));
         // Memory is one over the cap again; the store is not.
         assert_eq!(prune_experiments(&state, NOW), 1);
+    }
+
+    fn quality(run: &str, target: &str, at_ms: i64) -> sb_store::QualityRunRecord {
+        sb_store::QualityRunRecord {
+            id: 0,
+            run_id: run.into(),
+            target: target.into(),
+            suite: "s1".into(),
+            suite_version: "v".into(),
+            model_file: "f".into(),
+            engine_build: "b".into(),
+            settings_hash: "h".into(),
+            settings_revision: 1,
+            status: "complete".into(),
+            score: Some(0.5),
+            se: Some(0.1),
+            at_ms,
+            row: "{}".into(),
+        }
+    }
+
+    // The quality ledger keeps the newest 50 per (target, suite) and
+    // everything younger than 365 days, in the store and in memory; the
+    // experiment pruner does it.
+    #[test]
+    fn the_quality_ledger_is_pruned_with_the_experiments() {
+        let store: Arc<dyn sb_store::StateStore> =
+            Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+        let state = state_with("server:\n  bind: \"127.0.0.1:0\"\n", Some(store.clone()));
+        let day = 86_400_000;
+        let old = NOW - (QUALITY_KEEP_DAYS + 1) * day;
+        for i in 0..(QUALITY_KEEP_PER_KEY as i64 + 4) {
+            let run = format!("old_{i}");
+            store
+                .quality_run_append(&quality(&run, "box/a", old + i))
+                .unwrap();
+            state
+                .engine
+                .optimize()
+                .remember_quality_run(quality(&run, "box/a", old + i));
+        }
+        store
+            .quality_run_append(&quality("young", "box/b", NOW - day))
+            .unwrap();
+        state
+            .engine
+            .optimize()
+            .remember_quality_run(quality("young", "box/b", NOW - day))
+            .unwrap();
+        // A run id is kept once in memory.
+        assert!(state
+            .engine
+            .optimize()
+            .remember_quality_run(quality("young", "box/b", NOW))
+            .is_none());
+        // 4 over the per-key count, in the store and in memory.
+        assert_eq!(prune_experiments(&state, NOW), 8);
+        let left = store.quality_run_list(Some("box/a"), None, 1000).unwrap();
+        assert_eq!(left.len(), QUALITY_KEEP_PER_KEY);
+        assert_eq!(left.last().unwrap().run_id, "old_4");
+        assert_eq!(
+            store
+                .quality_run_list(Some("box/b"), None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let remembered = state
+            .engine
+            .optimize()
+            .remembered_quality_runs(Some("box/a"), None, 1000);
+        assert_eq!(remembered.len(), QUALITY_KEEP_PER_KEY);
+        assert_eq!(
+            remembered[0].run_id,
+            format!("old_{}", QUALITY_KEEP_PER_KEY + 3)
+        );
+        assert_eq!(prune_experiments(&state, NOW), 0);
+        // Rows left: the daily pruner keeps running.
+        assert!(experiment_rows_left(&state));
     }
 
     fn state_with(yaml: &str, store: Option<Arc<dyn sb_store::StateStore>>) -> AppState {
