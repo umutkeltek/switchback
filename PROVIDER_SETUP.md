@@ -559,6 +559,13 @@ a typed `reason` while the machine must stay on:
 | `poweroff_in_flight` | another power-off (an operator's or the idle timer's) is already running. |
 | `idle_check_in_flight` | the idle timer is checking the machine right now (its guard is still asking); the request waits up to 2 s for it first. Ask again in a moment. |
 
+A machine none of whose lanes answers is already off: `off` answers 200 with
+`"already_off": true` and runs no command, and `on` sends a wake. Any HTTP
+status is an answer: an engine that answers 503 while it loads runs on a
+machine that is up, so `off` powers it off and `on` answers `"status": "up"`.
+Only no answer at all (no connection, or none within the probe timeout)
+reads as off.
+
 `on` wakes the machine through the same wake path a hold with `wake: true`
 uses and answers at once (202): the wake runs in the background. It takes
 no hold, so the idle timer still applies and the machine powers off again
@@ -599,8 +606,10 @@ strictest lane counts.
 **The capacity report.** Each lane in `GET /v1/workloads/capacity` carries
 `poweroff_in_secs`: seconds until its machine's idle power-off, `null` while
 the machine has work or a waiting request, is held, is off, or has no
-`poweroff_command`; `0` once due (a busy guard may still postpone it). Each
-lane also lists `holds`, its machine's active holds (`id`, `reason`,
+`poweroff_command`; `0` once due (a busy guard may still postpone it).
+`up_since_ms` is when the lane's machine came up (Unix ms, its first healthy
+answer since it was last seen off), the same for every lane of a machine and
+absent while it is off. Each lane also lists `holds`, its machine's active holds (`id`, `reason`,
 `expires_at`, `expires_at_ms`, `owner` (tenant name, never a key), `state`).
 A client key (it got 403 before) reads a view of its own: per lane `name`,
 `host`, `state`, `level`, `queue_depth`, `in_flight`, `slots`,

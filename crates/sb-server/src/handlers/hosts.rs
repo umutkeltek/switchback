@@ -268,7 +268,9 @@ pub(crate) async fn delete(
 /// machine has not been up long enough, while a wake, a power-off or the
 /// idle check runs on it, and when the machine has no power-off command
 /// at all. A machine none of whose lanes answers is already off: 200 with
-/// `"already_off": true`, and no command runs. A machine the gateway
+/// `"already_off": true`, and no command runs. Any HTTP status is an
+/// answer (an engine that answers 503 while it loads runs on a machine
+/// that is up); only no answer at all is not. A machine the gateway
 /// knows is off is asked too (one probe per lane): someone may have
 /// started it by hand. A failed command is 502.
 ///

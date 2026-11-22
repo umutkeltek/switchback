@@ -438,6 +438,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 
 ### Fixed
 
+- **An engine that answers 503 runs on a machine that is up**: the power
+  checks (`sb ai off` and `POST /v1/hosts/{host}/power`, `sb ai on`, a
+  hold's wake, a shared machine's wake) read any non-2xx answer as no
+  answer, so a power-off on a machine whose engine was loading answered
+  `"already_off": true` and left it running, and a wake could be sent to a
+  machine that was up. Any HTTP status now counts as an answer; only no
+  answer at all reads as off. The capacity report also names
+  `up_since_ms`, when the lane's machine came up, so the window shows the
+  machine's real uptime instead of an estimate.
 - **`sb ai tune --wake` waits for the machine it woke**: a machine woken by
   the tuner's hold, with no request yet, reports `idle_countdown`, not
   `healthy`; the tuner waited for `healthy`, so a run on a sleeping machine

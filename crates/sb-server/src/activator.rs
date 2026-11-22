@@ -90,6 +90,14 @@ pub enum ProbeAnswer {
     Refused(u16),
 }
 
+/// One probe's answer as the lane reads it, and whether the machine gave
+/// any HTTP answer at all (see [`LocalExecutor::machine_answers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeReply {
+    answer: ProbeAnswer,
+    reached: bool,
+}
+
 /// Leases the credential a lane's health probe carries: the one of the
 /// provider whose id is the lane's name. Real: the engine's live resolver,
 /// so a vault or env key and a reload behave as for the provider's calls.
@@ -365,6 +373,12 @@ pub struct LocalLaneReport {
     /// the machine has work, is held, is off, or has no power-off command.
     /// Zero once it is due (a busy guard may still postpone it).
     pub poweroff_in_secs: Option<u64>,
+    /// When the lane's machine came up (clock ms, Unix epoch): the first
+    /// healthy answer of one of its lanes since every lane was last seen
+    /// down. Absent while the machine is off or was never seen up. Per
+    /// machine: lanes sharing a `host` show the same.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_since_ms: Option<u64>,
     /// The active holds on the lane's machine (`/v1/hosts/{host}/holds`,
     /// where `host` is the lane's `host`, or its name when it has a machine
     /// of its own).
@@ -828,6 +842,21 @@ impl LocalExecutor {
     /// probe carries the provider's credential when it has one and the
     /// health endpoint is on the provider's own origin.
     async fn probe_answer(&self) -> ProbeAnswer {
+        self.probe_reply().await.answer
+    }
+
+    /// Whether the lane's machine answers a fresh probe at all: any HTTP
+    /// status counts (an engine that answers 503 while it loads runs on a
+    /// machine that is up), only no answer at all does not. An answer
+    /// right after our own power-off, before the probe saw the machine go,
+    /// does not count either (see [`Self::probe_reply`]). The power checks
+    /// ask this: a wake skipped, a power-off run.
+    async fn machine_answers(&self) -> bool {
+        self.probe_reply().await.reached
+    }
+
+    /// [`Self::probe_answer`] and whether the machine answered at all.
+    async fn probe_reply(&self) -> ProbeReply {
         let ticket = {
             let mut rt = self.lock();
             rt.probe_seq += 1;
@@ -943,7 +972,10 @@ impl LocalExecutor {
         if answer == ProbeAnswer::Down {
             self.host().forget_up_since_if_all_down();
         }
-        answer
+        ProbeReply {
+            answer,
+            reached: trusted && !unreachable,
+        }
     }
 
     /// The lane fails at once because its health endpoint refused the
@@ -1789,7 +1821,7 @@ impl LocalExecutor {
             ));
         }
         for lane in host.lanes() {
-            if lane.name != self.name && lane.probe_answer().await != ProbeAnswer::Down {
+            if lane.name != self.name && lane.machine_answers().await {
                 return Some(format!(
                     "lane `{}` of host `{}` answers",
                     lane.name, host.id
@@ -2141,6 +2173,7 @@ impl LocalExecutor {
             detail,
             observed_healthy: rt.observed_healthy,
             poweroff_in_secs,
+            up_since_ms: host.up_since_ms(),
             holds: hold_views,
             slots,
         }
@@ -2973,7 +3006,7 @@ impl Host {
             .iter()
             .any(|lane| lane.lock().state == LaneState::PoweringOff);
         for lane in self.lanes().into_iter().filter(|_| !powering_off) {
-            if lane.probe_answer().await != ProbeAnswer::Down {
+            if lane.machine_answers().await {
                 return (
                     HoldState::Active,
                     format!(
@@ -3554,7 +3587,7 @@ impl Host {
         // goes through the whole power-off below, guard included.
         let mut answering = false;
         for lane in &lanes {
-            if lane.probe_answer().await != ProbeAnswer::Down {
+            if lane.machine_answers().await {
                 answering = true;
                 break;
             }
@@ -3722,7 +3755,7 @@ impl Host {
             .any(|lane| lane.lock().state == LaneState::PoweringOff);
         if !powering_off {
             for lane in &lanes {
-                if lane.probe_answer().await != ProbeAnswer::Down {
+                if lane.machine_answers().await {
                     tracing::info!(host = %self.id, "wake asked for on a machine that is up; nothing to do");
                     return Ok(PowerOnOutcome {
                         lanes: lanes.len(),
@@ -6864,7 +6897,8 @@ local_executors:
     // An engine that answers with an error status (503 while it starts, or
     // a box whose port answers) is no evidence the machine is off: only no
     // answer at all is. Its machine is never known off, so it is probed on
-    // every pass, routing reads it down, and a power-off asks it.
+    // every pass and routing reads it down. A power-off asks it and finds
+    // a machine that is up: the command runs (it is not "already off").
     #[tokio::test]
     async fn an_error_status_does_not_make_a_machine_known_off() {
         use sb_runtime::LaneStatus;
@@ -6883,10 +6917,14 @@ local_executors:
             clock.advance(10_000);
             settle().await;
         }
+        let woken = activator.power_on("gpu-box").await.expect("on");
+        assert!(woken.already_up, "no wake sent to a machine that answers");
+        assert_eq!(host.sim().wake, 0);
         let probes = host.sim().probes;
         let outcome = activator.power_off("gpu-box", false).await.expect("off");
-        assert!(outcome.already_off, "{outcome:?}");
+        assert!(!outcome.already_off, "{outcome:?}");
         assert!(host.sim().probes > probes, "the power-off asks it");
+        assert_eq!(host.sim().poweroff, 1, "the poweroff command ran");
     }
 
     // The real probe: a status that is not 2xx is an answer (down); a port
@@ -10071,6 +10109,43 @@ local_executors:
         assert!(!rig.off(false).await.expect("powered off").already_off);
         assert!(rig.off(false).await.expect("already off").already_off);
         assert_eq!(rig.poweroffs(), 1, "the repeat ran no command");
+    }
+
+    // The report names when the machine came up (the first healthy answer),
+    // keeps it while the machine stays up, and drops it once the machine is
+    // off: the window shows the machine's real uptime.
+    #[tokio::test]
+    async fn the_report_names_when_the_machine_came_up() {
+        let rig = power_rig(&shared_host_config(""));
+        let up_since = |lane: &str| {
+            rig.activator
+                .reports()
+                .into_iter()
+                .find(|report| report.name == lane)
+                .unwrap()
+                .up_since_ms
+        };
+        assert_eq!(up_since("text"), None, "never seen up");
+        let json = serde_json::to_value(rig.activator.reports()).unwrap();
+        assert!(
+            json[0].get("up_since_ms").is_none(),
+            "absent, not null: {json}"
+        );
+
+        (rig.advance)(1_000);
+        let before = rig.clock.now_ms();
+        rig.up().await;
+        let first = up_since("text").expect("up since");
+        assert!(first >= before, "{first} >= {before}");
+        assert!(first <= rig.clock.now_ms());
+        assert_eq!(up_since("comfy"), Some(first), "one machine, one uptime");
+
+        (rig.advance)(60_000);
+        rig.activator.executor("text").unwrap().observe().await;
+        assert_eq!(up_since("text"), Some(first), "kept while it stays up");
+
+        assert!(!rig.off(false).await.expect("powered off").already_off);
+        assert_eq!(up_since("text"), None, "gone once the machine is off");
     }
 
     // A failed poweroff command is a failure (502): the lanes go back to
