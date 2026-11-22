@@ -1687,26 +1687,10 @@ impl EngineControls {
 
     /// Apply the lane's load settings (under the lane's apply lock).
     pub(crate) async fn apply_lane(&self, state: &EngineCtx, lane: &EngineLane) -> Value {
-        let guard = self.apply_lock(&lane.name).lock_owned().await;
-        self.apply_lane_locked(state, lane, guard).await
-    }
-
-    /// [`Self::apply_lane`] with the lane's apply lock already taken
-    /// (`_guard`, let go when this returns).
-    async fn apply_lane_locked(
-        &self,
-        state: &EngineCtx,
-        lane: &EngineLane,
-        _guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> Value {
+        let _guard = self.apply_lock(&lane.name).lock_owned().await;
         // No request waits at a gate for this apply: nothing settles.
         let (result, _) = self.apply_locked(state, lane, Settle::none()).await;
         result
-    }
-
-    /// The lane's apply lock, when no apply holds it.
-    fn try_apply_lock(&self, lane: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        self.apply_lock(lane).try_lock_owned().ok()
     }
 
     /// Wait, until `deadline`, while a settle holds `key`'s gate (its first
@@ -3799,30 +3783,34 @@ pub(crate) async fn load_endpoint(
     }
 }
 
-/// Run `work` while `gate` (a closed gate, and when it must open at the
-/// latest) stays closed: at its deadline the gate opens and the work goes
-/// on, so a request waiting at it is never failed for this work's length.
-async fn open_at<T>(
-    gate: &mut Option<(sb_runtime::model_settings::ModelGate, tokio::time::Instant)>,
-    work: impl std::future::Future<Output = T>,
-) -> T {
-    tokio::pin!(work);
-    if let Some(deadline) = gate.as_ref().map(|(_, deadline)| *deadline) {
-        tokio::select! {
-            out = &mut work => return out,
-            () = tokio::time::sleep_until(deadline) => {
-                if let Some((closed, _)) = gate.take() {
-                    tracing::warn!(model = %closed.key(), "engine control: the old process has not ended within the gate's bound; reopening the gate");
-                }
-            }
-        }
-    }
-    work.await
+/// Whether a listing row shows `model` running a process started with the
+/// load settings `wanted`: loaded, sleeping or loading, with arguments listed
+/// that match `wanted` (the check `apply: now` makes, see [`args_mismatch`]).
+/// Arguments that cannot tell the new process from the old one (none
+/// listed, or no checked setting wanted) never count.
+fn runs_new_args(wanted: &BTreeMap<String, String>, row: &Value) -> bool {
+    let running = matches!(
+        row["status"]["value"].as_str(),
+        Some("loaded" | "sleeping" | "loading")
+    );
+    let listed = row["status"]["args"]
+        .as_array()
+        .is_some_and(|args| !args.is_empty());
+    let checked = wanted.keys().any(|key| {
+        let long = format!("--{key}");
+        CHECKED_ARGS
+            .iter()
+            .any(|(name, names)| name == key || names.contains(&long.as_str()))
+    });
+    running && listed && checked && args_mismatch(wanted, row).is_none()
 }
 
 /// Load a target's model (waking only when `wake`). A pending apply of
 /// the lane runs first, so the model loads with its current settings.
 /// `Err` is the response.
+///
+/// It never closes a gate a request waits at, and never unloads: a request
+/// for the model is never held or ended because of it.
 pub(crate) async fn load_target(
     state: &EngineCtx,
     target: &str,
@@ -3853,80 +3841,18 @@ pub(crate) async fn load_target(
             Err(e) => return Err(error(StatusCode::SERVICE_UNAVAILABLE, "wake_failed", e)),
         },
     };
-    use sb_runtime::model_settings::GateKind;
     let registry = state.engine.model_settings();
     let key = format!("{}/{model}", lane.name);
-    // A pending apply about to rewrite this model's section: drain the
-    // model first, as `apply: now` does, and keep it drained until its old
-    // process has ended. A request that waited for the apply's hold would
-    // otherwise be admitted the moment the re-read ends, start loading the
-    // model, and have that load ended under it. The drain opens before the
-    // load (a request admitted then loads the new section, as the load
-    // does), and never later than a waiting request allows.
-    //
-    // A request that comes in while the drain waits waits from then on, and
-    // what follows the drain keeps the model closed too: the apply's own
-    // hold through the settings command and the re-read. So the drain waits
-    // for busy requests only what is left of the bound after those two (none
-    // when nothing is left: it is kept only for a model idle at once), and
-    // it takes no apply lock it would wait for (another apply holds this
-    // model back instead, as when no drain is taken).
     let deadline = tokio::time::Instant::now() + gate_bound(lane_gate_wait(state, &lane));
-    let mut gate = None;
-    let mut apply_guard = None;
-    if controls.pending_apply(&lane.name) && controls.pending_models(state, &lane).contains(model) {
-        let drain_until = deadline
-            .checked_sub(lane.command_timeout + REREAD_TIMEOUT)
-            .unwrap_or_else(tokio::time::Instant::now);
-        let drain = registry.close(&key, GateKind::Drain);
-        // Still busy at its bound: the apply holds this model's section back
-        // (it is not rewritten), so the load below finds it running.
-        let wait = Duration::from_secs(lane.engine.apply_wait_secs)
-            .min(drain_until.saturating_duration_since(tokio::time::Instant::now()));
-        if drain.wait_idle(wait).await.is_ok() {
-            if let Some(guard) = controls.try_apply_lock(&lane.name) {
-                apply_guard = Some(guard);
-                gate = Some((drain, deadline));
-            }
-        }
-    }
-    let ended = open_at(&mut gate, async {
-        if !controls.pending_apply(&lane.name) {
-            return Ok(());
-        }
-        let applied = match apply_guard {
-            Some(guard) => controls.apply_lane_locked(state, &lane, guard).await,
-            None => controls.apply_lane(state, &lane).await,
-        };
-        // The re-read unloads a running model whose preset changed, and
-        // llama.cpp ends its process only after answering. A load before
-        // then meets the old process (400 "model is already running"), and
-        // the old settings would count as loaded: end it first.
+    if controls.pending_apply(&lane.name) {
+        let applied = controls.apply_lane(state, &lane).await;
         let rewrote = applied["reloaded"] == json!(true)
             && applied["changed"]
                 .as_array()
                 .is_some_and(|models| models.iter().any(|m| m == model));
-        if !rewrote {
-            return Ok(());
+        if rewrote {
+            wait_old_process(state, &lane, target, model, deadline).await?;
         }
-        match controls.models(state, &lane).await {
-            Ok(models) => match model_status(&models, model).as_deref() {
-                Some("loaded" | "sleeping" | "loading") => {
-                    controls.unload_model(state, &lane, model).await
-                }
-                status if process_running(status) => {
-                    controls.wait_unloaded(state, &lane, model).await
-                }
-                _ => Ok(()),
-            },
-            Err(e) => Err(e),
-        }
-    })
-    .await;
-    // The old process has ended: requests may come in while the model loads.
-    drop(gate);
-    if let Err(e) = ended {
-        return Err(error(StatusCode::BAD_GATEWAY, "engine_error", e));
     }
     // An apply that ended just before (this one's wait for the lock, or one
     // that ran without this load) may leave a settle holding this model: its
@@ -3952,6 +3878,61 @@ pub(crate) async fn load_target(
             }))
         }
         Err(e) => Err(error(StatusCode::BAD_GATEWAY, "engine_error", e)),
+    }
+}
+
+/// After an apply rewrote `model`'s section: the re-read made the engine
+/// end the model's old process, and llama.cpp ends it only after answering.
+/// A load before then meets the old process (400 "model is already
+/// running"), and the old settings would count as loaded. So wait, never
+/// longer than `deadline` or the lane's `load_timeout_secs`, until the
+/// listing shows the model not running (the old process ended), or running
+/// with the new arguments (a request's own load got there first). Never
+/// unloads: at the bound the load fails and the old process is left alone.
+async fn wait_old_process(
+    state: &EngineCtx,
+    lane: &EngineLane,
+    target: &str,
+    model: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), Response> {
+    let controls = &state.engines;
+    let wanted = state
+        .engine
+        .model_settings()
+        .get(target)
+        .map(|entry| model_preset(kind_ops(lane.engine.kind), &entry.doc))
+        .unwrap_or_default();
+    let bound = Duration::from_secs(lane.engine.load_timeout_secs);
+    let until = deadline.min(tokio::time::Instant::now() + bound);
+    let started = tokio::time::Instant::now();
+    loop {
+        let models = controls
+            .models(state, lane)
+            .await
+            .map_err(|e| error(StatusCode::BAD_GATEWAY, "engine_error", e))?;
+        let row = models.iter().find(|row| row["id"] == model);
+        let status = row.and_then(|row| row["status"]["value"].as_str());
+        if !process_running(status) || row.is_some_and(|row| runs_new_args(&wanted, row)) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= until {
+            return Err(error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "old_process_running",
+                format!(
+                    "`{model}` still runs with its old settings {} s after the engine was told \
+                     to end it; it was not loaded and nothing was stopped (requests are still \
+                     served); load it again later",
+                    started.elapsed().as_secs()
+                ),
+            ));
+        }
+        tokio::time::sleep(
+            Duration::from_millis(250)
+                .min(until.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
     }
 }
 

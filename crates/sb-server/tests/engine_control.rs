@@ -2589,9 +2589,8 @@ async fn a_model_that_does_not_run_never_waits_for_anothers_exit() {
     assert!(inner.exiting.contains_key("m"), "{:?}", inner.calls);
 }
 
-/// A load after a pending apply drains the model only until its old
-/// process has ended: chats that come in during the (long) load are
-/// admitted at once, not held until the load ends.
+/// A load after a pending apply holds no gate: chats that come in during
+/// the (long) load are admitted at once, not held until the load ends.
 #[tokio::test]
 async fn chats_during_a_load_after_a_pending_apply_are_served() {
     let (s, _state) = setup_with(Opts {
@@ -2686,11 +2685,10 @@ async fn the_settings_view_names_what_an_unload_may_take() {
     assert_eq!(engine["load_timeout_secs"], json!(5), "{view}");
 }
 
-/// A load drains a busy model whose section is pending; a chat comes in
-/// during the drain. The drain, the wait for the apply lock, the settings
-/// command and the re-read all count against one deadline, so the chat is
-/// admitted before its gate wait (35 s = max(apply_wait_secs 35,
-/// command_timeout_secs 5 + 30)) runs out.
+/// A load for a busy model whose section is pending; a chat comes in right
+/// after it. The load closes no gate (the busy model's section is held
+/// back), so the chat is served long before its gate wait (35 s =
+/// max(apply_wait_secs 35, command_timeout_secs 5 + 30)) could run out.
 #[tokio::test]
 async fn a_load_drain_and_its_apply_stay_within_a_waiting_chats_wait() {
     let (s, _state) = setup_with(Opts {
@@ -2785,11 +2783,10 @@ async fn a_load_waits_for_a_settle_that_holds_its_model() {
     );
 }
 
-/// A load drains a busy model whose section is held back while another
-/// apply holds the lane's apply lock (its settings command takes 6 s).
-/// Once the model is idle the load lets its drain go instead of keeping it
-/// while it waits for that lock: a chat that came in during the drain is
-/// served then, not after the other apply.
+/// A load for a busy model whose section is held back, while another apply
+/// holds the lane's apply lock (its settings command takes 6 s). The load
+/// waits for that lock without closing a gate: a chat that comes in
+/// meanwhile is served then, not after the other apply.
 #[tokio::test]
 async fn a_load_lets_its_drain_go_while_another_apply_runs() {
     let (s, _state) = setup_with(Opts {
@@ -2841,4 +2838,139 @@ async fn a_load_lets_its_drain_go_while_another_apply_runs() {
     assert_eq!(view["apply"]["changed"], json!(["other"]), "{view}");
     let (status, body) = load.await.unwrap();
     assert_eq!(status, 200, "{body}");
+}
+
+/// The reviewer's repro: a load while a busy model's new section is held
+/// back, and a chat for that model a moment later. The load closes no
+/// gate, so the chat is served (never 503 `model_paused`).
+#[tokio::test]
+async fn a_chat_during_a_load_behind_a_held_back_apply_is_served() {
+    let (s, _state) = setup_with(Opts {
+        lane: "    command_timeout_secs: 1",
+        apply_wait_secs: 40,
+        load_timeout_secs: 60,
+        ..Opts::default()
+    })
+    .await;
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.exit_delay_ms = 45_000;
+        inner.autoload_ms = 100;
+        inner.slow_ms = 5_000;
+    }
+    let slow = spawn_slow(&s.gw);
+    wait_for_chat(&s).await;
+    let (status, view) = put(&s.gw, "text/m", 1, json!({"load": {"ctx_size": 16384}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["deferred"], json!(["m"]), "{view}");
+    let gw = s.gw.clone();
+    let load = tokio::spawn(async move { post_to(&gw, "/v1/models/text/m/load", json!({})).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let (status, body) = post_to(
+        &s.gw,
+        "/v1/chat/completions",
+        json!({"model": "text/m", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    let took = started.elapsed();
+    let slow_status = slow.await.unwrap();
+    let (load_status, load_body) = load.await.unwrap();
+    let failed = s.stub.inner.lock().unwrap().failed_chats.clone();
+    assert_eq!(
+        status,
+        200,
+        "chat took {took:?}: {body}; slow {slow_status}; load {load_status} {load_body}; \
+         failed {failed:?}; calls {:?}",
+        s.stub.calls()
+    );
+    assert_eq!(slow_status, 200);
+}
+
+/// A load after a pending apply whose re-read leaves the model's old
+/// process running past the load's bound (`load_timeout_secs` 2): the load
+/// fails with a clear error and stops nothing (no unload, no load), and
+/// chats for the model are served at once the whole time.
+#[tokio::test]
+async fn a_load_whose_old_process_outlives_its_bound_fails_and_stops_nothing() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        load_timeout_secs: 2,
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.exit_delay_ms = 20_000;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"flash_attn": true}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    std::fs::write(format!("{}.go", s.overlay.display()), b"go").unwrap();
+    let gw = s.gw.clone();
+    let load = tokio::spawn(async move { post_to(&gw, "/v1/models/text/m/load", json!({})).await });
+    wait_for(&s, |calls| calls.contains(&"reload unloaded m".to_string())).await;
+    for _ in 0..4 {
+        let (status, took) = timed_chat(&s.gw, "m").await;
+        assert_eq!(status, 200, "{:?}", s.stub.calls());
+        assert!(took < Duration::from_millis(800), "chat took {took:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let (status, body) = load.await.unwrap();
+    assert_eq!(status, 504, "{body}");
+    assert_eq!(
+        body["error"]["type"],
+        json!("old_process_running"),
+        "{body}"
+    );
+    let calls = s.stub.calls();
+    assert!(
+        !calls.contains(&"POST /models/unload m".to_string()),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.contains(&"POST /models/load m".to_string()),
+        "{calls:?}"
+    );
+    // The old process was left to end by itself.
+    assert!(s.stub.inner.lock().unwrap().exiting.contains_key("m"));
+}
+
+/// A load after a pending apply that rewrote the model's section, found
+/// still running its old process, never sends `/models/unload`: it waits
+/// for the process the re-read ended, then loads the new settings.
+#[tokio::test]
+async fn a_load_after_a_pending_apply_never_unloads() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.exit_delay_ms = 600;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    std::fs::write(format!("{}.go", s.overlay.display()), b"go").unwrap();
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let inner = s.stub.inner.lock().unwrap();
+    assert!(
+        !inner.calls.contains(&"POST /models/unload m".to_string()),
+        "{:?}",
+        inner.calls
+    );
+    assert!(inner.refused_loads.is_empty(), "{:?}", inner.calls);
+    assert_eq!(inner.status["m"], "loaded", "{:?}", inner.calls);
+    assert!(
+        inner.args["m"].join(" ").contains("--ctx-size 8192"),
+        "{:?}",
+        inner.args
+    );
 }
