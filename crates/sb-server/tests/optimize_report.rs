@@ -948,6 +948,16 @@ async fn the_quality_ledger_refuses_text_and_round_trips_scores() {
     )
     .await;
     assert_eq!(status, 409);
+    // The same run id under another target or suite is a duplicate too.
+    let mut moved = quality_row("q_ok");
+    moved["target"] = json!("gpu-box/b");
+    moved["suite"] = json!("s9");
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(moved)).await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (409, Some("duplicate_run")),
+        "{body}"
+    );
     let mut partial = quality_row("q_partial");
     partial["suite"] = json!("s2");
     partial["status"] = json!("partial");

@@ -840,6 +840,12 @@ pub trait StateStore: Send + Sync {
         ))
     }
 
+    /// Whether a quality run with this `run_id` is stored (under any target
+    /// or suite).
+    fn quality_run_exists(&self, _run_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Quality runs, newest first, filtered by target and/or suite.
     fn quality_run_list(
         &self,
@@ -3567,6 +3573,16 @@ impl StateStore for SqliteStore {
         Ok(conn.last_insert_rowid() as u64)
     }
 
+    fn quality_run_exists(&self, run_id: &str) -> Result<bool> {
+        let conn = self.conn()?;
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM quality_runs WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        Ok(found > 0)
+    }
+
     fn quality_run_list(
         &self,
         target: Option<&str>,
@@ -5865,10 +5881,12 @@ mod model_settings_tests {
         partial.score = None;
         partial.se = None;
         store.quality_run_append(&partial).unwrap();
-        // run_id is unique.
+        // run_id is unique, under any target or suite.
         assert!(store
             .quality_run_append(&quality("q1", "box/a", "s1", 4))
             .is_err());
+        assert!(store.quality_run_exists("q1").unwrap());
+        assert!(!store.quality_run_exists("q9").unwrap());
         // status is checked.
         let mut bad = quality("q5", "box/a", "s1", 5);
         bad.status = "great".to_string();

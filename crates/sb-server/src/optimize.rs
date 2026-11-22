@@ -1348,7 +1348,8 @@ fn quality_record_view(record: sb_store::QualityRunRecord) -> Value {
 /// `text_not_allowed`) when a key is not a name (`[a-z][a-z0-9_]`, at most
 /// 32, not named like text: `prompt`, `answer`, `quote`, ...), a case-id
 /// key is not a case id, or a string sits anywhere but the identity fields
-/// (an array of strings included); at most 64 KiB.
+/// (an array of strings included); at most 64 KiB. A `run_id` stored
+/// before, under any target or suite, is 409 `duplicate_run`.
 pub(crate) async fn quality_append(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1402,12 +1403,8 @@ pub(crate) async fn quality_append(
     };
     let (id, durable) = match state.engine.store() {
         Some(store) => {
-            if !store
-                .quality_run_list(Some(&record.target), Some(&record.suite), 10_000)
-                .unwrap_or_default()
-                .iter()
-                .all(|r| r.run_id != record.run_id)
-            {
+            // `run_id` is unique across targets and suites.
+            if store.quality_run_exists(&record.run_id).unwrap_or(false) {
                 return duplicate();
             }
             match store.quality_run_append(&record) {
@@ -1635,6 +1632,39 @@ mod tests {
             engine = engine.with_store(store);
         }
         AppState::from_engine(engine)
+    }
+
+    // A run id stored before under another target or suite is a
+    // duplicate (409), not a store error (503).
+    #[tokio::test]
+    async fn a_duplicate_quality_run_id_is_409_under_any_target() {
+        use axum::http::StatusCode;
+        let store: Arc<dyn sb_store::StateStore> =
+            Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+        let state = state_with("server:\n  bind: \"127.0.0.1:0\"\n", Some(store));
+        let row = |target: &str, suite: &str| {
+            json!({
+                "run_id": "eval_dup", "target": target, "suite": suite,
+                "suite_version": "abc123def456", "model_file": "f", "engine_build": "b1",
+                "settings_hash": "h", "settings_revision": 1, "status": "complete",
+                "score": 0.5, "se": 0.1, "per_case": {"c01": [0.5]}
+            })
+        };
+        let post = |row: Value| {
+            quality_append(
+                State(state.clone()),
+                Extension(Principal::admin()),
+                Json(row),
+            )
+        };
+        assert_eq!(post(row("box/a", "s1")).await.status(), StatusCode::CREATED);
+        for (target, suite) in [("box/a", "s1"), ("box/b", "s1"), ("box/a", "s2")] {
+            assert_eq!(
+                post(row(target, suite)).await.status(),
+                StatusCode::CONFLICT,
+                "{target} {suite}"
+            );
+        }
     }
 
     #[test]
