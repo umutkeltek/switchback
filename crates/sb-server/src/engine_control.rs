@@ -3783,26 +3783,36 @@ pub(crate) async fn load_endpoint(
     }
 }
 
-/// Whether a listing row shows `model` running a process started with the
-/// load settings `wanted`: loaded, sleeping or loading, with arguments listed
-/// that match `wanted` (the check `apply: now` makes, see [`args_mismatch`]).
-/// Arguments that cannot tell the new process from the old one (none
-/// listed, or no checked setting wanted) never count.
-fn runs_new_args(wanted: &BTreeMap<String, String>, row: &Value) -> bool {
+/// Whether `row` (the model's listing row now) shows a process that is
+/// not the one `old` showed (its row from before the apply), started with
+/// the load settings `wanted`: loaded, sleeping or loading, with listed
+/// arguments that match `wanted` (the check `apply: now` makes, see
+/// [`args_mismatch`]). The arguments must tell the two apart: the old ones
+/// miss `wanted`, or the new ones differ from them. A change only to keys
+/// the check does not compare (load mode, fit, rope, raw arguments) leaves
+/// the old process looking like the new one, so it never counts; nor does
+/// a row with no listed arguments, or no `old` row.
+fn runs_new_args(wanted: &BTreeMap<String, String>, old: Option<&Value>, row: &Value) -> bool {
+    let Some(old) = old else {
+        return false;
+    };
     let running = matches!(
         row["status"]["value"].as_str(),
         Some("loaded" | "sleeping" | "loading")
     );
-    let listed = row["status"]["args"]
+    let args = listed_args(row);
+    running
+        && !args.is_empty()
+        && args_mismatch(wanted, row).is_none()
+        && (args_mismatch(wanted, old).is_some() || args != listed_args(old))
+}
+
+/// A listing row's arguments (`status.args`; empty when none are listed).
+fn listed_args(row: &Value) -> Vec<&str> {
+    row["status"]["args"]
         .as_array()
-        .is_some_and(|args| !args.is_empty());
-    let checked = wanted.keys().any(|key| {
-        let long = format!("--{key}");
-        CHECKED_ARGS
-            .iter()
-            .any(|(name, names)| name == key || names.contains(&long.as_str()))
-    });
-    running && listed && checked && args_mismatch(wanted, row).is_none()
+        .map(|args| args.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
 }
 
 /// Load a target's model (waking only when `wake`). A pending apply of
@@ -3845,13 +3855,26 @@ pub(crate) async fn load_target(
     let key = format!("{}/{model}", lane.name);
     let deadline = tokio::time::Instant::now() + gate_bound(lane_gate_wait(state, &lane));
     if controls.pending_apply(&lane.name) {
+        // The model's row before the apply (one listing, or the last one):
+        // only arguments that differ from it tell a new process from the
+        // old one.
+        let old_row = match controls.models_within(state, &lane, LISTING_TIMEOUT).await {
+            Ok(models) => Some(models),
+            Err(_) => controls.cached_models(&lane.name).map(|(_, models)| models),
+        }
+        .map(|models| {
+            models
+                .into_iter()
+                .find(|row| row["id"] == model)
+                .unwrap_or(Value::Null)
+        });
         let applied = controls.apply_lane(state, &lane).await;
         let rewrote = applied["reloaded"] == json!(true)
             && applied["changed"]
                 .as_array()
                 .is_some_and(|models| models.iter().any(|m| m == model));
         if rewrote {
-            wait_old_process(state, &lane, target, model, deadline).await?;
+            wait_old_process(state, &lane, target, model, old_row.as_ref()).await?;
         }
     }
     // An apply that ended just before (this one's wait for the lock, or one
@@ -3884,17 +3907,20 @@ pub(crate) async fn load_target(
 /// After an apply rewrote `model`'s section: the re-read made the engine
 /// end the model's old process, and llama.cpp ends it only after answering.
 /// A load before then meets the old process (400 "model is already
-/// running"), and the old settings would count as loaded. So wait, never
-/// longer than `deadline` or the lane's `load_timeout_secs`, until the
+/// running"), and the old settings would count as loaded. So wait, at most
+/// the lane's `load_timeout_secs` from here (no gate is held), until the
 /// listing shows the model not running (the old process ended), or running
-/// with the new arguments (a request's own load got there first). Never
-/// unloads: at the bound the load fails and the old process is left alone.
+/// a new process with the new arguments (a request's own load got there
+/// first; see [`runs_new_args`], `old` is the model's row from before the
+/// apply). A machine that is going away ends the wait at once (503) with no
+/// listing after it. Never unloads: past the bound the load fails and the
+/// old process is left alone.
 async fn wait_old_process(
     state: &EngineCtx,
     lane: &EngineLane,
     target: &str,
     model: &str,
-    deadline: tokio::time::Instant,
+    old: Option<&Value>,
 ) -> Result<(), Response> {
     let controls = &state.engines;
     let wanted = state
@@ -3903,30 +3929,48 @@ async fn wait_old_process(
         .get(target)
         .map(|entry| model_preset(kind_ops(lane.engine.kind), &entry.doc))
         .unwrap_or_default();
-    let bound = Duration::from_secs(lane.engine.load_timeout_secs);
-    let until = deadline.min(tokio::time::Instant::now() + bound);
     let started = tokio::time::Instant::now();
+    let until = started + Duration::from_secs(lane.engine.load_timeout_secs);
+    let was_offline = lane_offline(state, lane);
+    let timed_out = || {
+        error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "old_process_running",
+            format!(
+                "`{model}` still runs its old settings {} s after the engine was told \
+                 to end it; it was not loaded and nothing was stopped (requests are still \
+                 served); load it again later",
+                started.elapsed().as_secs()
+            ),
+        )
+    };
     loop {
-        let models = controls
-            .models(state, lane)
-            .await
-            .map_err(|e| error(StatusCode::BAD_GATEWAY, "engine_error", e))?;
+        // Checked before every listing: a machine that is going away is
+        // never connected to.
+        if let Some(why) = machine_going_off(state, lane, was_offline) {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "machine_going_off",
+                format!(
+                    "the machine of lane `{}` is {why}: stopped waiting for the old process \
+                     of `{model}`; it was not loaded and nothing was stopped",
+                    lane.name
+                ),
+            ));
+        }
+        let models = match tokio::time::timeout_at(until, controls.models(state, lane)).await {
+            Ok(listing) => {
+                listing.map_err(|e| error(StatusCode::BAD_GATEWAY, "engine_error", e))?
+            }
+            Err(_) => return Err(timed_out()),
+        };
         let row = models.iter().find(|row| row["id"] == model);
         let status = row.and_then(|row| row["status"]["value"].as_str());
-        if !process_running(status) || row.is_some_and(|row| runs_new_args(&wanted, row)) {
+        if !process_running(status) || row.is_some_and(|row| runs_new_args(&wanted, old, row)) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= until {
-            return Err(error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "old_process_running",
-                format!(
-                    "`{model}` still runs with its old settings {} s after the engine was told \
-                     to end it; it was not loaded and nothing was stopped (requests are still \
-                     served); load it again later",
-                    started.elapsed().as_secs()
-                ),
-            ));
+            return Err(timed_out());
         }
         tokio::time::sleep(
             Duration::from_millis(250)

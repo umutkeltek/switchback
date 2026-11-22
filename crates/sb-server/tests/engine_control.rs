@@ -2343,9 +2343,14 @@ async fn a_request_racing_a_hold_preload_through_a_pending_apply_is_served() {
     )
     .await;
     assert_eq!(status, 201, "{body}");
-    // The preload's apply runs its settings command (0.4 s): the request
-    // comes in meanwhile.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The preload lists the models twice (its wake check, then the model's
+    // row from before the apply), and only then runs its apply, whose
+    // settings command takes 0.4 s: the request comes in meanwhile.
+    wait_for(&s, |calls| {
+        calls.iter().filter(|call| *call == "GET /models").count() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let chat = spawn_chat(&s.gw, "hi");
     assert_eq!(chat.await.unwrap(), 200, "{:?}", s.stub.calls());
     wait_for(&s, |calls| {
@@ -2972,5 +2977,150 @@ async fn a_load_after_a_pending_apply_never_unloads() {
         inner.args["m"].join(" ").contains("--ctx-size 8192"),
         "{:?}",
         inner.args
+    );
+}
+
+/// `ctx_size 8192` applied and loaded (`--ctx-size 8192`), then a failed
+/// apply leaves `{ctx_size 8192, mmap false}` pending: only `load-mode`
+/// changes, a key the arguments check does not compare, so the old
+/// process's arguments already match every checked key. After the next
+/// re-read the old process takes `exit_ms` to end. Leaves the settings
+/// command able to run again.
+async fn load_mode_change_pending(s: &Setup, exit_ms: u64) {
+    s.stub.inner.lock().unwrap().overlay_path = Some(s.overlay.clone());
+    let go = format!("{}.go", s.overlay.display());
+    std::fs::write(&go, b"go").unwrap();
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 8192}})).await;
+    assert_eq!(status, 200, "{view}");
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        s.stub.inner.lock().unwrap().args["m"].join(" "),
+        "llama-server --ctx-size 8192"
+    );
+    std::fs::remove_file(&go).unwrap();
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        1,
+        json!({"load": {"ctx_size": 8192, "mmap": false}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    s.stub.inner.lock().unwrap().exit_delay_ms = exit_ms;
+    std::fs::write(&go, b"go").unwrap();
+}
+
+/// The reviewer's scenario: with only `load-mode` changed, the old,
+/// exiting process passes the arguments check, and must not count as the
+/// new one. The load answers 200 only once a fresh process runs with
+/// `--load-mode none`.
+#[tokio::test]
+async fn a_load_whose_change_the_args_check_misses_waits_for_a_fresh_process() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        ..Opts::default()
+    })
+    .await;
+    load_mode_change_pending(&s, 1_500).await;
+    let (status, body) = post_to(&s.gw, "/v1/models/text/m/load", json!({})).await;
+    assert_eq!(status, 200, "{body}");
+    let inner = s.stub.inner.lock().unwrap();
+    assert!(
+        inner.refused_loads.is_empty(),
+        "the load reached the engine while the old process ran: {:?}",
+        inner.calls
+    );
+    assert!(inner.exiting.is_empty(), "{:?}", inner.calls);
+    assert_eq!(inner.status["m"], "loaded", "{:?}", inner.calls);
+    let args = inner.args["m"].join(" ");
+    assert!(args.contains("--load-mode none"), "{args}");
+}
+
+/// A fresh process (a request's own load) that starts while the load waits
+/// for the old one, with arguments that differ from the old process's
+/// only in a key the check does not compare: it counts as the new one, so
+/// the load ends at once instead of at its bound.
+#[tokio::test]
+async fn a_fresh_process_with_other_args_ends_a_loads_wait() {
+    let (s, _state) = setup_with(Opts {
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        load_timeout_secs: 10,
+        ..Opts::default()
+    })
+    .await;
+    load_mode_change_pending(&s, 20_000).await;
+    let gw = s.gw.clone();
+    let load = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let answer = post_to(&gw, "/v1/models/text/m/load", json!({})).await;
+        (answer, started.elapsed())
+    });
+    wait_for(&s, |calls| calls.contains(&"reload unloaded m".to_string())).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    {
+        // The old process ends and a request's load starts the new one.
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.exiting.remove("m");
+        start_process(&mut inner, "m");
+        inner.status.insert("m".to_string(), "loaded".to_string());
+    }
+    let ((status, body), took) = load.await.unwrap();
+    assert_eq!(status, 200, "{body}; {:?}", s.stub.calls());
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    let args = s.stub.inner.lock().unwrap().args["m"].join(" ");
+    assert!(args.contains("--load-mode none"), "{args}");
+}
+
+/// A power-off that lands while a load waits for the model's old process
+/// ends the load at once with 503 naming why: no listing reaches the
+/// machine after it.
+#[tokio::test]
+async fn a_power_off_ends_a_loads_wait_without_another_listing() {
+    let (s, _state) = setup_with(Opts {
+        lane: "    poweroff_command: \"sleep 1 && rm -f {marker}\"",
+        command_template: Some("test -e {overlay}.go && cat > {overlay}"),
+        load_timeout_secs: 30,
+        ..Opts::default()
+    })
+    .await;
+    {
+        let mut inner = s.stub.inner.lock().unwrap();
+        inner.overlay_path = Some(s.overlay.clone());
+        inner.exit_delay_ms = 60_000;
+    }
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"flash_attn": true}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["pending"], json!(true), "{view}");
+    std::fs::write(format!("{}.go", s.overlay.display()), b"go").unwrap();
+    let gw = s.gw.clone();
+    let load = tokio::spawn(async move { post_to(&gw, "/v1/models/text/m/load", json!({})).await });
+    wait_for(&s, |calls| calls.contains(&"reload unloaded m".to_string())).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, body) = post_to(&s.gw, "/v1/hosts/text/power", json!({"action": "off"})).await;
+    assert_eq!(status, 200, "{body}");
+    let listings = |s: &Setup| {
+        s.stub
+            .calls()
+            .iter()
+            .filter(|call| *call == "GET /models")
+            .count()
+    };
+    let after = listings(&s);
+    let (status, body) = tokio::time::timeout(Duration::from_secs(3), load)
+        .await
+        .expect("the load still waits after the power-off")
+        .unwrap();
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"]["type"], json!("machine_going_off"), "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("powering off"), "{body}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(listings(&s), after, "{:?}", s.stub.calls());
+    assert!(
+        !s.stub.calls().contains(&"POST /models/load m".to_string()),
+        "{:?}",
+        s.stub.calls()
     );
 }
