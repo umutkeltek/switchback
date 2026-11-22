@@ -260,6 +260,12 @@ pub struct LocalExecutorConfig {
     /// settings (see [`LaneEngineConfig`]). Absent = no engine control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<LaneEngineConfig>,
+    /// Whether `sb ai tune` and `sb ai eval` may run on this lane. `false`
+    /// makes the gateway refuse the lane's tuning lock (409
+    /// `experiments_off`), and both tools refuse before they hold or wake
+    /// anything. Default `true`.
+    #[serde(default = "default_true")]
+    pub experiments: bool,
 }
 
 /// Which engine control a lane's engine speaks.

@@ -386,6 +386,9 @@ pub struct LocalLaneReport {
     /// The lane's `max_in_flight` and its queue: how many requests and
     /// media jobs hold a place now and how many wait for one.
     pub slots: LaneSlotsReport,
+    /// Whether `sb ai tune` and `sb ai eval` may run on the lane
+    /// (`experiments` in config).
+    pub experiments: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2176,6 +2179,7 @@ impl LocalExecutor {
             up_since_ms: host.up_since_ms(),
             holds: hold_views,
             slots,
+            experiments: cfg.experiments,
         }
     }
 }
@@ -4822,6 +4826,7 @@ mod tests {
             on_full: sb_core::LaneOnFull::Spill,
             engine: None,
             poweroff_min_uptime_secs: 0,
+            experiments: true,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -4991,6 +4996,7 @@ mod tests {
             on_full: sb_core::LaneOnFull::Spill,
             engine: None,
             poweroff_min_uptime_secs: 0,
+            experiments: true,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -5505,6 +5511,7 @@ local_executors:
             on_full: sb_core::LaneOnFull::Spill,
             engine: None,
             poweroff_min_uptime_secs: 0,
+            experiments: true,
         };
         LocalExecutor::new(
             cfg,
