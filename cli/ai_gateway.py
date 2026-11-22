@@ -201,8 +201,10 @@ default) leaves a loaded model on its old settings until it loads again;
 --apply now reloads it once nothing is in flight on it (exit 1 when it stays
 busy). Neither wakes a sleeping machine unless --wake. load preloads a model
 (exit 3 when the machine sleeps and --wake is not given); unload never powers
-anything off and waits up to --timeout SECS (default 810) while the gateway
-lets the model's requests end and its process exit. engines never wakes anything: a sleeping lane shows what it had
+anything off and waits up to --timeout SECS while the gateway lets the
+model's requests end and its process exit (default: longer than the model's
+lane allows, from its apply wait and load timeout; 810 when the gateway does
+not name them). engines never wakes anything: a sleeping lane shows what it had
 loaded when it was last seen. hold --load MODEL loads the model once the
 machine is up.
 
@@ -2200,13 +2202,27 @@ def cmd_load(gw, args):
     return OK
 
 
+def unload_wait(gw, model):
+    """How long `sb ai unload` waits by default: what the model's lane allows
+    an unload (its settings view names the lane's apply wait and load
+    timeout), else UNLOAD_TIMEOUT (810 s, the default engine settings')."""
+    try:
+        target = one_target(gw.get(model_path(model, "settings")), model)
+    except (GatewayError, Fail):
+        return UNLOAD_TIMEOUT
+    return ai_tune.lane_unload_timeout((target.get("load") or {}).get("engine") or {})
+
+
+
 def cmd_unload(gw, args):
     try:
         # The gateway answers once the model's requests ended and its
         # process exited (bounded by the lane's apply wait, its unload call
-        # and its load timeout, which the CLI cannot read): longer than
-        # their defaults together by default (UNLOAD_TIMEOUT).
-        answer = gw.post(model_path(args.model, "unload"), {}, timeout=args.timeout)
+        # and its load timeout): by default the client waits longer than
+        # the lane's own bounds, or than their defaults together
+        # (UNLOAD_TIMEOUT) when the gateway does not name them.
+        timeout = args.timeout if args.timeout is not None else unload_wait(gw, args.model)
+        answer = gw.post(model_path(args.model, "unload"), {}, timeout=timeout)
     except GatewayError as error:
         raise gateway_fail(error, f"unloading {args.model}") from None
     print(f"{answer.get('target')}: {answer.get('message') or answer.get('status')}")
@@ -2431,7 +2447,7 @@ def parser():
     load.add_argument("--timeout", type=float, default=900)
     unload_cmd = sub.add_parser("unload", add_help=False, allow_abbrev=False)
     unload_cmd.add_argument("model")
-    unload_cmd.add_argument("--timeout", type=float, default=UNLOAD_TIMEOUT)
+    unload_cmd.add_argument("--timeout", type=float, default=None)
     sub.add_parser("engines", add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
     chat = sub.add_parser("chat", add_help=False, allow_abbrev=False)
     chat.add_argument("model")

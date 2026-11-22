@@ -110,6 +110,20 @@ GATEWAY_APPLY_WAIT_S = 120
 GATEWAY_UNLOAD_CALL_S = 60
 GATEWAY_LOAD_TIMEOUT_S = 600
 UNLOAD_TIMEOUT = GATEWAY_APPLY_WAIT_S + GATEWAY_UNLOAD_CALL_S + GATEWAY_LOAD_TIMEOUT_S + 30
+
+
+def lane_unload_timeout(engine):
+    """How long a client waits for an unload on one lane: the lane's own
+    `apply_wait_secs` and `load_timeout_secs` (the settings view names them
+    under `load.engine`), the gateway's unload call and 30 s spare. A
+    gateway that does not name them gets UNLOAD_TIMEOUT (the defaults')."""
+    waits = [engine.get("apply_wait_secs"), engine.get("load_timeout_secs")]
+    if not all(isinstance(wait, (int, float)) and not isinstance(wait, bool) and wait >= 0
+               for wait in waits):
+        return UNLOAD_TIMEOUT
+    return waits[0] + GATEWAY_UNLOAD_CALL_S + waits[1] + 30
+
+
 # A load-time run unloads and loads the model this many times.
 LOAD_TIMES = 3
 PAUSED_WAIT_S = 300  # how long a request retries a paused model (503 model_paused)
@@ -384,6 +398,7 @@ class Tuner:
         load_view = target.get("load") or {}
         engine = load_view.get("engine") or {}
         self.lane = engine.get("lane") or self.provider
+        self.unload_timeout = lane_unload_timeout(engine)
         self.kind = engine.get("kind") or "llama_cpp_router"
         if self.kind not in CATALOGUE:
             raise TuneError(FAIL, f"no lever catalogue for engine kind {self.kind}")
@@ -806,7 +821,7 @@ class Tuner:
         times = []
         for _ in range(LOAD_TIMES):
             reload_started = self.clock()
-            self.call("POST", path + "/unload", body={}, timeout=UNLOAD_TIMEOUT, doing="unloading")
+            self.call("POST", path + "/unload", body={}, timeout=self.unload_timeout, doing="unloading")
             started = time.monotonic()
             self.call("POST", path + "/load", body={"wake": False}, timeout=900, doing="loading")
             times.append(time.monotonic() - started)

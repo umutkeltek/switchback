@@ -1571,6 +1571,41 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("text/m: unloaded", run.stdout)
 
+    def test_unload_waits_as_long_as_the_models_lane_allows(self):
+        # The settings view names the lane's apply wait and load timeout:
+        # the client waits longer than both plus the unload call. A
+        # gateway that names neither gets the defaults' bound.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ai_gateway_unload_wait", CLI / "ai_gateway.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        tune = module.ai_tune
+        lane = {"apply_wait_secs": 5, "load_timeout_secs": 60}
+        self.assertEqual(tune.lane_unload_timeout(lane), 5 + tune.GATEWAY_UNLOAD_CALL_S + 60 + 30)
+        self.assertEqual(tune.lane_unload_timeout({}), tune.UNLOAD_TIMEOUT)
+        self.assertEqual(tune.lane_unload_timeout({"apply_wait_secs": True, "load_timeout_secs": 60}),
+                         tune.UNLOAD_TIMEOUT)
+
+        class Gateway:
+            def __init__(self, answer):
+                self.answer = answer
+                self.paths = []
+
+            def get(self, path):
+                self.paths.append(path)
+                if isinstance(self.answer, Exception):
+                    raise self.answer
+                return self.answer
+
+        named = Gateway({"targets": [{"target": "text/m", "load": {"engine": lane}}]})
+        self.assertEqual(module.unload_wait(named, "text/m"), 155)
+        self.assertEqual(named.paths, ["/v1/models/text/m/settings"])
+        silent = Gateway({"targets": [{"target": "text/m", "load": {"engine": {"lane": "text"}}}]})
+        self.assertEqual(module.unload_wait(silent, "text/m"), module.UNLOAD_TIMEOUT)
+        refused = Gateway(module.GatewayError(404, "no such model", True))
+        self.assertEqual(module.unload_wait(refused, "text/m"), module.UNLOAD_TIMEOUT)
+        self.assertEqual(module.UNLOAD_TIMEOUT, 810)
+
     def test_help_and_bad_usage(self):
         run = self.sb("help")
         self.assertEqual(run.returncode, 0)

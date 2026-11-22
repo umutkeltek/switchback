@@ -3546,6 +3546,10 @@ pub(crate) fn add_load_view(
             "kind": kind_name(lane.engine.kind),
             "status": status.as_deref().unwrap_or("unknown"),
             "seen_at_ms": cached.as_ref().map(|(at, _)| *at),
+            // What an unload may take here (a client waits longer): the
+            // wait for the model's requests, then for its process to exit.
+            "apply_wait_secs": lane.engine.apply_wait_secs,
+            "load_timeout_secs": lane.engine.load_timeout_secs,
         },
         "settings": settings,
         "engine_args": doc.map(|doc| json!(doc.engine_args)).unwrap_or_else(|| json!({})),

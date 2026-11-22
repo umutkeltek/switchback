@@ -2672,3 +2672,14 @@ async fn a_power_off_ends_a_settle_without_another_listing() {
     let note = settle_note(&s).await;
     assert!(note.contains("powering off"), "{note}");
 }
+
+/// The settings view names what an unload may take on the model's lane, so
+/// a client can wait longer than that.
+#[tokio::test]
+async fn the_settings_view_names_what_an_unload_may_take() {
+    let (s, _state) = setup_with(Opts::default()).await;
+    let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;
+    let engine = &view["targets"][0]["load"]["engine"];
+    assert_eq!(engine["apply_wait_secs"], json!(1), "{view}");
+    assert_eq!(engine["load_timeout_secs"], json!(5), "{view}");
+}
