@@ -53,6 +53,11 @@ class Fake:
         self.beats = 0
         self.chat_delay = 0.0
         self.chat_started = threading.Event()
+        # A freshly restarted gateway: /v1/engines names no build and no
+        # model file for a lane until a model is loaded there.
+        self.engines_until_load = False
+        self.engines_never = False   # a gateway that never names them
+        self.loaded = set()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -97,6 +102,7 @@ class Fake:
                          "revision": self.targets[name]["revision"]}
         m = re.match(r"^/v1/models/(.+)/load$", path)
         if method == "POST" and m:
+            self.loaded.add(m.group(1))
             return 200, {"target": m.group(1), "status": "loaded"}
         if method == "GET" and path == "/v1/workloads/capacity":
             return 200, {"object": "list", "data": [
@@ -104,11 +110,15 @@ class Fake:
                  "queue_depth": 0, "in_flight": 0, "experiments": lane["experiments"]}
                 for name, lane in self.lanes.items()]}
         if method == "GET" and path == "/v1/engines":
-            return 200, {"object": "list", "data": [
-                {"lane": lane, "build": self.builds[lane],
-                 "models": [{"id": t.split("/", 1)[1], "file": v["file"]}
-                            for t, v in self.targets.items() if v["lane"] == lane]}
-                for lane in self.lanes]}
+            data = []
+            for lane in self.lanes:
+                listed = [t for t, v in self.targets.items() if v["lane"] == lane
+                          and not self.engines_never
+                          and (not self.engines_until_load or t in self.loaded)]
+                data.append({"lane": lane, "build": self.builds[lane] if listed else None,
+                             "models": [{"id": t.split("/", 1)[1], "file": self.targets[t]["file"]}
+                                        for t in listed]})
+            return 200, {"object": "list", "data": data}
         m = re.match(r"^/v1/hosts/([^/]+)/holds$", path)
         if method == "POST" and m:
             hold_id = f"hold-{len(self.holds) + 1}-{m.group(1)}"
@@ -492,6 +502,61 @@ class SafetyTests(Base):
         self.fake.answers[("box/m", "c00")] = ("anything", "stop")
         report = self.eval_json("box/m", "--suite", "p")
         self.assertEqual(report["runs"][0]["score"], 1.0)
+
+
+class IdentityTests(Base):
+    def test_identity_is_read_after_the_wake_and_the_load(self):
+        cases = [case(f"c{i:02d}") for i in range(3)]
+        path = self.suite("s", cases)
+        for c in cases:
+            self.fake.answers[("box/m", c["id"])] = (codes(10), "stop")
+        # The box is off and the gateway has just restarted: before the
+        # load, /v1/engines names neither the build nor the model file.
+        self.fake.lanes["box"]["state"] = "offline"
+        self.fake.engines_until_load = True
+        row = self.eval_json("box/m", "--suite", "s", "--wake")["runs"][0]
+        self.assertEqual(row["status"], "complete")
+        stored = self.fake.quality[-1]
+        self.assertEqual((stored["model_file"], stored["engine_build"]), ("file-m", "b100"))
+        self.store_row("lane/b", path, {c["id"]: [0.5] for c in cases})
+        # Listed and unchanged: current.
+        report = self.eval_json("box/m", "--compare", "lane/b", "--suite", "s")
+        self.assertFalse(report["rows"][0]["stale"], report)
+        # The gateway restarts again: nothing names the file, so the row
+        # is not current.
+        self.fake.loaded.clear()
+        report = self.eval_json("box/m", "--compare", "lane/b", "--suite", "s")
+        self.assertIn("no current complete row for box/m", report["verdict"]["text"])
+        # A new model file is loaded and listed: stale because of it.
+        self.fake.targets["box/m"]["file"] = "file-m2"
+        self.fake.loaded.add("box/m")
+        report = self.eval_json("box/m", "--compare", "lane/b", "--suite", "s", "--any")
+        self.assertEqual(report["rows"][0]["stale_because"], ["model_file"])
+
+    def test_an_identity_still_unknown_after_the_load_stores_a_failed_row(self):
+        self.suite("s", [case("c00")])
+        self.fake.answers[("box/m", "c00")] = (codes(10), "stop")
+        self.fake.engines_never = True
+        run = self.sb("eval", "box/m", "--suite", "s", "--json")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("does not name the model file or the engine build", run.stderr)
+        self.assertEqual(self.fake.chats(), [])
+        stored = self.fake.quality[-1]
+        self.assertEqual((stored["status"], stored["stop_reason"]), ("failed", "identity_unknown"))
+        self.assertIsNone(stored["score"])
+        self.assertIsNone(ai_eval.text_problem(stored))
+        self.assert_released()
+
+    def test_unknown_never_matches_unknown(self):
+        path = self.suite("s", [case("c00")])
+        self.store_row("box/m", path, {f"c{i:02d}": [1.0] for i in range(40)},
+                       model_file="unknown", engine_build="unknown")
+        self.store_row("lane/b", path, {f"c{i:02d}": [0.0] for i in range(40)})
+        self.fake.engines_never = True
+        report = self.eval_json("box/m", "--compare", "lane/b", "--suite", "s", "--any")
+        box = report["rows"][0]
+        self.assertTrue(box["stale"])
+        self.assertEqual(box["stale_because"], ["model_file", "engine_build"])
 
 
 class NoTextTests(Base):

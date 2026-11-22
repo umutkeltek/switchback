@@ -1618,7 +1618,13 @@ anything is stored. A score is
 (`/v1/engines`), its answer-settings hash (`settings_hash` in the operator
 settings view: SHA-256 over the settings document without `ceiling`, so
 storing a speed ceiling does not make a score stale) and the suite version
-all still match.
+all still match. The run reads that identity after the wake and the load,
+so a sleeping machine or a gateway just restarted cannot leave it blank. A
+part the gateway cannot name is `unknown` and never matches, not even
+another `unknown`; a run whose identity is still unknown after the load
+sends no case and stores a `failed` row with `stop_reason:
+identity_unknown`. Every row that stopped early names a typed
+`stop_reason`.
 
 **A beats B.** Paired on the case ids both runs measured (at least 30,
 same suite version): A beats B when its lead D is larger than both

@@ -86,6 +86,7 @@ LOAD_TIMEOUT_S = 900
 WAKE_TIMEOUT_S = 600
 MAX_LOCK_S = 14400
 LOCK_HEADER = "x-switchback-tune-lock"
+UNKNOWN = "unknown"       # an identity part the gateway does not name
 # Lane states of a machine that is up and serves requests.
 READY_STATES = ("healthy", "idle_countdown")
 ON_STATES = ("healthy", "draining", "idle_countdown", "degraded")
@@ -118,12 +119,14 @@ class EvalError(Exception):
 
 class Halt(Exception):
     """Stop at a case boundary: a quiet window began (`code` OK), the lock
-    is gone or the gateway stopped answering (`code` FAIL)."""
+    is gone or the gateway stopped answering (`code` FAIL). `kind` is the
+    typed reason the stored row carries as `stop_reason`."""
 
-    def __init__(self, reason, code):
+    def __init__(self, reason, code, kind):
         super().__init__(reason)
         self.reason = self.message = reason
         self.code = code
+        self.kind = kind
 
 
 class Interrupted(Exception):
@@ -650,7 +653,8 @@ def summed(details):
     return out
 
 
-def build_row(suite, results, answers, identity, status, extra_repeat, rescored_from=None):
+def build_row(suite, results, answers, identity, status, extra_repeat, rescored_from=None,
+              stop_reason=None):
     """The stored row (scores, ids and counts only) and its readable parts."""
     cases = by_case(results)
     complete = status == "complete" and bool(cases)
@@ -702,6 +706,8 @@ def build_row(suite, results, answers, identity, status, extra_repeat, rescored_
         row["provisional"] = row["unknown_share"] > 0.20
     if rescored_from:
         row["rescored_from"] = rescored_from
+    if stop_reason:
+        row["stop_reason"] = stop_reason
     return row
 
 
@@ -782,7 +788,15 @@ class Evaluator:
         provider, _, model = full.partition("/")
         engine = ((target.get("load") or {}).get("engine") or {})
         lane = engine.get("lane") or provider
-        build, model_file = "unknown", "unknown"
+        return dict(self.engine_identity(lane, model), name=name, target=full, model=model, lane=lane,
+                    settings_hash=str(target["settings_hash"]),
+                    settings_revision=int(target.get("revision") or 0))
+
+    def engine_identity(self, lane, model):
+        """The lane's engine build and the model's file from /v1/engines,
+        each UNKNOWN when the gateway does not name it (a sleeping machine,
+        a gateway that has not listed the engine since it started)."""
+        build, model_file = UNKNOWN, UNKNOWN
         try:
             engines = self.gw.call("GET", "/v1/engines", timeout=30, headers={})
         except self.fail_types:
@@ -790,14 +804,18 @@ class Evaluator:
         for row in engines.get("data") or []:
             if row.get("lane") != lane:
                 continue
-            build = str(row.get("build") or "unknown")
+            build = str(row.get("build") or UNKNOWN)
             for loaded in row.get("models") or []:
                 if loaded.get("id") == model:
                     model_file = str(loaded.get("file") or ai_tune.short_hash(json.dumps(loaded.get("args"))))
-        return {"name": name, "target": full, "model": model, "lane": lane,
-                "settings_hash": str(target["settings_hash"]),
-                "settings_revision": int(target.get("revision") or 0),
-                "engine_build": build, "model_file": model_file}
+        return {"engine_build": build, "model_file": model_file}
+
+    def loaded_identity(self, ident):
+        """The identity once the model is loaded: settings hash and revision
+        read again too, so the row names what actually answered."""
+        fresh = self.resolve(ident["name"])
+        return {key: fresh[key] for key in ("engine_build", "model_file", "settings_hash",
+                                            "settings_revision")}
 
     def lanes(self):
         return self.call("GET", "/v1/workloads/capacity", timeout=15, doing="reading the lanes").get("data") or []
@@ -884,12 +902,13 @@ class Evaluator:
         except self.fail_types as error:
             if getattr(error, "status", None) == 404:
                 self.lock_id = None
-                raise Halt("the tuning lock is gone (it ran out or the gateway restarted)", FAIL) from None
+                raise Halt("the tuning lock is gone (it ran out or the gateway restarted)", FAIL,
+                           "lock_gone") from None
             self.say(f"renewing the tuning lock: {getattr(error, 'message', error)}")
             return
         window = beat.get("quiet_window")
         if window:
-            raise Halt(f"the quiet window {window} began", OK)
+            raise Halt(f"the quiet window {window} began", OK, "quiet_window")
 
     # ------------------------------------------------------------ requests
 
@@ -930,7 +949,8 @@ class Evaluator:
                     time.sleep(max(0.05, 5.0 * self.scale))
                     continue
                 if status is None:
-                    raise Halt(f"the gateway stopped answering ({getattr(error, 'message', error)})", FAIL) from None
+                    raise Halt(f"the gateway stopped answering ({getattr(error, 'message', error)})", FAIL,
+                               "gateway_gone") from None
                 return {"text": "", "finish": None, "usage": {},
                         "error": f"{status}: {getattr(error, 'message', error)}"[:MAX_STRING],
                         "seconds": round(self.clock() - started, 3)}
@@ -987,7 +1007,7 @@ class Evaluator:
                         try:
                             self.heartbeat()
                             if self.clock() - self.started > self.budget:
-                                raise Halt("the budget ran out", OK)
+                                raise Halt("the budget ran out", OK, "budget")
                         except Halt as halt:
                             stop = halt
                             break
@@ -1055,26 +1075,40 @@ class Evaluator:
                           body={"wake": False}, timeout=LOAD_TIMEOUT_S, doing=f"loading {ident['target']}")
             except EvalError as error:
                 raise EvalError(FAIL, error.message) from None
+            # The identity read before the wake and the load may not know
+            # the model file or the engine build yet (a sleeping machine, a
+            # gateway just restarted): the row carries the one read now.
+            ident.update(self.loaded_identity(ident))
+            unknown = [key.replace("_", " ") for key in ("model_file", "engine_build")
+                       if ident[key] == UNKNOWN]
+            if unknown:
+                raise Halt(f"the gateway does not name the {' or the '.join(unknown)} of the loaded "
+                           "model, so a score could never be current; no case was sent",
+                           FAIL, "identity_unknown")
             answers, finished, stop, extra = self.run_cases(ident, suite, cases, repeats)
             status = "complete" if finished else "partial"
+        except Halt as halt:
+            status, stop = "failed", halt
         except Interrupted as stopped:
             answers = [a for a in (stopped.args[0] if stopped.args else [])]
             status, code, interrupted = "partial", INTERRUPTED, True
-            stop = Halt(f"interrupted ({self.signal_name or 'Ctrl-C'})", INTERRUPTED)
+            stop = Halt(f"interrupted ({self.signal_name or 'Ctrl-C'})", INTERRUPTED, "interrupted")
         except KeyboardInterrupt:
             status, code, interrupted = "partial", INTERRUPTED, True
-            stop = Halt(f"interrupted ({self.signal_name or 'Ctrl-C'})", INTERRUPTED)
+            stop = Halt(f"interrupted ({self.signal_name or 'Ctrl-C'})", INTERRUPTED, "interrupted")
         finally:
             self.release()
         if stop is not None and code == OK:
             code = stop.code
-            self.say(f"{ident['target']}: {stop.reason}; stopped at a case boundary ({status})")
+            where = "before the first case" if status == "failed" else "at a case boundary"
+            self.say(f"{ident['target']}: {stop.reason}; stopped {where} ({status})")
         if stop is not None and code == INTERRUPTED:
             self.say(f"{ident['target']}: {stop.reason}; the lock and the hold were let go")
-        if not answers:
+        if not answers and status != "failed":
             return None, code if code != OK else FAIL
         results = self.score_answers(suite, answers)
-        row = build_row(suite, results, answers, ident, status, extra)
+        row = build_row(suite, results, answers, ident, status, extra,
+                        stop_reason=stop.kind if stop is not None else None)
         self.keep(folder, row, ident, answers)
         if not interrupted:
             self.store(row)
@@ -1235,8 +1269,11 @@ class Evaluator:
             for row in rows:
                 if row.get("status") != "complete" or row.get("target") != ident["target"]:
                     continue
+                # An identity part nobody could name never matches, not
+                # even another unknown one.
                 reasons = [key for key in ("model_file", "engine_build", "settings_hash")
-                           if str(row.get(key)) != str(ident[key])]
+                           if str(row.get(key)) != str(ident[key])
+                           or UNKNOWN in (str(row.get(key)), str(ident[key]))]
                 if row.get("suite_version") != suite.version:
                     reasons.append("suite_version")
                 if not reasons:
