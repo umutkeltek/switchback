@@ -1336,15 +1336,18 @@ class Tuner:
         self.measure_noise(baseline_metric)
         if self.untuned_reason:
             return self.untuned_reason
-        # The SD the judge uses (floored, and widened for what a few runs
-        # cannot pin down): a run stops where no win could clear it.
-        sd = self.noise_sd(baseline_metric)
-        if sd > TOO_NOISY:
+        # Judged by the SD the judge uses (floored, and widened for what a
+        # few runs cannot pin down): a run stops where no win could clear
+        # it. The message names the SD the runs measured.
+        sd = self.noise.get(baseline_metric, 0.0)
+        widened = self.noise_sd(baseline_metric)
+        if widened > TOO_NOISY:
             # A kept win would have to clear about 1.7 times this noise
             # with room to spare: nothing the levers do could show.
             self.untuned_reason = (
                 f"too noisy to tune: noise ±{sd * 100:.1f}% (SD of one run) on {baseline_metric} "
-                f"between {self.noise_runs} runs of the same settings (at most "
+                f"between {self.noise_runs} runs of the same settings, ±{widened * 100:.1f}% "
+                f"allowing for so few runs (at most "
                 f"±{TOO_NOISY * 100:.0f}% can be tuned); nothing was changed")
             return self.untuned_reason
         started = self.clock()
