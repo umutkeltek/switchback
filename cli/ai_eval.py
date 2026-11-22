@@ -81,6 +81,13 @@ MIN_EFFECT = 0.02         # the smallest lead that counts (suite.json may raise 
 NONDETERMINISTIC = 0.10   # above this share of cases whose repeats differ: one more repeat
 HEARTBEAT_S = 30          # renew the lock and read the quiet window at most this often
 PAUSED_WAIT_S = 300       # how long a request retries a paused model (503 model_paused)
+# A gateway or upstream trouble, not the model's answer: retried after these
+# waits (seconds), then the run stops as partial. Never scored.
+RETRY_STATUSES = (408, 409, 425, 429, 500, 502, 503, 504)
+RETRY_WAITS_S = (1, 2, 4)
+# The request itself was refused (too long, malformed): the case's answer is
+# an error and scores 0. Any other status stops the run.
+CASE_STATUSES = (400, 413, 422)
 REQUEST_TIMEOUT_S = 900
 LOAD_TIMEOUT_S = 900
 WAKE_TIMEOUT_S = 600
@@ -942,6 +949,7 @@ class Evaluator:
         body = self.body_for(case, target, seed)
         headers = {LOCK_HEADER: self.lock_id} if self.lock_id else {}
         deadline = self.clock() + PAUSED_WAIT_S * self.scale
+        retries = list(RETRY_WAITS_S)
         while True:
             started = self.clock()
             try:
@@ -963,12 +971,19 @@ class Evaluator:
                     # unload runs): ask again later; never a failed answer.
                     time.sleep(max(0.05, 5.0 * self.scale))
                     continue
+                message = getattr(error, "message", error)
                 if status is None:
-                    raise Halt(f"the gateway stopped answering ({getattr(error, 'message', error)})", FAIL,
-                               "gateway_gone") from None
-                return {"text": "", "finish": None, "usage": {},
-                        "error": f"{status}: {getattr(error, 'message', error)}"[:MAX_STRING],
-                        "seconds": round(self.clock() - started, 3)}
+                    raise Halt(f"the gateway stopped answering ({message})", FAIL, "gateway_gone") from None
+                if status in CASE_STATUSES:
+                    return {"text": "", "finish": None, "usage": {},
+                            "error": f"{status}: {message}"[:MAX_STRING],
+                            "seconds": round(self.clock() - started, 3)}
+                if status in RETRY_STATUSES and retries and not self.stopping:
+                    time.sleep(max(0.05, retries.pop(0) * self.scale))
+                    continue
+                # Not an answer from the model: never scored as one.
+                raise Halt(f"case {case['id']} got no model answer: the gateway answered {status} "
+                           f"({message})", FAIL, "gateway_error") from None
 
     def ask_streaming(self, body, headers, started):
         text, finish, usage = [], None, {}

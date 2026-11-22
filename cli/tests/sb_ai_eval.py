@@ -58,6 +58,7 @@ class Fake:
         self.engines_until_load = False
         self.engines_never = False   # a gateway that never names them
         self.hold_delay = 0.0
+        self.chat_errors = {}        # case id -> statuses to answer first, in order
         self.hold_started = threading.Event()
         self.loaded = set()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
@@ -81,6 +82,11 @@ class Fake:
         user = body["messages"][-1]["content"]
         match = CASE_RE.search(user)
         case_id = match.group(1) if match else "?"
+        with self.lock:
+            queued = self.chat_errors.get(case_id)
+            status = queued.pop(0) if queued else None
+        if status is not None:
+            return status, {"error": {"message": "upstream closed", "type": "upstream_error"}}
         text, finish = self.answers.get((body["model"], case_id), self.default)
         if callable(text):
             text = text()
@@ -366,6 +372,47 @@ class RunTests(Base):
         self.assertEqual(row["hard_fails"], {"loop": 2, "empty": 2})
         self.assertEqual(row["per_case"]["c00"], [0.0, 0.0])
         self.assertEqual(row["per_case"]["c01"], [0.0, 0.0])
+
+    def test_one_gateway_error_is_retried_and_scores_normally(self):
+        cases = [case(f"c{i:02d}") for i in range(4)]
+        self.suite("s", cases)
+        for c in cases:
+            self.fake.answers[("box/m", c["id"])] = (codes(10), "stop")
+        self.fake.chat_errors["c01"] = [502]
+        row = self.eval_json("box/m", "--suite", "s")["runs"][0]
+        self.assertEqual(row["status"], "complete")
+        self.assertEqual(row["hard_fails"], {})
+        self.assertAlmostEqual(row["score"], 1.0)
+        self.assertEqual(len(self.fake.chats()), 9)
+
+    def test_a_persistent_gateway_error_stops_the_run_as_partial(self):
+        cases = [case(f"c{i:02d}") for i in range(4)]
+        self.suite("s", cases)
+        for c in cases:
+            self.fake.answers[("box/m", c["id"])] = (codes(10), "stop")
+        self.fake.chat_errors["c01"] = [502] * 50
+        run = self.sb("eval", "box/m", "--suite", "s", "--json")
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("got no model answer", run.stderr)
+        row = json.loads(run.stdout)["runs"][0]
+        self.assertEqual(row["status"], "partial")
+        self.assertIsNone(row["score"])
+        self.assertNotIn("error", row["hard_fails"])
+        self.assertNotIn("c01", row["per_case"])
+        stored = self.fake.quality[-1]
+        self.assertEqual((stored["status"], stored["stop_reason"]), ("partial", "gateway_error"))
+        self.assertEqual(len(self.fake.chats()), 2 + 1 + len(ai_eval.RETRY_WAITS_S))
+        self.assert_released()
+
+    def test_a_refused_request_is_the_cases_error(self):
+        cases = [case("c00"), case("c01")]
+        self.suite("s", cases)
+        for c in cases:
+            self.fake.answers[("box/m", c["id"])] = (codes(10), "stop")
+        self.fake.chat_errors["c01"] = [400, 400]
+        row = self.eval_json("box/m", "--suite", "s")["runs"][0]
+        self.assertEqual(row["status"], "complete")
+        self.assertEqual(row["hard_fails"], {"error": 2})
 
     def test_nondeterministic_answers_add_a_repeat(self):
         cases = [case(f"c{i:02d}") for i in range(6)]

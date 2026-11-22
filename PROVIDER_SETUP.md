@@ -1569,7 +1569,7 @@ repeat reaches the engine) and the lane's tuning-lock header. The suite's
 names, so a changed case, label or rule is a new version.
 
 **Checks.** Hard checks first; any failure scores the case 0 and is counted
-by reason: a request error, an empty answer, an answer cut at the token
+by reason: a request the gateway refused as such (400, 413, 422), an empty answer, an answer cut at the token
 limit (`finish_reason: length`), a repetition loop (a 6-word run repeated 5
 times) and, when `expect.json` is true, an answer that is not JSON. Then the
 case's scored checks, each pass or fail; the case score is the share that
@@ -1625,6 +1625,12 @@ another `unknown`; a run whose identity is still unknown after the load
 sends no case and stores a `failed` row with `stop_reason:
 identity_unknown`. Every row that stopped early names a typed
 `stop_reason`.
+
+A gateway or upstream error (408, 409, 425, 429, 5xx) is not the model's
+answer and is never scored: the request is tried again after 1, 2 and 4
+seconds, and if it still gets no answer the run stops as `partial`
+(`stop_reason: gateway_error`). A paused model (503 `model_paused`) is
+waited for up to 5 minutes first.
 
 **A beats B.** Paired on the case ids both runs measured (at least 30,
 same suite version): A beats B when its lead D is larger than both
