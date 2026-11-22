@@ -821,6 +821,29 @@ async fn the_quality_ledger_refuses_text_and_round_trips_scores() {
         (400, Some("text_not_allowed")),
         "{body}"
     );
+    // Case ids are ids, whatever word they start with; anything else
+    // under a case-id map is refused.
+    let mut ids = quality_row("q_ids");
+    ids["per_case"] = json!({"text01": [1.0], "answer-2": [0.0]});
+    ids["case_detail"] = json!({"text01": [{"findings": 2, "passed": 1}]});
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(ids)).await;
+    assert_eq!(status, 201, "{body}");
+    let mut sneaky = quality_row("q_sneaky");
+    sneaky["per_case"] = json!({"a case id with spaces": [1.0]});
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(sneaky)).await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (400, Some("text_not_allowed")),
+        "{body}"
+    );
+    let mut nested = quality_row("q_nested");
+    nested["case_detail"] = json!({"c01": [{"quote": 1}]});
+    let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(nested)).await;
+    assert_eq!(
+        (status, body["error"]["reason"].as_str()),
+        (400, Some("text_not_allowed")),
+        "{body}"
+    );
     let mut edge = quality_row("q_edge");
     edge["note"] = json!("n".repeat(200));
     let (status, body) = call(&fx.gw, "POST", "/v1/optimize/quality", ADMIN, Some(edge)).await;
@@ -875,13 +898,13 @@ async fn the_quality_ledger_refuses_text_and_round_trips_scores() {
         rows.iter()
             .map(|r| r["run_id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["q_ok", "q_edge"]
+        ["q_ok", "q_edge", "q_ids"]
     );
     assert_eq!(rows[0]["per_case"]["c02"], json!([0.5, 0.0]));
     assert_eq!(rows[0]["score"], json!(0.8));
     assert!(rows[0]["at_ms"].as_i64().unwrap() > 0);
     let (_, all) = call(&fx.gw, "GET", "/v1/optimize/quality", ADMIN, None).await;
-    assert_eq!(all["data"].as_array().unwrap().len(), 3);
+    assert_eq!(all["data"].as_array().unwrap().len(), 4);
     // Client keys: 403 both ways.
     let (status, _) = call(
         &fx.gw,

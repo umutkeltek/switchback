@@ -1170,9 +1170,22 @@ const QUALITY_MAX_STRING: usize = 200;
 /// The largest quality row.
 const QUALITY_MAX_ROW: usize = 64 * 1024;
 
+/// The top-level maps whose keys are case ids (checked as ids, not as
+/// names).
+const QUALITY_ID_MAPS: &[&str] = &["per_case", "case_detail", "case_fail"];
+
+/// Whether `key` is a case id: 1-64 of letters, digits, `_ . : -`.
+fn is_case_id(key: &str) -> bool {
+    (1..=64).contains(&key.len())
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+}
+
 /// The first place in `value` that looks like text: a forbidden key name
 /// or a string longer than [`QUALITY_MAX_STRING`] characters. `path` is
-/// where `value` sits (for the error).
+/// where `value` sits (for the error). The keys of a case-id map
+/// ([`QUALITY_ID_MAPS`]) must be case ids instead.
 fn quality_text_at(value: &Value, path: &str) -> Option<String> {
     match value {
         Value::String(s) if s.chars().count() > QUALITY_MAX_STRING => Some(format!(
@@ -1182,6 +1195,14 @@ fn quality_text_at(value: &Value, path: &str) -> Option<String> {
             .iter()
             .enumerate()
             .find_map(|(i, item)| quality_text_at(item, &format!("{path}[{i}]"))),
+        Value::Object(map) if QUALITY_ID_MAPS.contains(&path) => {
+            map.iter().find_map(|(key, item)| {
+                if !is_case_id(key) {
+                    return Some(format!("`{path}` has a key that is not a case id"));
+                }
+                quality_text_at(item, &format!("{path}.{key}"))
+            })
+        }
         Value::Object(map) => map.iter().find_map(|(key, item)| {
             let at = if path.is_empty() {
                 key.clone()
