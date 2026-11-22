@@ -329,6 +329,8 @@ pub(crate) fn target_view(
         "request_load": doc.and_then(|doc| doc.request_load.clone()),
     });
     if operator {
+        // The answer-settings identity `sb ai eval` keys quality scores on.
+        view["settings_hash"] = json!(sb_core::answer_settings_hash(doc));
         view["document"] = doc
             .map(|doc| serde_json::to_value(doc).unwrap_or(Value::Null))
             .unwrap_or_else(|| json!({}));

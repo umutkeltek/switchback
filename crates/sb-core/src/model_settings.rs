@@ -1250,11 +1250,109 @@ pub fn profile_known<'a>(
     (known, names)
 }
 
+/// JSON with every object's keys sorted, at every level, and no spaces:
+/// the same document always gives the same bytes.
+fn canonical_json(value: &Json, out: &mut String) {
+    match value {
+        Json::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Json::String(key.clone()).to_string());
+                out.push(':');
+                canonical_json(&map[key], out);
+            }
+            out.push('}');
+        }
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// The identity of a target's answer-affecting settings: the first 16 hex
+/// of SHA-256 over the canonical JSON of its settings document with
+/// `ceiling` left out (`defaults`, `profiles`, `locked`, `load`,
+/// `engine_args`, `request_load`, `reasoning` and `reasoning_guard` all
+/// count). A stored quality score is current only while this matches, so
+/// storing a speed ceiling never makes it stale, and any change that can
+/// change an answer does. No document hashes as the empty one.
+pub fn answer_settings_hash(doc: Option<&ModelSettingsDoc>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut value = doc
+        .map(|doc| serde_json::to_value(doc).unwrap_or(Json::Null))
+        .unwrap_or_else(|| Json::Object(Map::new()));
+    if let Json::Object(map) = &mut value {
+        map.remove("ceiling");
+    }
+    let mut text = String::new();
+    canonical_json(&value, &mut text);
+    let digest = Sha256::digest(text.as_bytes());
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Message;
     use serde_json::json;
+
+    // Test 21: the quality ledger's staleness key ignores the speed ceiling
+    // and follows every answer-affecting change.
+    #[test]
+    fn answer_settings_hash_ignores_the_ceiling_and_follows_defaults() {
+        let base: ModelSettingsDoc = serde_json::from_value(json!({
+            "defaults": {"temperature": 0.2, "top_p": 0.9},
+            "load": {"ctx_size": 16384}
+        }))
+        .unwrap();
+        let hash = answer_settings_hash(Some(&base));
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        // Same document, keys in another order: same hash.
+        let reordered: ModelSettingsDoc = serde_json::from_value(json!({
+            "load": {"ctx_size": 16384},
+            "defaults": {"top_p": 0.9, "temperature": 0.2}
+        }))
+        .unwrap();
+        assert_eq!(answer_settings_hash(Some(&reordered)), hash);
+        // A stored ceiling does not change it.
+        let mut with_ceiling = base.clone();
+        with_ceiling.ceiling = Some(
+            serde_json::from_value(json!({"decode_tps": 50.0, "bytes_per_token": 1000})).unwrap(),
+        );
+        assert_ne!(with_ceiling, base);
+        assert_eq!(answer_settings_hash(Some(&with_ceiling)), hash);
+        // A temperature change does.
+        let mut warmer = base.clone();
+        warmer.defaults.insert("temperature".into(), json!(0.7));
+        assert_ne!(answer_settings_hash(Some(&warmer)), hash);
+        // And so does a load change.
+        let mut bigger = base.clone();
+        bigger.load.insert("ctx_size".into(), json!(32768));
+        assert_ne!(answer_settings_hash(Some(&bigger)), hash);
+        // No document is the empty one.
+        assert_eq!(
+            answer_settings_hash(None),
+            answer_settings_hash(Some(&ModelSettingsDoc::default()))
+        );
+    }
 
     fn doc(value: Json) -> ModelSettingsDoc {
         let doc: ModelSettingsDoc = serde_json::from_value(value).unwrap();
