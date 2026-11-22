@@ -638,6 +638,8 @@ routes:
 #       apply_wait_secs: 120           # apply-now and unload wait for in-flight requests;
 #                                      # a request waits at a closed model at least command_timeout_secs + 30
 #       load_timeout_secs: 600
+#     # experiments: false           # refuse `sb ai tune` / `sb ai eval` on this lane
+#                                    # (409 experiments_off; default true)
 #
 # Holds. An agent working on the machine directly takes a hold so the idle
 # power-off waits: POST /v1/hosts/gpu-box/holds {"ttl_secs": 7200, "reason":

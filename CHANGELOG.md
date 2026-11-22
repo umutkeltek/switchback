@@ -8,6 +8,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 ## [Unreleased]
 
 ### Added
+- **Answer quality: `sb ai eval`** (speed tricks, layer 4): replays a suite
+  of requests (`suite.json`, `cases.jsonl`, optional labels and `score.py`
+  plug-in) through the gateway byte for byte, `repeats` times at the suite's
+  concurrency, scores each answer with hard checks (error, empty, cut,
+  loop, invalid JSON) and scored checks (`contains_all`, `contains_none`,
+  `regex`, `exact`, `json_schema`, `fields`, `length`), and reports a
+  bootstrap interval. `--compare` says whether A beats B on paired cases (a
+  lead over 2 points and two standard errors, at least 30 shared cases);
+  `--rescore` scores kept answers again without a model call. Runs hold the
+  machine and take the lane's tuning lock like `sb ai tune`. Scores live in
+  a new store table `quality_runs` (migration 23) behind
+  `POST/GET /v1/optimize/quality` (operator), which refuses any text
+  (`text_not_allowed`); a score is current while the model file, engine
+  build, answer-settings hash (`settings_hash`, new in the operator settings
+  view) and suite version match. New lane key
+  `local_executors[].experiments` (default `true`): `false` refuses the
+  tuning lock (409 `experiments_off`) so neither tool runs there. Example
+  suite `cli/suites/example-short-answers`.
 
 - **Speed tricks, layer 2: the speed report** (`GET /v1/optimize/report`,
   `sb ai doctor [MODEL] [--json]`): per local target, measured decode,

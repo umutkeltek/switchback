@@ -1158,7 +1158,7 @@ variants.
 
 Switchback applies the method of the inference-optimisation skill
 (<https://github.com/sybil-solutions/inference-optimisation-skill>) to its
-local engines, in three layers:
+local engines, in three layers, and measures answer quality in a fourth:
 
 1. **Per-request tricks** (always on once configured, no experiments):
    conversation stickiness, loaded-model preference, big-prompt placement
@@ -1167,6 +1167,8 @@ local engines, in three layers:
    findings, each with its evidence and one suggested action.
 3. **Experiments** (`sb ai tune`): controlled A/B/A runs that keep a
    settings change only when it measurably wins.
+4. **Answer quality** (`sb ai eval`): real requests replayed and scored by
+   fixed checks, one stored score per target and suite.
 
 #### Layer 1: per-request tricks
 
@@ -1524,6 +1526,116 @@ undo with: sb ai revert gpu-box/qwen 12
 skipped) and changes nothing. `--json` prints the summary as JSON. The
 numbers are measured on the client's clock through the gateway, the way a
 client sees them; the engine's own timings stay in the speed report.
+
+#### Layer 4: answer quality (`sb ai eval`)
+
+Speed is only half of choosing a model or a setting. `sb ai eval` replays a
+**suite** of real requests through the gateway, scores every answer with
+fixed checks, and stores one score per target and suite (operator key):
+
+```bash
+sb ai eval lane/a lane/b --suite short-answers [--repeats 2] [--cases N]
+           [--budget 30m] [--wake] [--json] [--no-store] [-o FILE]
+sb ai eval lane/a --compare lane/b --suite short-answers [--any] [--json]
+sb ai eval --list [--json]
+sb ai eval --rescore RUN_ID [--no-store] [--json]
+```
+
+**Suites.** A suite is a folder found under `SB_AI_SUITES` (a
+`:`-separated list; default `${XDG_DATA_HOME:-~/.local/share}/switchback/suites`)
+or among the examples that ship with `sb` (`cli/suites/`;
+`example-short-answers` shows the format with 12 made-up cases). Both
+`SB_AI_SUITES` and `SB_AI_EVAL_RUNS` may be set in `ai.env`.
+
+```
+my-suite/
+  suite.json     {"name", "kind": "chat", "scorer": "checks" | "plugin",
+                  "concurrency": 1, "repeats": 2, "min_effect": 0.02, "seed": 1,
+                  "roles": [], "gate_cases": [], "version_inputs": []}
+  cases.jsonl    {"id": "c01", "request": {...the exact body, no "model"...},
+                  "expect": {...}, "tags": [...]}
+  labels.jsonl   optional gold labels a plug-in reads
+  score.py       optional plug-in: score(case, answer) -> {"score", "hard_fail",
+                 "detail"}; optional aggregate(results) -> float
+```
+
+A case's request is sent exactly as written: the runner adds only `model`,
+a per-request settings block (`"switchback": {"settings": {"seed": N}}`,
+which keeps the gateway's exact-request cache from answering, so every
+repeat reaches the engine) and the lane's tuning-lock header. The suite's
+**version** is the first 12 hex of SHA-256 over `suite.json`,
+`cases.jsonl`, `labels.jsonl`, `score.py` and every file `version_inputs`
+names, so a changed case, label or rule is a new version.
+
+**Checks.** Hard checks first; any failure scores the case 0 and is counted
+by reason: a request error, an empty answer, an answer cut at the token
+limit (`finish_reason: length`), a repetition loop (a 6-word run repeated 5
+times) and, when `expect.json` is true, an answer that is not JSON. Then the
+case's scored checks, each pass or fail; the case score is the share that
+pass:
+
+| Check | Passes when |
+|---|---|
+| `contains_all` / `contains_none` | every / none of the strings appear (`ignore_case` optional) |
+| `regex` | the pattern matches |
+| `exact` | the answer equals the value after normalizing (`as`: `text`, `int`, `upper`) |
+| `json_schema` | the answer is JSON of the given `type` with every `required` key and the given property `type`s; `additional: false` refuses other keys |
+| `fields` | each named JSON field equals its value after normalizing (`text`, `int`, `upper`, or `loose`: either contains the other) |
+| `length` | word and character counts within `min_words`, `max_words`, `min_chars`, `max_chars` |
+
+A suite with `"scorer": "plugin"` scores with its own `score.py`. It is
+loaded only from inside a suites folder, only when the file and its folder
+belong to the current user and nobody else may write them.
+
+**Runs.** Each case runs `repeats` times at the suite's `concurrency` (the
+job's own, since slot sharing is part of what the job gets). When more than
+10% of the cases answer differently on a repeat, the run adds one more
+repeat for the remaining cases and says so. The score is the suite's
+aggregate (the mean of case scores, or the plug-in's `aggregate`), with a
+standard error and 95% interval from 2,000 bootstrap resamples over case
+ids (seed 1, so a printout repeats). Answers are kept only in
+`SB_AI_EVAL_RUNS` (default
+`${XDG_STATE_HOME:-~/.local/state}/switchback/eval-runs`), never inside a
+git work tree; `--rescore RUN_ID` scores them again after a label round
+with no model call.
+
+**Storage and staleness.** The gateway keeps one row per run
+(`POST/GET /v1/optimize/quality`, operator; store table `quality_runs`; in
+memory without a store; the newest 50 per target and suite and everything
+younger than 365 days, pruned with the experiment ledger). A row holds
+scores, case ids and counts only: the gateway refuses (400
+`text_not_allowed`) any key named like text (`prompt`, `answer`, `quote`,
+...) and any string longer than 200 characters, at any depth. A score is
+**current** while the target's model file and engine build
+(`/v1/engines`), its answer-settings hash (`settings_hash` in the operator
+settings view: SHA-256 over the settings document without `ceiling`, so
+storing a speed ceiling does not make a score stale) and the suite version
+all still match.
+
+**A beats B.** Paired on the case ids both runs measured (at least 30,
+same suite version): A beats B when its lead D is larger than both
+`min_effect` (default 2 points) and two standard errors of the paired
+difference. Otherwise it is a **tie** when two standard errors are at most
+5 points, and **cannot separate, add cases** when they are more.
+`--compare` uses each target's newest complete, current row; `--any` also
+takes stale rows and marks them. A `partial` row never counts.
+
+**Safety.** Eval follows the tuner's rules. It never starts on a sleeping
+machine without `--wake` (exit 3, nothing sent), never on a lane with
+`experiments: false` (refused before anything is held or woken), and never
+inside a quiet window. It holds the machine (the hold ends by the next
+quiet window), takes the lane's tuning lock (other requests go elsewhere),
+loads the model once, and lets both go at the end, also on Ctrl-C, SIGTERM
+and SIGHUP. Between cases a heartbeat renews the lock; a quiet window that
+began, or a lock that is gone, stops the run at the next case boundary and
+stores a `partial` row. A route that reaches several targets is refused:
+eval measures targets, not roles.
+
+**Lane key `experiments`.** `local_executors[].experiments: false`
+(default `true`) makes the gateway refuse the lane's tuning lock (409
+`experiments_off`), and both `sb ai tune` and `sb ai eval` refuse that
+lane before they hold or wake anything. The capacity report shows the
+flag per lane.
 
 ### Speech to text and text to speech (`/v1/audio/*`)
 

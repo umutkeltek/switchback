@@ -748,6 +748,8 @@ sb ai segment photo.png "the cat"   # segment an image; the mask is saved next t
 sb ai bench             # measure the text models: first token, prompt and decode speed
 sb ai doctor            # the speed report: speed against the ceiling, swaps, cache, findings
 sb ai tune gpu-box/qwen # A/B/A speed experiments; keeps only what measurably wins
+sb ai eval box/a box/b --suite example-short-answers  # answer quality on a suite; who beats whom
+sb ai eval --list       # the suites found, with version and case count
 sb ai status            # one line per lane, and whether the machine is on; never wakes it
 sb ai models            # text, image, video and segment models the gateway offers
 sb ai hold 2h "batch"   # keep the machine on for direct work (--wake turns it on now)

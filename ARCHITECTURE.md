@@ -427,7 +427,16 @@ library): it drives the gateway's own APIs (settings writes with `apply:
 now` and a `note`, load/unload, chat requests carrying the lane's tuning
 lock) and keeps its ledger in the store (`optimize_experiments`, migration
 22, through `StateStore::optimize_experiment_*`; in memory without a
-store; 180 days and 20,000 rows at most, pruned at start-up and daily). The tuning lock is runtime state on `OptimizeState`: after
+store; 180 days and 20,000 rows at most, pruned at start-up and daily).
+The quality bench (layer 4, `cli/ai_eval.py`) also lives in the CLI: suites,
+answers and scoring stay on the client, and the gateway keeps one row per
+run in `quality_runs` (migration 23, `StateStore::quality_run_*`; newest 50
+per target and suite plus 365 days, pruned with the experiments). The row is
+scores, case ids and counts only; `POST /v1/optimize/quality` walks it and
+refuses text-like keys and long strings, so the metadata-only rule holds.
+Its staleness key, `settings_hash` (`sb_core::answer_settings_hash`), is
+computed by the gateway over the settings document without `ceiling`.
+A lane's `experiments: false` refuses the tuning lock first. The tuning lock is runtime state on `OptimizeState`: after
 resolving, candidates on a locked lane leave a request that does not carry
 the lock's id (a typed 503 `lane_tuning` when none is left), for chat,
 embeddings and audio alike; while a quiet window is in force, locks are set
