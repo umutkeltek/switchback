@@ -1282,13 +1282,23 @@ fn canonical_json(value: &Json, out: &mut String) {
     }
 }
 
+/// Sort and deduplicate a list of names whose order means nothing.
+fn sort_set(list: Option<&mut Json>) {
+    if let Some(Json::Array(items)) = list {
+        items.sort_by_key(|item| item.to_string());
+        items.dedup();
+    }
+}
+
 /// The identity of a target's answer-affecting settings: the first 16 hex
 /// of SHA-256 over the canonical JSON of its settings document with
 /// `ceiling` left out (`defaults`, `profiles`, `locked`, `load`,
 /// `engine_args`, `request_load`, `reasoning` and `reasoning_guard` all
 /// count). A stored quality score is current only while this matches, so
 /// storing a speed ceiling never makes it stale, and any change that can
-/// change an answer does. No document hashes as the empty one.
+/// change an answer does. Set-like lists (`locked`, `request_load.allow`)
+/// are sorted and deduplicated first, so their order never matters. No
+/// document hashes as the empty one.
 pub fn answer_settings_hash(doc: Option<&ModelSettingsDoc>) -> String {
     use sha2::{Digest, Sha256};
     let mut value = doc
@@ -1296,6 +1306,10 @@ pub fn answer_settings_hash(doc: Option<&ModelSettingsDoc>) -> String {
         .unwrap_or_else(|| Json::Object(Map::new()));
     if let Json::Object(map) = &mut value {
         map.remove("ceiling");
+        sort_set(map.get_mut("locked"));
+        if let Some(Json::Object(policy)) = map.get_mut("request_load") {
+            sort_set(policy.get_mut("allow"));
+        }
     }
     let mut text = String::new();
     canonical_json(&value, &mut text);
@@ -1347,6 +1361,21 @@ mod tests {
         let mut bigger = base.clone();
         bigger.load.insert("ctx_size".into(), json!(32768));
         assert_ne!(answer_settings_hash(Some(&bigger)), hash);
+        // The order of a set-like list does not.
+        let locked = |names: &[&str]| -> ModelSettingsDoc {
+            serde_json::from_value(json!({
+                "defaults": {"temperature": 0.2, "top_p": 0.9},
+                "locked": names,
+                "request_load": {"allow": names}
+            }))
+            .unwrap()
+        };
+        let sorted = answer_settings_hash(Some(&locked(&["temperature", "top_p"])));
+        assert_eq!(
+            answer_settings_hash(Some(&locked(&["top_p", "temperature"]))),
+            sorted
+        );
+        assert_ne!(answer_settings_hash(Some(&locked(&["top_p"]))), sorted);
         // No document is the empty one.
         assert_eq!(
             answer_settings_hash(None),
