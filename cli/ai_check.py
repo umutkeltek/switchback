@@ -471,6 +471,17 @@ def picture(rng):
 
 # ------------------------------------------------------------------ one request
 
+def over_context(word, result, wanted, truth):
+    """A 400 for a request larger than one request's context (the truth
+    view's) is the context running out, whatever text the gateway passed on."""
+    per = (truth or {}).get("per_request_ctx")
+    if word == "request_failed" and result.get("status") == 400 and per and wanted > per:
+        result["error"] = (f"{result.get('error')} (the request wanted {wanted:,} tokens; one "
+                           f"request can use {per:,})")
+        return "context_exceeded"
+    return word
+
+
 def classify(result, codes=None):
     """One answer's result word: ok, context_exceeded, request_failed,
     not_read (it came back faster than the prompt can be read), length_capped,
@@ -593,8 +604,11 @@ class Checker:
             if props.get("vision") is True:
                 truth["projector"] = True
         file = self.row.get("file")
-        if not file and self.row.get("args"):
-            file = "args-" + hex(zlib.crc32(json.dumps(self.row["args"]).encode()))[2:]
+        model_arg = arg_value([str(a) for a in self.row.get("args") or []], ("--model", "-m"))
+        if not file and model_arg:
+            # The model file's identity: a hash of its path, never the path
+            # (the port and the other arguments change with every load).
+            file = "file-" + hex(zlib.crc32(model_arg.encode()))[2:]
         ident.update(engine_build=build, model_file=str(file or UNKNOWN))
         self.truth = truth
         return truth
@@ -801,7 +815,7 @@ class Checker:
         watch = self.watch_start(ident)
         result = self.ask(ident, prompt, room, prompt_tokens_hint=tokens)
         events = self.watch_stop(watch, ident)
-        result["result"] = classify(result, codes)
+        result["result"] = over_context(classify(result, codes), result, tokens + room, truth)
         result["codes_found"] = len(codes_found(result.get("text"), codes))
         return self.verdict("long", [result], events, truth, tested_ctx=ctx, sent_tokens=tokens)
 
@@ -865,7 +879,7 @@ class Checker:
             time.sleep(index * 0.3 * self.scale)
             out = self.ask(ident, prompt, max_tokens, prompt_tokens_hint=tokens)
             out["name"] = name
-            out["result"] = classify(out, codes)
+            out["result"] = over_context(classify(out, codes), out, tokens + max_tokens, truth)
             out["codes_found"] = len(codes_found(out.get("text"), codes))
             results[index] = out
 
@@ -1040,10 +1054,27 @@ class Checker:
         finding = split_finding(truth)
         if finding:
             self.log(f"  note: {finding}")
+        watch = self.watch_start(ident)
         probe = self.probe(ident)
+        events = self.watch_stop(watch, ident)
+        verdicts = []
         if probe.get("status") != 200:
             self.say(f"the first request failed ({probe.get('status')}: {probe.get('error')})")
-        verdicts = []
+            if events.get("crashed") or events.get("restarted") or events.get("unloaded"):
+                # The model's process died on a short first request: every
+                # check fails here (the gateway now cools the lane down, so a
+                # check sent next would only meet that).
+                probe["name"], probe["result"] = "first", "request_failed"
+                for name in checks:
+                    verdict = self.verdict(name, [probe], events, truth)
+                    verdict["why"] = (f"the model's process {verdict['result'].split('_')[1]} on the "
+                                      f"first, short request ({probe.get('status')}: "
+                                      f"{probe.get('error')})")
+                    verdict["revision"] = ident["revision"]
+                    verdict["ledger_id"] = self.store(ident, verdict)
+                    verdicts.append(verdict)
+                    self.log("  " + verdict_line(verdict))
+                return truth, verdicts
         for name in checks:
             self.renew()
             self.log(f"  {name} ...")

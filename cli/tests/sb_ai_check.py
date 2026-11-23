@@ -134,8 +134,13 @@ class Engine:
         return out
 
     def row(self):
-        return {"id": "m", "target": TARGET, "file": "file-a", "status": self.status,
-                "failed": self.failed, "args": self.args()}
+        row = {"id": "m", "target": TARGET, "file": "file-a", "status": self.status,
+               "failed": self.failed, "args": self.args()}
+        if getattr(self, "no_file", False):
+            # A router that lists no file: the model's argument names it.
+            del row["file"]
+            row["args"] += ["--model", "/models/m.gguf"]
+        return row
 
 
 class Fake:
@@ -326,6 +331,9 @@ class Fake:
                     body = dict(body, revision=int(self.headers["If-Match"].strip('"')))
                 if self.command == "POST" and self.path == "/v1/chat/completions":
                     status, payload = fake.chat(body)
+                    if status >= 400 and getattr(fake, "bare_errors", False):
+                        # The gateway passes no engine text on.
+                        payload = {"error": {"message": f"upstream {status} error", "type": "upstream"}}
                 else:
                     status, payload = fake.route(self.command, self.path, body)
                 data = json.dumps(payload).encode()
@@ -503,6 +511,37 @@ class CheckTests(Base):
         self.assertTrue(pool["engine"]["crashed"] or pool["engine"]["restarted"])
         self.assertIn("out of memory", pool["why"])
         self.assertEqual(self.fake.ledger[-1]["engine_crashed"] or self.fake.ledger[-1]["engine_restarted"], 1)
+
+    def test_a_crash_on_the_first_short_request_fails_every_check(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        self.fake.engine.crash_rule = lambda cfg, tokens: True
+        run, report = self.check("--checks", "long,pool")
+        self.assertEqual(run.returncode, 1)
+        for name in ("long", "pool"):
+            verdict = self.by_check(report)[name]
+            self.assertEqual((verdict["passed"], verdict["result"]), (False, "engine_crashed"), verdict)
+            self.assertIn("first, short request", verdict["why"])
+        self.assertEqual([r["engine_crashed"] for r in self.fake.ledger], [1, 1])
+        # Only the first request was sent.
+        self.assertEqual(len(self.fake.chats()), 1)
+
+    def test_a_bare_400_over_one_requests_context_is_named_as_such(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}})
+        self.fake.bare_errors = True
+        run, report = self.check("--checks", "long")
+        long = self.by_check(report)["long"]
+        self.assertEqual(long["result"], "context_exceeded")
+        self.assertIn("one request can use 8,192", long["requests"][0]["error"])
+
+    def test_the_model_file_stays_the_same_across_loads_without_a_file_field(self):
+        self.fake.engine.no_file = True
+        self.fake.write({"load": {"ctx_size": 16384, "parallel": 1}})
+        self.check("--checks", "long")
+        self.fake.engine.restart()  # a new process on a new port
+        self.check("--checks", "long")
+        files = {r["model_file"] for r in self.fake.ledger}
+        self.assertEqual(len(files), 1, files)
+        self.assertNotIn("/models", next(iter(files)))
 
     def test_a_cached_answer_is_not_a_pass(self):
         self.fake.write({"load": {"ctx_size": 24576, "parallel": 1}})
