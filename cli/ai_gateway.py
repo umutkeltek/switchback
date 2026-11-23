@@ -69,14 +69,16 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai speak "TEXT" [--model ID] [--voice V] -o OUT
                                  text to speech, saved to OUT
   sb ai fit REPO [--ctx N] [--machines FILE] [--vram GB] [--ram GB]
-                 [--bandwidth GBS] [--json]
+                 [--bandwidth GBS] [--cache-type-k T] [--cache-type-v T]
+                 [--others GB] [--compute GB] [--target TARGET] [--json]
   sb ai fit REPO --store TARGET [--quant LABEL] [--bandwidth GBS]
                                   write the target's ceiling (bytes per token, and the
                                   decode ceiling when the bandwidth is known)
   sb ai doctor [MODEL] [--json]   the speed report: measured speed against the ceiling,
                                   swaps, cache hits, acceptance, findings and what to do
   sb ai tune MODEL [--levers LIST] [--budget 30m] [--wake] [--workload chat|read|mixed]
-                  [--concurrency 1,2,3] [--samples N] [--dry-run] [--history] [--json]
+                  [--concurrency 1,2,3] [--samples N] [--ctx-max N] [--picture-runs N]
+                  [--dry-run] [--history] [--json]
                                   controlled A/B/A speed experiments on one local model;
                                   keeps only what measurably wins (`sb ai revert` undoes it)
   sb ai eval MODEL... --suite NAME [--repeats N] [--cases N] [--budget 30m] [--wake]
@@ -169,6 +171,14 @@ then its host memory), a unified memory machine when only --ram is given.
 SB_AI_MACHINES names the same file. Without a machine only the file sizes
 and the KV cache are shown. The speed is an estimate: the bandwidth of the
 machine times 0.55 divided by the bytes a token reads.
+The KV cache is sized with --cache-type-k/--cache-type-v (f16 by default;
+q8_0 takes 34/32 bytes an element, q4_0 18/32). --target TARGET takes them,
+and the context (unless --ctx), from what TARGET runs with now (the
+engine's listing, through the gateway). A GPU machine's room is its memory
+less what other users of the card hold at its normal state (--others GB,
+or "others_gb" in the machine file: a desktop, an image server), and the
+fit keeps --compute GB (or "compute_gb"; 1.5 by default) for the runtime's
+compute buffers. A fit on an empty card is not a fit on the card in use.
 
 --json prints the same answer with stable keys: repo, kind (gguf,
 safetensors, diffusion), context_length, model {architecture, layers,
@@ -1896,6 +1906,26 @@ def ceiling_from_fit(report, quant=None, bandwidth=None):
     return ceiling
 
 
+def cmd_fit_target(gw, args, environ):
+    """`sb ai fit REPO --target TARGET`: size REPO with what TARGET runs
+    with now (its KV cache types and the context its pool holds, from the
+    engine's listing), unless --cache-type-k/v or --ctx name others."""
+    target = one_target(settings_view(gw, args.target, "reading the settings"), args.target)
+    lane = ((target.get("load") or {}).get("engine") or {}).get("lane")
+    model = str(target.get("target", "")).partition("/")[2]
+    row = engine_rows(gw).get((lane, model))
+    truth = ai_check.truth_of(row) if row else None
+    if not truth:
+        raise Fail(GATEWAY_ERROR, f"the engine of {target.get('target')} lists no arguments "
+                                  "for it, so its KV cache and context are unknown")
+    args.cache_type_k = args.cache_type_k or truth.get("cache_type_k")
+    args.cache_type_v = args.cache_type_v or truth.get("cache_type_v")
+    if args.ctx == ai_fit.DEFAULT_CTX and truth.get("ctx_size"):
+        args.ctx = truth["ctx_size"]
+    print(f"{target.get('target')}: {ai_check.truth_words(truth)}", file=sys.stderr)
+    return ai_fit.run(args, environ)
+
+
 def cmd_fit_store(gw, args):
     try:
         report = ai_fit.build_report(args, os.environ)
@@ -2655,7 +2685,7 @@ def main(argv=None, environ=None):
         print(HELP, end="")
         return OK
     args = parser().parse_args(argv)
-    if args.command == "fit" and not args.store:
+    if args.command == "fit" and not args.store and not args.target:
         # fit reads the model index, not the gateway: it needs no key.
         return ai_fit.run(args)
     if args.command == "eval" and not ai_eval.needs_gateway(args):
@@ -2705,6 +2735,8 @@ def main(argv=None, environ=None):
             return cmd_unload(gw, args)
         if args.command == "engines":
             return cmd_engines(gw, args)
+        if args.command == "fit" and args.target and not args.store:
+            return cmd_fit_target(gw, args, environ)
         if args.command == "fit":
             return cmd_fit_store(gw, args)
         if args.command == "doctor":

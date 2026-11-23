@@ -582,6 +582,79 @@ class SbAiFit(unittest.TestCase):
         self.assertLessEqual(machine["needed_bytes"], 32 * GB)
         self.assertEqual(machine["disk_bytes"], 21_713_462_944 + 899_283_520)
 
+    def test_the_kv_cache_follows_its_cache_types(self):
+        f16 = self.answer("test/moe-35b")["kv_cache"]["bytes"]
+        q8 = self.answer("test/moe-35b", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0")
+        self.assertEqual(q8["kv_cache"]["bytes"], int(11 * 32768 * 2 * (256 + 256) * 34 / 32))
+        self.assertEqual((q8["kv_cache"]["cache_type_k"], q8["kv_cache"]["cache_type_v"]),
+                         ("q8_0", "q8_0"))
+        mixed = self.answer("test/moe-35b", "--cache-type-k", "q8_0")
+        self.assertEqual(mixed["kv_cache"]["bytes"], int(11 * 32768 * 2 * (256 * 34 / 32 + 256 * 2)))
+        self.assertLess(q8["kv_cache"]["bytes"], f16)
+        run = self.fit("test/moe-35b", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0")
+        self.assertIn("(q8_0/q8_0)", run.stdout)
+
+    def test_other_gpu_users_and_the_compute_buffer_count_against_the_card(self):
+        # A model that fits an empty 24 GB card exactly does not fit once
+        # the desktop and an image server hold 1.4 GB of it.
+        empty = self.answer("test/moe-35b", "--vram", "25.5", "--ram", "62")["machines"][0]
+        self.assertEqual((empty["verdict"], empty["quant"]), ("fits", "Q4_K_M"))
+        busy = self.answer("test/moe-35b", "--vram", "25.5", "--ram", "62", "--others", "1.4")
+        busy = busy["machines"][0]
+        self.assertEqual(busy["others_bytes"], 1.4 * GB)
+        self.assertNotEqual((busy["verdict"], busy.get("quant")), ("fits", "Q4_K_M"))
+        compute = self.answer("test/moe-35b", "--vram", "32", "--ram", "62", "--compute", "3")
+        machine = compute["machines"][0]
+        self.assertEqual(machine["compute_bytes"], 3 * GB)
+        self.assertEqual(machine["needed_bytes"],
+                         21_713_462_944 + compute["kv_cache"]["bytes"] + 899_283_520 + 3 * GB)
+        machines = self.root / "machines.json"
+        machines.write_text(json.dumps({"machines": [{"name": "box", "kind": "gpu", "vram_gb": 25.5,
+                                                      "ram_gb": 62, "others_gb": 1.4}]}))
+        from_file = self.answer("test/moe-35b", "--machines", str(machines))["machines"][0]
+        self.assertEqual(from_file["others_bytes"], 1.4 * GB)
+        run = self.fit("test/moe-35b", "--vram", "32", "--ram", "62", "--others", "1.4")
+        self.assertIn("other GPU users hold 1.40 GB", run.stdout)
+
+    def test_target_sizes_the_kv_cache_with_what_the_engine_runs(self):
+        args = ["/app/llama-server", "--ctx-size", "98304", "--parallel", "3", "--kv-unified",
+                "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--n-gpu-layers", "999"]
+
+        class Gateway(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path == "/v1/models/box/m/settings":
+                    body = {"targets": [{"target": "box/m", "revision": 3, "document": {},
+                                         "load": {"engine": {"lane": "box"}}}]}
+                elif self.path == "/v1/engines":
+                    body = {"data": [{"lane": "box", "models": [{"id": "m", "args": args}]}]}
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        env = dict(self.env, SWITCHBACK_AI_URL=f"http://127.0.0.1:{server.server_address[1]}",
+                   SWITCHBACK_AI_KEY="sk-gw-test-1")
+        run = self.fit("test/moe-35b", "--target", "box/m", "--json", env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        report = json.loads(run.stdout)
+        self.assertEqual(report["context_length"], 98304)
+        self.assertEqual(report["kv_cache"]["cache_type_k"], "q8_0")
+        self.assertEqual(report["kv_cache"]["bytes"], int(11 * 98304 * 2 * (256 + 256) * 34 / 32))
+        self.assertIn("one request 98,304", run.stderr)
+
     def test_a_model_that_does_not_fit_is_offloaded_and_says_so(self):
         report = self.answer("test/dense-27b", "--vram", "12", "--ram", "64",
                               "--bandwidth", "1008")

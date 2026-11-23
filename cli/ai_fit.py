@@ -35,6 +35,9 @@ DEFAULT_CTX = 32768
 GB = 1_000_000_000
 MARGIN_BYTES = 1_500_000_000   # room for the compute buffers of the runtime
 CACHE_ELEMENT_BYTES = 2         # an f16 KV cache
+# Bytes per KV cache element of each cache type (llama.cpp block sizes).
+CACHE_TYPE_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32,
+                    "q5_0": 22 / 32, "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
 # How much of the stated memory bandwidth a decode really gets. The 0.55 is
 # calibrated on two kinds of machine: a discrete 24 GB GPU, where a dense 14B
 # Q4_K_M wrote about 93 tok/s, and a unified memory machine of 546 GB/s,
@@ -804,12 +807,22 @@ def rank_options(options):
 class Machine:
     """What a machine has: memory, and how fast its memory is."""
 
-    def __init__(self, name, kind, budget, host, bandwidth):
+    def __init__(self, name, kind, budget, host, bandwidth, others=0, compute=None):
         self.name = name
         self.kind = kind
         self.budget = budget
         self.host = host
         self.bandwidth = bandwidth
+        # Memory other users of the GPU hold at the card's normal state (a
+        # desktop, an image server): never the model's.
+        self.others = others or 0
+        # The runtime's compute buffers (flash attention, the batch).
+        self.compute = MARGIN_BYTES if compute is None else compute
+
+    @property
+    def room(self):
+        """What the model may take: the budget less the other users."""
+        return max(0, self.budget - self.others)
 
 
 def machine_from_entry(entry, where):
@@ -830,7 +843,9 @@ def machine_from_entry(entry, where):
         budget = float(entry["usable_gb"]) * GB
     host = float(entry["ram_gb"]) * GB if entry.get("ram_gb") is not None else None
     bandwidth = float(entry["bandwidth_gbs"]) if entry.get("bandwidth_gbs") is not None else None
-    return Machine(name, kind, budget, host, bandwidth)
+    others = float(entry["others_gb"]) * GB if entry.get("others_gb") is not None else 0
+    compute = float(entry["compute_gb"]) * GB if entry.get("compute_gb") is not None else None
+    return Machine(name, kind, budget, host, bandwidth, others, compute)
 
 
 def read_machines(path):
@@ -855,16 +870,34 @@ def ad_hoc_machine(args):
     if args.vram is not None:
         budget = float(args.vram) * GB
         host = float(args.ram) * GB if args.ram is not None else None
-        return Machine("ad-hoc", "gpu", budget, host, args.bandwidth)
+        return Machine("ad-hoc", "gpu", budget, host, args.bandwidth, others_of(args),
+                       compute_of(args))
     budget = float(args.ram) * GB
-    return Machine("ad-hoc", "unified", budget, None, args.bandwidth)
+    return Machine("ad-hoc", "unified", budget, None, args.bandwidth, others_of(args),
+                   compute_of(args))
+
+
+def others_of(args):
+    others = getattr(args, "others", None)
+    return float(others) * GB if others is not None else 0
+
+
+def compute_of(args):
+    compute = getattr(args, "compute", None)
+    return float(compute) * GB if compute is not None else None
 
 
 def load_machines(args, environ):
     """The machines to judge against: a file, the flags, or none at all."""
     path = args.machines or environ.get("SB_AI_MACHINES")
     if path:
-        return read_machines(path)
+        machines = read_machines(path)
+        for machine in machines:
+            if getattr(args, "others", None) is not None:
+                machine.others = others_of(args)
+            if getattr(args, "compute", None) is not None:
+                machine.compute = compute_of(args)
+        return machines
     if args.vram is not None or args.ram is not None:
         return [ad_hoc_machine(args)]
     return []
@@ -872,7 +905,7 @@ def load_machines(args, environ):
 
 # ---------------------------------------------------------------- the fit
 
-def kv_bytes_for(numbers, ctx, weights_bytes):
+def kv_bytes_for(numbers, ctx, weights_bytes, cache_k="f16", cache_v="f16"):
     """The KV cache at a context length, and whether it is known.
 
     A layer can keep a different number of heads, or a shorter window, than
@@ -882,7 +915,13 @@ def kv_bytes_for(numbers, ctx, weights_bytes):
     the weights is reserved for the cache, so a model that does not fit is
     not called a model that fits.
     """
+    k_bytes = CACHE_TYPE_BYTES.get(cache_k or "f16", CACHE_ELEMENT_BYTES)
+    v_bytes = CACHE_TYPE_BYTES.get(cache_v or "f16", CACHE_ELEMENT_BYTES)
     width = (numbers.head_dim or 0) + (numbers.value_dim or numbers.head_dim or 0)
+    # Bytes one token keeps per KV head: its key at the K type, its value
+    # at the V type.
+    per_head = ((numbers.head_dim or 0) * k_bytes
+                + (numbers.value_dim or numbers.head_dim or 0) * v_bytes)
     if numbers.kv_layers and width and (numbers.kv_heads or numbers.kv_heads_per_layer):
         if numbers.cache_layers and (numbers.kv_heads_per_layer or numbers.sliding_layers):
             total = 0
@@ -894,9 +933,9 @@ def kv_bytes_for(numbers, ctx, weights_bytes):
                 if (numbers.sliding_layers and numbers.sliding_layers[index]
                         and numbers.sliding_window):
                     tokens = min(ctx, numbers.sliding_window)
-                total += tokens * CACHE_ELEMENT_BYTES * heads * width
+                total += tokens * heads * per_head
             return int(total), True
-        value = numbers.kv_layers * ctx * CACHE_ELEMENT_BYTES * numbers.kv_heads * width
+        value = numbers.kv_layers * ctx * numbers.kv_heads * per_head
         return int(value), True
     return int(weights_bytes * UNKNOWN_KV_SHARE), False
 
@@ -931,8 +970,10 @@ def speed_estimate(machine, option, per_token, on_gpu, on_host):
 class Analysis:
     """What one repository is, and what it needs."""
 
-    def __init__(self, repo, kind, ctx):
+    def __init__(self, repo, kind, ctx, cache_k="f16", cache_v="f16"):
         self.repo = repo
+        self.cache_k = cache_k or "f16"
+        self.cache_v = cache_v or "f16"
         self.kind = kind
         self.ctx = ctx
         self.numbers = Numbers("unknown")
@@ -946,7 +987,7 @@ class Analysis:
 
     def as_json(self):
         biggest = max((option.bytes for option in self.options), default=0)
-        kv, known = kv_bytes_for(self.numbers, self.ctx, biggest)
+        kv, known = kv_bytes_for(self.numbers, self.ctx, biggest, self.cache_k, self.cache_v)
         options = []
         for option in self.options:
             row = option.as_json()
@@ -963,10 +1004,12 @@ class Analysis:
             "context_length": self.ctx,
             "model": self.numbers.as_json(),
             "kv_cache": {"bytes": kv, "known": known,
-                         "element_bytes": CACHE_ELEMENT_BYTES,
+                         "element_bytes": CACHE_TYPE_BYTES.get(self.cache_k, CACHE_ELEMENT_BYTES),
+                         "cache_type_k": self.cache_k, "cache_type_v": self.cache_v,
                          "note": ("the KV cache is unknown; a tenth of the weights "
                                   "is reserved for it" if not known else
-                                  "an f16 KV cache at the given context length")},
+                                  f"a {self.cache_k}/{self.cache_v} KV cache at the given "
+                                  "context length")},
             "options": options,
             "projector": {"files": [f.as_json() for f in self.projector],
                           "chosen": (one_projector(self.projector).name
@@ -1076,8 +1119,9 @@ def fill_diffusion(analysis, files):
 def no_fit_reason(machine, analysis, projector_bytes):
     """Why nothing fits, in one line."""
     biggest = max((option.bytes for option in analysis.options), default=0)
-    kv, _ = kv_bytes_for(analysis.numbers, analysis.ctx, biggest)
-    if kv + projector_bytes + MARGIN_BYTES > machine.budget:
+    kv, _ = kv_bytes_for(analysis.numbers, analysis.ctx, biggest, analysis.cache_k,
+                         analysis.cache_v)
+    if kv + projector_bytes + machine.compute > machine.room:
         return ("the KV cache and the compute margin do not fit in the memory "
                 "of this machine")
     if machine.kind == "gpu" and machine.host is None:
@@ -1094,6 +1138,7 @@ def judge_machine(machine, analysis):
     """What this machine should take, and what it would cost."""
     row = {"name": machine.name, "kind": machine.kind,
            "budget_bytes": machine.budget, "host_bytes": machine.host,
+           "others_bytes": machine.others, "compute_bytes": machine.compute,
            "bandwidth_gbs": machine.bandwidth,
            "verdict": "no-fit", "warnings": []}
     if analysis.kind == "diffusion":
@@ -1102,9 +1147,10 @@ def judge_machine(machine, analysis):
     projector_bytes = (chosen.size or 0) if chosen else 0
     choice = None
     for option in analysis.options:
-        kv, _ = kv_bytes_for(analysis.numbers, analysis.ctx, option.bytes)
-        needed = option.bytes + kv + projector_bytes + MARGIN_BYTES
-        if needed <= machine.budget:
+        kv, _ = kv_bytes_for(analysis.numbers, analysis.ctx, option.bytes,
+                              analysis.cache_k, analysis.cache_v)
+        needed = option.bytes + kv + projector_bytes + machine.compute
+        if needed <= machine.room:
             choice = {"option": option, "kv": kv, "needed": needed,
                       "on_gpu": option.bytes, "on_host": 0}
             break
@@ -1113,8 +1159,9 @@ def judge_machine(machine, analysis):
         # the one that writes fastest is worth naming as well.
         offered = []
         for option in analysis.options:
-            kv, _ = kv_bytes_for(analysis.numbers, analysis.ctx, option.bytes)
-            room = machine.budget - kv - projector_bytes - MARGIN_BYTES
+            kv, _ = kv_bytes_for(analysis.numbers, analysis.ctx, option.bytes,
+                              analysis.cache_k, analysis.cache_v)
+            room = machine.room - kv - projector_bytes - machine.compute
             if room <= 0 or machine.kind != "gpu" or machine.host is None:
                 continue
             on_gpu = min(option.bytes, room)
@@ -1123,7 +1170,7 @@ def judge_machine(machine, analysis):
                 continue
             per_token = bytes_per_token(analysis.numbers, option.bytes,
                                         analysis.expert_share)
-            offered.append({"option": option, "kv": kv, "needed": machine.budget,
+            offered.append({"option": option, "kv": kv, "needed": machine.room,
                             "on_gpu": on_gpu, "on_host": on_host,
                             "per_token": per_token,
                             "speed": speed_estimate(machine, option, per_token,
@@ -1143,7 +1190,7 @@ def judge_machine(machine, analysis):
     row["weights_bytes"] = option.bytes
     row["kv_cache_bytes"] = choice["kv"]
     row["projector_bytes"] = projector_bytes
-    row["margin_bytes"] = MARGIN_BYTES
+    row["margin_bytes"] = machine.compute
     row["needed_bytes"] = choice["needed"]
     row["on_gpu_bytes"] = choice["on_gpu"]
     row["offloaded_bytes"] = choice["on_host"]
@@ -1179,7 +1226,7 @@ def judge_diffusion(machine, analysis, row):
              if part["role"] == "component" and part["bytes"]]
     best = None
     for part in sorted(models, key=lambda p: (-p["bytes"], p["name"])):
-        if part["bytes"] + MARGIN_BYTES <= machine.budget:
+        if part["bytes"] + machine.compute <= machine.room:
             best = part
             break
     if best is None:
@@ -1189,7 +1236,7 @@ def judge_diffusion(machine, analysis, row):
         return row
     row["verdict"] = "fits"
     row["model"] = best
-    room = machine.budget - best["bytes"] - MARGIN_BYTES
+    room = machine.room - best["bytes"] - machine.compute
     on_gpu = []
     offload = []
     for part in sorted(parts, key=lambda p: (COMPONENT_ORDER.get(p["folder"], 4),
@@ -1301,7 +1348,8 @@ def render_components(report):
 def render_cache(report):
     """The KV cache, and where its numbers come from."""
     cache = report["kv_cache"]
-    lines = [f"  kv cache at {report['context_length']} tokens (f16): "
+    kinds = f"{cache.get('cache_type_k', 'f16')}/{cache.get('cache_type_v', 'f16')}"
+    lines = [f"  kv cache at {report['context_length']} tokens ({kinds}): "
              f"{human_bytes(cache['bytes'])}"]
     model = report["model"]
     words = []
@@ -1354,10 +1402,14 @@ def render_machine(machine, report):
                   f"{human_bytes(machine['kv_cache_bytes'])} kv cache"]
         if machine.get("projector_bytes"):
             pieces.append(f"{human_bytes(machine['projector_bytes'])} projector")
-        pieces.append(f"{human_bytes(machine['margin_bytes'])} margin")
+        pieces.append(f"{human_bytes(machine['margin_bytes'])} compute")
+        room = machine["budget_bytes"] - (machine.get("others_bytes") or 0)
+        of = human_bytes(room)
+        if machine.get("others_bytes"):
+            of += (f" (of {human_bytes(machine['budget_bytes'])}, other GPU users hold "
+                   f"{human_bytes(machine['others_bytes'])})")
         lines.append(f"    fits {machine.get('quant')}: " + " + ".join(pieces) +
-                     f" = {human_bytes(machine['needed_bytes'])} of "
-                     f"{human_bytes(machine['budget_bytes'])}")
+                     f" = {human_bytes(machine['needed_bytes'])} of {of}")
     elif verdict == "partial":
         lines.append(f"    partial {machine.get('quant')}: "
                      f"{human_bytes(machine['on_gpu_bytes'])} of "
@@ -1395,7 +1447,8 @@ def build_report(args, environ):
         size = sibling.get("size")
         files.append(File(name, size if isinstance(size, int) else None))
     kind = classify(data, files)
-    analysis = Analysis(repo, kind, args.ctx)
+    analysis = Analysis(repo, kind, args.ctx, getattr(args, "cache_type_k", None),
+                        getattr(args, "cache_type_v", None))
     analysis.pipeline = data.get("pipeline_tag") or ""
     if kind == "gguf":
         fill_gguf(analysis, repo, files, token)
@@ -1423,6 +1476,11 @@ def add_arguments(parser):
     parser.add_argument("--ram", type=float)
     parser.add_argument("--bandwidth", type=float)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--cache-type-k", choices=sorted(CACHE_TYPE_BYTES))
+    parser.add_argument("--cache-type-v", choices=sorted(CACHE_TYPE_BYTES))
+    parser.add_argument("--others", type=float)
+    parser.add_argument("--compute", type=float)
+    parser.add_argument("--target")
 
 
 def parser():
