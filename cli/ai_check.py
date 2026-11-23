@@ -76,7 +76,7 @@ PICTURE_RUNS = 12
 PICTURE_FLOOR = 0.9      # with nothing to compare against: right at least this share of answered runs
 PROBE_TOKENS = 1500
 FIRST_GUESS_CHARS = 5.0  # characters per token before the probe measured it
-MAX_READ_TPS = 50000.0   # faster than this a prompt was not read: it came from a cache
+MAX_READ_TPS = 200000.0  # faster than this a long prompt was not read: it came from a cache
 MIN_FILL_TOKENS = 1000   # a filler shorter than this is left out
 REQUEST_TIMEOUT_S = 1200
 PAUSED_WAIT_S = 300
@@ -305,6 +305,12 @@ def guarded_changes(before, after):
 
 
 # ------------------------------------------------------------------ fresh text and pictures
+
+def answer_room(ctx, most):
+    """Tokens kept free for the answer of a request at a context of `ctx`:
+    `most`, but never more than an eighth of the context."""
+    return min(most, max(256, int(ctx) // 8))
+
 
 def fresh_rng():
     return random.Random(uuid.uuid4().int)
@@ -734,11 +740,12 @@ class Checker:
         if not ctx:
             return self.cannot("long", "the model's context is unknown (no --ctx-size in its "
                                        "arguments); pass --ctx N")
-        tokens = int(ctx * LONG_SHARE) - LONG_MAX_TOKENS
+        room = answer_room(ctx, LONG_MAX_TOKENS)
+        tokens = int(ctx * LONG_SHARE) - room
         rng = fresh_rng()
         prompt, codes = long_prompt(rng, tokens, self.chars_per_token)
         watch = self.watch_start(ident)
-        result = self.ask(ident, prompt, LONG_MAX_TOKENS, prompt_tokens_hint=tokens)
+        result = self.ask(ident, prompt, room, prompt_tokens_hint=tokens)
         events = self.watch_stop(watch, ident)
         result["result"] = classify(result, codes)
         result["codes_found"] = len(codes_found(result.get("text"), codes))
@@ -766,17 +773,18 @@ class Checker:
         if not pool or not per:
             return None, []
         others = slots - 1
+        fill_room = answer_room(per, FILL_MAX_TOKENS)
         # Room for every other slot's filler first: a pool shared by the
         # slots is no fuller with one long request than the long check.
         long_total = min(int(per * LONG_SHARE),
-                         int(pool * POOL_SHARE) - others * (MIN_FILL_TOKENS + FILL_MAX_TOKENS))
-        long_tokens = long_total - LONG_MAX_TOKENS
+                         int(pool * POOL_SHARE) - others * (MIN_FILL_TOKENS + fill_room))
+        long_tokens = long_total - answer_room(long_total, LONG_MAX_TOKENS)
         room = int(pool * POOL_SHARE) - long_total
         fillers = []
         if others > 0 and room > 0:
             each = min(room // others, int(per * LONG_SHARE))
-            if each - FILL_MAX_TOKENS >= MIN_FILL_TOKENS:
-                fillers = [each - FILL_MAX_TOKENS] * others
+            if each - fill_room >= MIN_FILL_TOKENS:
+                fillers = [each - fill_room] * others
         return long_tokens, fillers
 
     def check_pool(self, ident, truth):
@@ -786,11 +794,13 @@ class Checker:
         if not long_tokens or long_tokens < MIN_FILL_TOKENS:
             return self.cannot("pool", "the model's context is unknown or too small")
         jobs = []
+        per = truth.get("per_request_ctx") or truth.get("ctx_size")
         for i, tokens in enumerate([long_tokens] + fillers):
             rng = fresh_rng()
             prompt, codes = long_prompt(rng, tokens, self.chars_per_token)
-            jobs.append(("long" if i == 0 else f"fill{i}", tokens, prompt, codes,
-                         LONG_MAX_TOKENS if i == 0 else FILL_MAX_TOKENS))
+            room = (answer_room(per * LONG_SHARE, LONG_MAX_TOKENS) if i == 0
+                    else answer_room(per, FILL_MAX_TOKENS))
+            jobs.append(("long" if i == 0 else f"fill{i}", tokens, prompt, codes, room))
         watch = self.watch_start(ident)
         results = [None] * len(jobs)
 

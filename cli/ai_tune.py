@@ -26,9 +26,15 @@ whose settings do not apply or load is a failed trial: shown as such, not a
 rejection, and not a lever inside the noise. A change that cannot finish
 inside the budget is not started; one the budget cuts off changes nothing.
 Changes that claim to be lossless must give the same greedy answer; changes
-to the KV cache or context must find needles at about half and all of the
-context; a change to the slot count must survive a concurrent soak at full
-per-slot context. The run stops after three levers in a row inside the
+to the KV cache or context must pass `sb ai check` long (three fresh codes at
+10/50/90% of the context one request can use; and picture, on a model with a
+projector, not below the run's starting revision); changes to the slots, the
+pool or where the weights sit must also pass check pool (one long request and
+fillers filling the shared pool at once, with no crash, restart or unload of
+the model's process). Memory levers (kv_unified, a smaller KV cache type,
+ctx_search) are kept when speed stays inside the noise and the checks pass;
+ctx_search looks for the largest per-request context whose full pool passes
+at the card's normal state (other GPU users left as they are). The run stops after three levers in a row inside the
 noise, at the end of its budget, when a quiet window begins, when its tuning
 lock is gone (the gateway restarted), or on Ctrl-C, SIGTERM or SIGHUP, and
 always leaves the best known settings applied.
@@ -64,6 +70,13 @@ import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from types import SimpleNamespace
+
+try:
+    import ai_check
+except ImportError:  # the module sits next to this file
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ai_check
 
 OK, FAIL, USAGE = 0, 1, 2
 INTERRUPTED = 130
@@ -154,9 +167,26 @@ CATALOGUE = {
          "note": "more slots serve more users at once; context = slots x per-slot context, "
                  "checked for fit first and proven with a concurrent full-context soak"},
         {"lever": "cache_type", "keys": ["cache_type_k", "cache_type_v"], "metric": "decode",
-         "gate": "needle", "values": ["f16", "q8_0"],
+         "gate": "needle", "values": ["f16", "q8_0"], "hold_when": "smaller_kv",
          "note": "q8_0 halves KV memory but halved decode on a model with KV in 16 of 64 "
-                 "layers; a lossy change, so it must find needles across the context"},
+                 "layers, and misread picture digits on a vision model; a lossy change, so "
+                 "it must pass the long check (and picture, with a projector); the smaller "
+                 "type is kept when speed holds"},
+        {"lever": "kv_unified", "keys": ["engine_args.kv-unified"], "metric": "decode",
+         "gate": "soak", "accept": "hold",
+         "note": "the slots share one context pool, so one request can use the whole set "
+                 "context (without it llama.cpp splits the context over the slots); kept "
+                 "when speed holds and the long and pool checks pass"},
+        {"lever": "n_cpu_moe", "keys": ["engine_args.n-cpu-moe"], "metric": "decode",
+         "gate": "soak",
+         "note": "expert layers back on the GPU: faster when they fit; the pool check "
+                 "proves they fit at the card's normal state"},
+        {"lever": "ctx_search", "keys": ["ctx_size"], "metric": "decode", "gate": "soak",
+         "kind": "search", "accept": "hold", "explicit_only": True,
+         "note": "the largest per-request context whose full pool passes the long and pool "
+                 "checks at the card's normal state (other GPU users left as they are), "
+                 "searched in 4096-token steps up to --ctx-max or the model's trained "
+                 "context; kept when speed holds"},
         {"lever": "n_gpu_layers", "keys": ["n_gpu_layers", "fit"], "metric": "decode",
          "gate": "greedy",
          "note": "every layer on the GPU against the engine's own fit"},
@@ -289,6 +319,34 @@ def looping(text):
     return False
 
 
+# The context search's step (tokens of one request's context).
+CTX_STEP = 4096
+# Bytes per KV element of each cache type (llama.cpp block sizes).
+KV_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32,
+            "q5_0": 22 / 32, "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
+
+
+def switch_on(value):
+    return str(value).strip().lower() in ("true", "on", "1", "enabled")
+
+
+def doc_truth(doc):
+    """What a settings document asks the engine for, in the shape of
+    `ai_check.truth_from_args` (when the engine lists no arguments)."""
+    load = (doc or {}).get("load") or {}
+    args = (doc or {}).get("engine_args") or {}
+    ctx = load.get("ctx_size")
+    if not isinstance(ctx, int) or ctx <= 0:
+        return None
+    slots = int(load.get("parallel") or 1)
+    unified = switch_on(args.get("kv-unified"))
+    return {"source": "settings", "ctx_size": ctx, "slots": slots, "kv_unified": unified,
+            "per_request_ctx": ctx if unified else ctx // max(1, slots), "pool_ctx": ctx,
+            "cache_type_k": load.get("cache_type_k") or "f16",
+            "cache_type_v": load.get("cache_type_v") or "f16",
+            "projector": bool(load.get("mmproj")), "cpu_weights": "unknown"}
+
+
 def median(values):
     return statistics.median(values) if values else None
 
@@ -388,6 +446,10 @@ class Tuner:
         self.last_control = None
         self.current_lever, self.current_metric = "baseline", "decode"
         self.last_beat = 0.0
+        self.picture_runs = max(1, int(getattr(args, "picture_runs", None) or ai_check.PICTURE_RUNS))
+        self.picture_baseline = None
+        self.check_calibrated = False
+        self._checker = None
         poll = getattr(args, "poll_secs", None)
         # Test runs pass a short poll; every wait scales with it.
         self.scale = 1.0 if poll is None else max(0.001, float(poll) / 2.0)
@@ -545,6 +607,23 @@ class Tuner:
             quant = load.get("cache_type_k") == "q8_0" and load.get("cache_type_v") == "q8_0"
             value = "f16" if quant else "q8_0"
             return [{"cache_type_k": value, "cache_type_v": value}], None
+        if lever == "kv_unified":
+            truth = self.truth_now(listing_row)
+            args = self.best.get("engine_args") or {}
+            if switch_on(args.get("kv-unified")) or (truth or {}).get("kv_unified"):
+                return [], "the slots already share one pool (kv-unified on)"
+            slots = int(load.get("parallel") or (truth or {}).get("slots") or 1)
+            if slots <= 1:
+                return [], "one slot: there is no pool to share"
+            return [{"engine_args.kv-unified": True}], None
+        if lever == "n_cpu_moe":
+            truth = self.truth_now(listing_row) or {}
+            args = self.best.get("engine_args") or {}
+            if args.get("n-cpu-moe"):
+                return [{"engine_args.n-cpu-moe": None}], None
+            if truth.get("n_cpu_moe"):
+                return [{"engine_args.n-cpu-moe": 0}], None
+            return [], "no expert layers on the CPU (n-cpu-moe 0)"
         if lever == "n_gpu_layers":
             if load.get("n_gpu_layers") == "all":
                 return [{"n_gpu_layers": None, "fit": "on"}], None
@@ -555,6 +634,11 @@ class Tuner:
         if lever == "mmap":
             return [{"mmap": load.get("mmap") is False}], None
         return [], "advice only"
+
+    def truth_now(self, listing_row):
+        """What the engine runs the model with (its listing row), else what
+        the best settings ask for."""
+        return ai_check.truth_of(listing_row or {}) or doc_truth(self.best)
 
     @staticmethod
     def spec_type_now(load, listing_row):
@@ -667,13 +751,16 @@ class Tuner:
     def with_change(self, doc, change):
         new = json.loads(json.dumps(doc))
         load = new.setdefault("load", {})
+        args = new.setdefault("engine_args", {})
         for key, value in change.items():
+            layer, name = (args, key.partition(".")[2]) if key.startswith("engine_args.") else (load, key)
             if value is None:
-                load.pop(key, None)
+                layer.pop(name, None)
             else:
-                load[key] = value
-        if not load:
-            new.pop("load", None)
+                layer[name] = value
+        for name in ("load", "engine_args"):
+            if not new[name]:
+                new.pop(name)
         return new
 
     # ------------------------------------------------------------ requests
@@ -876,42 +963,170 @@ class Tuner:
                 return ("greedy output changed at temperature 0 (a change claimed lossless must "
                         "give the same answer; small numeric differences can cause this)")
             return None
-        if kind == "needle":
-            ctx = int((candidate_doc.get("load") or {}).get("ctx_size") or 8192)
-            return self.needles(ctx, 1)
-        if kind == "soak":
-            load = candidate_doc.get("load") or {}
-            slots = int(load.get("parallel") or 1)
-            ctx = int(load.get("ctx_size") or 4096)
-            return self.needles(max(512, ctx // slots), slots)
+        if kind in ("needle", "soak"):
+            return self.check_gate(kind, candidate_doc)
         return None
 
-    def needles(self, ctx_tokens, streams):
-        """Needles at about 50% and 100% of `ctx_tokens`, on `streams`
-        concurrent requests; every code must come back exactly."""
-        def one():
-            codes = ["".join(self.rng.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-                     for _ in range(2)]
-            words = int(ctx_tokens * 0.85 / 1.3)
-            filler = [FILLER[i % len(FILLER)] for i in range(words)]
-            filler.insert(len(filler) // 2, f"NEEDLE-ONE is {codes[0]}.")
-            filler.append(f"NEEDLE-TWO is {codes[1]}.")
-            prompt = ("Find NEEDLE-ONE and NEEDLE-TWO in the document and reply with both codes.\n\n"
-                      + " ".join(filler))
-            answer = self.chat(prompt, 48, temperature=0, fresh=False)
-            if "error" in answer:
-                return f"a long-context request failed ({answer['error']})"
-            missing = [code for code in codes if code not in answer.get("text", "")]
-            if missing:
-                return f"needle gate: {len(missing)} of 2 needles not found at {ctx_tokens} tokens"
-            return None
-        results = self.run_parallel([one] * streams)
-        problems = [r for r in results if r]
-        if problems:
-            if streams > 1:
-                return f"concurrent soak ({streams} x {ctx_tokens} tokens): {problems[0]}"
-            return problems[0]
+    # ------------------------------------------------------------ check gates
+
+    def checker(self):
+        """An `sb ai check` runner on this run's hold and lock: it measures
+        the context one request can really use, and stores every result in
+        the quality ledger under the trial's settings revision."""
+        if getattr(self, "_checker", None) is None:
+            args = SimpleNamespace(json=True, ctx=None, per_request=True, checks="",
+                                   runs=self.picture_runs, no_store=False, wake=False)
+            self._checker = ai_check.Checker(self.gw, args, self.fail_types,
+                                             out=self.out, err=self.err,
+                                             poll_secs=2.0 * self.scale)
+            self._checker.no_cache = None
+        self._checker.lock_id = self.lock_id
+        return self._checker
+
+    def check_ident(self):
+        return {"name": self.target, "target": self.target, "model": self.model, "lane": self.lane,
+                "revision": self.revision, "settings_hash": f"tune-{self.run_id}-{self.revision}",
+                "document": self.applied_doc or {}}
+
+    def check_truth(self, checker, ident, doc):
+        """The engine's truth after the apply; the settings' own when the
+        engine lists no arguments (8192 tokens when they name no context)."""
+        truth = checker.read_truth(ident) or doc_truth(doc)
+        if checker.no_cache is None:
+            checker.no_cache = isinstance((checker.row or {}).get("effective"), dict)
+        if truth is None:
+            truth = doc_truth({"load": {"ctx_size": 8192}})
+        return truth
+
+    def check_gate(self, kind, doc):
+        """None when the candidate passes the checks of its gate (needle:
+        long, and picture on a projector model; soak: long and pool), else
+        why not. A check that cannot judge (answers cut at max_tokens) does
+        not pass: a gate must prove the change."""
+        checker = self.checker()
+        ident = self.check_ident()
+        label = "needle gate" if kind == "needle" else "concurrent soak"
+        try:
+            truth = self.check_truth(checker, ident, doc)
+            if not self.check_calibrated:
+                checker.probe(ident)
+                self.check_calibrated = True
+            names = ["long"] + (["pool"] if kind == "soak" else [])
+            if (truth or {}).get("projector") and self.picture_baseline is not None:
+                names.append("picture")
+            for name in names:
+                if name == "long":
+                    verdict = checker.check_long(ident, truth)
+                elif name == "pool":
+                    verdict = checker.check_pool(ident, truth)
+                else:
+                    verdict = checker.check_picture(ident, truth, self.picture_baseline)
+                verdict["revision"] = ident["revision"]
+                checker.store(ident, verdict)
+                self.log(f"    check {ai_check.verdict_line(verdict)}")
+                if verdict.get("passed") is not True:
+                    why = verdict.get("why") or verdict.get("result")
+                    if verdict.get("passed") is None:
+                        why = f"could not judge ({why})"
+                    return f"{label} (check {name}): {why}"
+        except ai_check.CheckError as error:
+            return f"{label}: {error.message}"
         return None
+
+    def measure_picture_baseline(self):
+        """On a model with a projector, the picture score of the settings the
+        run starts from (the ledger's, when this revision has one with the
+        same number of runs; else measured now): a lever's picture check may
+        not fall below it."""
+        if not any(entry.get("gate") in ("needle", "soak") for entry in self.plan):
+            return None
+        checker = self.checker()
+        ident = self.check_ident()
+        truth = self.check_truth(checker, ident, self.best)
+        if not (truth or {}).get("projector"):
+            return None
+        stored = checker.baseline(ident, self.revision, self.picture_runs)
+        if stored:
+            return stored
+        first = checker.check_picture(ident, truth)
+        first["revision"] = self.revision
+        checker.store(ident, first)
+        self.log(f"  picture baseline: {ai_check.verdict_line(first)}")
+        if first.get("number_right") is None or not first.get("scored_runs"):
+            return None
+        return {"revision": self.revision, "runs": self.picture_runs, "number_right": first["number_right"]}
+
+    def search_ctx(self, entry):
+        """The largest per-request context, in CTX_STEP steps, whose full
+        pool passes the soak checks (long and pool) at the card's normal
+        state. Each step writes the context, applies it and checks it; the
+        best settings are put back at the end. Returns the change to judge
+        for speed, or None."""
+        truth = self.truth_now(self.listing_row) or {}
+        per = truth.get("per_request_ctx")
+        if not per:
+            self.notes.append(f"{entry['lever']}: skipped, the context one request can use is unknown")
+            return None
+        slots = int(truth.get("slots") or (self.best.get("load") or {}).get("parallel") or 1)
+        unified = bool(truth.get("kv_unified")) or slots <= 1
+        trained = ((self.listing_row.get("memory") or {}).get("max") or {}).get("n_ctx")
+        top = int(getattr(self.args, "ctx_max", None) or trained or per * 4)
+        lo, hi = int(per), top // CTX_STEP * CTX_STEP
+        if hi <= lo:
+            self.notes.append(f"{entry['lever']}: skipped, one request already gets {lo} "
+                              f"(the most is {top})")
+            return None
+        self.log(f"  ctx_search: per-request context {lo} now, searching up to {hi} "
+                 f"({slots} slot(s), {'shared pool' if unified else 'split pool'})")
+        while hi - lo > CTX_STEP and not self.stopping:
+            if not self.budget_fits(self.apply_cost() + self.gate_cost("soak")):
+                self.budget_cut = True
+                self.notes.append(f"{entry['lever']}: the budget ran out at {lo} (next {hi} failed)")
+                break
+            mid = max(lo + CTX_STEP, (lo + hi) // 2 // CTX_STEP * CTX_STEP)
+            if mid >= hi:
+                break
+            change = {"ctx_size": mid if unified else mid * slots}
+            doc = self.with_change(self.best, change)
+            started = self.clock()
+            try:
+                self.put_doc(doc, f"tune {self.run_id} search ctx {mid}")
+                problem = self.check_gate("soak", doc)
+            except TuneError as error:
+                problem = f"did not load: {error.message}"
+            self.gate_secs.setdefault("soak", []).append(self.clock() - started)
+            passed = problem is None
+            self.record({"role": "search", "lever": entry["lever"], "value": change, "metrics": None,
+                         "samples": self.samples, "verdict": "passed" if passed else "failed",
+                         "reason": problem or "long and pool checks passed",
+                         "per_request_ctx": mid})
+            self.log(f"  ctx_search {mid}: {'passed' if passed else 'failed: ' + problem}")
+            if passed:
+                lo = mid
+            else:
+                hi = mid
+            self.heartbeat()
+        self.restore_best("search done")
+        self.last_control = None
+        if lo <= int(per):
+            self.notes.append(f"{entry['lever']}: no context above {per} passed the pool check")
+            return None
+        self.log(f"  ctx_search: largest passing per-request context {lo}")
+        return {"ctx_size": lo if unified else lo * slots}
+
+    def accept_rule(self, entry, change):
+        """`hold` (kept when speed stays inside the noise) for a memory
+        lever, else `win` (kept only on a clear win)."""
+        if entry.get("accept") == "hold":
+            return "hold"
+        if entry.get("hold_when") == "smaller_kv":
+            load = self.best.get("load") or {}
+            before = sum(KV_BYTES.get(load.get(k) or "f16", 2.0) for k in ("cache_type_k", "cache_type_v"))
+            after = sum(KV_BYTES.get(change.get(k) or load.get(k) or "f16", 2.0)
+                        for k in ("cache_type_k", "cache_type_v"))
+            if after < before:
+                return "hold"
+        return "win"
 
     # ------------------------------------------------------------ the ledger
 
@@ -991,6 +1206,31 @@ class Tuner:
         if sd is None:
             sd, df = self.sd_for(metric), max(1, getattr(self, "noise_runs", 0) - 1)
         return max(NOISE_FLOOR, sd) * (1 + 1 / math.sqrt(2 * df))
+
+    def judge_hold(self, metric, controls, cands, last):
+        """Like `judge`, for a memory lever: kept when the metric loses no
+        more than the noise allows (1.7 SD, or two standard errors when
+        those are wider) and no other metric got worse, rejected as soon as
+        the loss is clearly larger."""
+        higher = HIGHER_IS_BETTER[metric]
+        sd = self.experiment_sd(metric, controls, cands)
+        base = statistics.fmean(run[metric] for run in controls)
+        now = statistics.fmean(run[metric] for run in cands)
+        gain = (now / base - 1) if higher else (base / now - 1 if now > 0 else 0.0)
+        n = len(cands)
+        error = sd * math.sqrt(1 / n + 1 / len(controls))
+        allowed = max(CONFIDENCE * error, WIN_SD * sd)
+        need = 2 if sd > REPEAT_ABOVE else 1
+        said = (f"{metric} {gain * 100:+.1f}% over controls after {n} run{'s' if n > 1 else ''} "
+                f"(noise ±{sd * 100:.1f}%; may lose at most {allowed * 100:.1f}%)")
+        if -gain > allowed + CONFIDENCE * error or (-gain > allowed and (last or n >= need)):
+            return False, gain, f"{said}: slower than the noise allows", allowed
+        if n < need and not last:
+            return None, gain, said, allowed
+        worse = self.side_loss(metric, controls, cands)
+        if worse:
+            return False, gain, f"{said}, but {worse}", allowed
+        return True, gain, f"{said}: speed holds", allowed
 
     def judge(self, metric, controls, cands, last):
         """(decision, gain, reason, bar) for a change after its latest
@@ -1099,6 +1339,8 @@ class Tuner:
         cannot pay for ends the experiment as rejected (nothing changes)."""
         lever, metric = entry["lever"], entry["metric"]
         self.current_lever, self.current_metric = lever, metric
+        rule = self.accept_rule(entry, change)
+        judge = self.judge_hold if rule == "hold" else self.judge
         controls, cands = [self.control()], []
         first = None
         while True:
@@ -1121,8 +1363,8 @@ class Tuner:
                          "samples": self.samples, "round": len(cands) + 1})
             cands.append(cand)
             controls.append(self.control())
-            accepted, gain, reason, bar = self.judge(metric, controls, cands,
-                                                     last=len(cands) >= MAX_ROUNDS)
+            accepted, gain, reason, bar = judge(metric, controls, cands,
+                                                last=len(cands) >= MAX_ROUNDS)
             if first is None:
                 first = (gain, bar)
             if accepted is None:
@@ -1135,7 +1377,7 @@ class Tuner:
                     continue
                 self.budget_cut = True
                 accepted, reason = False, f"{reason}: the budget ran out before it was clear"
-            if not accepted and len(cands) > 1 and first[0] > first[1]:
+            if not accepted and rule == "win" and len(cands) > 1 and first[0] > first[1]:
                 reason = f"a {first[0] * 100:+.0f}% first run did not hold: {reason}"
             break
         if accepted:
@@ -1407,6 +1649,7 @@ class Tuner:
         # The greedy gate asks the same: what it costs.
         self.gate_secs.setdefault("greedy", []).append(self.clock() - started)
         self.greedy_reference = greedy.get("text")
+        self.picture_baseline = self.measure_picture_baseline()
         self.ceiling_row = self.ceiling()
         flat = 0
         for entry in self.plan:
@@ -1421,7 +1664,16 @@ class Tuner:
                 self.advice(entry)
                 continue
             load = self.best.get("load") or {}
-            changes, why = self.candidates(entry, load, self.listing_row)
+            if entry.get("kind") == "search":
+                found = self.search_ctx(entry)
+                if self.budget_cut:
+                    stop = "the budget ran out"
+                    break
+                changes, why = ([found], None) if found else ([], None)
+                if not found:
+                    continue
+            else:
+                changes, why = self.candidates(entry, load, self.listing_row)
             if why:
                 self.notes.append(f"{entry['lever']}: skipped, {why}")
                 continue
@@ -1747,6 +1999,8 @@ def add_arguments(parser):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--history", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--ctx-max", type=int)
+    parser.add_argument("--picture-runs", type=int)
 
 
 def run(gw, args, fail_types, poll_secs=None):

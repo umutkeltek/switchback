@@ -69,6 +69,7 @@ class Engine:
         self.load_fails = set()       # (key, json value) that fail to load
         self.load_error = None        # the message of a failed load (default: generic)
         self.soak_breaks = False      # concurrent long requests fail at parallel > 1
+        self.oom_above = None         # a long request at a context over this runs out of memory
         self.slots = threading.Semaphore(1)
         self.slot_count = 1
         self.requests = []            # (kind, completed)
@@ -134,6 +135,7 @@ class Fake:
         self.locks = {}
         self.holds = {}
         self.ledger = []
+        self.quality = []
         self.build = "b100"
         self.model_file = "file-a"
         # Shaped like the gateway over a real llama.cpp router (b12359): a
@@ -195,7 +197,11 @@ class Fake:
                              "deferred": ["m"], "message": "held back until idle"}
             return 200, view
         if apply == "now":
-            problem = self.engine.apply(body.get("load") or {})
+            # Engine arguments count as settings for the fake's effects
+            # (`engine_args.kv-unified` and the like).
+            load = dict(body.get("load") or {})
+            load.update({f"engine_args.{k}": v for k, v in (body.get("engine_args") or {}).items()})
+            problem = self.engine.apply(load)
             if note and note.endswith(getattr(self, "slow_note", "\x00")):
                 self.slow_started = True
                 time.sleep(2.0)
@@ -236,7 +242,9 @@ class Fake:
                     + prompt_tokens / (engine.base_prefill * engine.factor("prefill")) * 1000) * engine.jitter(0.01)
             completion = 64 if body.get("max_tokens", 64) >= 64 else body["max_tokens"]
             decode_s = completion / (engine.base_decode * engine.factor("decode")) * engine.jitter()
-            if long_request and engine.soak_breaks and engine.slot_count > 1:
+            oom = (engine.oom_above is not None and long_request
+                   and int(engine.loaded.get("ctx_size") or 0) > engine.oom_above)
+            if long_request and (oom or (engine.soak_breaks and engine.slot_count > 1)):
                 handler.send_response(500)
                 handler.send_header("Content-Type", "application/json")
                 payload = json.dumps({"error": {"message": "out of memory", "type": "engine_error"}}).encode()
@@ -244,15 +252,31 @@ class Fake:
                 handler.end_headers()
                 handler.wfile.write(payload)
                 return
-            if "NEEDLE-ONE" in prompt:
-                codes = re.findall(r"NEEDLE-(?:ONE|TWO) is ([A-Z0-9]{8})\.", prompt)
+            if "vault access code" in prompt:
+                # `sb ai check`: three codes, one per archive.
+                codes = re.findall(r"archive is (\d{4}-[A-Z]+[0-9A-F]{2})\.", prompt)
                 if engine.broken(engine.needle_breaks):
-                    codes = codes[:1]
-                text = "The codes are " + " and ".join(codes) + "."
+                    codes = codes[:2]
+                text = "\n".join(f"Archive {i + 1}: {code}" for i, code in enumerate(codes))
             elif prompt == "List the first ten prime numbers, separated by commas, and nothing else.":
                 text = PRIMES if not engine.broken(engine.greedy_breaks) else "2, 3, 5, 7, 9, 11"
             else:
                 text = "The notes list words about rivers, stones and markets in a loose order."
+            if not body.get("stream"):
+                # A plain answer (`sb ai check` asks without streaming).
+                time.sleep(ttft / 1000 + decode_s)
+                payload = json.dumps({"id": "x", "object": "chat.completion", "choices": [{
+                    "index": 0, "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop"}], "usage": {
+                    "prompt_tokens": prompt_tokens, "completion_tokens": completion,
+                    "total_tokens": prompt_tokens + completion}}).encode()
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/json")
+                handler.send_header("Content-Length", str(len(payload)))
+                handler.end_headers()
+                handler.wfile.write(payload)
+                completed = True
+                return
             handler.send_response(200)
             handler.send_header("Content-Type", "text/event-stream")
             handler.end_headers()
@@ -330,6 +354,12 @@ class Fake:
             return 201, {"id": row["id"], "durable": True}
         if method == "GET" and path.startswith("/v1/optimize/experiments"):
             return 200, {"object": "list", "data": self.ledger[::-1]}
+        if method == "POST" and path == "/v1/optimize/quality":
+            row = dict(body, at_ms=int(time.time() * 1000), id=len(self.quality) + 1)
+            self.quality.append(row)
+            return 201, {"id": row["id"], "durable": True}
+        if method == "GET" and path.startswith("/v1/optimize/quality"):
+            return 200, {"object": "list", "data": self.quality[::-1]}
         if method == "GET" and path.startswith("/v1/optimize/report"):
             return 200, {"object": "optimize.report", "targets": self.report_targets,
                          "findings": self.report_findings, "hosts": []}
@@ -549,6 +579,57 @@ class TuneTests(Base):
         self.assertEqual(verdict["verdict"], "rejected")
         self.assertIn("concurrent soak", verdict["reason"])
         self.assertEqual(self.fake.doc["load"], {"ctx_size": 4096})
+
+    def test_kv_unified_is_kept_when_speed_holds_and_the_checks_pass(self):
+        self.fake.engine.spread = 0.01
+        self.fake.doc = {"load": {"ctx_size": 8192, "parallel": 2}}
+        run = self.tune("--levers", "kv_unified")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "accepted", verdict)
+        self.assertIn("speed holds", verdict["reason"])
+        self.assertEqual(self.fake.doc["engine_args"], {"kv-unified": True})
+        suites = [r["suite"] for r in self.fake.quality]
+        self.assertIn("check-long", suites)
+        self.assertIn("check-pool", suites)
+        self.assertTrue(all(r["passed"] == 1 for r in self.fake.quality))
+
+    def test_kv_unified_that_slows_decode_beyond_the_noise_is_rejected(self):
+        self.fake.engine.spread = 0.01
+        self.effect("engine_args.kv-unified", True, decode=0.7)
+        self.fake.doc = {"load": {"ctx_size": 8192, "parallel": 2}}
+        run = self.tune("--levers", "kv_unified")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "rejected", verdict)
+        self.assertIn("slower than the noise allows", verdict["reason"])
+        self.assertNotIn("engine_args", self.fake.doc)
+
+    def test_a_smaller_kv_cache_is_kept_when_speed_holds(self):
+        self.fake.engine.spread = 0.01
+        self.fake.doc = {"load": {"ctx_size": 8192}}
+        run = self.tune("--levers", "cache_type")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "accepted", verdict)
+        self.assertEqual(self.fake.doc["load"]["cache_type_k"], "q8_0")
+
+    def test_ctx_search_finds_the_largest_context_that_passes_the_pool_check(self):
+        # Like the night model: a bigger pool loads, then the first long
+        # request runs out of memory above 20480 tokens.
+        self.fake.engine.spread = 0.01
+        self.fake.engine.oom_above = 20480
+        self.fake.doc = {"load": {"ctx_size": 8192, "parallel": 1}}
+        run = self.tune("--levers", "ctx_search", "--ctx-max", "32768")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        searched = {r["per_request_ctx"]: r["verdict"] for r in self.fake.ledger if r.get("role") == "search"}
+        self.assertEqual(searched.get(20480), "passed", searched)
+        self.assertTrue(any(v == "failed" and c > 20480 for c, v in searched.items()), searched)
+        verdict = self.verdicts()[-1]
+        self.assertEqual(verdict["verdict"], "accepted", verdict)
+        self.assertEqual(self.fake.doc["load"]["ctx_size"], 20480)
+        failed = [r for r in self.fake.quality if r["passed"] == 0]
+        self.assertTrue(failed and all(r["stop_reason"] == "request_failed" for r in failed))
 
     def test_draft_length_is_swept_per_concurrency(self):
         self.fake.doc = {"load": {"spec_type": "draft-mtp", "draft_max": 1}}
