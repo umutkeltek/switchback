@@ -100,6 +100,19 @@ pub(crate) fn settings_cache_bypass(policy: &CachePolicy) -> CacheLookupReceipt 
     }
 }
 
+/// A request that asked for no cache (`switchback.no_cache: true`, sent
+/// by `sb ai check`): never looked up, never remembered.
+pub(crate) fn no_cache_bypass(policy: &CachePolicy) -> CacheLookupReceipt {
+    CacheLookupReceipt {
+        layer: policy.layer,
+        status: CacheStatus::Bypass,
+        key: None,
+        reason: Some("request_no_cache".to_string()),
+        policy_version: policy.version.clone(),
+        ttl_seconds: policy.ttl_seconds,
+    }
+}
+
 fn body_redacted_cache_bypass(policy: &CachePolicy) -> CacheLookupReceipt {
     CacheLookupReceipt {
         layer: policy.layer,

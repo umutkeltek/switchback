@@ -756,11 +756,15 @@ pub struct RequestSettings {
     /// Load-time settings for this request (variants).
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub load: Map<String, Json>,
+    /// No gateway cache may answer or record this request (`sb ai check`
+    /// sends it: a check that a cache answered proves nothing).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_cache: bool,
 }
 
 impl RequestSettings {
     pub fn is_empty(&self) -> bool {
-        self.profile.is_none() && self.settings.is_empty() && self.load.is_empty()
+        self.profile.is_none() && self.settings.is_empty() && self.load.is_empty() && !self.no_cache
     }
 }
 
@@ -808,9 +812,15 @@ pub fn take_request_settings(
                     Json::Null => {}
                     _ => return err("`switchback.load` must be an object"),
                 },
+                "no_cache" => match value {
+                    Json::Bool(no_cache) => out.no_cache |= no_cache,
+                    Json::Null => {}
+                    _ => return err("`switchback.no_cache` must be true or false"),
+                },
                 other => {
                     return err(format!(
-                    "unknown key `switchback.{other}`; `switchback` takes profile, settings, load"
+                    "unknown key `switchback.{other}`; `switchback` takes profile, settings, load, \
+                     no_cache"
                 ))
                 }
             }
@@ -1598,6 +1608,26 @@ mod tests {
             !r.passthrough.contains_key("switchback"),
             "stripped even on error"
         );
+    }
+
+    #[test]
+    fn no_cache_alone_is_a_request_setting() {
+        let mut r = req();
+        r.passthrough
+            .insert("switchback".into(), json!({"no_cache": true}));
+        let taken = take_request_settings(&mut r).unwrap().unwrap();
+        assert!(taken.no_cache);
+        assert!(taken.settings.is_empty() && taken.load.is_empty());
+
+        let mut r = req();
+        r.passthrough
+            .insert("switchback".into(), json!({"no_cache": false}));
+        assert_eq!(take_request_settings(&mut r).unwrap(), None);
+
+        let mut r = req();
+        r.passthrough
+            .insert("switchback".into(), json!({"no_cache": "yes"}));
+        assert!(take_request_settings(&mut r).is_err());
     }
 
     #[test]

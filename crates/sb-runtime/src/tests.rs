@@ -801,6 +801,33 @@ async fn execution_trace_carries_receipt_and_cache_events() {
 }
 
 #[tokio::test]
+async fn a_no_cache_request_is_never_looked_up_or_remembered() {
+    let engine = engine_from_config(Config::from_yaml(BASIC_CONFIG).unwrap());
+    let ask = |no_cache: bool| {
+        let mut req = AiRequest::new("mock/echo", vec![Message::user("same words")]);
+        if no_cache {
+            req.passthrough
+                .insert("switchback".into(), serde_json::json!({"no_cache": true}));
+        }
+        req
+    };
+    for no_cache in [true, true, false] {
+        let (_revision, outcome) = engine.execute(ask(no_cache), Instant::now()).await;
+        assert!(matches!(outcome, ExecOutcome::Collected { .. }));
+        let trace = engine.traces().recent(1).pop().expect("trace");
+        let receipt = trace.decision.receipt.expect("execution receipt");
+        if no_cache {
+            assert_eq!(receipt.cache.status, sb_core::CacheStatus::Bypass);
+            assert_eq!(receipt.cache.reason.as_deref(), Some("request_no_cache"));
+        } else {
+            // The no-cache requests left nothing behind: the same words
+            // without the flag are a miss, not a hit.
+            assert_eq!(receipt.cache.status, sb_core::CacheStatus::Miss);
+        }
+    }
+}
+
+#[tokio::test]
 async fn execution_cache_can_be_disabled_by_config() {
     let cfg = Config::from_yaml(&BASIC_CONFIG.replace(
         "server:\n  bind: \"127.0.0.1:0\"",

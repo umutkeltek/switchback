@@ -276,7 +276,9 @@ impl Engine {
         };
         let cache_policy = snap.config.server.execution_cache.policy();
         let body_redacted = scope.is_some();
-        let cache_receipt = if request_settings.is_some() {
+        let cache_receipt = if request_settings.as_ref().is_some_and(|s| s.no_cache) {
+            crate::execution_meta::no_cache_bypass(&cache_policy)
+        } else if request_settings.is_some() {
             crate::execution_meta::settings_cache_bypass(&cache_policy)
         } else {
             lookup_exact_cache(self, &req, &cache_policy, body_redacted)
