@@ -1042,7 +1042,12 @@ class Tuner:
             return None
         checker = self.checker()
         ident = self.check_ident()
-        truth = self.check_truth(checker, ident, self.best)
+        try:
+            truth = self.check_truth(checker, ident, self.best)
+        except ai_check.CheckError as error:
+            self.unverified.append(f"picture: the engine listing was not read ({error.message}), "
+                                   "so no picture baseline")
+            return None
         if not (truth or {}).get("projector"):
             return None
         stored = checker.baseline(ident, self.revision, self.picture_runs)

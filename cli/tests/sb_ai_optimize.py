@@ -1256,6 +1256,7 @@ def sim_tuner(seed, sd=0.07, effect=1.0, levers=("flash_attn",), concurrency="1"
     tuner.history = lambda: []
     tuner.ceiling = lambda: {}
     tuner.run_parallel = lambda jobs: [{"text": PRIMES}]
+    tuner.measure_picture_baseline = lambda: None
     tuner.state = {}
 
     def run(metrics):
