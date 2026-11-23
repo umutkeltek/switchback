@@ -43,6 +43,7 @@ pub(crate) enum ModelPath {
     Revert(String),
     Load(String),
     Unload(String),
+    EngineProps(String),
 }
 
 pub(crate) fn parse_model_path(tail: &str) -> Option<ModelPath> {
@@ -60,6 +61,8 @@ pub(crate) fn parse_model_path(tail: &str) -> Option<ModelPath> {
         Some(ModelPath::Settings(name))
     } else if let Some(name) = take("/load") {
         Some(ModelPath::Load(name))
+    } else if let Some(name) = take("/engine-props") {
+        Some(ModelPath::EngineProps(name))
     } else {
         take("/unload").map(ModelPath::Unload)
     }
@@ -69,7 +72,8 @@ fn not_found() -> Response {
     error(
         StatusCode::NOT_FOUND,
         "not_found",
-        "no such model endpoint (settings, settings/history, settings/revert, load, unload)",
+        "no such model endpoint (settings, settings/history, settings/revert, load, unload, \
+         engine-props)",
     )
 }
 
@@ -369,6 +373,12 @@ pub(crate) async fn get(
                 return crate::tenancy::forbidden();
             }
             history(&state, &principal, &name)
+        }
+        Some(ModelPath::EngineProps(name)) => {
+            if !principal.is_operator_or_admin() {
+                return crate::tenancy::forbidden();
+            }
+            crate::engine_control::engine_props_endpoint(&state, &principal, &name).await
         }
         _ => not_found(),
     }

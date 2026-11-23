@@ -11,6 +11,7 @@ mod controlplane;
 mod cp;
 mod doctor_cli;
 mod engine_control;
+mod engine_truth;
 mod eval_cli;
 mod fal_probe;
 mod forward_proxy;

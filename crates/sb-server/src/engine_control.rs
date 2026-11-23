@@ -3651,6 +3651,7 @@ pub(crate) fn add_load_view(
         "engine_args": doc.map(|doc| json!(doc.engine_args)).unwrap_or_else(|| json!({})),
         "pending": pending,
         "memory": row.as_ref().map(|row| memory_summary(&row["memory"])).unwrap_or(Value::Null),
+        "effective": row.as_ref().map(crate::engine_truth::effective).unwrap_or(Value::Null),
         "last_apply": controls.lock().last_apply.get(&lane.name).cloned(),
     });
 }
@@ -4038,6 +4039,93 @@ pub(crate) async fn unload_endpoint(app: &AppState, principal: &Principal, name:
     }
 }
 
+/// `GET /v1/models/{model}/engine-props` (operator/admin): the model's own
+/// numbers from its process's `/props` (one slot's context, the slot count,
+/// whether it reads pictures) beside the truth view of its arguments. Only
+/// for a model the engine lists as loaded, only on an awake machine, and
+/// never from the background: a call to the model's process counts as
+/// activity. 409 when the machine sleeps or the model is not loaded.
+pub(crate) async fn engine_props_endpoint(
+    app: &AppState,
+    principal: &Principal,
+    name: &str,
+) -> Response {
+    let state = &EngineCtx::from(app);
+    let named = match resolve_one(app, principal, name) {
+        Ok(named) => named,
+        Err(response) => return response,
+    };
+    let snap = state.snapshot();
+    let Some((provider, model)) = split_target(&named.target) else {
+        return no_engine(&named.target);
+    };
+    let Some(lane) = engine_lane(&snap.config, provider) else {
+        return no_engine(&named.target);
+    };
+    let controls = &state.engines;
+    if let Awake::Asleep(why) = controls.awake(state, &lane).await {
+        return error(
+            StatusCode::CONFLICT,
+            "lane_asleep",
+            format!("lane `{}` is {why}; nothing was called", lane.name),
+        );
+    }
+    let models = match controls.models_within(state, &lane, LISTING_TIMEOUT).await {
+        Ok(models) => models,
+        Err(e) => return error(StatusCode::BAD_GATEWAY, "engine_error", e),
+    };
+    let Some(row) = models.iter().find(|row| row["id"] == model) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("the engine of lane `{}` does not list `{model}`", lane.name),
+        );
+    };
+    if row["status"]["value"] != "loaded" {
+        return error(
+            StatusCode::CONFLICT,
+            "model_not_loaded",
+            format!(
+                "`{}` is {}; its process has no props to read (load it first)",
+                named.target,
+                row["status"]["value"].as_str().unwrap_or("not loaded")
+            ),
+        );
+    }
+    let path = format!("/props?model={}", urlencoding_component(model));
+    let props = match controls
+        .call(
+            state,
+            &lane,
+            reqwest::Method::GET,
+            &path,
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+    {
+        Ok(props) => props,
+        Err(e) => return error(StatusCode::BAD_GATEWAY, "engine_error", e),
+    };
+    let mut out = crate::engine_truth::from_props(&props);
+    out["target"] = json!(named.target);
+    out["effective"] = crate::engine_truth::effective(row);
+    Json(out).into_response()
+}
+
+/// A model id as one query value (ids are names: letters, digits and a
+/// few marks; anything else is percent-encoded).
+fn urlencoding_component(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
 /// One lane's part of `GET /v1/engines`.
 async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
     let registry = state.engine.model_settings();
@@ -4080,6 +4168,7 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
                 "status": status,
                 "failed": row["status"]["failed"],
                 "args": row["status"]["args"],
+                "effective": crate::engine_truth::effective(row),
                 "memory": memory_summary(&row["memory"]),
                 "settings_revision": registry.revision(&target),
                 "pending": controls.load_pending(&target, status),
