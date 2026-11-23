@@ -27,11 +27,13 @@ import urllib.request
 import uuid
 
 try:
+    import ai_check
     import ai_eval
     import ai_fit
     import ai_tune
 except ImportError:  # the module sits next to this file
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ai_check
     import ai_eval
     import ai_fit
     import ai_tune
@@ -87,6 +89,10 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai eval --rescore RUN_ID [--no-store] [--json]
                                   score a run's kept answers again (new labels), no model call
                                  where a model fits and which file to take
+  sb ai check MODEL [--checks long,pool,picture] [--runs N] [--ctx N] [--per-request]
+                   [--baseline REV] [--wake] [--no-store] [--json]
+                                 does the model's memory and context setting hold up: a long
+                                 request at its set context, a full pool, picture reading
   sb ai settings MODEL [--profile NAME] [--history] [--json]
                                  a model's settings: each key, its value and where it comes from
   sb ai set MODEL key=value ... [--profile NAME] [--lock]
@@ -95,11 +101,15 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  remove settings (and their locks)
   sb ai revert MODEL REVISION    put back the settings of an earlier revision
                                  (0: no saved settings and no locks, the engine's own values)
-  sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake]
-                                 change load settings (ctx_size=65536 cache_type_k=q8_0)
+  sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake] [--check]
+                                 change load settings (ctx_size=65536 cache_type_k=q8_0);
+                                 --check runs the checks at once and puts the old settings
+                                 back when one fails
   sb ai chat MODEL "prompt" [--profile NAME] [--set key=value ...] [--load key=value ...]
              [--json]            one quick request to try settings: answer, tokens, speed, route
-  sb ai load MODEL [--wake]      load a model now (preload); never wakes without --wake
+  sb ai load MODEL [--wake] [--no-check]
+                                 load a model now (preload); never wakes without --wake;
+                                 runs the checks a memory or context change left pending
   sb ai unload MODEL             unload a model; refused while it serves a request
   sb ai engines [--json]         what each engine has loaded, with memory and pending settings
 
@@ -234,6 +244,33 @@ shared cases and a lead larger than 2 points and two standard errors of the
 paired difference. eval holds the machine and takes the lane's tuning lock like
 tune: never on a sleeping machine without --wake (exit 3), never on a lane with
 experiments: false, never inside a quiet window.
+
+check sends every request through the gateway with fresh random text and
+asks the gateway not to answer from a cache. long sends one request at about
+90% of the context the model is set to (its --ctx-size; --per-request: what
+one request can really use; --ctx N: N), with three fresh codes at 10%, 50%
+and 90% depth, and passes only on HTTP 200 with all three codes. A set
+context that llama.cpp splits over its slots (kv-unified off) fails here:
+one request gets only its slot's share. pool sends one long request and
+fillers at once, together filling the model's context pool (prompts and
+answer room) without going over it, and fails when a request fails or the
+model's process crashed, restarted (a new port) or was unloaded during the
+run; the gateway cannot read GPU memory, so peak use is not shown. picture
+(a model with a projector only) draws a fresh three-digit number and a shape
+--runs times and counts the numbers read right; --baseline REV compares with
+that revision's result with the same runs (below it: fail). An answer cut at
+max_tokens or empty is reported on its own, never as wrong. Results go to the
+quality ledger (suites check-long, check-pool, check-picture) with the
+settings revision, engine build and model file; settings shows the newest
+per revision. check holds the machine and takes the lane's tuning lock, like
+eval. A load change of ctx_size, parallel, cache_type_k/v, batch_size,
+ubatch_size, n_gpu_layers, fit, fit_ctx, mmproj, or of the engine arguments
+kv-unified, n-cpu-moe, cpu-moe, override-tensor (and the like) is guarded:
+`set --check` runs the checks at once (a picture baseline of the old
+revision first, when there is none) and writes the old settings back, with
+the reason in the history note, when one fails (a picture result below the
+old revision's counts as failed); without --check the checks wait for the
+next `sb ai load MODEL` (--no-check skips them), which reverts the same way.
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
@@ -1921,7 +1958,20 @@ def cmd_doctor(gw, args):
         print("* decode: all requests, median (any concurrency, not a single-stream c1 figure)")
     for host in report.get("hosts") or []:
         print(f"host {host.get('host')}: {host.get('bandwidth_gbs')} GB/s ({host.get('source')})")
-    findings = report.get("findings") or []
+    findings = list(report.get("findings") or [])
+    if not any(f.get("kind") == "context_split" for f in findings):
+        # A gateway from before the truth view: the same finding from the
+        # engine listing's arguments.
+        wanted = {t.get("target") for t in targets}
+        for (lane, model), row in engine_rows(gw).items():
+            target = f"{lane}/{model}"
+            if isinstance(row.get("effective"), dict) or (args.model and target not in wanted):
+                continue
+            split = ai_check.split_finding(ai_check.truth_of(row))
+            if split and (target in wanted or not args.model):
+                findings.append({"kind": "context_split", "target": target, "evidence": split,
+                                 "action": "set engine_args.kv-unified=true so the slots share the "
+                                           "context, or lower parallel; then `sb ai check " + target + "`"})
     if findings:
         print("findings")
         for f in findings:
@@ -2019,13 +2069,21 @@ def print_settings(view):
             print(f"  profile {name}: {keys or '(empty)'}")
         load = target.get("load")
         if isinstance(load, dict):
-            print_load(load)
+            print_load(load, target.get("_truth"))
+        for line in target.get("_checks") or []:
+            print(line)
 
 
-def print_load(load):
+def print_load(load, truth=None):
     engine = load.get("engine") or {}
     status = engine.get("status") or "unknown"
     print(f"  engine {engine.get('lane', '?')}: model {status}")
+    truth = load.get("effective") if isinstance(load.get("effective"), dict) else truth
+    if truth:
+        print(f"  runs with: {ai_check.truth_words(truth)}")
+        split = ai_check.split_finding(truth)
+        if split:
+            print(f"  note: {split}")
     for key, row in sorted((load.get("settings") or {}).items()):
         note = "  pending until reload" if row.get("pending") else ""
         print(f"  load {key} = {value_words(row.get('value'))}{note}")
@@ -2063,8 +2121,57 @@ def cmd_settings(gw, args):
     if args.json:
         print(json.dumps(view, indent=2))
     else:
+        add_truth_and_checks(gw, view)
         print_settings(view)
     return OK
+
+
+def engine_rows(gw):
+    """(lane, model) -> engine listing row; never wakes a machine."""
+    try:
+        answer = gw.get("/v1/engines")
+    except (GatewayError, Fail):
+        return {}
+    return {(lane.get("lane"), row.get("id")): row
+            for lane in answer.get("data") or [] for row in lane.get("models") or []}
+
+
+def add_truth_and_checks(gw, view):
+    """For the text view of `sb ai settings`: what the engine runs each
+    target with (from the engine listing when the gateway's view does not
+    name it), and its last checks per settings revision."""
+    rows = None
+    for target in view.get("targets") or []:
+        load = target.get("load")
+        if not isinstance(load, dict):
+            continue
+        if not isinstance(load.get("effective"), dict):
+            if rows is None:
+                rows = engine_rows(gw)
+            lane = (load.get("engine") or {}).get("lane")
+            model = str(target.get("target", "")).partition("/")[2]
+            row = rows.get((lane, model))
+            if row:
+                target["_truth"] = ai_check.truth_of(row)
+        target["_checks"] = check_lines(gw, target)
+
+
+def check_lines(gw, target):
+    name = target.get("target", "")
+    checker = ai_check.Checker(gw, None, (Fail, GatewayError))
+    newest = ai_check.last_checks(checker.ledger_rows(name))
+    lines = []
+    revisions = sorted({rev for rev, _ in newest if rev is not None}, reverse=True)[:3]
+    for rev in revisions:
+        parts = [f"{check} {ai_check.check_words(newest[(rev, check)])}"
+                 for check in ai_check.CHECKS if (rev, check) in newest]
+        current = " (current)" if rev == target.get("revision") else ""
+        lines.append(f"  checks, revision {rev}{current}: " + "; ".join(parts))
+    waiting = ai_check.pending(gw, (Fail, GatewayError), name)
+    if waiting:
+        lines.append(f"  checks pending for revision {waiting[0]} ({', '.join(waiting[1])} changed): "
+                     f"`sb ai check {name}`")
+    return lines
 
 
 def write_settings(gw, model, change, extra=None, target=None):
@@ -2112,7 +2219,7 @@ def clean_empty(doc):
         doc.pop("locked")
 
 
-def cmd_set(gw, args):
+def cmd_set(gw, args, poll_secs=None):
     pairs = [parse_assignment(text) for text in args.pairs]
     load = getattr(args, "load", False)
     for key, value in pairs:
@@ -2151,7 +2258,26 @@ def cmd_set(gw, args):
         extra["apply"] = "now" if args.apply == "now" else "next_load"
         if args.wake:
             extra["wake"] = True
-    answer = write_settings(gw, args.model, change, extra)
+    guarded = []
+    target = None
+    if load:
+        # A memory or context change is guarded by `sb ai check`: at once
+        # with --check, else on the model's next `sb ai load`.
+        target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
+        before = json.loads(json.dumps(target.get("document") or {}))
+        after = json.loads(json.dumps(before))
+        change(after)
+        guarded = ai_check.guarded_changes(before, after)
+    if getattr(args, "check", False):
+        if not load or not guarded:
+            raise Fail(USAGE, "--check guards a change to a memory or context load setting "
+                              f"({', '.join(ai_check.GUARDED_LOAD)}, engine_args."
+                              f"{', engine_args.'.join(ai_check.GUARDED_ARGS[:6])}, ...)")
+        return ai_check.guard(gw, args, (Fail, GatewayError), target,
+                              lambda more: write_settings(gw, args.model, change, dict(extra, **more),
+                                                          target=target),
+                              poll_secs=poll_secs)
+    answer = write_settings(gw, args.model, change, extra, target=target)
     if args.json:
         print(json.dumps(answer, indent=2))
         return OK
@@ -2159,6 +2285,10 @@ def cmd_set(gw, args):
     apply = answer.get("apply")
     if isinstance(apply, dict) and apply.get("message"):
         print(apply["message"])
+    if guarded:
+        print(f"checks pending for revision {answer.get('revision')} ({', '.join(guarded)} changed): "
+              f"they run on the next `sb ai load {answer.get('target')}`, or now with "
+              f"`sb ai check {answer.get('target')}`; `--check` runs them with the change")
     return OK
 
 
@@ -2217,7 +2347,7 @@ def cmd_revert(gw, args):
     return OK
 
 
-def cmd_load(gw, args):
+def cmd_load(gw, args, poll_secs=None):
     try:
         answer = gw.call("POST", model_path(args.model, "load"), body={"wake": bool(args.wake)},
                          timeout=args.timeout)
@@ -2227,16 +2357,23 @@ def cmd_load(gw, args):
         raise gateway_fail(error, f"loading {args.model}") from None
     if args.json:
         print(json.dumps(answer, indent=2))
+    else:
+        line = f"{answer.get('target')}: {answer.get('status')}"
+        memory = answer.get("memory") or {}
+        for name in ("effective", "min"):
+            part = memory.get(name) if isinstance(memory, dict) else None
+            if isinstance(part, dict) and part.get("bytes"):
+                line += f" ({part['bytes'] / 2**30:.1f} GiB on GPU at ctx {part.get('n_ctx', '?')})"
+                break
+        print(line)
+    if getattr(args, "no_check", False) or not answer.get("target"):
         return OK
-    line = f"{answer.get('target')}: {answer.get('status')}"
-    memory = answer.get("memory") or {}
-    for name in ("effective", "min"):
-        part = memory.get(name) if isinstance(memory, dict) else None
-        if isinstance(part, dict) and part.get("bytes"):
-            line += f" ({part['bytes'] / 2**30:.1f} GiB on GPU at ctx {part.get('n_ctx', '?')})"
-            break
-    print(line)
-    return OK
+    waiting = ai_check.pending(gw, (Fail, GatewayError), answer["target"])
+    if waiting is None:
+        return OK
+    revision, keys = waiting
+    return ai_check.after_load(gw, args, (Fail, GatewayError), answer["target"], revision, keys,
+                               poll_secs=poll_secs)
 
 
 def unload_wait(gw, model):
@@ -2294,6 +2431,11 @@ def cmd_engines(gw, args):
                 notes.append(f"{row['in_flight']} in flight")
             if row.get("failed"):
                 notes.append("last load failed")
+            truth = ai_check.truth_of(row)
+            if truth and truth.get("ctx_size"):
+                notes.append(ai_check.truth_words(truth))
+                if ai_check.split_finding(truth):
+                    notes.append("set context split over slots")
             extra = f"  ({'; '.join(notes)})" if notes else ""
             print(f"  {row.get('id')}  {row.get('status')}{extra}")
         for variant in lane.get("variants") or []:
@@ -2455,6 +2597,7 @@ def parser():
     doctor.add_argument("--json", action="store_true")
     ai_tune.add_arguments(sub.add_parser("tune", add_help=False, allow_abbrev=False))
     ai_eval.add_arguments(sub.add_parser("eval", add_help=False, allow_abbrev=False))
+    ai_check.add_arguments(sub.add_parser("check", add_help=False, allow_abbrev=False))
     settings = sub.add_parser("settings", add_help=False, allow_abbrev=False)
     settings.add_argument("model")
     settings.add_argument("--profile")
@@ -2469,6 +2612,9 @@ def parser():
     set_cmd.add_argument("--apply", choices=("next-load", "now"), default="next-load")
     set_cmd.add_argument("--wake", action="store_true")
     set_cmd.add_argument("--json", action="store_true")
+    set_cmd.add_argument("--check", action="store_true")
+    set_cmd.add_argument("--checks", default="")
+    set_cmd.add_argument("--runs", type=int, default=ai_check.PICTURE_RUNS)
     unset = sub.add_parser("unset", add_help=False, allow_abbrev=False)
     unset.add_argument("model")
     unset.add_argument("keys", nargs="+")
@@ -2482,6 +2628,9 @@ def parser():
     load.add_argument("--wake", action="store_true")
     load.add_argument("--json", action="store_true")
     load.add_argument("--timeout", type=float, default=900)
+    load.add_argument("--no-check", action="store_true")
+    load.add_argument("--checks", default="")
+    load.add_argument("--runs", type=int, default=ai_check.PICTURE_RUNS)
     unload_cmd = sub.add_parser("unload", add_help=False, allow_abbrev=False)
     unload_cmd.add_argument("model")
     unload_cmd.add_argument("--timeout", type=float, default=None)
@@ -2543,7 +2692,7 @@ def main(argv=None, environ=None):
         if args.command == "settings":
             return cmd_settings(gw, args)
         if args.command == "set":
-            return cmd_set(gw, args)
+            return cmd_set(gw, args, poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
         if args.command == "unset":
             return cmd_unset(gw, args)
         if args.command == "revert":
@@ -2551,7 +2700,7 @@ def main(argv=None, environ=None):
         if args.command == "chat":
             return cmd_chat(gw, args)
         if args.command == "load":
-            return cmd_load(gw, args)
+            return cmd_load(gw, args, poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
         if args.command == "unload":
             return cmd_unload(gw, args)
         if args.command == "engines":
@@ -2566,6 +2715,9 @@ def main(argv=None, environ=None):
         if args.command == "eval":
             return ai_eval.run(gw, args, (Fail, GatewayError), eval_paths(environ), environ,
                                poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
+        if args.command == "check":
+            return ai_check.run(gw, args, (Fail, GatewayError),
+                                poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
         raise Fail(USAGE, f"unknown command {args.command}")
     except Fail as failure:
         message = gw.scrub(failure.message) if gw else failure.message
