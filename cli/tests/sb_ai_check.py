@@ -461,7 +461,7 @@ class TruthTests(unittest.TestCase):
 
 class CheckTests(Base):
     def test_a_split_context_fails_long_and_the_truth_view_shows_one_requests_share(self):
-        # Like revision 54: 98,304 over 3 slots, kv-unified off.
+        # A set context split over 3 slots (kv-unified off).
         self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}})
         run, report = self.check("--checks", "long")
         self.assertEqual(run.returncode, 1)
@@ -491,7 +491,7 @@ class CheckTests(Base):
         self.released()
 
     def test_a_crash_on_the_first_long_request_fails_pool(self):
-        # Like revision 57: loads, then the first long request runs out of
+        # A shared pool too big for the card: loads, then the first long request runs out of
         # GPU memory and the process ends (the router starts a new one).
         self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
         self.fake.engine.crash_rule = lambda cfg, tokens: tokens > 12000
@@ -587,7 +587,7 @@ class GuardTests(Base):
         self.released()
 
     def test_a_picture_score_below_the_old_revision_puts_it_back(self):
-        # Like hauhau35 revision 4: text checks pass, pictures get worse.
+        # A vision model on a smaller KV cache: text checks pass, pictures get worse.
         self.fake.engine.projector = True
         self.fake.write({"load": {"ctx_size": 16384, "parallel": 1}})
         self.fake.engine.misread = lambda cfg: cfg["cache_type_k"] == "q8_0"

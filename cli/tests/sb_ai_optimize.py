@@ -615,7 +615,7 @@ class TuneTests(Base):
         self.assertEqual(self.fake.doc["load"]["cache_type_k"], "q8_0")
 
     def test_ctx_search_finds_the_largest_context_that_passes_the_pool_check(self):
-        # Like the night model: a bigger pool loads, then the first long
+        # A bigger pool loads, then the first long
         # request runs out of memory above 20480 tokens.
         self.fake.engine.spread = 0.01
         self.fake.engine.oom_above = 20480

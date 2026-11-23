@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn a_set_context_is_split_over_the_slots_without_kv_unified() {
-        // The night model on 2026-11-23, revision 54: 98304 over 3 slots.
+        // A model set to 98304 over 3 slots without kv-unified.
         let args = [
             "llama-server",
             "--ctx-size",
