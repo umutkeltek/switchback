@@ -67,6 +67,9 @@ pub(crate) struct ReportInput {
     /// Per lane: when it was under a tuning lock (from, to in epoch ms).
     /// Requests served then were the tuner's own trials.
     pub tuning_spans: HashMap<String, Vec<(i64, i64)>>,
+    /// Per target: what the engine runs it with (the truth view of its
+    /// last listing row, see [`crate::engine_truth`]). Operator view only.
+    pub effective: HashMap<String, Value>,
     /// The client view: measurements from the key's own records only, no
     /// gateway-wide counters and no findings drawn from them.
     pub client: bool,
@@ -514,6 +517,24 @@ pub(crate) fn build_report(input: &ReportInput) -> Value {
                 );
             }
         }
+        if !input.client {
+            if let Some(effective) = input.effective.get(&info.target) {
+                row["effective"] = effective.clone();
+                if let Some(evidence) = crate::engine_truth::split_finding(effective) {
+                    finding(
+                        &info.target,
+                        "context_split",
+                        evidence,
+                        format!(
+                            "a request over one slot's share gets HTTP 400: set \
+                             engine_args.kv-unified=true (the slots share one pool) or lower \
+                             parallel, then `sb ai check {}`",
+                            info.target
+                        ),
+                    );
+                }
+            }
+        }
         targets_out.push(row);
     }
     json!({
@@ -526,6 +547,30 @@ pub(crate) fn build_report(input: &ReportInput) -> Value {
         "findings": findings,
         "method": "https://github.com/sybil-solutions/inference-optimisation-skill",
     })
+}
+
+/// The truth view of every model in the engines' last listings, by target.
+/// Never calls a machine.
+fn listed_effective(state: &AppState) -> HashMap<String, Value> {
+    let snap = state.snapshot();
+    let mut out = HashMap::new();
+    for lane in &snap.config.local_executors {
+        if crate::engine_control::engine_lane(&snap.config, &lane.name).is_none() {
+            continue;
+        }
+        if let Some((_, models)) = state.engines.cached_models(&lane.name) {
+            for row in models {
+                let Some(model) = row["id"].as_str() else {
+                    continue;
+                };
+                let view = crate::engine_truth::effective(&row);
+                if !view.is_null() {
+                    out.insert(format!("{}/{model}", lane.name), view);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,6 +737,11 @@ pub(crate) async fn report(
                 .iter()
                 .any(|r| r.optimize.is_some_and(|o| o.stickiness == Some(true))),
         client: !operator,
+        effective: if operator {
+            listed_effective(&state)
+        } else {
+            HashMap::new()
+        },
     };
     let mut report = build_report(&input);
     if operator {
@@ -1796,6 +1846,56 @@ mod tests {
                 .collect(),
             ..ReportInput::default()
         }
+    }
+
+    #[test]
+    fn a_set_context_split_over_slots_is_a_finding_in_the_operator_view() {
+        let mut input = input(&[("box/split", "gpu"), ("box/shared", "gpu")]);
+        input.effective.insert(
+            "box/split".into(),
+            crate::engine_truth::effective_from_args(&[
+                "s",
+                "--ctx-size",
+                "98304",
+                "--parallel",
+                "3",
+            ]),
+        );
+        input.effective.insert(
+            "box/shared".into(),
+            crate::engine_truth::effective_from_args(&[
+                "s",
+                "--ctx-size",
+                "98304",
+                "--parallel",
+                "3",
+                "--kv-unified",
+            ]),
+        );
+        let report = build_report(&input);
+        let splits: Vec<&Value> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["kind"] == "context_split")
+            .collect();
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0]["target"], "box/split");
+        assert!(splits[0]["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("one request can use 32768"));
+        let split_row = report["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["target"] == "box/split")
+            .unwrap();
+        assert_eq!(split_row["effective"]["per_request_ctx"], 32768);
+
+        input.client = true;
+        let client = build_report(&input);
+        assert!(!kinds(&client).iter().any(|k| k == "context_split"));
     }
 
     fn kinds(report: &Value) -> Vec<String> {
