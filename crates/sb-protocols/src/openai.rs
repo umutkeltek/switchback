@@ -106,6 +106,11 @@ fn openai_usage_json(usage: &Usage) -> Value {
         "completion_tokens": usage.output_tokens,
         "total_tokens": usage.prompt_tokens().saturating_add(usage.output_tokens),
     });
+    // Prompt tokens a cache served (OpenAI's own field): a client can tell
+    // an answer that read its prompt from one that did not.
+    if usage.cached_input_tokens > 0 {
+        value["prompt_tokens_details"] = json!({"cached_tokens": usage.cached_input_tokens});
+    }
     if let Some(energy) = &usage.energy {
         value["energy"] = energy_usage_json(energy);
     }
@@ -1707,5 +1712,39 @@ mod tests {
                           "usage": usage});
         let response = parse_openai_chat_response(&body).unwrap();
         assert_eq!(response.usage.prompt_tokens(), 100);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_go_back_to_the_client_in_both_shapes() {
+        // From the engine's timings (llama.cpp `cache_n`): 800 of 900 prompt
+        // tokens came from its prefix cache.
+        let body = json!({"id": "x", "model": "m", "choices": [{"index": 0, "finish_reason": "stop",
+                          "message": {"role": "assistant", "content": "hi"}}],
+                          "usage": {"prompt_tokens": 900, "completion_tokens": 3},
+                          "timings": {"prompt_n": 100, "prompt_ms": 10.0, "cache_n": 800}});
+        let mut response = parse_openai_chat_response(&body).unwrap();
+        response.usage.fill_cached_from_timings();
+        let out = response_to_openai_chat(&response);
+        assert_eq!(out["usage"]["prompt_tokens"], 900);
+        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 800);
+
+        let mut encoder = OpenAiStreamEncoder::new("req_1".to_string(), "m".to_string());
+        let frames = encoder.encode(&AiStreamEvent::UsageDelta {
+            usage: response.usage.clone(),
+        });
+        let usage_frame = frames.join("");
+        assert!(
+            usage_frame.contains("\"cached_tokens\":800"),
+            "{usage_frame}"
+        );
+
+        // Nothing cached: the usage keeps its old shape.
+        let mut none = response.usage.clone();
+        none.input_tokens += none.cached_input_tokens;
+        none.cached_input_tokens = 0;
+        response.usage = none;
+        assert!(response_to_openai_chat(&response)["usage"]
+            .get("prompt_tokens_details")
+            .is_none());
     }
 }
