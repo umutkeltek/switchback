@@ -1272,6 +1272,12 @@ def put_back(checker, ident, doc, note):
                         timeout=900, doing="putting the previous settings back")
 
 
+def history_doc(row):
+    """A settings history row's document (`document`, an object)."""
+    doc = row.get("document")
+    return doc if isinstance(doc, dict) else {}
+
+
 def pending(gw, fail_types, target):
     """Guarded keys the newest revision changed whose checks have not run
     (no check result for that revision): (revision, [keys]) or None."""
@@ -1286,11 +1292,8 @@ def pending(gw, fail_types, target):
     newest = rows[0]
     if "sb ai check:" in str(newest.get("action") or ""):
         return None  # the checks put earlier settings back: nothing new to check
-    try:
-        after = json.loads(newest.get("doc") or "{}")
-        before = json.loads(rows[1].get("doc") or "{}") if len(rows) > 1 else {}
-    except ValueError:
-        return None
+    after = history_doc(newest)
+    before = history_doc(rows[1]) if len(rows) > 1 else {}
     keys = guarded_changes(before, after)
     if not keys:
         return None
@@ -1317,7 +1320,7 @@ def after_load(gw, args, fail_types, target, revision, keys, poll_secs=None, out
             raise CheckError(FAIL, f"reading the settings history: {getattr(error, 'message', error)}") from None
         rows = sorted(history.get("history") or [], key=lambda r: r.get("revision") or 0, reverse=True)
         before = next((r for r in rows if (r.get("revision") or 0) < revision), None)
-        before_doc = json.loads(before.get("doc") or "{}") if before else {}
+        before_doc = history_doc(before) if before else {}
         before_revision = before.get("revision") if before else 0
         checker.log(f"{target} revision {revision} changed {', '.join(keys)}: its checks run now")
         checker.preflight(ident)

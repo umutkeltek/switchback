@@ -162,7 +162,8 @@ class Fake:
         self.doc = doc
         self.revision += 1
         self.history.append({"revision": self.revision, "action": action + (f": {note}" if note else ""),
-                             "doc": json.dumps(doc), "at_ms": int(time.time() * 1000)})
+                             "document": json.loads(json.dumps(doc)),
+                             "at_ms": int(time.time() * 1000)})
         self.engine.configure(doc)
 
     def view(self):
