@@ -48,7 +48,9 @@ INTERRUPTED = 130
 
 CHECKS = ("long", "pool", "picture")
 SUITE_PREFIX = "check-"
-SUITE_VERSION = "1"
+# 2: the picture draws smooth pen-stroke digits (1 drew blocky 5x7 pixel digits,
+# which a model misread on settings that read printed numbers right).
+SUITE_VERSION = "2"
 LOCK_HEADER = "x-switchback-tune-lock"
 UNKNOWN = "unknown"
 
@@ -122,19 +124,76 @@ violet voyage wagon walnut water weather western wheat whisper willow window
 winter wooden worker yellow yonder young zephyr
 """.split()
 
-# A 5x7 pixel font for the digits the picture check draws.
-DIGITS = {
-    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
-    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
-    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
-    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
-    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
-    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
-    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
-    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
-    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
-    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+# The digits the picture check draws, as pen strokes in a box one wide and
+# one high (y down), drawn thick and smooth like a plain sans-serif: a model
+# that reads ordinary printed numbers must read these. Each stroke is a
+# polyline ("line", points) or a piece of an ellipse ("arc", centre x, y,
+# radius x, y, from and to angle in degrees; 0 is right, 90 is down).
+DIGIT_STROKES = {
+    "0": [("arc", 0.5, 0.5, 0.40, 0.47, 0, 360)],
+    "1": [("line", [(0.22, 0.20), (0.52, 0.03), (0.52, 0.97)]),
+          ("line", [(0.24, 0.97), (0.80, 0.97)])],
+    "2": [("arc", 0.5, 0.30, 0.37, 0.27, -165, 25),
+          ("line", [(0.835, 0.414), (0.10, 0.97), (0.92, 0.97)])],
+    "3": [("arc", 0.5, 0.27, 0.34, 0.24, -150, 90),
+          ("arc", 0.5, 0.74, 0.39, 0.24, -90, 150)],
+    "4": [("line", [(0.70, 0.97), (0.70, 0.03), (0.06, 0.68), (0.94, 0.68)])],
+    "5": [("line", [(0.86, 0.03), (0.23, 0.03), (0.19, 0.47)]),
+          ("arc", 0.48, 0.67, 0.38, 0.30, -140, 140)],
+    "6": [("line", [(0.80, 0.08), (0.55, 0.03), (0.30, 0.12), (0.16, 0.35), (0.13, 0.69)]),
+          ("arc", 0.5, 0.69, 0.37, 0.28, 0, 360)],
+    "7": [("line", [(0.08, 0.03), (0.92, 0.03), (0.38, 0.97)])],
+    "8": [("arc", 0.5, 0.26, 0.31, 0.23, 0, 360),
+          ("arc", 0.5, 0.73, 0.38, 0.25, 0, 360)],
+    "9": [("arc", 0.5, 0.31, 0.37, 0.28, 0, 360),
+          ("line", [(0.87, 0.31), (0.84, 0.65), (0.62, 0.93), (0.40, 0.98), (0.20, 0.93)])],
 }
+DIGIT_HEIGHT = 150      # pixels
+DIGIT_WIDTH = 96
+DIGIT_GAP = 28
+DIGIT_STROKE = 0.065    # half the pen width, in glyph heights
+DIGIT_LEFT, DIGIT_TOP = 40, 105
+
+
+def digit_segments(digit, x0, y0, height=DIGIT_HEIGHT, width=DIGIT_WIDTH):
+    """The pen strokes of one digit as line segments in pixels."""
+    import math
+    out = []
+    for stroke in DIGIT_STROKES[digit]:
+        if stroke[0] == "line":
+            points = stroke[1]
+        else:
+            _, cx, cy, rx, ry, start, stop = stroke
+            steps = max(8, int(abs(stop - start) / 6))
+            points = [(cx + rx * math.cos(math.radians(start + (stop - start) * i / steps)),
+                       cy + ry * math.sin(math.radians(start + (stop - start) * i / steps)))
+                      for i in range(steps + 1)]
+        pixels = [(x0 + x * width, y0 + y * height) for x, y in points]
+        out.extend(zip(pixels, pixels[1:]))
+    return out
+
+
+def digit_pixels(digit, x0, y0, height=DIGIT_HEIGHT, width=DIGIT_WIDTH):
+    """Every pixel the pen covers for one digit (a set of (x, y))."""
+    half = DIGIT_STROKE * height
+    covered = set()
+    for (ax, ay), (bx, by) in digit_segments(digit, x0, y0, height, width):
+        dx, dy = bx - ax, by - ay
+        length = dx * dx + dy * dy
+        for y in range(int(min(ay, by) - half) - 1, int(max(ay, by) + half) + 2):
+            for x in range(int(min(ax, bx) - half) - 1, int(max(ax, bx) + half) + 2):
+                t = 0.0 if length == 0 else max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / length))
+                px, py = ax + t * dx - x, ay + t * dy - y
+                if px * px + py * py <= half * half:
+                    covered.add((x, y))
+    return covered
+
+
+def digit_origin(index):
+    """Where the `index`-th digit of a number is drawn."""
+    return DIGIT_LEFT + index * (DIGIT_WIDTH + DIGIT_GAP), DIGIT_TOP
+
+
 SHAPES = ("circle", "square", "triangle")
 COLOURS = {"red": (220, 30, 30), "blue": (30, 70, 220), "green": (30, 160, 60)}
 
@@ -392,15 +451,10 @@ def picture(rng):
             pixels[i:i + 3] = bytes(rgb)
 
     number = str(rng.randrange(100, 1000))
-    scale, left, top = 18, 40 + rng.randrange(0, 20), 50 + rng.randrange(0, 60)
     for n, digit in enumerate(number):
-        x0 = left + n * 6 * scale
-        for row, bits in enumerate(DIGITS[digit]):
-            for col, bit in enumerate(bits):
-                if bit == "1":
-                    for dy in range(scale):
-                        for dx in range(scale):
-                            put(x0 + col * scale + dx, top + row * scale + dy, (0, 0, 0))
+        x0, y0 = digit_origin(n)
+        for x, y in digit_pixels(digit, x0, y0):
+            put(x, y, (0, 0, 0))
     shape = rng.choice(SHAPES)
     colour = rng.choice(sorted(COLOURS))
     rgb = COLOURS[colour]
@@ -939,6 +993,7 @@ class Checker:
         """The newest picture result of `revision` with the same number of runs."""
         for row in self.ledger_rows(ident["target"], "check-picture"):
             if row.get("settings_revision") == revision and row.get("runs") == runs \
+                    and row.get("suite_version") == SUITE_VERSION \
                     and row.get("number_right") is not None:
                 return {"revision": revision, "number_right": row["number_right"], "runs": runs}
         return None
@@ -1298,8 +1353,18 @@ def pending(gw, fail_types, target):
     if not keys:
         return None
     checker = Checker(gw, None, fail_types)
-    done = last_checks(checker.ledger_rows(target), newest.get("revision"))
-    return None if done else (newest.get("revision"), keys)
+    ledger = checker.ledger_rows(target)
+    if last_checks(ledger, newest.get("revision")):
+        return None
+    # The same memory and context settings under an earlier revision (a
+    # revert to them) whose long check passed: nothing new to check.
+    same = {row.get("revision") for row in rows[1:]
+            if not guarded_changes(history_doc(row), after)}
+    passed = last_checks(ledger)
+    if any(rev in same and check == "long" and row.get("passed") in (1, True)
+           for (rev, check), row in passed.items()):
+        return None
+    return newest.get("revision"), keys
 
 
 def after_load(gw, args, fail_types, target, revision, keys, poll_secs=None, out=sys.stdout,

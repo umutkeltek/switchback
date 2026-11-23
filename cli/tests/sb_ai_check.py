@@ -36,6 +36,9 @@ TARGET = "box/m"
 CHARS_PER_TOKEN = 5
 
 
+TEMPLATES = {}
+
+
 def decode_picture(data):
     """The number and shape a check picture shows, read from its pixels."""
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
@@ -56,22 +59,19 @@ def decode_picture(data):
         i = y * stride + 1 + x * 3
         return tuple(raw[i:i + 3])
 
-    scale = 18
-    fonts = {bits: digit for digit, bits in ai_check.DIGITS.items()}
-    number = None
-    for top in range(50, 111):
-        for left in range(40, 61):
-            digits = []
-            for n in range(3):
-                bits = tuple("".join("1" if px(left + n * 6 * scale + c * scale + scale // 2,
-                                               top + r * scale + scale // 2) == (0, 0, 0) else "0"
-                                     for c in range(5)) for r in range(7))
-                digits.append(fonts.get(bits))
-            if all(digits) and px(left - 1, top + scale // 2) != (0, 0, 0):
-                number = "".join(digits)
-                break
-        if number:
-            break
+    # Each digit slot against every digit's own pen strokes: the best match.
+    number = ""
+    for n in range(3):
+        x0, y0 = ai_check.digit_origin(n)
+        slot = {(x, y) for y in range(y0 - 15, y0 + ai_check.DIGIT_HEIGHT + 15)
+                for x in range(x0 - 15, x0 + ai_check.DIGIT_WIDTH + 15) if px(x, y) == (0, 0, 0)}
+        best, score = None, -1.0
+        for digit in "0123456789":
+            covered = TEMPLATES.setdefault((digit, n), ai_check.digit_pixels(digit, x0, y0))
+            match = len(covered & slot) / len(covered | slot)
+            if match > score:
+                best, score = digit, match
+        number += best
     colour = {v: k for k, v in ai_check.COLOURS.items()}.get(px(520, 180))
     if px(520 - 75, 180 - 75) != (255, 255, 255):
         shape = "square"
@@ -434,6 +434,11 @@ class TruthTests(unittest.TestCase):
         self.assertEqual(ai_check.truth_from_args(base + ["--fit", "on"])["cpu_weights"], "maybe")
 
     def test_a_picture_carries_its_number_and_shape(self):
+        for digits in ("102", "345", "678", "981"):
+            rng = ai_check.fresh_rng()
+            rng.randrange = lambda a, b, d=iter([int(digits)]): next(d)
+            data, number, _, _ = ai_check.picture(rng)
+            self.assertEqual((number, decode_picture(data)[0]), (digits, digits))
         for _ in range(5):
             data, number, shape, colour = ai_check.picture(ai_check.fresh_rng())
             self.assertEqual(decode_picture(data), (number, shape, colour))
@@ -615,6 +620,17 @@ class GuardTests(Base):
         again = self.sb("load", TARGET)
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertNotIn("checks run now", again.stdout)
+
+    def test_a_revert_to_settings_that_passed_is_not_pending(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        self.check("--checks", "long")
+        self.assertEqual(self.fake.ledger[-1]["passed"], 1)
+        self.fake.write({"load": {"ctx_size": 30000, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        self.assertIn("checks pending for revision 2", self.sb("settings", TARGET).stdout)
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}},
+                        action="revert:1")
+        settings = self.sb("settings", TARGET)
+        self.assertNotIn("checks pending", settings.stdout)
 
     def test_set_check_refuses_a_change_that_is_not_guarded(self):
         self.fake.write({"load": {"ctx_size": 16384}})
