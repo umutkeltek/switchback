@@ -5,8 +5,9 @@
 //! A model's pool comes from the engine's last model listing (its argument
 //! list, read by [`crate::engine_truth`]): `--ctx-size` is the pool, and one
 //! request may use all of it with `--kv-unified`, else `ctx-size /
-//! parallel`. A model the engine has not listed loaded yet falls back to its
-//! settings document (the load settings the overlay gives the engine). When
+//! parallel`. A model the engine has not loaded yet uses the preset
+//! arguments the listing shows for it, else its settings document (the load
+//! settings the overlay gives the engine). When
 //! neither knows the context size the pool is unknown and requests go
 //! unchecked.
 //!
@@ -50,6 +51,13 @@ fn loaded_truth(rows: &[Value], model: &str) -> Option<PoolTruth> {
             && matches!(row["status"]["value"].as_str(), Some("loaded" | "loading"))
     })?;
     truth_of(&crate::engine_truth::effective(row), PoolSource::Engine)
+}
+
+/// The pool `model` will load with: the preset arguments the router lists
+/// for a model it has not loaded (llama.cpp lists them for every model).
+fn preset_truth(rows: &[Value], model: &str) -> Option<PoolTruth> {
+    let row = rows.iter().find(|row| row["id"].as_str() == Some(model))?;
+    truth_of(&crate::engine_truth::effective(row), PoolSource::Preset)
 }
 
 /// The pool of a truth view ([`crate::engine_truth::effective`]): the set
@@ -178,6 +186,10 @@ impl EnginePoolView {
 impl PoolView for EnginePoolView {
     fn cached(&self, provider_id: &str, model: &str) -> Option<PoolTruth> {
         self.listed(provider_id, model)
+            .or_else(|| {
+                let (_, rows) = self.engines.cached_models(provider_id)?;
+                preset_truth(&rows, model)
+            })
             .or_else(|| self.settings_truth(provider_id, model))
     }
 
@@ -216,10 +228,9 @@ impl PoolView for EnginePoolView {
                                 }
                             }
                         }
-                        if let Some(truth) = last
-                            .as_ref()
-                            .and_then(|(_, rows)| loaded_truth(rows, model))
-                        {
+                        if let Some(truth) = last.as_ref().and_then(|(_, rows)| {
+                            loaded_truth(rows, model).or_else(|| preset_truth(rows, model))
+                        }) {
                             return Some(truth);
                         }
                     }
@@ -290,6 +301,22 @@ mod tests {
         );
         // No context size: unknown.
         assert!(truth_of(&json!({"ctx_size": null}), PoolSource::Engine).is_none());
+    }
+
+    #[test]
+    fn a_model_not_loaded_yet_uses_its_listed_preset() {
+        let rows = vec![
+            json!({"id": "big", "status": {"value": "unloaded", "args": [
+                "llama-server", "--ctx-size", "98304", "--parallel", "3", "--kv-unified"]}}),
+            json!({"id": "bare", "status": {"value": "unloaded"}}),
+        ];
+        assert!(loaded_truth(&rows, "big").is_none(), "not loaded");
+        let truth = preset_truth(&rows, "big").unwrap();
+        assert_eq!(
+            (truth.pool_tokens, truth.source),
+            (98_304, PoolSource::Preset)
+        );
+        assert!(preset_truth(&rows, "bare").is_none(), "no arguments listed");
     }
 
     #[test]

@@ -734,7 +734,8 @@ is the engine's own, read from its model listing (`--ctx-size` is the pool;
 one request may use all of it with `--kv-unified`, else `ctx-size / parallel`),
 so a settings change or a reload updates it; requests already running are
 never cut by a smaller pool, new ones wait for room under it. A model the
-engine has not listed loaded yet uses its settings document's load settings;
+engine has not loaded yet uses the preset arguments its listing shows for it,
+else its settings document's load settings;
 when neither knows the context size the request is sent unchecked (as without
 admission) and counted, so later requests see it. Hedging skips targets with a
 token pool. Embeddings and audio requests are not admitted by tokens.

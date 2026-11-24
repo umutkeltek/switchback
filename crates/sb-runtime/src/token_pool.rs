@@ -19,8 +19,9 @@
 //! success, error, client disconnect and stream cut alike.
 //!
 //! The pool's size is read at every admission from the engine's own numbers
-//! (its last model listing, through [`PoolView`]), else from the model's
-//! settings document; when neither is known the request is sent unchecked,
+//! (its last model listing, through [`PoolView`]: the loaded model's
+//! arguments, else the preset arguments it lists for a model not loaded
+//! yet), else from the model's settings document; when neither is known the request is sent unchecked,
 //! as without admission, but its need is still counted so later requests
 //! see it once the size is known.
 //!
@@ -66,8 +67,11 @@ const TRUTH_RECHECK_MS: u64 = 1_000;
 pub enum PoolSource {
     /// The engine's own listing of the loaded model (its arguments).
     Engine,
+    /// The engine's listing of a model it has not loaded yet: the
+    /// arguments its preset will load it with.
+    Preset,
     /// The model's settings document (its load settings), while the
-    /// engine has not listed the model loaded.
+    /// engine lists no arguments for the model.
     Settings,
 }
 
@@ -75,6 +79,7 @@ impl PoolSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Engine => "engine",
+            Self::Preset => "preset",
             Self::Settings => "settings",
         }
     }
@@ -751,7 +756,7 @@ pub struct PoolReport {
     pub per_request_tokens: Option<u64>,
     pub slots: Option<u64>,
     pub kv_unified: Option<bool>,
-    /// `engine` or `settings`.
+    /// `engine`, `preset` or `settings`.
     pub source: Option<PoolSource>,
     /// Tokens the requests running now reserved.
     pub reserved_tokens: u64,
