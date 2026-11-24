@@ -774,6 +774,13 @@ class Checker:
     def lanes(self):
         return self.call("GET", "/v1/workloads/capacity", timeout=15, doing="reading the lanes").get("data") or []
 
+    def locate(self, ident):
+        """The model's host (for its machine facts), with no check of the
+        lane's state: the margin before a write needs nothing else."""
+        lane = next((l for l in self.lanes() if l.get("name") == ident["lane"]), None)
+        if lane is not None:
+            ident.setdefault("host", lane.get("host") or lane.get("name"))
+
     def preflight(self, ident):
         lanes = self.lanes()
         lane = next((l for l in lanes if l.get("name") == ident["lane"]), None)
@@ -975,7 +982,39 @@ class Checker:
                + f" + compute {gb(compute)}")
         return {"bytes": total, "n_ctx": int(ctx), "card": None, "how": how}, None
 
-    def check_margin(self, ident, truth):
+    def predicted_margin(self, ident, truth_before, after_doc):
+        """The margin rule at the settings a change asks for, before anything
+        is written, held or loaded: the pool the document asks for (what it
+        leaves out is what the engine runs now), sized from the engine's
+        measurement with its KV cache scaled (same cache types), else from
+        `sb ai fit`'s numbers. None when nothing can size it (the normal
+        checks then judge it after the load)."""
+        if not truth_before:
+            return None
+        if not ident.get("file_quant"):
+            # The quant of the file the engine runs (its listed --model), as
+            # the checks after a load read it.
+            row, _ = self.engine_row(ident)
+            model_arg = arg_value([str(a) for a in (row or {}).get("args") or []], ("--model", "-m"))
+            if model_arg:
+                ident["file_quant"] = ai_fit.quant_label(str(model_arg))
+        pool = doc_pool(after_doc, truth_before)
+        if not pool.get("ctx_size"):
+            return None
+        predicted = dict(truth_before)
+        predicted.update({"ctx_size": pool["ctx_size"], "pool_ctx": pool["ctx_size"],
+                          "cache_type_k": pool["cache_type_k"] or truth_before.get("cache_type_k"),
+                          "cache_type_v": pool["cache_type_v"] or truth_before.get("cache_type_v"),
+                          "kv_unified": pool["kv_unified"],
+                          "slots": pool["parallel"] or truth_before.get("slots")})
+        same_cache = all(str(predicted.get(k) or "f16").lower() == str(truth_before.get(k) or "f16").lower()
+                         for k in ("cache_type_k", "cache_type_v"))
+        verdict = self.check_margin(ident, predicted, use_measurement=same_cache)
+        if verdict.get("passed") is None:
+            return None
+        return verdict
+
+    def check_margin(self, ident, truth, use_measurement=True):
         """Before any request: the card memory the model leaves free at its
         settings, from the engine's own measurement. The card's size is the
         measurement's (when the gateway passes it on), else --card-gb, else
@@ -990,7 +1029,7 @@ class Checker:
         pool_ctx = (truth or {}).get("pool_ctx") or (truth or {}).get("ctx_size")
         machine = self.machine(ident)
         where = f"host {ident.get('host') or ident['lane']}"
-        mine = measured((row or {}).get("memory"), pool_ctx)
+        mine = measured((row or {}).get("memory"), pool_ctx) if use_measurement else None
         if mine is None:
             mine, why = self.fit_estimate(ident, truth, machine)
             if mine is None:
@@ -1800,6 +1839,22 @@ def guard(gw, args, fail_types, target_view, write, after_doc=None, poll_secs=No
         checks = checker.wanted()
         ident = checker.resolve(target_view["target"])
         before_revision, before_doc = ident["revision"], ident["document"]
+        row, _ = checker.engine_row(ident)
+        truth_before = truth_of(row or {})
+        growth = pool_growth(before_doc, after_doc, truth_before) if after_doc is not None else []
+        if growth:
+            # The margin needs no request and no load: a change that leaves too
+            # little free is refused before anything is written, held, woken
+            # or loaded (on a work machine, a too-big model would otherwise load
+            # first and squeeze everything else until the check puts it back).
+            checker.locate(ident)
+            early = checker.predicted_margin(ident, truth_before, after_doc)
+            if early is not None:
+                checker.log(f"{ident['target']}: at the new settings ({', '.join(growth)}), before any "
+                            f"write: {verdict_line(early)}")
+                if early.get("passed") is False:
+                    raise CheckError(FAIL, f"{ident['target']}: the change would leave too little memory "
+                                           "free; nothing was written, held, woken or loaded")
         try:
             checker.preflight(ident)
         except CheckError as error:
@@ -1807,9 +1862,6 @@ def guard(gw, args, fail_types, target_view, write, after_doc=None, poll_secs=No
                 raise CheckError(MACHINE_OFF, f"{error.message}, or --no-check to keep the change "
                                               "for the next load, unchecked") from None
             raise
-        row, _ = checker.engine_row(ident)
-        truth_before = truth_of(row or {})
-        growth = pool_growth(before_doc, after_doc, truth_before) if after_doc is not None else []
         repeats = pool_repeats_for(args, growth)
         runs = int(getattr(args, "runs", None) or PICTURE_RUNS)
         need = need_s(checks, repeats, runs, projector=(truth_before or {}).get("projector"))

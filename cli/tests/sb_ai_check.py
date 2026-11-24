@@ -178,6 +178,7 @@ class Fake:
         self.load_fails = False  # loads answer 502
         self.others = []        # other models the engine lists
         self.machines = []      # the gateway's machine facts (GET /v1/engines `machines`)
+        self.experiments = True  # the lane's `experiments` flag
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -319,7 +320,7 @@ class Fake:
                          "machines": self.machines}
         if method == "GET" and path == "/v1/workloads/capacity":
             return 200, {"object": "list", "data": [{"name": "box", "host": "gpu-box", "state": "healthy",
-                                                     "experiments": True}]}
+                                                     "experiments": self.experiments}]}
         if method == "POST" and path == "/v1/hosts/gpu-box/holds":
             hold_id = f"hold-{len(self.holds) + 1}"
             self.holds[hold_id] = body
@@ -910,16 +911,20 @@ class MarginTests(Base):
                                    "card": 24e9}
         self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
         before = json.loads(json.dumps(self.fake.doc))
+        revision = self.fake.revision
         run = self.sb("set", TARGET, "ctx_size=49152", "--load", "--checks", "long,pool")
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        # Judged from the measurement with its KV cache scaled, before any
+        # write: nothing written, held, loaded or sent.
         self.assertEqual(self.fake.doc, before)
-        self.assertEqual(self.fake.chats(), [])  # refused before any request
-        self.assertIn("margin failed (margin_short)", self.fake.history[-1]["action"])
+        self.assertEqual(self.fake.revision, revision)
+        self.assertEqual(self.fake.chats(), [])
+        self.assertIn("before any write: margin   FAIL", run.stdout)
         self.assertIn("1.04 GB free, under the 1.50 GB", run.stdout)
-        row = [r for r in self.fake.ledger if r["suite"] == "check-margin"][-1]
-        self.assertEqual((row["passed"], row["stop_reason"], row["settings_revision"]), (0, "margin_short", 2))
-        self.assertEqual((row["card_bytes"], row["free_bytes"]), (24_000_000_000, 1_042_400_000))
-        self.released()
+        self.assertIn("nothing was written, held, woken or loaded", run.stderr)
+        self.assertEqual(self.fake.holds, {})
+        self.assertEqual(self.fake.locks, {})
+        self.assertEqual(self.fake.engine.status, "loaded")  # never reloaded
 
     def test_the_same_change_with_room_to_spare_passes(self):
         self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9,
@@ -1042,6 +1047,26 @@ class GatewayMachineTests(Base):
         self.fake.machines = [dict(self.ENTRY)]
         self.assertIsNone(self.margin()["passed"])
 
+    def test_a_too_big_change_is_refused_with_its_numbers_on_a_lane_without_experiments(self):
+        # A work machine: no checks may run there, but the margin needs none.
+        self.fake.experiments = False
+        self.fake.machines = [{"name": "gpu-box", "kind": "unified", "usable_gb": 40,
+                               "others_gb": 12, "min_free_gb": 6}]
+        self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9}
+        self.fake.write({"load": {"ctx_size": 49152, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        revision = self.fake.revision
+        run = self.sb("set", TARGET, "ctx_size=196608", "--load")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("before any write: margin   FAIL", run.stdout)
+        self.assertIn("usable_gb (unified memory) of host gpu-box in the gateway's config", run.stdout)
+        self.assertEqual(self.fake.revision, revision)
+        # One that fits still meets the lane's own refusal: no checks there.
+        run = self.sb("set", TARGET, "ctx_size=65536", "--load")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("before any write: margin   PASS", run.stdout)
+        self.assertIn("does not allow experiments", run.stderr)
+        self.assertEqual(self.fake.revision, revision)
+
     def test_a_unified_memory_host_is_judged_on_its_usable_memory(self):
         self.fake.machines = [{"name": "gpu-box", "kind": "unified", "usable_gb": 40,
                                "others_gb": 12, "min_free_gb": 6}]
@@ -1157,6 +1182,7 @@ class FitMarginTests(Base):
                       "+ compute 0.85 GB", run.stdout)
         self.assertIn("= 1.12 GB free", run.stdout)
         kept = json.loads(json.dumps(self.fake.doc))
+        revision = self.fake.revision
         sent = len(self.fake.chats())
         run = self.sb("set", TARGET, "ctx_size=131072", "--load", "--checks", "long,pool")
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
@@ -1164,7 +1190,7 @@ class FitMarginTests(Base):
         self.assertIn("0.38 GB free, under the 0.50 GB", run.stdout)
         self.assertEqual(len(self.fake.chats()), sent)  # no request at 131,072
         self.assertEqual(self.fake.doc, kept)
-        self.assertIn("margin failed (margin_short)", self.fake.history[-1]["action"])
+        self.assertEqual(self.fake.revision, revision)  # refused before the write
         # The model index was read once per pool size.
         listings = [r for r in self.index.seen if r["path"].startswith("/api/models/")]
         self.assertEqual(len(listings), 2)

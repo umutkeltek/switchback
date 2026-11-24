@@ -291,7 +291,9 @@ per revision. check holds the machine and takes the lane's tuning lock, like
 eval. A load change of ctx_size, parallel, cache_type_k/v, batch_size,
 ubatch_size, n_gpu_layers, fit, fit_ctx, mmproj, or of the engine arguments
 kv-unified, n-cpu-moe, cpu-moe, override-tensor (and the like) is guarded:
-`set --load` runs the checks at once with apply now (a picture baseline of
+`set --load` first judges the margin rule at the new settings (below), with
+no write, hold, wake or load, and refuses a change that leaves too little
+free; then it runs the checks at once with apply now (a picture baseline of
 the old revision first, when there is none; --check says the same) and
 writes the old settings back, with the reason in the history note, when one
 fails (a picture result below the old revision's counts as failed) or when
@@ -305,14 +307,18 @@ stopped pending check reverts the same way). A change that grows the shared
 pool (ctx_size or parallel up, kv-unified on, a smaller KV cache type) also
 meets the margin rule before any request: the card memory left free (the
 card's size, from the engine's measurement, else --card-gb, else vram_gb of
-the host in the machine file; less the model as the engine measured it,
+the host in the machine file, else in the gateway's machine facts
+(server.optimize.hosts: kind gpu with vram_gb, or kind unified with
+usable_gb); less the model as the engine measured it,
 less the other models it has loaded, less the card's other users: --others,
 else others_gb) must be at least --min-free (else min_free_gb, else 1.5
 GB); a change that grows the pool fails when the margin cannot be judged.
 Its pool check runs --pool-repeats times (3 by default), each after
 the first on a fresh process (unload, load); one failure fails it. The
 machine file is the one `fit` reads (--machines, else SB_AI_MACHINES in the
-environment or ai.env), matched by host name, then lane name:
+environment or ai.env), matched by host name, then lane name; a host it
+does not name, or no file at all, takes the gateway's machine facts
+(GET /v1/engines `machines`; `fit` uses them too without a file):
 {"machines":[{"name":"box","kind":"gpu","vram_gb":25.7,"others_gb":2.1,"compute_gb":2.2,
 "min_free_gb":0.5}]} (card size, other users, the runtime's own buffers and the
 room to keep, measured on the card at its normal state).
