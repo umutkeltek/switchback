@@ -1040,6 +1040,16 @@ class FitMarginTests(Base):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("at 131,072 q8_0/q8_0", run.stdout)
 
+    def test_another_loaded_model_without_a_measurement_leaves_the_margin_unjudged(self):
+        self.fake.others = [{"id": "embed", "status": "loaded", "args": [], "memory": None}]
+        self.fake.write({"load": {"ctx_size": 32768, "parallel": 3}, "engine_args": {"kv-unified": True},
+                         "ceiling": self.ceiling})
+        before = json.loads(json.dumps(self.fake.doc))
+        run = self.sb("set", TARGET, "ctx_size=65536", "--load", "--checks", "long")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("embed is loaded on the same engine with no memory measurement", run.stdout)
+        self.assertEqual(self.fake.doc, before)
+
 
 class RepeatTests(Base):
     """A change that grows the shared pool needs every pool repeat to pass,

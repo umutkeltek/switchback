@@ -966,12 +966,21 @@ class Checker:
                     "why": (f"the card's size is unknown: the gateway does not pass it on, so set "
                             f"vram_gb for {where} in the machine file (SB_AI_MACHINES) or pass "
                             "--card-gb")}
-        loaded = 0
+        loaded, unknown = 0, []
         for other in rows:
             if other is row or other.get("status") not in ("loaded", "loading"):
                 continue
             theirs = measured(other.get("memory"))
-            loaded += theirs["bytes"] if theirs else 0
+            if theirs is None:
+                unknown.append(str(other.get("id")))
+            else:
+                loaded += theirs["bytes"]
+        if unknown:
+            # Their share of the card is not known: the room left is not either.
+            return {"check": "margin", "passed": None, "result": "skipped",
+                    "why": (f"{', '.join(unknown[:3])} {'is' if len(unknown) == 1 else 'are'} loaded "
+                            "on the same engine with no memory measurement, so the room left is "
+                            "unknown")}
         others_flag = getattr(self.args, "others", None)
         if others_flag is not None:
             others, others_from = int(float(others_flag) * GB), "--others"
