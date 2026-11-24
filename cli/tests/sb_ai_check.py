@@ -104,6 +104,10 @@ class Engine:
         self.read_tps = 30000.0
         self.prompts = []
         self.pictures = 0
+        # The engine's own memory measurement: a 4 GB model on a 24 GB card
+        # (None: the engine measures nothing, as llama.cpp's router today).
+        self.memory = {"weights": 4e9, "kv_per_token": 1000, "compute": 0.5e9, "card": 24e9}
+        self.model_path = "/models/m.gguf"
 
     def configure(self, doc):
         load = doc.get("load") or {}
@@ -133,13 +137,26 @@ class Engine:
             out += ["--mmproj", "/models/mmproj.gguf"]
         return out
 
+    def measurement(self):
+        """The engine's memory measurement at the running settings, as the
+        gateway's listing summarises it (`total_bytes` only when the
+        gateway passes the card's size on)."""
+        if not self.memory or self.status not in ("loaded", "loading"):
+            return None
+        kv = int(self.memory["kv_per_token"] * self.cfg["ctx_size"])
+        part = {"n_ctx": self.cfg["ctx_size"], "host_bytes": 0, "context_bytes": kv,
+                "bytes": int(self.memory["weights"] + self.memory["compute"]) + kv}
+        if self.memory.get("card"):
+            part["total_bytes"] = int(self.memory["card"])
+        return {"status": "measured", "effective": part}
+
     def row(self):
         row = {"id": "m", "target": TARGET, "file": "file-a", "status": self.status,
-               "failed": self.failed, "args": self.args()}
+               "failed": self.failed, "args": self.args(), "memory": self.measurement()}
         if getattr(self, "no_file", False):
             # A router that lists no file: the model's argument names it.
             del row["file"]
-            row["args"] += ["--model", "/models/m.gguf"]
+            row["args"] += ["--model", self.model_path]
         return row
 
 
@@ -154,6 +171,12 @@ class Fake:
         self.locks, self.holds, self.ledger = {}, {}, []
         self.props = False    # the gateway has GET .../engine-props
         self.effective = False  # the gateway's engine rows carry `effective`
+        self.quiet = None       # a quiet window in force: lock renewals name it
+        self.quiet_in = None    # seconds to the next quiet window: new locks end there
+        self.lock_lost = False  # lock renewals answer 404
+        self.lock_refused = None  # new locks are refused with this reason (409)
+        self.load_fails = False  # loads answer 502
+        self.others = []        # other models the engine lists
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -263,10 +286,16 @@ class Fake:
         if method == "GET" and path == base + "/settings/history":
             return 200, {"target": TARGET, "revision": self.revision, "history": self.history[::-1]}
         if method == "POST" and path == base + "/load":
+            if self.load_fails:
+                return 502, {"error": {"message": "the engine did not answer", "type": "engine_error"}}
             with self.engine.lock:
                 if self.engine.status not in ("loaded", "sleeping"):
                     self.engine.restart()
             return 200, {"target": TARGET, "model": "m", "lane": "box", "status": "loaded"}
+        if method == "POST" and path == base + "/unload":
+            with self.engine.lock:
+                self.engine.status = "unloaded"
+            return 200, {"target": TARGET, "status": "unloaded", "message": "unloaded"}
         if method == "GET" and path == base + "/engine-props":
             if not self.props:
                 return 404, {"error": {"message": "not found", "type": "not_found"}}
@@ -277,7 +306,8 @@ class Fake:
             row = self.engine.row()
             if self.effective:
                 row["effective"] = ai_check.truth_from_args(row["args"])
-            return 200, {"object": "list", "data": [{"lane": "box", "build": "b100", "models": [row]}]}
+            return 200, {"object": "list", "data": [{"lane": "box", "build": "b100",
+                                                     "models": [row] + self.others}]}
         if method == "GET" and path == "/v1/workloads/capacity":
             return 200, {"object": "list", "data": [{"name": "box", "host": "gpu-box", "state": "healthy",
                                                      "experiments": True}]}
@@ -289,11 +319,21 @@ class Fake:
             self.holds.pop(path.rsplit("/", 1)[1], None)
             return 200, {"deleted": True}
         if method == "POST" and path == "/v1/optimize/locks":
+            if self.lock_refused:
+                return 409, {"error": {"message": f"refused: {self.lock_refused}", "type": "conflict",
+                                       "reason": self.lock_refused}}
             lock_id = f"lock-{len(self.locks) + 1}"
             self.locks[lock_id] = body
-            return 201, {"id": lock_id}
+            now = int(time.time() * 1000)
+            expires = now + int(body.get("ttl_secs") or 1800) * 1000
+            if self.quiet_in is not None:
+                expires = min(expires, now + int(self.quiet_in * 1000))
+            return 201, {"id": lock_id, "created_ms": now, "expires_at_ms": expires}
         if method == "PATCH" and path.startswith("/v1/optimize/locks/"):
-            return 200, {"id": path.rsplit("/", 1)[1], "quiet_window": None}
+            if self.lock_lost:  # it ran out, or the gateway restarted
+                self.locks.pop(path.rsplit("/", 1)[1], None)
+                return 404, {"error": {"message": "no tuning lock", "type": "not_found"}}
+            return 200, {"id": path.rsplit("/", 1)[1], "quiet_window": self.quiet}
         if method == "DELETE" and path.startswith("/v1/optimize/locks/"):
             self.locks.pop(path.rsplit("/", 1)[1], None)
             return 200, {"deleted": True}
@@ -642,11 +682,13 @@ class GuardTests(Base):
         self.assertEqual(self.fake.doc, {"load": {"ctx_size": 16384, "parallel": 1}})
         self.assertIn("picture failed (below_baseline)", self.fake.history[-1]["action"])
 
-    def test_without_check_the_checks_wait_for_the_next_load_and_revert_there(self):
+    def test_no_check_leaves_the_checks_for_the_next_load_which_reverts(self):
         self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
-        run = self.sb("set", TARGET, "engine_args.kv-unified=false", "--load")
+        run = self.sb("set", TARGET, "engine_args.kv-unified=false", "--load", "--no-check")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("checks pending for revision 2", run.stdout)
+        self.assertIn("warning: --no-check", run.stderr)
+        self.assertIn("not checked", run.stderr)
         self.assertEqual(self.fake.engine.prompts, [])  # nothing was sent yet
         settings = self.sb("settings", TARGET)
         self.assertIn("checks pending for revision 2", settings.stdout)
@@ -670,6 +712,33 @@ class GuardTests(Base):
                         action="revert:1")
         settings = self.sb("settings", TARGET)
         self.assertNotIn("checks pending", settings.stdout)
+
+    def test_set_load_checks_a_guarded_change_by_default(self):
+        # No --check: a memory or context change is checked at once all the same.
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}})
+        run = self.sb("set", TARGET, "engine_args.kv-unified=true", "--load", "--checks", "long,pool")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("kept", run.stdout)
+        puts = [b for m, p, b, h in self.fake.seen if m == "PUT"]
+        self.assertEqual(puts[-1]["apply"], "now")
+        self.assertTrue(self.fake.chats())
+        self.released()
+
+    def test_set_load_without_a_guarded_key_writes_for_the_next_load_unchecked(self):
+        self.fake.write({"load": {"ctx_size": 16384}})
+        run = self.sb("set", TARGET, "temp=0.5", "--load")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.fake.chats(), [])
+        puts = [b for m, p, b, h in self.fake.seen if m == "PUT"]
+        self.assertEqual(puts[-1]["apply"], "next_load")
+        self.assertNotIn("checks pending", run.stdout)
+
+    def test_a_guarded_change_for_the_next_load_needs_no_check(self):
+        self.fake.write({"load": {"ctx_size": 16384}})
+        run = self.sb("set", TARGET, "ctx_size=32768", "--load", "--apply", "next-load")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("--no-check", run.stderr)
+        self.assertEqual(self.fake.revision, 1)
 
     def test_set_check_refuses_a_change_that_is_not_guarded(self):
         self.fake.write({"load": {"ctx_size": 16384}})
@@ -696,6 +765,371 @@ class ViewTests(Base):
         doctor = self.sb("doctor", TARGET)
         self.assertIn("box/m: the set context 24,576 is split over 3 slots", doctor.stdout)
         self.assertIn("kv-unified=true", doctor.stdout)
+
+
+def _lines(text):
+    return [line for line in text.splitlines() if line.strip()]
+
+
+class StopTests(Base):
+    """Checks that stop after the write put the previous settings back and
+    exit non-zero: an unchecked change never stays live."""
+
+    def start(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        return json.loads(json.dumps(self.fake.doc))
+
+    def assert_put_back(self, run, before, why):
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc, before, "the unchecked change stayed live")
+        self.assertIn(why, self.fake.history[-1]["action"])
+        self.assertIn("back to revision 1", self.fake.history[-1]["action"])
+        self.released()
+
+    def test_a_quiet_window_during_set_puts_the_old_settings_back(self):
+        before = self.start()
+        self.fake.quiet = "00:30-03:00"
+        run = self.sb("set", TARGET, "ctx_size=98304", "--load", "--check", "--checks", "long,pool")
+        self.assert_put_back(run, before, "quiet window 00:30-03:00 began")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("put back the settings of revision 1 as revision 3", run.stdout)
+
+    def test_a_lost_lock_during_set_puts_the_old_settings_back(self):
+        before = self.start()
+        self.fake.lock_lost = True
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "long")
+        self.assert_put_back(run, before, "the tuning lock is gone")
+
+    def test_a_gateway_error_after_the_write_puts_the_old_settings_back(self):
+        before = self.start()
+        self.fake.load_fails = True
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "long")
+        self.assert_put_back(run, before, "checks stopped: loading box/m")
+
+    def test_ctrl_c_during_the_checks_puts_the_old_settings_back(self):
+        before = self.start()
+        sys.path.insert(0, str(CLI))
+        import ai_gateway
+        gw = ai_gateway.Gateway(self.fake.url, KEY)
+        fails = (ai_gateway.Fail, ai_gateway.GatewayError)
+        view = gw.get(f"/v1/models/{TARGET}/settings")["targets"][0]
+        after = {"load": {"ctx_size": 30000, "parallel": 3}, "engine_args": {"kv-unified": True}}
+
+        def write(extra):
+            body = dict(after, **extra)
+            return gw.call("PUT", f"/v1/models/{TARGET}/settings", body=body,
+                           headers={"If-Match": str(view["revision"])})
+
+        def interrupted(*_args, **_kwargs):
+            raise KeyboardInterrupt
+
+        args = ai_gateway.parser().parse_args(["set", TARGET, "ctx_size=30000", "--load", "--checks", "long"])
+        original = ai_check.Checker.run_checks
+        ai_check.Checker.run_checks = interrupted
+        try:
+            import io
+            out, err = io.StringIO(), io.StringIO()
+            code = ai_check.guard(gw, args, fails, view, write, after_doc=after, poll_secs=0.05,
+                                  out=out, err=err)
+        finally:
+            ai_check.Checker.run_checks = original
+        self.assertEqual(code, ai_check.INTERRUPTED)
+        self.assertEqual(self.fake.doc, before)
+        self.assertIn("checks stopped: interrupted", self.fake.history[-1]["action"])
+        self.released()
+
+    def test_nothing_is_written_when_the_quiet_window_begins_before_the_checks_can_end(self):
+        self.start()
+        self.fake.quiet_in = 600  # ten minutes
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "long,pool")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("the quiet window begins in 10 min", run.stderr)
+        self.assertIn("nothing was written", run.stderr)
+        self.assertEqual(self.fake.revision, 1)
+        self.assertEqual(self.fake.chats(), [])
+        self.released()
+
+    def test_a_quiet_window_far_enough_away_lets_the_checks_run(self):
+        self.start()
+        self.fake.quiet_in = 3 * 3600
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "long")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc["load"]["ctx_size"], 30000)
+
+    def pending_change(self):
+        before = self.start()
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--no-check")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.fake.revision, 2)
+        return before
+
+    def test_a_quiet_window_during_pending_checks_puts_the_old_settings_back(self):
+        before = self.pending_change()
+        self.fake.quiet = "00:30-03:00"
+        load = self.sb("load", TARGET, "--checks", "long")
+        self.assertEqual(load.returncode, 1, load.stdout + load.stderr)
+        self.assert_put_back(load, before, "quiet window 00:30-03:00 began")
+
+    def test_pending_checks_that_cannot_start_put_the_old_settings_back(self):
+        before = self.pending_change()
+        self.fake.lock_refused = "quiet_window"
+        load = self.sb("load", TARGET, "--checks", "long")
+        self.assertEqual(load.returncode, 1, load.stdout + load.stderr)
+        self.assertEqual(self.fake.doc, before)
+        self.assertIn("checks stopped", self.fake.history[-1]["action"])
+
+    def test_load_no_check_skips_the_pending_checks(self):
+        self.pending_change()
+        load = self.sb("load", TARGET, "--no-check")
+        self.assertEqual(load.returncode, 0, load.stderr)
+        self.assertEqual(self.fake.doc["load"]["ctx_size"], 30000)
+        self.assertEqual(self.fake.chats(), [])
+
+
+class MarginTests(Base):
+    """The margin rule: the card memory a change leaves free, from the
+    engine's own measurement, before any request."""
+
+    def machines(self, **entry):
+        path = self.root / "machines.json"
+        path.write_text(json.dumps({"machines": [dict({"name": "gpu-box", "kind": "gpu"}, **entry)]}))
+        self.env["SB_AI_MACHINES"] = str(path)
+
+    def test_a_change_that_leaves_too_little_free_is_put_back_before_any_request(self):
+        # 20 GB weights + 0.5 GB compute + 50 kB per token of KV on a 24 GB card.
+        self.fake.engine.memory = {"weights": 20e9, "kv_per_token": 50_000, "compute": 0.5e9,
+                                   "card": 24e9}
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        before = json.loads(json.dumps(self.fake.doc))
+        run = self.sb("set", TARGET, "ctx_size=49152", "--load", "--checks", "long,pool")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc, before)
+        self.assertEqual(self.fake.chats(), [])  # refused before any request
+        self.assertIn("margin failed (margin_short)", self.fake.history[-1]["action"])
+        self.assertIn("1.04 GB free, under the 1.50 GB", run.stdout)
+        row = [r for r in self.fake.ledger if r["suite"] == "check-margin"][-1]
+        self.assertEqual((row["passed"], row["stop_reason"], row["settings_revision"]), (0, "margin_short", 2))
+        self.assertEqual((row["card_bytes"], row["free_bytes"]), (24_000_000_000, 1_042_400_000))
+        self.released()
+
+    def test_the_same_change_with_room_to_spare_passes(self):
+        self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9,
+                                   "card": 24e9}
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        run = self.sb("set", TARGET, "ctx_size=49152", "--load", "--checks", "long,pool")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("margin   PASS", run.stdout)
+        self.assertEqual(self.fake.doc["load"]["ctx_size"], 49152)
+
+    def test_the_card_size_and_its_other_users_come_from_the_machine_file(self):
+        # The gateway does not pass the card's size on: the host's entry names it,
+        # and the desktop and an image server hold 2 GB of it.
+        self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9}
+        self.machines(vram_gb=24, others_gb=2, min_free_gb=1.5)
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        run = self.sb("set", TARGET, "ctx_size=49152", "--load", "--checks", "long")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("vram_gb of host gpu-box in the machine file", run.stdout)
+        self.assertIn("other users of the card 2.00 GB (others_gb of host gpu-box) = 1.04 GB free",
+                      run.stdout)
+        self.assertEqual(self.fake.chats(), [])
+        # Flags win over the file: a smaller margin passes.
+        run = self.sb("set", TARGET, "ctx_size=49152", "--load", "--checks", "long", "--min-free", "1")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_other_loaded_models_count_against_the_card(self):
+        self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9,
+                                   "card": 24e9}
+        self.fake.others = [{"id": "embed", "status": "loaded", "args": [],
+                             "memory": {"status": "measured", "effective": {"n_ctx": 2048,
+                                                                           "bytes": 2_000_000_000}}},
+                            {"id": "asleep", "status": "unloaded", "args": [],
+                             "memory": {"status": "measured", "effective": {"n_ctx": 2048,
+                                                                           "bytes": 9_000_000_000}}}]
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        run = self.sb("check", TARGET, "--checks", "margin,long", "--json")
+        report = json.loads(run.stdout)
+        margin = self.by_check(report)["margin"]
+        self.assertEqual(margin["margin"]["loaded_bytes"], 2_000_000_000)
+        self.assertEqual(margin["passed"], True)  # 24 - 19.73 - 2 = 2.27 GB
+
+    def test_without_a_measurement_the_margin_is_skipped_not_failed(self):
+        self.fake.engine.memory = None
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        run, report = self.check("--checks", "margin,long")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        margin = self.by_check(report)["margin"]
+        self.assertEqual((margin["passed"], margin["result"]), (None, "skipped"))
+        self.assertFalse([r for r in self.fake.ledger if r["suite"] == "check-margin"])
+
+    def test_a_larger_pool_whose_margin_cannot_be_judged_is_put_back_before_any_request(self):
+        self.fake.engine.memory = None  # no measurement, and no fit ceiling to size the model
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        before = json.loads(json.dumps(self.fake.doc))
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "long,pool")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertEqual(self.fake.chats(), [])
+        self.assertEqual(self.fake.doc, before)
+        self.assertIn("margin could not judge", self.fake.history[-1]["action"])
+        self.assertIn("sb ai fit REPO --store", run.stderr)
+        self.released()
+
+    def test_a_change_that_does_not_grow_the_pool_runs_without_a_margin(self):
+        self.fake.engine.memory = None
+        self.fake.write({"load": {"ctx_size": 30000, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        run = self.sb("set", TARGET, "ctx_size=24576", "--load", "--checks", "long")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc["load"]["ctx_size"], 24576)
+
+
+class FitMarginTests(Base):
+    """Without an engine measurement, the margin sizes the model with `sb ai
+    fit`: the running file's weights, the pool's KV cache from the file
+    header, and the host's compute buffers."""
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import sb_ai_fit as fixtures
+        listing = fixtures.MOE_LISTING
+        headers = {(listing["id"], f["rfilename"]): fixtures.moe_header()
+                   for f in listing["siblings"] if f["rfilename"].endswith(".gguf")}
+        self.index = fixtures.Index({listing["id"]: listing}, {}, headers)
+        self.addCleanup(self.index.close)
+        self.env["SB_AI_FIT_HF_BASE"] = self.index.url
+        # The card as measured on a 24 GB box: 28 GB here, others 2.1 GB, the
+        # runtime's own buffers 0.85 GB, and 0.5 GB that must stay free.
+        path = self.root / "machines.json"
+        path.write_text(json.dumps({"machines": [{"name": "gpu-box", "kind": "gpu", "vram_gb": 28,
+                                                  "others_gb": 2.1, "compute_gb": 0.85,
+                                                  "min_free_gb": 0.5}]}))
+        self.env["SB_AI_MACHINES"] = str(path)
+        engine = self.fake.engine
+        engine.memory = None
+        engine.no_file = True
+        engine.model_path = "/models/moe-35b-Q4_K_M.gguf"  # the file that runs
+        # The stored fit ceiling names the repository (its quant is not the one that runs).
+        self.ceiling = {"bytes_per_token": 1, "source": "sb ai fit test/moe-35b Q8_0 at 1008 GB/s"}
+
+    def test_a_pool_that_leaves_room_passes_and_one_that_does_not_is_put_back(self):
+        self.fake.write({"load": {"ctx_size": 32768, "parallel": 3}, "engine_args": {"kv-unified": True},
+                         "ceiling": self.ceiling})
+        run = self.sb("set", TARGET, "ctx_size=98304", "--load", "--checks", "long")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("fit test/moe-35b Q4_K_M: weights 21.71 GB + KV 2.21 GB at 98,304 f16/f16 "
+                      "+ compute 0.85 GB", run.stdout)
+        self.assertIn("= 1.12 GB free", run.stdout)
+        kept = json.loads(json.dumps(self.fake.doc))
+        sent = len(self.fake.chats())
+        run = self.sb("set", TARGET, "ctx_size=131072", "--load", "--checks", "long,pool")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("KV 2.95 GB at 131,072", run.stdout)
+        self.assertIn("0.38 GB free, under the 0.50 GB", run.stdout)
+        self.assertEqual(len(self.fake.chats()), sent)  # no request at 131,072
+        self.assertEqual(self.fake.doc, kept)
+        self.assertIn("margin failed (margin_short)", self.fake.history[-1]["action"])
+        # The model index was read once per pool size.
+        listings = [r for r in self.index.seen if r["path"].startswith("/api/models/")]
+        self.assertEqual(len(listings), 2)
+        self.released()
+
+    def test_a_smaller_kv_cache_type_is_sized_by_its_bytes(self):
+        self.fake.write({"load": {"ctx_size": 131072, "parallel": 3}, "engine_args": {"kv-unified": True},
+                         "ceiling": self.ceiling}, )
+        run = self.sb("set", TARGET, "cache_type_k=q8_0", "cache_type_v=q8_0", "--load", "--checks", "long")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("at 131,072 q8_0/q8_0", run.stdout)
+
+
+class RepeatTests(Base):
+    """A change that grows the shared pool needs every pool repeat to pass,
+    each after the first on a fresh process."""
+
+    def crash_on_the_third_process(self):
+        # An out-of-memory crash that comes only on some fresh processes: the
+        # third process after the write dies on its first long request.
+        engine = self.fake.engine
+        start = {}
+
+        def rule(cfg, tokens):
+            start.setdefault("port", engine.port)
+            return engine.port == start["port"] + 2 and tokens > 5000
+
+        engine.crash_rule = rule
+
+    def test_one_pool_pass_misses_an_intermittent_crash(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        self.crash_on_the_third_process()
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "pool", "--pool-repeats", "1")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc["load"]["ctx_size"], 30000)
+
+    def test_three_pool_passes_catch_it_and_put_the_old_settings_back(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        before = json.loads(json.dumps(self.fake.doc))
+        self.crash_on_the_third_process()
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "pool")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("ctx_size 24,576 -> 30,000", run.stdout)
+        self.assertIn("pool 3/3 failed", self.fake.history[-1]["action"])
+        self.assertEqual(self.fake.doc, before)
+        pools = [r for r in self.fake.ledger if r["suite"] == "check-pool"]
+        self.assertEqual([(r["repeat"], r["passed"]) for r in pools], [(1, 1), (2, 1), (3, 0)])
+        self.released()
+
+    def test_a_change_that_shrinks_the_pool_runs_the_pool_check_once(self):
+        self.fake.write({"load": {"ctx_size": 30000, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        run = self.sb("set", TARGET, "ctx_size=24576", "--load", "--checks", "pool")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        pools = [r for r in self.fake.ledger if r["suite"] == "check-pool"]
+        self.assertEqual(len(pools), 1)
+        self.assertNotIn("repeat", pools[0])
+
+    def test_a_pool_repeat_that_cannot_judge_does_not_approve_a_larger_pool(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        before = json.loads(json.dumps(self.fake.doc))
+        self.fake.engine.capped = True
+        run = self.sb("set", TARGET, "ctx_size=30000", "--load", "--checks", "pool")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("pool passed 0 of 3", self.fake.history[-1]["action"])
+        self.assertEqual(self.fake.doc, before)
+
+
+class GrowthTests(unittest.TestCase):
+    def test_what_grows_the_shared_pool(self):
+        base = {"load": {"ctx_size": 98304, "parallel": 3}, "engine_args": {"kv-unified": True}}
+        grow = ai_check.pool_growth
+        self.assertEqual(grow(base, {"load": {"ctx_size": 131072, "parallel": 3},
+                                     "engine_args": {"kv-unified": True}}), ["ctx_size 98,304 -> 131,072"])
+        self.assertEqual(grow(base, {"load": {"ctx_size": 65536, "parallel": 3},
+                                     "engine_args": {"kv-unified": True}}), [])
+        self.assertEqual(grow({"load": {"ctx_size": 98304, "parallel": 3}}, base), ["kv-unified on"])
+        self.assertEqual(grow(base, {"load": {"ctx_size": 98304, "parallel": 4},
+                                     "engine_args": {"kv-unified": True}}), ["parallel 3 -> 4"])
+        smaller = {"load": dict(base["load"], cache_type_k="q8_0"), "engine_args": {"kv-unified": True}}
+        self.assertEqual(grow(base, smaller), ["cache_type_k f16 -> q8_0"])
+        self.assertEqual(grow(smaller, base), [])
+        # Unset: the engine's own context, which may be far larger.
+        self.assertEqual(grow(base, {"load": {"parallel": 3}, "engine_args": {"kv-unified": True}}),
+                         ["ctx_size 98,304 -> the engine's own"])
+        # What the engine runs now fills in what the document leaves out.
+        truth = {"ctx_size": 98304, "slots": 3, "kv_unified": True}
+        self.assertEqual(grow({}, {"load": {"ctx_size": 65536}}, truth), [])
+        self.assertEqual(grow({}, {"load": {"ctx_size": 131072}}, truth), ["ctx_size 98,304 -> 131,072"])
+
+    def test_the_margin_reads_the_engines_measurement(self):
+        memory = {"status": "measured",
+                  "min": {"n_ctx": 4096, "bytes": 20_000_000_000, "context_bytes": 200_000_000,
+                          "total_bytes": 24_000_000_000}}
+        got = ai_check.measured(memory, 8192)
+        self.assertEqual((got["bytes"], got["card"]), (20_200_000_000, 24_000_000_000))
+        self.assertIsNone(ai_check.measured({"status": "unmeasured"}, 8192))
+        self.assertIsNone(ai_check.measured(None))
+        # An older gateway: no KV part to scale, so only a measurement at the
+        # running context counts.
+        old = {"min": {"n_ctx": 4096, "bytes": 20_000_000_000}}
+        self.assertIsNone(ai_check.measured(old, 8192))
+        self.assertEqual(ai_check.measured(old, 4096)["bytes"], 20_000_000_000)
 
 
 if __name__ == "__main__":

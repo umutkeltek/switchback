@@ -24,29 +24,56 @@ Every result goes to the gateway's quality ledger (suites check-long,
 check-pool, check-picture), tied to the target, its settings revision, the
 engine build and the model file.
 
-`set --check`, `load` and `sb ai tune` use the same checks as a guard: a
+`set --load`, `load` and `sb ai tune` use the same checks as a guard: a
 change to a memory or context setting must pass them, or it is put back.
+Once such a change is written, checks that stop for any reason (a quiet
+window, a lost lock, a machine that went off, a gateway error, Ctrl-C) put
+the previous settings back too: an unchecked change never stays live.
+
+Two more rules guard a change that makes the shared pool bigger (a larger
+ctx_size or parallel, kv-unified turned on) or its cache smaller (a lower
+KV cache type):
+
+  margin   before any request: the card memory the model leaves free, from
+           the engine's own memory measurement (the card's size, less this
+           model, less the other models the engine has loaded, less the
+           card's other users), must be at least a minimum (1.5 GB by
+           default; per host `min_free_gb` in the machine file).
+  repeats  the pool check runs 3 times (--pool-repeats), each on a fresh
+           process of the model; one failure fails the change. An
+           out-of-memory crash can depend on what else holds the card, and
+           one pass missed one.
 
 Standard library only.
 """
 
 import base64
 import json
+import math
+import os
 import random
 import re
 import struct
 import sys
 import threading
 import time
+import types
 import urllib.parse
 import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
+try:
+    import ai_fit
+except ImportError:  # the module sits next to this file
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ai_fit
+
 OK, FAIL, USAGE, MACHINE_OFF = 0, 1, 2, 3
 INTERRUPTED = 130
 
 CHECKS = ("long", "pool", "picture")
+SHOWN = ("margin",) + CHECKS  # what the settings view lists per revision
 SUITE_PREFIX = "check-"
 # 2: the picture draws smooth pen-stroke digits (1 drew blocky 5x7 pixel digits,
 # which a model misread on settings that read printed numbers right).
@@ -86,6 +113,14 @@ WATCH_EVERY_S = 2.0
 LOAD_TIMEOUT_S = 900
 WAKE_TIMEOUT_S = 600
 MAX_LOCK_S = 14400
+
+POOL_REPEATS = 3         # pool passes a change that grows the shared pool needs
+MIN_FREE_BYTES = 1_500_000_000  # card memory a change must leave free (min_free_gb per host)
+GB = ai_fit.GB
+# What the checks take at most, to tell before a guarded write whether they
+# end before the next quiet window: a (re)load, a short first request, one
+# long check, one pool check, one picture request, and putting settings back.
+NEED_S = {"load": 240, "first": 60, "long": 300, "pool": 300, "picture": 30, "put_back": 300}
 
 READY_STATES = ("healthy", "idle_countdown")
 ON_STATES = ("healthy", "draining", "idle_countdown", "degraded")
@@ -157,7 +192,6 @@ DIGIT_LEFT, DIGIT_TOP = 40, 105
 
 def digit_segments(digit, x0, y0, height=DIGIT_HEIGHT, width=DIGIT_WIDTH):
     """The pen strokes of one digit as line segments in pixels."""
-    import math
     out = []
     for stroke in DIGIT_STROKES[digit]:
         if stroke[0] == "line":
@@ -363,6 +397,107 @@ def guarded_changes(before, after):
     return out
 
 
+def _on(value):
+    return value is True or str(value).lower() in ("true", "on", "1", "yes")
+
+
+def doc_pool(doc, truth=None):
+    """The pool settings a settings document asks for: context, slots,
+    shared pool and KV cache types. A key the document leaves out is what
+    the engine runs now (`truth`), else unknown (None)."""
+    load, args = (doc or {}).get("load") or {}, (doc or {}).get("engine_args") or {}
+    truth = truth or {}
+
+    def pick(load_key, arg_key, truth_key):
+        value = load.get(load_key, args.get(arg_key))
+        return value if value is not None else truth.get(truth_key)
+
+    if _on(args.get("no-kv-unified")):
+        unified = False
+    elif "kv-unified" in args:
+        unified = _on(args.get("kv-unified"))
+    else:
+        unified = truth.get("kv_unified")
+    return {"ctx_size": _int(pick("ctx_size", "ctx-size", "ctx_size")),
+            "parallel": _int(pick("parallel", "parallel", "slots")),
+            "kv_unified": unified,
+            "cache_type_k": pick("cache_type_k", "cache-type-k", "cache_type_k"),
+            "cache_type_v": pick("cache_type_v", "cache-type-v", "cache_type_v")}
+
+
+def pool_growth(before, after, truth=None):
+    """How a change makes the shared pool bigger or its cache smaller, as
+    short phrases (empty: it does neither). A larger ctx_size or parallel,
+    kv-unified turned on, or a KV cache type with fewer bytes per element.
+    `truth` (what the engine runs now) fills in what `before` leaves out; a
+    key `after` sets that nothing knew before counts as a change."""
+    old, new = doc_pool(before, truth), doc_pool(after, truth)
+    set_before, set_after = doc_pool(before), doc_pool(after)
+    out = []
+    for key in ("ctx_size", "parallel"):
+        if set_before[key] is not None and set_after[key] is None:
+            # Unset: the engine's own value, which may be far larger.
+            out.append(f"{key} {fmt(set_before[key])} -> the engine's own")
+        elif new[key] is not None and (old[key] is None or new[key] > old[key]):
+            out.append(f"{key} {fmt(old[key])} -> {fmt(new[key])}")
+    if new["kv_unified"] is True and old["kv_unified"] is not True:
+        out.append("kv-unified on")
+    sizes = ai_fit.CACHE_TYPE_BYTES
+    for key in ("cache_type_k", "cache_type_v"):
+        was, now = (old[key] or "f16").lower(), (new[key] or "f16").lower()
+        if now in sizes and sizes[now] < sizes.get(was, sizes["f16"]):
+            out.append(f"{key} {was} -> {now}")
+    return out
+
+
+# ------------------------------------------------------------------ the memory margin
+
+def measured(memory, pool_ctx=None):
+    """The GPU bytes a model takes at its settings, from the engine's own
+    memory measurement (an engine listing row's `memory`): its `effective`
+    part (measured at what it runs), else its `min` part with the KV cache
+    (`context_bytes`) scaled to `pool_ctx`. A dict of bytes, the context it
+    stands for, the card size the measurement saw (None when the gateway
+    does not pass it on) and how it was read; None when there is none."""
+    if not isinstance(memory, dict):
+        return None
+    for name in ("effective", "min"):
+        part = memory.get(name)
+        if not isinstance(part, dict) or not part.get("bytes"):
+            continue
+        n_ctx, kv = _int(part.get("n_ctx")), part.get("context_bytes")
+        card = _int(part.get("total_bytes")) or None
+        if pool_ctx and n_ctx and n_ctx != pool_ctx and isinstance(kv, (int, float)):
+            grown = int(part["bytes"] - kv + kv * pool_ctx / n_ctx)
+            return {"bytes": grown, "n_ctx": pool_ctx, "card": card,
+                    "how": f"{name} measurement at {n_ctx:,}, KV cache scaled to {pool_ctx:,}"}
+        if name == "effective" or (pool_ctx and n_ctx == pool_ctx):
+            return {"bytes": int(part["bytes"]), "n_ctx": n_ctx, "card": card,
+                    "how": f"{name} measurement at {fmt(n_ctx)}"}
+    return None
+
+
+def margin_verdict(numbers, min_free):
+    """Pass when the card keeps at least `min_free` bytes free."""
+    free = numbers["free_bytes"]
+    parts = (f"card {gb(numbers['card_bytes'])} ({numbers['card_from']}) - model "
+             f"{gb(numbers['model_bytes'])} ({numbers['model_from']})")
+    if numbers.get("loaded_bytes"):
+        parts += f" - other loaded models {gb(numbers['loaded_bytes'])}"
+    if numbers.get("others_bytes"):
+        parts += f" - other users of the card {gb(numbers['others_bytes'])} ({numbers['others_from']})"
+    parts += f" = {gb(free)} free"
+    if free < min_free:
+        return {"check": "margin", "passed": False, "result": "margin_short",
+                "why": f"{parts}, under the {gb(min_free)} the card must keep free", "margin": numbers}
+    return {"check": "margin", "passed": True, "result": "ok",
+            "why": f"{parts} (at least {gb(min_free)})", "margin": numbers}
+
+
+def gb(number):
+    return f"{number / GB:.2f} GB" if isinstance(number, (int, float)) else "?"
+
+
 # ------------------------------------------------------------------ fresh text and pictures
 
 def answer_room(ctx, most):
@@ -515,6 +650,7 @@ class Checker:
         self.poll = 2.0 if poll_secs is None else max(0.01, float(poll_secs))
         self.scale = 1.0 if poll_secs is None else max(0.001, float(poll_secs) / 2.0)
         self.lock_id = None
+        self.lock_left = None   # seconds the lock was given (the next quiet window caps it)
         self.hold = None
         self.chars_per_token = FIRST_GUESS_CHARS
         self.no_cache = None  # whether the gateway takes `switchback.no_cache`
@@ -609,7 +745,8 @@ class Checker:
             # The model file's identity: a hash of its path, never the path
             # (the port and the other arguments change with every load).
             file = "file-" + hex(zlib.crc32(model_arg.encode()))[2:]
-        ident.update(engine_build=build, model_file=str(file or UNKNOWN))
+        ident.update(engine_build=build, model_file=str(file or UNKNOWN),
+                     file_quant=ai_fit.quant_label(str(model_arg or file or "")))
         self.truth = truth
         return truth
 
@@ -636,8 +773,8 @@ class Checker:
             raise CheckError(MACHINE_OFF, f"{host} is {power}; rerun with --wake to let the gateway "
                                           "wake it, or the checks cannot run")
 
-    def take_hold_and_lock(self, ident, why):
-        ttl = MAX_LOCK_S // 4
+    def take_hold_and_lock(self, ident, why, ttl=None):
+        ttl = min(MAX_LOCK_S, max(MAX_LOCK_S // 4, int(ttl or 0)))
         if ident["asleep"]:
             self.take_lock(ident, why, ttl, None)
             self.take_hold(ident, why, ttl, wake=bool(getattr(self.args, "wake", False)))
@@ -661,6 +798,19 @@ class Checker:
         except CheckError as error:
             raise CheckError(FAIL, error.message.replace("taking the lane's tuning lock: ", "")) from None
         self.lock_id = lock.get("id")
+        # The gateway ends a lock no later than the next quiet window: a
+        # lock shorter than asked for says when that window begins.
+        created, expires = _int(lock.get("created_ms")), _int(lock.get("expires_at_ms"))
+        if created and expires and expires - created < (ttl - 60) * 1000:
+            self.lock_left = max(0, (expires - created) // 1000)
+
+    def ends_in_time(self, need_s):
+        """Raise when the next quiet window begins before checks that take
+        `need_s` seconds can end (nothing has been written yet)."""
+        if self.lock_left is not None and self.lock_left < need_s:
+            raise CheckError(FAIL, f"the quiet window begins in {self.lock_left // 60} min and the "
+                                   f"checks need up to {math.ceil(need_s / 60)} min; nothing was "
+                                   "written (try after the window)")
 
     def wait_awake(self, ident):
         deadline = time.monotonic() + WAKE_TIMEOUT_S * self.scale
@@ -683,7 +833,9 @@ class Checker:
                 raise CheckError(FAIL, "the tuning lock is gone (it ran out or the gateway restarted)") from None
             return
         if beat.get("quiet_window"):
-            raise CheckError(OK, f"the quiet window {beat['quiet_window']} began; checks stopped")
+            # Not a pass: the checks did not end. A guarded change is put
+            # back by the caller.
+            raise CheckError(FAIL, f"the quiet window {beat['quiet_window']} began; checks stopped")
 
     def release(self):
         if self.lock_id:
@@ -707,6 +859,138 @@ class Checker:
                                 timeout=LOAD_TIMEOUT_S, headers={})
         except self.fail_types as error:
             raise CheckError(FAIL, f"loading {ident['target']}: {getattr(error, 'message', error)}") from None
+
+    def fresh_process(self, ident):
+        """Unload the model and load it again: a new process, whose first
+        requests meet the card as a fresh load does (an out-of-memory crash
+        came on a fresh process's first requests)."""
+        try:
+            self.gw.call("POST", self.model_path(ident["target"], "unload"), body={},
+                         timeout=LOAD_TIMEOUT_S, headers={})
+        except self.fail_types as error:
+            raise CheckError(FAIL, f"unloading {ident['target']}: {getattr(error, 'message', error)}") from None
+        self.load(ident)
+        return self.read_truth(ident)
+
+    # ------------------------------------------------------------ the card's memory
+
+    def machine(self, ident):
+        """The machine file's entry for the model's host (or lane), or None."""
+        path = getattr(self.args, "machines", None)
+        if not path:
+            return None
+        try:
+            machines = ai_fit.read_machines(path)
+        except ai_fit.FitError as error:
+            raise CheckError(USAGE, error.message) from None
+        names = (ident.get("host"), ident.get("lane"))
+        return next((m for m in machines if m.name in names), None)
+
+    def fit_estimate(self, ident, truth, machine):
+        """The model's GPU bytes at its settings from `sb ai fit`'s numbers,
+        when the engine measures nothing: the weights of the running file's
+        quant (the model index's file sizes), the KV cache of the whole pool
+        at its cache types (the file header's layers and heads), the
+        projector when it reads pictures, and the runtime's compute buffers
+        (the host's compute_gb, else fit's 1.5 GB). The repository is the
+        one the settings' fit ceiling names (`sb ai fit REPO --store`).
+        Returns (numbers, None) or (None, why not)."""
+        source = str(((ident.get("document") or {}).get("ceiling") or {}).get("source") or "")
+        found = re.match(r"sb ai fit (\S+/\S+)(?: (\S+))?", source)
+        if not found:
+            return None, (f"its model file is unknown to fit (run `sb ai fit REPO --store "
+                          f"{ident['target']}` once)")
+        repo = found.group(1)
+        quant = ident.get("file_quant") or found.group(2)
+        ctx = (truth or {}).get("ctx_size")
+        if not quant or not ctx:
+            return None, "the running file's quant or the pool's context is unknown"
+        k = str((truth or {}).get("cache_type_k") or "f16").lower()
+        v = str((truth or {}).get("cache_type_v") or "f16").lower()
+        key = (repo, ctx, k, v)
+        cache = self.__dict__.setdefault("_fits", {})
+        if key not in cache:
+            args = types.SimpleNamespace(repo=repo, ctx=int(ctx), cache_type_k=k, cache_type_v=v,
+                                         machines=None, vram=None, ram=None, others=None, compute=None)
+            try:
+                cache[key] = ai_fit.build_report(args, {"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
+            except ai_fit.FitError as error:
+                return None, f"fit could not read {repo} ({error.message})"
+        report = cache[key]
+        option = next((o for o in report.get("options") or []
+                       if str(o.get("quant") or "").upper() == quant.upper()), None)
+        kv = report.get("kv_cache") or {}
+        if option is None or not option.get("bytes"):
+            return None, f"fit finds no {quant} file in {repo}"
+        if not kv.get("known"):
+            return None, f"fit cannot size the KV cache of {repo} from its header"
+        projector = int((report.get("projector") or {}).get("bytes") or 0) \
+            if (truth or {}).get("projector") else 0
+        compute = int(machine.compute) if machine is not None else ai_fit.MARGIN_BYTES
+        total = int(option["bytes"]) + int(kv["bytes"]) + projector + compute
+        how = (f"fit {repo} {quant}: weights {gb(option['bytes'])} + KV {gb(kv['bytes'])} at "
+               f"{int(ctx):,} {k}/{v}" + (f" + projector {gb(projector)}" if projector else "")
+               + f" + compute {gb(compute)}")
+        return {"bytes": total, "n_ctx": int(ctx), "card": None, "how": how}, None
+
+    def check_margin(self, ident, truth):
+        """Before any request: the card memory the model leaves free at its
+        settings, from the engine's own measurement. The card's size is the
+        measurement's (when the gateway passes it on), else --card-gb, else
+        the host's vram_gb in the machine file; other users of the card
+        (a desktop, an image server) are --others, else the host's
+        others_gb; the minimum is --min-free, else the host's min_free_gb,
+        else 1.5 GB."""
+        engines = self.call("GET", "/v1/engines", timeout=30, doing="reading the engines")
+        rows = next((lane.get("models") or [] for lane in engines.get("data") or []
+                     if lane.get("lane") == ident["lane"]), [])
+        row = next((r for r in rows if r.get("id") == ident["model"]), None)
+        pool_ctx = (truth or {}).get("pool_ctx") or (truth or {}).get("ctx_size")
+        machine = self.machine(ident)
+        where = f"host {ident.get('host') or ident['lane']}"
+        mine = measured((row or {}).get("memory"), pool_ctx)
+        if mine is None:
+            mine, why = self.fit_estimate(ident, truth, machine)
+            if mine is None:
+                return {"check": "margin", "passed": None, "result": "skipped",
+                        "why": f"the engine reports no memory measurement for the model, and {why}"}
+        card_flag = getattr(self.args, "card_gb", None)
+        if card_flag:
+            card, card_from = int(float(card_flag) * GB), "--card-gb"
+        elif mine["card"]:
+            card, card_from = mine["card"], "the engine's measurement"
+        elif machine is not None and machine.kind == "gpu" and machine.budget:
+            card, card_from = int(machine.budget), f"vram_gb of {where} in the machine file"
+        else:
+            return {"check": "margin", "passed": None, "result": "skipped",
+                    "why": (f"the card's size is unknown: the gateway does not pass it on, so set "
+                            f"vram_gb for {where} in the machine file (SB_AI_MACHINES) or pass "
+                            "--card-gb")}
+        loaded = 0
+        for other in rows:
+            if other is row or other.get("status") not in ("loaded", "loading"):
+                continue
+            theirs = measured(other.get("memory"))
+            loaded += theirs["bytes"] if theirs else 0
+        others_flag = getattr(self.args, "others", None)
+        if others_flag is not None:
+            others, others_from = int(float(others_flag) * GB), "--others"
+        elif machine is not None and machine.others:
+            others, others_from = int(machine.others), f"others_gb of {where}"
+        else:
+            others, others_from = 0, "none named"
+        free_flag = getattr(self.args, "min_free", None)
+        if free_flag is not None:
+            min_free = int(float(free_flag) * GB)
+        elif machine is not None and getattr(machine, "min_free", None) is not None:
+            min_free = int(machine.min_free)
+        else:
+            min_free = MIN_FREE_BYTES
+        numbers = {"card_bytes": card, "card_from": card_from, "model_bytes": mine["bytes"],
+                   "model_from": mine["how"], "measured_ctx": mine["n_ctx"], "loaded_bytes": loaded,
+                   "others_bytes": others, "others_from": others_from,
+                   "free_bytes": card - mine["bytes"] - loaded - others, "min_free_bytes": min_free}
+        return margin_verdict(numbers, min_free)
 
     # ------------------------------------------------------------ requests
 
@@ -1036,16 +1320,40 @@ class Checker:
     # ------------------------------------------------------------ one run of checks
 
     def wanted(self):
-        names = getattr(self.args, "checks", None) or ",".join(CHECKS)
+        """The checks --checks names (all of them by default), the margin
+        rule among them."""
+        names = getattr(self.args, "checks", None) or ",".join(SHOWN)
         out = [n.strip() for n in names.split(",") if n.strip()]
-        unknown = [n for n in out if n not in CHECKS]
+        unknown = [n for n in out if n not in SHOWN]
         if unknown:
-            raise CheckError(USAGE, f"unknown check {', '.join(unknown)}; checks: {', '.join(CHECKS)}")
+            raise CheckError(USAGE, f"unknown check {', '.join(unknown)}; checks: {', '.join(SHOWN)}")
         return out
 
-    def run_checks(self, ident, checks, baseline=None):
+    def record(self, ident, verdict, verdicts):
+        verdict["revision"] = ident["revision"]
+        verdict["ledger_id"] = self.store(ident, verdict)
+        verdicts.append(verdict)
+        self.log("  " + verdict_line(verdict))
+        return verdict
+
+    def margin_step(self, ident, truth, verdicts, required=False):
+        """The margin rule on the process now loaded; True when it failed,
+        or (`required`: a change that grows the pool) could not judge. Then
+        no request is sent."""
+        verdict = self.check_margin(ident, truth)
+        self.record(ident, verdict, verdicts)
+        if verdict.get("passed") is None and required:
+            self.say(f"a larger pool needs the margin rule: {verdict.get('why')}")
+            return True
+        return verdict.get("passed") is False
+
+    def run_checks(self, ident, checks, baseline=None, pool_repeats=1, margin=True):
         """Load the model, read its truth view, run `checks`; every result
-        is stored. The machine is held and the lane locked by the caller."""
+        is stored. The machine is held and the lane locked by the caller.
+        `margin`: the margin rule first, before any request (a failure ends
+        the run there; "required": one that cannot judge too). `pool_repeats`: the pool check that many times, the
+        later ones each on a fresh process; the first that does not pass
+        ends the repeats."""
         self.load(ident)
         truth = self.read_truth(ident)
         if self.no_cache is None:
@@ -1054,10 +1362,13 @@ class Checker:
         finding = split_finding(truth)
         if finding:
             self.log(f"  note: {finding}")
+        verdicts = []
+        required = margin == "required"
+        if margin and self.margin_step(ident, truth, verdicts, required):
+            return truth, verdicts
         watch = self.watch_start(ident)
         probe = self.probe(ident)
         events = self.watch_stop(watch, ident)
-        verdicts = []
         if probe.get("status") != 200:
             self.say(f"the first request failed ({probe.get('status')}: {probe.get('error')})")
             if events.get("crashed") or events.get("restarted") or events.get("unloaded"):
@@ -1075,19 +1386,32 @@ class Checker:
                     verdicts.append(verdict)
                     self.log("  " + verdict_line(verdict))
                 return truth, verdicts
+        repeats = max(1, int(pool_repeats or 1))
         for name in checks:
             self.renew()
+            if name == "pool":
+                for n in range(repeats):
+                    if n:
+                        self.renew()
+                        self.log(f"  pool {n + 1}/{repeats}: unload and load again (a fresh process) ...")
+                        truth = self.fresh_process(ident)
+                        if margin and self.margin_step(ident, truth, verdicts, required):
+                            break
+                    else:
+                        self.log(f"  pool{f' 1/{repeats}' if repeats > 1 else ''} ...")
+                    verdict = self.check_pool(ident, truth)
+                    if repeats > 1:
+                        verdict.update(repeat=n + 1, repeats=repeats)
+                    self.record(ident, verdict, verdicts)
+                    if verdict.get("passed") is not True:
+                        break
+                continue
             self.log(f"  {name} ...")
             if name == "long":
                 verdict = self.check_long(ident, truth)
-            elif name == "pool":
-                verdict = self.check_pool(ident, truth)
             else:
                 verdict = self.check_picture(ident, truth, baseline)
-            verdict["revision"] = ident["revision"]
-            verdict["ledger_id"] = self.store(ident, verdict)
-            verdicts.append(verdict)
-            self.log("  " + verdict_line(verdict))
+            self.record(ident, verdict, verdicts)
         return truth, verdicts
 
 
@@ -1142,7 +1466,15 @@ def ledger_row(ident, verdict, truth, note=None):
         "passed": None if passed is None else int(bool(passed)),
     }
     requests = verdict.get("requests") or []
-    if verdict["check"] == "picture":
+    if verdict["check"] == "margin":
+        numbers = verdict.get("margin") or {}
+        if status == "complete":
+            row["score"] = 1.0 if passed else 0.0
+        for key in ("card_bytes", "model_bytes", "loaded_bytes", "others_bytes", "free_bytes",
+                    "min_free_bytes", "measured_ctx"):
+            if isinstance(numbers.get(key), int):
+                row[key] = numbers[key]
+    elif verdict["check"] == "picture":
         runs = verdict.get("runs") or len(requests)
         row["score"] = (verdict.get("number_right", 0) / runs) if runs and status == "complete" else None
         row["per_case"] = {f"r{i + 1:02d}": [1.0 if r.get("number_right") else 0.0]
@@ -1172,6 +1504,9 @@ def ledger_row(ident, verdict, truth, note=None):
         row["per_request_ctx"] = truth.get("per_request_ctx")
         row["slots"] = truth.get("slots")
         row["kv_unified"] = None if truth.get("kv_unified") is None else int(bool(truth["kv_unified"]))
+    for key in ("repeat", "repeats"):
+        if isinstance(verdict.get(key), int):
+            row[key] = verdict[key]
     seconds = sum(r.get("seconds") or 0 for r in requests)
     row["seconds"] = round(seconds, 1)
     if note:
@@ -1182,7 +1517,10 @@ def ledger_row(ident, verdict, truth, note=None):
 def verdict_line(verdict):
     mark = {True: "PASS", False: "FAIL", None: "----"}[verdict.get("passed")]
     words = verdict.get("why") or verdict.get("result")
-    line = f"{verdict['check']:<8} {mark}  {verdict.get('result')}: {words}"
+    name = verdict["check"]
+    if verdict.get("repeats"):
+        name += f" {verdict.get('repeat')}/{verdict['repeats']}"
+    line = f"{name:<8} {mark}  {verdict.get('result')}: {words}"
     events = verdict.get("engine") or {}
     if events.get("ports"):
         line += f" (process ports {', '.join(str(p) for p in events['ports'])})"
@@ -1223,6 +1561,8 @@ def check_words(row):
     detail = row.get("stop_reason") or ""
     if row.get("suite") == "check-picture" and row.get("runs"):
         detail += f" {row.get('number_right')}/{row.get('runs')}"
+    elif row.get("suite") == "check-margin" and isinstance(row.get("free_bytes"), int):
+        detail += f" {gb(row['free_bytes'])} free"
     elif row.get("read_tokens"):
         detail += f" {row['read_tokens']:,} tokens"
     return f"{mark} ({detail.strip()}, {when})"
@@ -1240,12 +1580,48 @@ def add_arguments(parser):
     parser.add_argument("--wake", action="store_true")
     parser.add_argument("--no-store", action="store_true")
     parser.add_argument("--json", action="store_true")
+    add_guard_arguments(parser)
+
+
+def add_guard_arguments(parser):
+    """The flags of the margin rule and the pool repeats (check, set, load)."""
+    parser.add_argument("--pool-repeats", type=int)
+    parser.add_argument("--min-free", type=float)
+    parser.add_argument("--others", type=float)
+    parser.add_argument("--card-gb", type=float)
+
+
+def pool_repeats_for(args, growth):
+    """--pool-repeats, else POOL_REPEATS for a change that grows the pool,
+    else one."""
+    asked = getattr(args, "pool_repeats", None)
+    if asked is not None:
+        if asked < 1:
+            raise CheckError(USAGE, "--pool-repeats takes a number of 1 or more")
+        return asked
+    return POOL_REPEATS if growth else 1
+
+
+def need_s(checks, repeats, runs, projector=True, baseline=False):
+    """The most the checks of a guarded change take, in seconds: the load,
+    the first request, each check (the pool once per repeat, the later
+    repeats each with an unload and a load), the picture runs (twice
+    without a stored baseline), and putting the settings back."""
+    total = NEED_S["load"] + NEED_S["first"] + NEED_S["put_back"]
+    if "long" in checks:
+        total += NEED_S["long"]
+    if "pool" in checks:
+        total += repeats * NEED_S["pool"] + (repeats - 1) * 2 * NEED_S["load"]
+    if "picture" in checks and projector is not False:
+        total += runs * NEED_S["picture"] * (1 if baseline else 2)
+    return total
 
 
 def run(gw, args, fail_types, poll_secs=None, out=sys.stdout, err=sys.stderr):
     checker = Checker(gw, args, fail_types, out=out, err=err, poll_secs=poll_secs)
     try:
         checks = checker.wanted()
+        repeats = pool_repeats_for(args, [])
         ident = checker.resolve(args.model)
         checker.preflight(ident)
         checker.take_hold_and_lock(ident, f"sb ai check {ident['target']}")
@@ -1256,12 +1632,13 @@ def run(gw, args, fail_types, poll_secs=None, out=sys.stdout, err=sys.stderr):
                 if baseline is None:
                     checker.say(f"no picture result of revision {args.baseline} with {args.runs} runs "
                                 "to compare against")
-            truth, verdicts = checker.run_checks(ident, checks, baseline)
+            truth, verdicts = checker.run_checks(ident, [c for c in checks if c != "margin"], baseline,
+                                                 pool_repeats=repeats, margin="margin" in checks)
         finally:
             checker.release()
     except CheckError as error:
         print(f"sb ai check: {error.message}", file=err)
-        return error.code
+        return error.code or FAIL
     except KeyboardInterrupt:
         checker.release()
         print("\nsb ai check: interrupted", file=err)
@@ -1277,23 +1654,109 @@ def run(gw, args, fail_types, poll_secs=None, out=sys.stdout, err=sys.stderr):
     return OK if verdict is not False else FAIL
 
 
-def guard(gw, args, fail_types, target_view, write, poll_secs=None, out=sys.stdout, err=sys.stderr):
+def change_failure(verdicts, checks, growth, repeats):
+    """Why the checks of a change do not let it stay, or None. A failed
+    check fails it; a change that grows the shared pool also needs every
+    pool repeat to pass (one that cannot judge does not approve it)."""
+    failed = [v for v in verdicts if v.get("passed") is False]
+    unjudged = [v for v in verdicts if v.get("check") == "margin" and v.get("passed") is None]
+    if growth and unjudged and not failed:
+        return "margin could not judge (a larger pool needs it)"
+    if failed:
+        first = failed[0]
+        name = first["check"]
+        if first.get("repeats"):
+            name += f" {first.get('repeat')}/{first['repeats']}"
+        return f"{name} failed ({first.get('result')})"
+    if growth and "pool" in checks:
+        passed = sum(1 for v in verdicts if v.get("check") == "pool" and v.get("passed") is True)
+        if passed < repeats:
+            return f"pool passed {passed} of {repeats} (a larger pool needs every one)"
+    return None
+
+
+def keep_or_put_back(checker, ident, before_revision, before_doc, checks, growth, repeats, run_them):
+    """Run the checks of a change that is live now (`run_them()` returns
+    (truth, verdicts)) and keep it only when they pass. A failed check, or
+    checks that stop for any reason (a quiet window, a lost lock, a machine
+    gone off, a gateway error, Ctrl-C), write the previous revision's
+    document back, with the reason in the history note. Returns the exit
+    code: 0 only when the change was kept."""
+    verdicts, failure, code = [], None, FAIL
+    try:
+        _, verdicts = run_them()
+    except CheckError as error:
+        failure, code = f"checks stopped: {error.message}", error.code or FAIL
+    except KeyboardInterrupt:
+        failure, code = "checks stopped: interrupted", INTERRUPTED
+    except Exception as error:  # noqa: BLE001 - an unchecked change must never stay live
+        failure = f"checks stopped: {type(error).__name__}: {error}"
+    if failure is None:
+        failure = change_failure(verdicts, checks, growth, repeats)
+    if failure is None:
+        word = "all checks passed" if overall(verdicts) else "no check could judge"
+        checker.log(f"{ident['target']} revision {ident['revision']}: {word}; kept")
+        return OK
+    note = f"sb ai check: {failure}; back to revision {before_revision}"[:120]
+    try:
+        back = put_back(checker, ident, before_doc, note)
+    except (CheckError, KeyboardInterrupt) as error:
+        why = getattr(error, "message", "interrupted")
+        checker.say(f"{failure}; putting the settings of revision {before_revision} back failed "
+                    f"({why}): revision {ident['revision']} is live and unchecked; run "
+                    f"`sb ai revert {ident['target']} {before_revision}`")
+        return code
+    done = (f"{failure}: put back the settings of revision {before_revision} "
+            f"as revision {back.get('revision')}")
+    if getattr(checker.args, "json", False):
+        checker.say(done)
+    else:
+        checker.log(done)
+    apply = back.get("apply") if isinstance(back, dict) else None
+    if isinstance(apply, dict) and apply.get("pending"):
+        checker.say("the model is busy: the gateway applies the old settings once its requests end")
+    elif isinstance(apply, dict) and apply.get("ok") is False:
+        checker.say(f"the old settings are saved but not applied yet: {apply.get('error') or apply.get('message')}")
+    return code
+
+
+def guard(gw, args, fail_types, target_view, write, after_doc=None, poll_secs=None, out=sys.stdout,
+          err=sys.stderr):
     """Write a guarded change and check it at once: a picture baseline of
     the current revision first (when the model has a projector and has none),
-    then the write with apply now, then the checks. A failed check writes the
-    previous revision's document back (the note says why). `write(extra)`
-    does the settings write and returns the gateway's answer."""
+    then the write with apply now, then the checks. A failed check, or
+    checks that stop for any reason after the write, write the previous
+    revision's document back (the note says why). Nothing is written when
+    the checks cannot end before the next quiet window. `write(extra)` does
+    the settings write and returns the gateway's answer; `after_doc` is the
+    document it writes."""
     checker = Checker(gw, args, fail_types, out=out, err=err, poll_secs=poll_secs)
     try:
         checks = checker.wanted()
         ident = checker.resolve(target_view["target"])
         before_revision, before_doc = ident["revision"], ident["document"]
-        checker.preflight(ident)
-        checker.take_hold_and_lock(ident, f"sb ai set --check {ident['target']}")
         try:
+            checker.preflight(ident)
+        except CheckError as error:
+            if error.code == MACHINE_OFF:
+                raise CheckError(MACHINE_OFF, f"{error.message}, or --no-check to keep the change "
+                                              "for the next load, unchecked") from None
+            raise
+        row, _ = checker.engine_row(ident)
+        truth_before = truth_of(row or {})
+        growth = pool_growth(before_doc, after_doc, truth_before) if after_doc is not None else []
+        repeats = pool_repeats_for(args, growth)
+        runs = int(getattr(args, "runs", None) or PICTURE_RUNS)
+        need = need_s(checks, repeats, runs, projector=(truth_before or {}).get("projector"))
+        checker.take_hold_and_lock(ident, f"sb ai set --check {ident['target']}", ttl=need + 600)
+        try:
+            checker.ends_in_time(need)
+            if growth:
+                checker.log(f"{ident['target']}: the change grows the shared pool ({', '.join(growth)}): "
+                            f"margin rule, then {repeats} pool checks, each after the first on a fresh "
+                            "process")
             baseline = None
             if "picture" in checks:
-                runs = int(getattr(args, "runs", None) or PICTURE_RUNS)
                 baseline = checker.baseline(ident, before_revision, runs)
                 if baseline is None:
                     checker.load(ident)
@@ -1309,40 +1772,29 @@ def guard(gw, args, fail_types, target_view, write, poll_secs=None, out=sys.stdo
                             baseline = {"revision": before_revision, "runs": runs,
                                         "number_right": first["number_right"]}
             answer = write({"apply": "now", "wake": bool(getattr(args, "wake", False))})
+            # Written: from here on the change is live, and only checks that
+            # pass keep it.
             apply = answer.get("apply") if isinstance(answer, dict) else None
             ident["revision"] = int(answer.get("revision") or ident["revision"])
             ident["settings_hash"] = str(answer.get("settings_hash") or ident["settings_hash"])
             checker.log(f"{ident['target']}: revision {ident['revision']}")
             if isinstance(apply, dict) and apply.get("message"):
                 checker.log(apply["message"])
-            failure = None
-            verdicts = []
-            if isinstance(apply, dict) and apply.get("ok") is False:
-                failure = f"the apply failed: {apply.get('error') or apply.get('message')}"
-            else:
-                try:
-                    truth, verdicts = checker.run_checks(ident, checks, baseline)
-                except CheckError as error:
-                    if error.code == OK:
-                        raise
-                    failure = error.message
-                failed = [v for v in verdicts if v.get("passed") is False]
-                if failed:
-                    failure = f"{failed[0]['check']} failed ({failed[0].get('result')})"
-            if failure:
-                note = f"sb ai check: {failure}; back to revision {before_revision}"[:120]
-                back = put_back(checker, ident, before_doc, note)
-                checker.log(f"{failure}: put back the settings of revision {before_revision} "
-                            f"as revision {back.get('revision')}")
-                return FAIL
-            word = "all checks passed" if overall(verdicts) else "no check could judge"
-            checker.log(f"{ident['target']} revision {ident['revision']}: {word}; kept")
-            return OK
+
+            def run_them():
+                if isinstance(apply, dict) and apply.get("ok") is False:
+                    raise CheckError(FAIL, f"the apply failed: {apply.get('error') or apply.get('message')}")
+                return checker.run_checks(ident, [c for c in checks if c != "margin"], baseline,
+                                          pool_repeats=repeats,
+                                          margin="required" if growth else "margin" in checks)
+
+            return keep_or_put_back(checker, ident, before_revision, before_doc, checks, growth,
+                                    repeats, run_them)
         finally:
             checker.release()
     except CheckError as error:
         print(f"sb ai set: {error.message}", file=err)
-        return error.code
+        return error.code or FAIL
 
 
 def put_back(checker, ident, doc, note):
@@ -1401,8 +1853,9 @@ def pending(gw, fail_types, target):
 def after_load(gw, args, fail_types, target, revision, keys, poll_secs=None, out=sys.stdout,
                err=sys.stderr):
     """The checks a guarded change left pending, run on the model's next
-    load through `sb ai load`. A failed check writes the document of the
-    revision before it back (the note says why)."""
+    load through `sb ai load`. The change is live once loaded, so a failed
+    check, or checks that cannot start or stop for any reason, write the
+    document of the revision before it back (the note says why)."""
     checker = Checker(gw, args, fail_types, out=out, err=err, poll_secs=poll_secs)
     try:
         checks = checker.wanted()
@@ -1418,31 +1871,30 @@ def after_load(gw, args, fail_types, target, revision, keys, poll_secs=None, out
         before = next((r for r in rows if (r.get("revision") or 0) < revision), None)
         before_doc = history_doc(before) if before else {}
         before_revision = before.get("revision") if before else 0
+        growth = pool_growth(before_doc, ident["document"])
+        repeats = pool_repeats_for(args, growth)
+        runs = int(getattr(args, "runs", None) or PICTURE_RUNS)
         checker.log(f"{target} revision {revision} changed {', '.join(keys)}: its checks run now")
-        checker.preflight(ident)
-        checker.take_hold_and_lock(ident, f"sb ai load {target}: pending checks")
-        try:
-            runs = int(getattr(args, "runs", None) or PICTURE_RUNS)
+        if growth:
+            checker.log(f"{target}: the change grows the shared pool ({', '.join(growth)}): margin "
+                        f"rule, then {repeats} pool checks, each after the first on a fresh process")
+
+        def run_them():
+            checker.preflight(ident)
             baseline = checker.baseline(ident, before_revision, runs) if "picture" in checks else None
-            try:
-                _, verdicts = checker.run_checks(ident, checks, baseline)
-            except CheckError as error:
-                if error.code == OK:
-                    raise
-                verdicts = [{"check": "run", "passed": False, "result": "request_failed",
-                             "why": error.message}]
-            failed = [v for v in verdicts if v.get("passed") is False]
-            if failed:
-                failure = f"{failed[0]['check']} failed ({failed[0].get('result')})"
-                note = f"sb ai check: {failure}; back to revision {before_revision}"[:120]
-                back = put_back(checker, ident, before_doc, note)
-                checker.log(f"{failure}: put back the settings of revision {before_revision} "
-                            f"as revision {back.get('revision')}")
-                return FAIL
-            checker.log(f"{target} revision {revision}: checks done; kept")
-            return OK
+            need = need_s(checks, repeats, runs, projector=(checker.truth or {}).get("projector"),
+                          baseline=baseline is not None)
+            checker.take_hold_and_lock(ident, f"sb ai load {target}: pending checks", ttl=need + 600)
+            checker.ends_in_time(need)
+            return checker.run_checks(ident, [c for c in checks if c != "margin"], baseline,
+                                      pool_repeats=repeats,
+                                      margin="required" if growth else "margin" in checks)
+
+        try:
+            return keep_or_put_back(checker, ident, before_revision, before_doc, checks, growth,
+                                    repeats, run_them)
         finally:
             checker.release()
     except CheckError as error:
         print(f"sb ai load: {error.message}", file=err)
-        return error.code
+        return error.code or FAIL

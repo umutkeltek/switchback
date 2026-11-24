@@ -807,7 +807,7 @@ def rank_options(options):
 class Machine:
     """What a machine has: memory, and how fast its memory is."""
 
-    def __init__(self, name, kind, budget, host, bandwidth, others=0, compute=None):
+    def __init__(self, name, kind, budget, host, bandwidth, others=0, compute=None, min_free=None):
         self.name = name
         self.kind = kind
         self.budget = budget
@@ -818,6 +818,9 @@ class Machine:
         self.others = others or 0
         # The runtime's compute buffers (flash attention, the batch).
         self.compute = MARGIN_BYTES if compute is None else compute
+        # The card memory a memory or context change must leave free
+        # (`sb ai check`'s margin rule); None: its default.
+        self.min_free = min_free
 
     @property
     def room(self):
@@ -845,7 +848,8 @@ def machine_from_entry(entry, where):
     bandwidth = float(entry["bandwidth_gbs"]) if entry.get("bandwidth_gbs") is not None else None
     others = float(entry["others_gb"]) * GB if entry.get("others_gb") is not None else 0
     compute = float(entry["compute_gb"]) * GB if entry.get("compute_gb") is not None else None
-    return Machine(name, kind, budget, host, bandwidth, others, compute)
+    min_free = float(entry["min_free_gb"]) * GB if entry.get("min_free_gb") is not None else None
+    return Machine(name, kind, budget, host, bandwidth, others, compute, min_free)
 
 
 def read_machines(path):

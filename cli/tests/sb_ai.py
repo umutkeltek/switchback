@@ -1673,9 +1673,16 @@ class SbAi(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertIn("--load", run.stderr)
         self.assertEqual(self.requests("PUT"), [])
+        # A memory or context change is checked at once by default; the
+        # checks need a lane with engine control, which this fake has not.
         run = self.sb("set", "text/m", "ctx_size=65536", "cache_type_k=q8_0", "--load",
                       "--apply", "now", "--wake")
+        self.assertEqual(run.returncode, 1)
+        self.assertEqual(self.requests("PUT"), [])
+        run = self.sb("set", "text/m", "ctx_size=65536", "cache_type_k=q8_0", "--load",
+                      "--apply", "now", "--wake", "--no-check")
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("warning: --no-check", run.stderr)
         put = self.posted_with("PUT", "/v1/models/text/m/settings")
         self.assertEqual(put["json"]["load"], {"ctx_size": 65536, "cache_type_k": "q8_0"})
         self.assertEqual(put["json"]["apply"], "now")

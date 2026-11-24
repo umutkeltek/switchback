@@ -91,10 +91,12 @@ sb ai: images, video, audio and machine status through a Switchback gateway
   sb ai eval --rescore RUN_ID [--no-store] [--json]
                                   score a run's kept answers again (new labels), no model call
                                  where a model fits and which file to take
-  sb ai check MODEL [--checks long,pool,picture] [--runs N] [--ctx N] [--per-request]
-                   [--baseline REV] [--wake] [--no-store] [--json]
-                                 does the model's memory and context setting hold up: a long
-                                 request at its set context, a full pool, picture reading
+  sb ai check MODEL [--checks margin,long,pool,picture] [--runs N] [--ctx N] [--per-request]
+                   [--baseline REV] [--pool-repeats N] [--min-free GB] [--others GB]
+                   [--card-gb GB] [--machines FILE] [--wake] [--no-store] [--json]
+                                 does the model's memory and context setting hold up: the card
+                                 memory it leaves free, a long request at its set context, a
+                                 full pool, picture reading
   sb ai settings MODEL [--profile NAME] [--history] [--json]
                                  a model's settings: each key, its value and where it comes from
   sb ai set MODEL key=value ... [--profile NAME] [--lock]
@@ -103,15 +105,17 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  remove settings (and their locks)
   sb ai revert MODEL REVISION    put back the settings of an earlier revision
                                  (0: no saved settings and no locks, the engine's own values)
-  sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake] [--check]
-                                 change load settings (ctx_size=65536 cache_type_k=q8_0);
-                                 --check runs the checks at once and puts the old settings
-                                 back when one fails
+  sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake] [--no-check]
+                                 change load settings (ctx_size=65536 cache_type_k=q8_0); a
+                                 memory or context change is checked at once and the old
+                                 settings go back when a check fails or the checks stop;
+                                 --no-check leaves it unchecked until the next `sb ai load`
   sb ai chat MODEL "prompt" [--profile NAME] [--set key=value ...] [--load key=value ...]
              [--json]            one quick request to try settings: answer, tokens, speed, route
   sb ai load MODEL [--wake] [--no-check]
                                  load a model now (preload); never wakes without --wake;
                                  runs the checks a memory or context change left pending
+                                 (and puts the old settings back when they fail or stop)
   sb ai unload MODEL             unload a model; refused while it serves a request
   sb ai engines [--json]         what each engine has loaded, with memory and pending settings
 
@@ -256,7 +260,11 @@ tune: never on a sleeping machine without --wake (exit 3), never on a lane with
 experiments: false, never inside a quiet window.
 
 check sends every request through the gateway with fresh random text and
-asks the gateway not to answer from a cache. long sends one request at about
+asks the gateway not to answer from a cache. margin sends nothing: it reads
+the card memory the model leaves free (see the margin rule below; the
+model's size is the engine's own measurement, else `sb ai fit`'s numbers for
+the running file of the repository the settings' fit ceiling names, plus
+the host's compute_gb). long sends one request at about
 90% of the context the model is set to (its --ctx-size; --per-request: what
 one request can really use; --ctx N: N), with three fresh codes at 10%, 50%
 and 90% depth, and passes only on HTTP 200 with all three codes. A set
@@ -276,17 +284,37 @@ per revision. check holds the machine and takes the lane's tuning lock, like
 eval. A load change of ctx_size, parallel, cache_type_k/v, batch_size,
 ubatch_size, n_gpu_layers, fit, fit_ctx, mmproj, or of the engine arguments
 kv-unified, n-cpu-moe, cpu-moe, override-tensor (and the like) is guarded:
-`set --check` runs the checks at once (a picture baseline of the old
-revision first, when there is none) and writes the old settings back, with
-the reason in the history note, when one fails (a picture result below the
-old revision's counts as failed); without --check the checks wait for the
-next `sb ai load MODEL` (--no-check skips them), which reverts the same way.
+`set --load` runs the checks at once with apply now (a picture baseline of
+the old revision first, when there is none; --check says the same) and
+writes the old settings back, with the reason in the history note, when one
+fails (a picture result below the old revision's counts as failed) or when
+the checks stop for any reason after the write (a quiet window, a lost
+lock, a machine gone off, a gateway error, Ctrl-C); exit 0 means the change
+passed and stays. Nothing is written when the checks cannot end before the
+next quiet window. --no-check writes it for the next load, unchecked, with a
+warning: the router loads models on demand, so it can go live before
+`sb ai load MODEL` runs its checks (load --no-check skips them; a failed or
+stopped pending check reverts the same way). A change that grows the shared
+pool (ctx_size or parallel up, kv-unified on, a smaller KV cache type) also
+meets the margin rule before any request: the card memory left free (the
+card's size, from the engine's measurement, else --card-gb, else vram_gb of
+the host in the machine file; less the model as the engine measured it,
+less the other models it has loaded, less the card's other users: --others,
+else others_gb) must be at least --min-free (else min_free_gb, else 1.5
+GB); a change that grows the pool fails when the margin cannot be judged.
+Its pool check runs --pool-repeats times (3 by default), each after
+the first on a fresh process (unload, load); one failure fails it. The
+machine file is the one `fit` reads (--machines, else SB_AI_MACHINES in the
+environment or ai.env), matched by host name, then lane name:
+{"machines":[{"name":"box","kind":"gpu","vram_gb":25.7,"others_gb":2.1,"compute_gb":0.85,
+"min_free_gb":0.5}]} (card size, other users, the runtime's own buffers and the
+room to keep, measured on the card at its normal state).
 
 Config: SWITCHBACK_AI_URL and SWITCHBACK_AI_KEY in the environment, else in
 ${XDG_CONFIG_HOME:-~/.config}/switchback/ai.env (KEY=VALUE lines). Optional there too:
 SWITCHBACK_AI_IMAGE_MODEL, SWITCHBACK_AI_VIDEO_MODEL, SWITCHBACK_AI_SEGMENT_MODEL,
 SWITCHBACK_AI_SPEECH_MODEL (defaults), SWITCHBACK_AI_OUT_DIR, SB_AI_SUITES,
-SB_AI_EVAL_RUNS.
+SB_AI_EVAL_RUNS, SB_AI_MACHINES.
 Exit codes: 0 ok, 1 the gateway reported an error, 2 usage error, 3 the gateway does
 not answer, or the machine is off. fit answers 3 when the model index cannot be
 reached and 1 when it answers with an error.
@@ -295,7 +323,7 @@ reached and 1 when it answers with an error.
 CONFIG_KEYS = ("SWITCHBACK_AI_URL", "SWITCHBACK_AI_KEY", "SWITCHBACK_AI_IMAGE_MODEL",
                "SWITCHBACK_AI_VIDEO_MODEL", "SWITCHBACK_AI_SEGMENT_MODEL",
                "SWITCHBACK_AI_SPEECH_MODEL", "SWITCHBACK_AI_OUT_DIR",
-               "SB_AI_SUITES", "SB_AI_EVAL_RUNS")
+               "SB_AI_SUITES", "SB_AI_EVAL_RUNS", "SB_AI_MACHINES")
 # `sb ai eval`: where suites are found and where answers are kept.
 EVAL_PATH_KEYS = ("SB_AI_SUITES", "SB_AI_EVAL_RUNS")
 IMAGE_KIND, VIDEO_KIND = "image_generation", "video_generation"
@@ -2194,7 +2222,7 @@ def check_lines(gw, target):
     revisions = sorted({rev for rev, _ in newest if rev is not None}, reverse=True)[:3]
     for rev in revisions:
         parts = [f"{check} {ai_check.check_words(newest[(rev, check)])}"
-                 for check in ai_check.CHECKS if (rev, check) in newest]
+                 for check in ai_check.SHOWN if (rev, check) in newest]
         current = " (current)" if rev == target.get("revision") else ""
         lines.append(f"  checks, revision {rev}{current}: " + "; ".join(parts))
     waiting = ai_check.pending(gw, (Fail, GatewayError), name)
@@ -2290,23 +2318,32 @@ def cmd_set(gw, args, poll_secs=None):
             extra["wake"] = True
     guarded = []
     target = None
+    after = None
     if load:
         # A memory or context change is guarded by `sb ai check`: at once
-        # with --check, else on the model's next `sb ai load`.
+        # (the router also loads models on demand, so a change left for the
+        # next load could go live unchecked), or with --no-check on the
+        # model's next `sb ai load`.
         target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
         before = json.loads(json.dumps(target.get("document") or {}))
         after = json.loads(json.dumps(before))
         change(after)
         guarded = ai_check.guarded_changes(before, after)
-    if getattr(args, "check", False):
-        if not load or not guarded:
-            raise Fail(USAGE, "--check guards a change to a memory or context load setting "
-                              f"({', '.join(ai_check.GUARDED_LOAD)}, engine_args."
-                              f"{', engine_args.'.join(ai_check.GUARDED_ARGS[:6])}, ...)")
+    no_check = getattr(args, "no_check", False)
+    if getattr(args, "check", False) and (not load or not guarded):
+        raise Fail(USAGE, "--check guards a change to a memory or context load setting "
+                          f"({', '.join(ai_check.GUARDED_LOAD)}, engine_args."
+                          f"{', engine_args.'.join(ai_check.GUARDED_ARGS[:6])}, ...)")
+    if getattr(args, "check", False) and no_check:
+        raise Fail(USAGE, "--check and --no-check together")
+    if guarded and not no_check:
+        if args.apply == "next-load":
+            raise Fail(USAGE, f"{', '.join(guarded)}: a memory or context change is checked at once, "
+                              "so it applies now; --no-check keeps it for the next load, unchecked")
         return ai_check.guard(gw, args, (Fail, GatewayError), target,
                               lambda more: write_settings(gw, args.model, change, dict(extra, **more),
                                                           target=target),
-                              poll_secs=poll_secs)
+                              after_doc=after, poll_secs=poll_secs)
     answer = write_settings(gw, args.model, change, extra, target=target)
     if args.json:
         print(json.dumps(answer, indent=2))
@@ -2316,9 +2353,12 @@ def cmd_set(gw, args, poll_secs=None):
     if isinstance(apply, dict) and apply.get("message"):
         print(apply["message"])
     if guarded:
+        print(f"sb ai set: warning: --no-check: revision {answer.get('revision')} changed "
+              f"{', '.join(guarded)} and is not checked; the engine may load it on the next request "
+              "unchecked", file=sys.stderr)
         print(f"checks pending for revision {answer.get('revision')} ({', '.join(guarded)} changed): "
               f"they run on the next `sb ai load {answer.get('target')}`, or now with "
-              f"`sb ai check {answer.get('target')}`; `--check` runs them with the change")
+              f"`sb ai check {answer.get('target')}`")
     return OK
 
 
@@ -2627,7 +2667,9 @@ def parser():
     doctor.add_argument("--json", action="store_true")
     ai_tune.add_arguments(sub.add_parser("tune", add_help=False, allow_abbrev=False))
     ai_eval.add_arguments(sub.add_parser("eval", add_help=False, allow_abbrev=False))
-    ai_check.add_arguments(sub.add_parser("check", add_help=False, allow_abbrev=False))
+    check = sub.add_parser("check", add_help=False, allow_abbrev=False)
+    ai_check.add_arguments(check)
+    check.add_argument("--machines")
     settings = sub.add_parser("settings", add_help=False, allow_abbrev=False)
     settings.add_argument("model")
     settings.add_argument("--profile")
@@ -2639,12 +2681,15 @@ def parser():
     set_cmd.add_argument("--profile")
     set_cmd.add_argument("--lock", action="store_true")
     set_cmd.add_argument("--load", action="store_true")
-    set_cmd.add_argument("--apply", choices=("next-load", "now"), default="next-load")
+    set_cmd.add_argument("--apply", choices=("next-load", "now"))
     set_cmd.add_argument("--wake", action="store_true")
     set_cmd.add_argument("--json", action="store_true")
     set_cmd.add_argument("--check", action="store_true")
+    set_cmd.add_argument("--no-check", action="store_true")
     set_cmd.add_argument("--checks", default="")
     set_cmd.add_argument("--runs", type=int, default=ai_check.PICTURE_RUNS)
+    set_cmd.add_argument("--machines")
+    ai_check.add_guard_arguments(set_cmd)
     unset = sub.add_parser("unset", add_help=False, allow_abbrev=False)
     unset.add_argument("model")
     unset.add_argument("keys", nargs="+")
@@ -2661,6 +2706,8 @@ def parser():
     load.add_argument("--no-check", action="store_true")
     load.add_argument("--checks", default="")
     load.add_argument("--runs", type=int, default=ai_check.PICTURE_RUNS)
+    load.add_argument("--machines")
+    ai_check.add_guard_arguments(load)
     unload_cmd = sub.add_parser("unload", add_help=False, allow_abbrev=False)
     unload_cmd.add_argument("model")
     unload_cmd.add_argument("--timeout", type=float, default=None)
@@ -2695,6 +2742,9 @@ def main(argv=None, environ=None):
     try:
         config = load_config(environ)
         gw = Gateway(config["SWITCHBACK_AI_URL"], config["SWITCHBACK_AI_KEY"])
+        if args.command in ("check", "set", "load") and not getattr(args, "machines", None):
+            # The margin rule's per-host numbers: the machine file of `sb ai fit`.
+            args.machines = config.get("SB_AI_MACHINES") or None
         if args.command == "image":
             return cmd_image(gw, config, args)
         if args.command == "video":

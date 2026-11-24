@@ -1092,7 +1092,7 @@ class DoctorAndFitTests(Base):
         self.sb("set", TARGET, "reasoning.enabled=false")
         self.assertEqual(self.fake.doc["defaults"]["reasoning"], {"enabled": False})
         self.assertEqual(self.fake.doc["reasoning"], True)
-        run = self.sb("set", TARGET, "ctx_size=8192", "--load", "--lock")
+        run = self.sb("set", TARGET, "ctx_size=8192", "--load", "--lock", "--no-check")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("load.ctx_size", self.fake.doc["locked"])
         self.sb("unset", TARGET, "reasoning_guard")
