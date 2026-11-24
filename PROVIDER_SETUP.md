@@ -728,6 +728,12 @@ nor over-counted. A short request never waits for a count.
 - A request alone in an empty pool is always admitted, with or without
   `max_tokens`.
 
+A wait for room also covers the time the requests ahead of it spend in the
+engine, including a model load when the router first has to swap models in.
+On a lane whose router keeps one model and serves several, set
+`queue_timeout_secs` with that in mind (a lane without `max_in_flight` uses
+it only for this wait).
+
 The reservation is given back when the answer is complete, the stream ends,
 the client goes away (waiting or running), or the attempt fails. The pool size
 is the engine's own, read from its model listing (`--ctx-size` is the pool;
