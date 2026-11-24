@@ -28,8 +28,9 @@
 //! The prompt estimate: a quick bound over the request's text (no call),
 //! measured against the Qwen tokenizer on English prose, code, JSON, six
 //! other scripts, hex, base64, UUIDs, digits and emoji: at least the real
-//! count on every sample but random mixed-case words (0.99x) and at most
-//! about 1.7x on prose and code. A prompt whose bound reaches the lane's
+//! count on every sample but random mixed-case words (0.99x), about 1.1x to
+//! 1.7x on prose, code and JSON (1.25x to 1.36x on twelve 148,000-character
+//! cuts of Python's library documentation), and at most 3.2x (Arabic). A prompt whose bound reaches the lane's
 //! `count_above_tokens` is counted by the engine's own tokenizer instead
 //! (one bounded call), so a large prompt is neither under- nor
 //! over-counted; when that call fails the bound is used.
@@ -218,8 +219,18 @@ pub fn quick_text_tokens(text: &str) -> f64 {
                 total += len.div_ceil(8) as f64;
             }
         } else if byte < 0x80 {
-            total += 1.0;
-            i += 1;
+            // A rule of one repeated mark (`-----`, `=====`, `*****`) merges
+            // into a few tokens; any other mark is about one token.
+            let start = i;
+            while i < bytes.len() && bytes[i] == byte {
+                i += 1;
+            }
+            let run = i - start;
+            total += if run >= 3 {
+                run.div_ceil(4) as f64
+            } else {
+                run as f64
+            };
         } else {
             let Some(ch) = text.get(i..).and_then(|rest| rest.chars().next()) else {
                 break;
@@ -1418,10 +1429,15 @@ mod tests {
                 "{text:?}: bound {bound} < real {real}"
             );
         }
-        // Prose is not wildly over-counted (about 1.4x measured).
+        // Prose is not wildly over-counted (about 1.3x measured).
         let prose = "The quick brown fox jumps over the lazy dog. ".repeat(200);
         let words = 9.0 * 200.0 + 200.0;
         assert!(quick_text_tokens(&prose) < words * 2.0);
+        // A rule of dashes is a few tokens, not one per dash (the Qwen
+        // tokenizer makes 70 dashes one token).
+        let rule = "-".repeat(70);
+        assert!(quick_text_tokens(&rule) >= 1.0);
+        assert!(quick_text_tokens(&rule) < 25.0);
     }
 
     #[test]
