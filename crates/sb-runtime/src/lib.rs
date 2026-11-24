@@ -36,6 +36,8 @@ mod outcome;
 mod prefer_awake;
 mod profiles;
 pub(crate) mod quality_eval;
+pub mod revisioned;
+pub mod route_roles;
 pub mod scorecard;
 mod scorecard_runtime;
 mod snapshot;
@@ -278,6 +280,10 @@ pub struct Engine {
     /// settings). State, not config: survives a publish, durable in the
     /// state store when one is attached.
     model_settings: Arc<model_settings::ModelSettingsRegistry>,
+    /// Route roles: which targets answer a public name, over the config's
+    /// routes. State, not config: survives a publish or reload, durable in
+    /// the state store when one is attached, read by routing per request.
+    route_roles: Arc<route_roles::RouteRoles>,
     /// Engine variants for per-request load settings (`sb-server`'s engine
     /// control). Unset = such requests are refused.
     model_variants: OnceLock<Arc<dyn model_settings::ModelVariants>>,

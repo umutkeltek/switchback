@@ -94,11 +94,15 @@ pub(crate) struct CandidateResolution {
     /// when the route has any trick on; every plan of the request applies
     /// it the same way.
     pub(crate) optimize: Option<crate::optimize::Hints>,
+    /// A store role made this route: the decision's reason line saying
+    /// which and at what revision (or that its targets are unknown and the
+    /// config's route answered).
+    pub(crate) role: Option<String>,
 }
 
 /// What a model resolved to before candidates are stamped: route name,
-/// requirements, candidates, unknown target ids, combo, `pin_order`, and the
-/// route's own `prefer_awake`.
+/// requirements, candidates, unknown target ids, combo, `pin_order`, the
+/// route's own `prefer_awake`, and the store role's reason line.
 type ResolvedRoute = (
     String,
     RouteRequire,
@@ -107,7 +111,57 @@ type ResolvedRoute = (
     Option<ResolvedCombo>,
     bool,
     Option<sb_core::PreferAwakeOverride>,
+    Option<String>,
 );
+
+/// The route to plan from an exact match: a store role's route, unless
+/// none of its targets is known in this snapshot (a reload removed its lane
+/// or model): then the config's route of that name, when there is one, and
+/// the reason line says so.
+fn usable_route<'a>(
+    snap: &Snapshot,
+    exact: &'a crate::route_roles::ExactRoute<'a>,
+) -> (&'a sb_core::RouteConfig, Option<String>) {
+    let route = exact.route.as_ref();
+    let Some(role) = &exact.role else {
+        return (route, None);
+    };
+    if route
+        .targets
+        .iter()
+        .any(|target| snap.registry.target_for(target).is_some())
+    {
+        return (route, Some(role.reason()));
+    }
+    match exact.config_route {
+        Some(base) => (
+            base,
+            Some(format!(
+                "role `{}`: no target of the role store (revision {}) is known now ({}); the config's route answers",
+                role.name,
+                role.revision,
+                route.targets.join(",")
+            )),
+        ),
+        None => (route, Some(role.reason())),
+    }
+}
+
+/// Every target of a route as candidates, and the ids no provider knows.
+fn route_candidates(
+    snap: &Snapshot,
+    route: &sb_core::RouteConfig,
+) -> (Vec<sb_core::ExecutionTarget>, Vec<String>) {
+    let mut candidates = Vec::new();
+    let mut unknown = Vec::new();
+    for target_id in &route.targets {
+        match snap.registry.target_for(target_id) {
+            Some(target) => candidates.push(target),
+            None => unknown.push(target_id.clone()),
+        }
+    }
+    (candidates, unknown)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedCombo {
@@ -281,32 +335,31 @@ pub(crate) fn resolve_candidates(
     model: &str,
     scorecard: &crate::scorecard::Scorecard,
     lanes: Option<&dyn crate::LaneStatus>,
+    roles: &crate::route_roles::RouteRoles,
 ) -> Result<CandidateResolution, ExecError> {
     let profile = ExecutionProfile::from_model(model);
-    let (route_name, require, mut candidates, unknown, combo, pin_order, route_prefer_awake): ResolvedRoute = if let Some(profile) = profile {
-        let route = snap
-            .config
-            .exact_route_for(model)
-            .or_else(|| snap.config.wildcard_route())
-            .ok_or_else(|| {
-                ExecError::new(
-                    404,
-                    "invalid_request_error",
-                    format!(
-                        "execution profile `{}` needs a matching route or catch-all `*` route",
-                        profile.id()
-                    ),
-                    None,
-                )
-            })?;
-        let mut candidates = Vec::new();
-        let mut unknown = Vec::new();
-        for target_id in &route.targets {
-            match snap.registry.target_for(target_id) {
-                Some(target) => candidates.push(target),
-                None => unknown.push(target_id.clone()),
-            }
-        }
+    // The exact route of this name, with a store role over it (read now:
+    // a role written a moment ago answers this request).
+    let exact = roles.exact_route(&snap.config, model);
+    let (route_name, require, mut candidates, unknown, combo, pin_order, route_prefer_awake, role): ResolvedRoute = if let Some(profile) = profile {
+        let (route, role) = match &exact {
+            Some(exact) => usable_route(snap, exact),
+            None => (
+                snap.config.wildcard_route().ok_or_else(|| {
+                    ExecError::new(
+                        404,
+                        "invalid_request_error",
+                        format!(
+                            "execution profile `{}` needs a matching route or catch-all `*` route",
+                            profile.id()
+                        ),
+                        None,
+                    )
+                })?,
+                None,
+            ),
+        };
+        let (candidates, unknown) = route_candidates(snap, route);
         let route_name = if route.match_.model.as_deref() == Some(model) {
             route.name.clone()
         } else {
@@ -320,16 +373,11 @@ pub(crate) fn resolve_candidates(
             None,
             route.pin_order,
             route.prefer_awake,
+            role,
         )
-    } else if let Some(route) = snap.config.exact_route_for(model) {
-        let mut candidates = Vec::new();
-        let mut unknown = Vec::new();
-        for target_id in &route.targets {
-            match snap.registry.target_for(target_id) {
-                Some(target) => candidates.push(target),
-                None => unknown.push(target_id.clone()),
-            }
-        }
+    } else if let Some(exact) = &exact {
+        let (route, role) = usable_route(snap, exact);
+        let (candidates, unknown) = route_candidates(snap, route);
         (
             route.name.clone(),
             route.require.clone(),
@@ -338,6 +386,7 @@ pub(crate) fn resolve_candidates(
             None,
             route.pin_order,
             route.prefer_awake,
+            role,
         )
     } else if let Some(combo_cfg) = snap.config.combo_for(model) {
         let mut candidates = Vec::new();
@@ -359,6 +408,7 @@ pub(crate) fn resolve_candidates(
             }),
             false,
             None,
+            None,
         )
     } else if let Some(target) = snap.registry.target_for(model) {
         (
@@ -369,16 +419,10 @@ pub(crate) fn resolve_candidates(
             None,
             false,
             None,
+            None,
         )
     } else if let Some(route) = snap.config.wildcard_route() {
-        let mut candidates = Vec::new();
-        let mut unknown = Vec::new();
-        for target_id in &route.targets {
-            match snap.registry.target_for(target_id) {
-                Some(target) => candidates.push(target),
-                None => unknown.push(target_id.clone()),
-            }
-        }
+        let (candidates, unknown) = route_candidates(snap, route);
         (
             route.name.clone(),
             route.require.clone(),
@@ -387,6 +431,7 @@ pub(crate) fn resolve_candidates(
             None,
             route.pin_order,
             route.prefer_awake,
+            None,
         )
     } else if let Some(provider) = snap.config.server.default_provider.as_deref() {
         match snap.registry.target_for_provider_model(provider, model) {
@@ -401,6 +446,7 @@ pub(crate) fn resolve_candidates(
                     Vec::new(),
                     None,
                     false,
+                    None,
                     None,
                 )
             }
@@ -471,6 +517,7 @@ pub(crate) fn resolve_candidates(
         lane_down,
         prefer_awake,
         optimize: None,
+        role,
     })
 }
 
@@ -710,6 +757,9 @@ pub(crate) fn plan_candidates(
         &resolved.candidates,
         &policy,
     );
+    if let Some(role) = &resolved.role {
+        plan.decision.add_reason(role.clone());
+    }
     if let Some(hints) = &resolved.optimize {
         crate::optimize::apply_hints(&mut plan, hints, resolved.pin_order);
     }

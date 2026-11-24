@@ -17,7 +17,7 @@ use sb_core::{
     AiRequest, ExecutionTarget, ModelSettingsDoc, OpenAiEngine, ProviderKind, RequestSettings,
     SettingsEngine,
 };
-use sb_store::{ModelSettingsChange, ModelSettingsWrite, StateStore};
+use sb_store::{ModelSettingsChange, StateStore};
 
 use crate::{ExecError, Snapshot};
 
@@ -63,12 +63,7 @@ pub trait ModelVariants: Send + Sync {
 }
 
 /// One target's current settings.
-#[derive(Debug, Clone)]
-pub struct SettingsEntry {
-    pub revision: u64,
-    pub doc: Arc<ModelSettingsDoc>,
-    pub updated_at_ms: i64,
-}
+pub type SettingsEntry = crate::revisioned::DocEntry<ModelSettingsDoc>;
 
 /// Who is writing: tenant/project and role of the key (never the key), and
 /// where the write came from.
@@ -90,6 +85,8 @@ pub enum SettingsWriteError {
     UnknownRevision(u64),
     /// The state store refused the write.
     Store(String),
+    /// The document is locked: the message says why and how to unlock.
+    Locked(String),
 }
 
 impl std::fmt::Display for SettingsWriteError {
@@ -105,19 +102,15 @@ impl std::fmt::Display for SettingsWriteError {
                 write!(f, "no settings revision {revision} in the history")
             }
             SettingsWriteError::Store(message) => write!(f, "state store: {message}"),
+            SettingsWriteError::Locked(message) => f.write_str(message),
         }
     }
 }
 
 /// The settings documents of every target, revisioned.
 pub struct ModelSettingsRegistry {
-    entries: RwLock<BTreeMap<String, SettingsEntry>>,
-    store: RwLock<Option<Arc<dyn StateStore>>>,
-    /// History kept here when there is no state store (process lifetime).
-    memory_history: Mutex<BTreeMap<String, Vec<ModelSettingsChange>>>,
-    /// Serializes writes so read-revision → check → write is atomic in
-    /// this process (the store's transaction covers other processes).
-    write_lock: Mutex<()>,
+    /// Every target's document, revisioned, with its history.
+    docs: crate::revisioned::DocRegistry<ModelSettingsDoc>,
     /// Per engine model (`provider/model`, a variant's own name included):
     /// requests admitted and dispatched, when it was last used, and its
     /// admission gate.
@@ -129,8 +122,6 @@ pub struct ModelSettingsRegistry {
     /// dispatched request ends: the engine control retries an apply it held
     /// back for that model.
     idle_hook: RwLock<Option<IdleHook>>,
-    /// How many revisions of each target the history keeps (newest first).
-    history_keep: std::sync::atomic::AtomicUsize,
 }
 
 /// See [`ModelSettingsRegistry::set_idle_hook`].
@@ -142,14 +133,10 @@ pub const DEFAULT_HISTORY_KEEP: usize = 500;
 impl Default for ModelSettingsRegistry {
     fn default() -> Self {
         ModelSettingsRegistry {
-            entries: RwLock::default(),
-            store: RwLock::default(),
-            memory_history: Mutex::default(),
-            write_lock: Mutex::default(),
+            docs: crate::revisioned::DocRegistry::default(),
             in_flight: Mutex::default(),
             changed: tokio::sync::watch::channel(0).0,
             idle_hook: RwLock::default(),
-            history_keep: std::sync::atomic::AtomicUsize::new(DEFAULT_HISTORY_KEEP),
         }
     }
 }
@@ -370,12 +357,11 @@ impl ModelSettingsRegistry {
 
     /// How many revisions per target the history keeps (at least 1).
     pub fn set_history_keep(&self, keep: usize) {
-        self.history_keep
-            .store(keep.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.docs.set_history_keep(keep);
     }
 
     pub fn history_keep(&self) -> usize {
-        self.history_keep.load(std::sync::atomic::Ordering::Relaxed)
+        self.docs.history_keep()
     }
 
     /// Admit one request to an engine model now, if its gate is open.
@@ -485,73 +471,34 @@ impl ModelSettingsRegistry {
     /// document that no longer parses is skipped with a warning (it stays
     /// in the store and its history).
     pub fn attach_store(&self, store: Arc<dyn StateStore>) {
-        match store.model_settings_list() {
-            Ok(records) => {
-                let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
-                for record in records {
-                    match serde_json::from_str::<ModelSettingsDoc>(&record.doc) {
-                        Ok(doc) => {
-                            entries.insert(
-                                record.target,
-                                SettingsEntry {
-                                    revision: record.revision,
-                                    doc: Arc::new(doc),
-                                    updated_at_ms: record.updated_at_ms,
-                                },
-                            );
-                        }
-                        Err(e) => tracing::warn!(
-                            target_model = %record.target,
-                            error = %e,
-                            "stored model settings do not parse; skipped"
-                        ),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "model settings: state store read failed"),
-        }
-        *self.store.write().unwrap_or_else(|e| e.into_inner()) = Some(store);
+        self.docs.attach_store(store);
     }
 
     /// Whether writes are durable.
     pub fn durable(&self) -> bool {
-        self.store
-            .read()
-            .map(|store| store.is_some())
-            .unwrap_or(false)
+        self.docs.durable()
     }
 
     pub fn get(&self, target: &str) -> Option<SettingsEntry> {
-        self.entries
-            .read()
-            .ok()
-            .and_then(|entries| entries.get(target).cloned())
+        self.docs.get(target)
     }
 
     /// The target's revision (0 = never written).
     pub fn revision(&self, target: &str) -> u64 {
-        self.get(target).map(|entry| entry.revision).unwrap_or(0)
+        self.docs.revision(target)
     }
 
     pub fn all(&self) -> Vec<(String, SettingsEntry)> {
-        self.entries
-            .read()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|(target, entry)| (target.clone(), entry.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.docs.all()
     }
 
     /// Whether any target has settings (the request path skips all work
     /// when none does and the request asked nothing).
     pub fn is_empty(&self) -> bool {
-        self.entries
-            .read()
-            .map(|entries| entries.values().all(|entry| entry.doc.is_empty()))
-            .unwrap_or(true)
+        self.docs
+            .all()
+            .iter()
+            .all(|(_, entry)| entry.doc.is_empty())
     }
 
     /// Replace a target's document if the writer edited the current
@@ -565,114 +512,12 @@ impl ModelSettingsRegistry {
         actor: &SettingsActor,
         action: &str,
     ) -> Result<SettingsEntry, SettingsWriteError> {
-        doc.validate()
-            .map_err(|e| SettingsWriteError::Invalid(e.0))?;
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = self.get(target);
-        let current = previous.as_ref().map(|entry| entry.revision).unwrap_or(0);
-        if expected != current {
-            return Err(SettingsWriteError::Conflict { expected, current });
-        }
-        let before = previous
-            .as_ref()
-            .map(|entry| (*entry.doc).clone())
-            .unwrap_or_default();
-        let doc_json =
-            serde_json::to_string(&doc).map_err(|e| SettingsWriteError::Invalid(e.to_string()))?;
-        let now = sb_store::now_millis();
-        let change = ModelSettingsChange {
-            target: target.to_string(),
-            revision: current + 1,
-            doc: doc_json,
-            actor: actor.actor.clone(),
-            role: actor.role.clone(),
-            source: actor.source.clone(),
-            action: action.to_string(),
-            changed: changed_paths(&before, &doc),
-            at_ms: now,
-        };
-        let store = self.store.read().ok().and_then(|store| store.clone());
-        match store {
-            Some(store) => match store.model_settings_write(&change) {
-                Ok(ModelSettingsWrite::Written) => {}
-                Ok(ModelSettingsWrite::Conflict { current: stored }) => {
-                    // Another gateway sharing the store wrote first: take
-                    // its document so the next read is current.
-                    self.refresh_from_store(target, store.as_ref());
-                    return Err(SettingsWriteError::Conflict {
-                        expected,
-                        current: stored,
-                    });
-                }
-                Err(e) => return Err(SettingsWriteError::Store(e.0)),
-            },
-            None => {
-                let mut history = self
-                    .memory_history
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let changes = history.entry(target.to_string()).or_default();
-                changes.push(change);
-                let keep = self.history_keep();
-                if changes.len() > keep {
-                    let extra = changes.len() - keep;
-                    changes.drain(..extra);
-                }
-            }
-        }
-        if let Some(store) = self.store.read().ok().and_then(|store| store.clone()) {
-            // The write stands; a failed prune only leaves older rows.
-            if let Err(e) = store.model_settings_prune(target, self.history_keep()) {
-                tracing::warn!(target_model = %target, error = %e.0, "model settings: history prune failed");
-            }
-        }
-        let entry = SettingsEntry {
-            revision: current + 1,
-            doc: Arc::new(doc),
-            updated_at_ms: now,
-        };
-        self.entries
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(target.to_string(), entry.clone());
-        Ok(entry)
-    }
-
-    fn refresh_from_store(&self, target: &str, store: &dyn StateStore) {
-        let Ok(records) = store.model_settings_list() else {
-            return;
-        };
-        let Some(record) = records.into_iter().find(|record| record.target == target) else {
-            return;
-        };
-        if let Ok(doc) = serde_json::from_str::<ModelSettingsDoc>(&record.doc) {
-            self.entries
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    target.to_string(),
-                    SettingsEntry {
-                        revision: record.revision,
-                        doc: Arc::new(doc),
-                        updated_at_ms: record.updated_at_ms,
-                    },
-                );
-        }
+        self.docs.write(target, doc, expected, actor, action)
     }
 
     /// The target's changes, newest first.
     pub fn history(&self, target: &str, limit: usize) -> Result<Vec<ModelSettingsChange>, String> {
-        let store = self.store.read().ok().and_then(|store| store.clone());
-        match store {
-            Some(store) => store.model_settings_history(target, limit).map_err(|e| e.0),
-            None => Ok(self
-                .memory_history
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(target)
-                .map(|changes| changes.iter().rev().take(limit).cloned().collect())
-                .unwrap_or_default()),
-        }
+        self.docs.history(target, limit)
     }
 
     /// Revision `to`'s document, searched in every revision the history
@@ -684,18 +529,7 @@ impl ModelSettingsRegistry {
         target: &str,
         to: u64,
     ) -> Result<ModelSettingsDoc, SettingsWriteError> {
-        if to == 0 {
-            return Ok(ModelSettingsDoc::default());
-        }
-        let history = self
-            .history(target, self.history_keep())
-            .map_err(SettingsWriteError::Store)?;
-        let change = history
-            .into_iter()
-            .find(|change| change.revision == to)
-            .ok_or(SettingsWriteError::UnknownRevision(to))?;
-        serde_json::from_str(&change.doc)
-            .map_err(|e| SettingsWriteError::Invalid(format!("revision {to}: {e}")))
+        self.docs.revision_doc(target, to)
     }
 
     /// Write revision `to`'s document again as a new revision. The HTTP
@@ -710,6 +544,18 @@ impl ModelSettingsRegistry {
     ) -> Result<SettingsEntry, SettingsWriteError> {
         let doc = self.revision_doc(target, to)?;
         self.write(target, doc, expected, actor, &format!("revert:{to}"))
+    }
+}
+
+impl crate::revisioned::RevisionedDoc for ModelSettingsDoc {
+    const FAMILY: crate::revisioned::DocFamily = crate::revisioned::DocFamily::ModelSettings;
+
+    fn check(&self) -> Result<(), String> {
+        self.validate().map_err(|e| e.0)
+    }
+
+    fn changed(before: &Self, after: &Self) -> Vec<String> {
+        changed_paths(before, after)
     }
 }
 

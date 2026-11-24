@@ -215,11 +215,16 @@ impl Engine {
             return self.audio_denied(snap, &req, error, started);
         }
 
-        let mut resolved =
-            match resolve_candidates(snap, &req.model, &self.scorecard, self.lanes.as_deref()) {
-                Ok(resolved) => resolved,
-                Err(error) => return self.audio_denied(snap, &req, error, started),
-            };
+        let mut resolved = match resolve_candidates(
+            snap,
+            &req.model,
+            &self.scorecard,
+            self.lanes.as_deref(),
+            &self.route_roles,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => return self.audio_denied(snap, &req, error, started),
+        };
         // The hard capability filter: a target whose provider does not
         // declare it is rejected by the router with the reason, like vision.
         // Set before the lane wake and lane limit plans, so they never pick

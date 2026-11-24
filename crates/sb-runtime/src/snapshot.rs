@@ -78,6 +78,11 @@ impl Engine {
                 registry.set_history_keep(history_keep);
                 Arc::new(registry)
             },
+            route_roles: {
+                let roles = crate::route_roles::RouteRoles::new();
+                roles.set_history_keep(history_keep);
+                Arc::new(roles)
+            },
             model_variants: OnceLock::new(),
             optimize: Arc::new(crate::optimize::OptimizeState::new()),
             token_pools: Arc::new(crate::token_pool::TokenPools::default()),
@@ -97,6 +102,11 @@ impl Engine {
     /// The per-model settings registry (shared; survives reloads).
     pub fn model_settings(&self) -> Arc<crate::model_settings::ModelSettingsRegistry> {
         self.model_settings.clone()
+    }
+
+    /// The route roles (shared; survive reloads).
+    pub fn route_roles(&self) -> Arc<crate::route_roles::RouteRoles> {
+        self.route_roles.clone()
     }
 
     /// Attach the managed local lane view (see [`crate::LaneStatus`]).
@@ -133,6 +143,7 @@ impl Engine {
     ) -> Result<Self, String> {
         self.quality_eval.attach_store(store.clone());
         self.model_settings.attach_store(store.clone());
+        self.route_roles.attach_store(store.clone());
         self.store = Some(store);
         self.store_required = required;
         self.hydrate_scorecard_from_store();
@@ -427,8 +438,13 @@ impl Engine {
             return Err(ExecError::new(status, "plugin_rejected", message, None));
         }
         let client_profile = apply_request_client_profile(&snap, &mut req)?;
-        let resolved =
-            resolve_candidates(&snap, &req.model, &self.scorecard, self.lanes.as_deref())?;
+        let resolved = resolve_candidates(
+            &snap,
+            &req.model,
+            &self.scorecard,
+            self.lanes.as_deref(),
+            &self.route_roles,
+        )?;
         let (_route_name, mut plan) = plan_resolved_route(
             &self.combo_rr,
             &snap,

@@ -199,28 +199,33 @@ impl Engine {
             };
         }
 
-        let mut resolved =
-            match resolve_candidates(snap, &req.model, &self.scorecard, self.lanes.as_deref()) {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    self.record_denial_trace(DenialTrace {
-                        request_id: &req.id,
-                        revision: snap.revision,
-                        tenant: req.tenant.as_deref(),
-                        project: req.project.as_deref(),
-                        inbound_model: &req.model,
-                        status: e.status,
-                        error_type: &e.error_type,
-                        message: &e.message,
-                        started,
-                        streamed: false,
-                    });
-                    return EmbeddingsOutcome::Error {
-                        request_id: req.id,
-                        error: e,
-                    };
-                }
-            };
+        let mut resolved = match resolve_candidates(
+            snap,
+            &req.model,
+            &self.scorecard,
+            self.lanes.as_deref(),
+            &self.route_roles,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: false,
+                });
+                return EmbeddingsOutcome::Error {
+                    request_id: req.id,
+                    error: e,
+                };
+            }
+        };
         // Tuning locks, as for chat (see `execute`).
         let tune_rejected = match self.apply_tune_locks(snap, &req, &mut resolved) {
             Ok(rejected) => rejected,

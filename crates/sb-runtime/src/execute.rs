@@ -286,25 +286,30 @@ impl Engine {
 
         // Resolve the request's model to candidate targets (route → provider/model
         // → default provider → 404), pool-health-stamped. Shared with route-preview.
-        let mut resolved =
-            match resolve_candidates(snap, &req.model, &self.scorecard, self.lanes.as_deref()) {
-                Ok(resolved) => resolved,
-                Err(e) => {
-                    self.record_denial_trace(DenialTrace {
-                        request_id: &req.id,
-                        revision: snap.revision,
-                        tenant: req.tenant.as_deref(),
-                        project: req.project.as_deref(),
-                        inbound_model: &req.model,
-                        status: e.status,
-                        error_type: &e.error_type,
-                        message: &e.message,
-                        started,
-                        streamed: req.stream,
-                    });
-                    return ExecOutcome::Error(e);
-                }
-            };
+        let mut resolved = match resolve_candidates(
+            snap,
+            &req.model,
+            &self.scorecard,
+            self.lanes.as_deref(),
+            &self.route_roles,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                self.record_denial_trace(DenialTrace {
+                    request_id: &req.id,
+                    revision: snap.revision,
+                    tenant: req.tenant.as_deref(),
+                    project: req.project.as_deref(),
+                    inbound_model: &req.model,
+                    status: e.status,
+                    error_type: &e.error_type,
+                    message: &e.message,
+                    started,
+                    streamed: req.stream,
+                });
+                return ExecOutcome::Error(e);
+            }
+        };
         let mut scope_rejected = Vec::new();
         if let Some(scope) = scope {
             resolved.candidates.retain(|candidate| {

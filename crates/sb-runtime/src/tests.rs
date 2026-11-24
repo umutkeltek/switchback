@@ -3334,3 +3334,179 @@ async fn a_hedged_request_races_its_lane_on_the_place_it_already_holds() {
         "the place is given back"
     );
 }
+
+// ---------------------------------------------------------------------
+// Route roles: a store role answers its name on the next request (no
+// restart), a config reload never replaces it, revert 0 gives the config's
+// route back, and a new engine over the same store routes by it again.
+
+const ROLE_YAML: &str = r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: one
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+  - id: two
+    type: mock
+    accounts:
+      - id: a
+        auth: { kind: api_key, inline: "k" }
+routes:
+  - name: fast
+    match: { model: fast }
+    pin_order: true
+    targets: ["one/echo"]
+"#;
+
+fn role_engine(yaml: &str, store: Arc<dyn sb_store::StateStore>) -> Engine {
+    let cfg = Arc::new(Config::from_yaml(yaml).unwrap());
+    let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    Engine::new(
+        cfg,
+        registry,
+        resolver,
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    )
+    .with_store(store)
+}
+
+/// Which target served one request for `model`, and the decision's reasons.
+async fn served_by(engine: &Engine, model: &str) -> (String, Vec<String>) {
+    let req = AiRequest::new(model, vec![Message::user("hi")]);
+    let (_revision, outcome) = engine.execute(req, Instant::now()).await;
+    assert!(matches!(outcome, ExecOutcome::Collected { .. }), "served");
+    let trace = engine.traces().recent(1).pop().expect("trace");
+    (
+        trace.decision.selected.as_ref().unwrap().target_id.clone(),
+        trace.decision.reason.clone(),
+    )
+}
+
+fn role_actor() -> crate::model_settings::SettingsActor {
+    crate::model_settings::SettingsActor {
+        actor: "gateway key".into(),
+        role: "admin".into(),
+        source: "test".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_store_role_routes_at_once_survives_reload_and_restart_and_reverts() {
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let engine = role_engine(ROLE_YAML, store.clone());
+    assert_eq!(served_by(&engine, "fast").await.0, "one/echo");
+
+    engine
+        .route_roles()
+        .set(
+            "fast",
+            vec!["two/echo".into()],
+            None,
+            None,
+            0,
+            &role_actor(),
+        )
+        .unwrap();
+    let (target, reasons) = served_by(&engine, "fast").await;
+    assert_eq!(target, "two/echo", "the next request, no restart");
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r == "role `fast`: targets from the role store (revision 1)"),
+        "{reasons:?}"
+    );
+
+    // A regenerated config (the same route, other targets) is reloaded:
+    // the store role still answers.
+    let regenerated = ROLE_YAML.replace(r#"targets: ["one/echo"]"#, r#"targets: ["one/other"]"#);
+    engine
+        .reload(Config::from_yaml(&regenerated).unwrap())
+        .unwrap();
+    assert_eq!(
+        served_by(&engine, "fast").await.0,
+        "two/echo",
+        "after reload"
+    );
+
+    // A restart: a new engine over the same store.
+    let restarted = role_engine(&regenerated, store.clone());
+    assert_eq!(
+        served_by(&restarted, "fast").await.0,
+        "two/echo",
+        "after restart"
+    );
+
+    // Revert to 0: the config's route (now the regenerated one) answers.
+    restarted
+        .route_roles()
+        .revert("fast", 0, 1, &role_actor())
+        .unwrap();
+    let (target, reasons) = served_by(&restarted, "fast").await;
+    assert_eq!(target, "one/other");
+    assert!(
+        !reasons.iter().any(|r| r.starts_with("role ")),
+        "{reasons:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_store_role_whose_targets_are_all_gone_falls_back_to_the_config_route() {
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let engine = role_engine(ROLE_YAML, store);
+    engine
+        .route_roles()
+        .set(
+            "fast",
+            vec!["two/echo".into()],
+            None,
+            None,
+            0,
+            &role_actor(),
+        )
+        .unwrap();
+    // A reload drops provider `two`.
+    let without_two = ROLE_YAML.replace(
+        "  - id: two\n    type: mock\n    accounts:\n      - id: a\n        auth: { kind: api_key, inline: \"k\" }\n",
+        "",
+    );
+    assert!(!without_two.contains("id: two"));
+    engine
+        .reload(Config::from_yaml(&without_two).unwrap())
+        .unwrap();
+    let (target, reasons) = served_by(&engine, "fast").await;
+    assert_eq!(target, "one/echo");
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("no target of the role store")),
+        "{reasons:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_role_of_its_own_answers_its_name() {
+    let store: Arc<dyn sb_store::StateStore> =
+        Arc::new(sb_store::SqliteStore::in_memory().unwrap());
+    let engine = role_engine(ROLE_YAML, store);
+    let req = AiRequest::new("long", vec![Message::user("hi")]);
+    assert!(engine.preview_route(&req).is_err(), "no route yet");
+    engine
+        .route_roles()
+        .set(
+            "long",
+            vec!["two/echo".into(), "one/echo".into()],
+            None,
+            None,
+            0,
+            &role_actor(),
+        )
+        .unwrap();
+    let (target, _) = served_by(&engine, "long").await;
+    assert_eq!(target, "two/echo");
+}

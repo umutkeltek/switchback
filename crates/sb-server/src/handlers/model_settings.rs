@@ -249,18 +249,20 @@ fn expected_revision(
     }
 }
 
-fn write_error(e: SettingsWriteError) -> Response {
+pub(crate) fn write_error(e: SettingsWriteError) -> Response {
     let status = match &e {
         SettingsWriteError::Conflict { .. } => StatusCode::CONFLICT,
         SettingsWriteError::Invalid(_) => StatusCode::BAD_REQUEST,
         SettingsWriteError::UnknownRevision(_) => StatusCode::NOT_FOUND,
         SettingsWriteError::Store(_) => StatusCode::SERVICE_UNAVAILABLE,
+        SettingsWriteError::Locked(_) => StatusCode::LOCKED,
     };
     let kind = match &e {
         SettingsWriteError::Conflict { .. } => "revision_conflict",
         SettingsWriteError::Invalid(_) => "invalid_settings",
         SettingsWriteError::UnknownRevision(_) => "not_found",
         SettingsWriteError::Store(_) => "state_store_unavailable",
+        SettingsWriteError::Locked(_) => "locked",
     };
     let mut body = json!({"error": {"message": e.to_string(), "type": kind}});
     if let SettingsWriteError::Conflict { current, .. } = e {
