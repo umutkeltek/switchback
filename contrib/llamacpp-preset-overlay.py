@@ -27,6 +27,19 @@ with `--models-preset`):
 - OUT is written atomically (a temporary file in the same folder, then a
   rename), and only when its content changes.
 
+Two or more lanes on one engine (one router, one presets file) each send
+the overlay of their own models. With `--state-dir DIR` every lane's last
+overlay is kept as `DIR/<lane>.json` and OUT is the merge of all of them, so
+one lane's write never drops another lane's settings. Two lanes that set one
+model's key to different values are refused (exit 2) and nothing is saved.
+
+`--show` writes nothing: it prints BASE's keys and pins as JSON, for the
+gateway's settings view (`engine.machine_file_command`):
+
+    {"global": {"keys": {"jinja": "true"}, "pinned": []},
+     "models": {"qwen3-35b": {"keys": {"model": "/m/q.gguf"},
+                              "pinned": ["ctx-size"]}}}
+
 The overlay looks like:
 
     {"version": 1, "lane": "text", "engine": "llama_cpp_router",
@@ -34,8 +47,8 @@ The overlay looks like:
                 "qwen3-35b~1a2b3c4d": {"base": "qwen3-35b",
                                        "settings": {"ctx-size": "131072"}}}}
 
-Standard library only. Exit codes: 0 written (or unchanged), 1 cannot read or
-write a file, 2 the overlay is refused.
+Standard library only. Exit codes: 0 written (or unchanged, or shown), 1
+cannot read or write a file, 2 the overlay is refused.
 """
 
 import argparse
@@ -181,9 +194,9 @@ def merge(base_text, overlay):
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def write_atomic(path, text):
+def write_atomic(path, text, prefix=".preset-", suffix=".ini"):
     folder = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(prefix=".preset-", suffix=".ini", dir=folder)
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=folder)
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(text)
@@ -198,27 +211,112 @@ def write_atomic(path, text):
         raise
 
 
+def show(base_text):
+    """BASE's keys and pins per section, as the gateway's settings view
+    reads them (`--show`)."""
+    sections = {name: lines for name, lines in parse(base_text) if name is not None}
+
+    def part(lines):
+        return {"keys": keys_of(lines), "pinned": sorted(pinned_of(lines))}
+
+    return {"global": part(sections.get("*", [])),
+            "models": {name: part(lines) for name, lines in sections.items() if name != "*"}}
+
+
+LANE_OK = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def combined(state_dir, overlay):
+    """Every lane's last overlay with this one in place of its lane's: one
+    overlay, and the saved lanes it read. Refused when two lanes set one
+    model's key to different values."""
+    lane = overlay.get("lane") if isinstance(overlay, dict) else None
+    if not isinstance(lane, str) or not LANE_OK.match(lane):
+        raise Refused("with --state-dir the overlay needs its `lane` (a plain name)")
+    lanes = {}
+    try:
+        names = sorted(os.listdir(state_dir))
+    except OSError as error:
+        raise OSError(f"cannot read the state folder: {error}") from None
+    for name in names:
+        if not name.endswith(".json") or name[:-5] == lane or not LANE_OK.match(name[:-5]):
+            continue
+        try:
+            with open(os.path.join(state_dir, name), encoding="utf-8") as handle:
+                lanes[name[:-5]] = json.load(handle)
+        except (OSError, ValueError) as error:
+            raise OSError(f"cannot read the saved overlay of lane {name[:-5]}: {error}") from None
+    lanes[lane] = overlay
+    models, owner = {}, {}
+    for name in sorted(lanes):
+        saved = lanes[name]
+        entries = saved.get("models", {}) if isinstance(saved, dict) else None
+        if not isinstance(entries, dict):
+            raise Refused(f"the saved overlay of lane {name} has no `models` object")
+        for model, entry in entries.items():
+            if model not in models:
+                models[model], owner[model] = entry, name
+                continue
+            if not isinstance(entry, dict) or not isinstance(models[model], dict):
+                raise Refused(f"{model}: lanes {owner[model]} and {name} both set it")
+            mine, theirs = entry.get("settings") or {}, models[model].get("settings") or {}
+            clash = sorted(k for k in set(mine) & set(theirs) if str(mine[k]) != str(theirs[k]))
+            if clash or entry.get("base") != models[model].get("base"):
+                what = ", ".join(clash) or "base"
+                raise Refused(f"{model}: lanes {owner[model]} and {name} set {what} differently")
+            models[model] = dict(models[model], settings=dict(theirs, **mine))
+    return {"version": 1, "engine": overlay.get("engine"), "models": models}, lane
+
+
+def save_lane(state_dir, lane, overlay):
+    path = os.path.join(state_dir, f"{lane}.json")
+    write_atomic(path, json.dumps(overlay, sort_keys=True, indent=1) + "\n", prefix=".lane-",
+                 suffix=".json")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base", required=True, help="the hand-written presets INI")
-    parser.add_argument("--out", required=True, help="the INI the router reads")
+    parser.add_argument("--out", help="the INI the router reads (not with --show)")
+    parser.add_argument("--state-dir", help="keep each lane's last overlay here and merge them all")
+    parser.add_argument("--show", action="store_true",
+                        help="print BASE's keys and pins as JSON; write nothing")
     args = parser.parse_args(argv)
-    try:
-        overlay = json.load(sys.stdin)
-    except ValueError as error:
-        print(f"overlay is not JSON: {error}", file=sys.stderr)
-        return 2
     try:
         with open(args.base, encoding="utf-8") as handle:
             base_text = handle.read()
     except OSError as error:
         print(f"cannot read the base file: {error}", file=sys.stderr)
         return 1
+    if args.show:
+        print(json.dumps(show(base_text), sort_keys=True))
+        return 0
+    if not args.out:
+        parser.error("--out is required (except with --show)")
     try:
+        overlay = json.load(sys.stdin)
+    except ValueError as error:
+        print(f"overlay is not JSON: {error}", file=sys.stderr)
+        return 2
+    lane, own = None, overlay
+    try:
+        if args.state_dir:
+            overlay, lane = combined(args.state_dir, own)
         text = merge(base_text, overlay)
     except Refused as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
+    except OSError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if lane is not None:
+        # The lane's own overlay is saved before OUT: a failed OUT write is
+        # retried by the gateway with the same overlay.
+        try:
+            save_lane(args.state_dir, lane, own)
+        except OSError as error:
+            print(f"cannot save the overlay of lane {lane}: {error}", file=sys.stderr)
+            return 1
     try:
         with open(args.out, encoding="utf-8") as handle:
             if handle.read() == text:

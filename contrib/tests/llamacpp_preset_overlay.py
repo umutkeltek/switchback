@@ -124,5 +124,80 @@ class Overlay(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+    def run_with_state(self, overlay):
+        state = self.dir / "state"
+        state.mkdir(exist_ok=True)
+        return subprocess.run([sys.executable, "-I", str(SCRIPT), "--base", str(self.base),
+                               "--out", str(self.out), "--state-dir", str(state)],
+                              input=json.dumps(overlay), capture_output=True, text=True,
+                              timeout=30)
+
+    def test_show_prints_the_base_keys_and_pins_and_writes_nothing(self):
+        run = subprocess.run([sys.executable, "-I", str(SCRIPT), "--base", str(self.base),
+                              "--show"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        shown = json.loads(run.stdout)
+        self.assertEqual(shown["global"], {"keys": {"c": "8192"}, "pinned": ["n-gpu-layers"]})
+        self.assertEqual(shown["models"]["qwen3-35b"]["keys"],
+                         {"model": "/models/qwen3-35b.gguf", "ctx-size": "32768",
+                          "cache-type-k": "f16"})
+        self.assertEqual(shown["models"]["qwen3-35b"]["pinned"], ["cache-type-k"])
+        self.assertEqual(shown["models"]["small"], {"keys": {"model": "/models/small.gguf"},
+                                                    "pinned": []})
+        self.assertNotIn("*", shown["models"])
+        self.assertFalse(self.out.exists())
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["base.ini"])
+
+    def test_two_lanes_on_one_engine_keep_each_others_settings(self):
+        run = self.run_with_state({"lane": "big", "models": {
+            "qwen3-35b": {"settings": {"ctx-size": "65536"}}}})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        run = self.run_with_state({"lane": "light", "models": {
+            "small": {"settings": {"ctx-size": "4096"}}}})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        text = self.out.read_text()
+        # The second lane's write kept the first lane's setting.
+        self.assertIn("ctx-size = 65536", text)
+        self.assertIn("[small]\nmodel = /models/small.gguf\n; managed by switchback\nctx-size = 4096",
+                      text)
+        # A lane's empty overlay takes only its own settings off.
+        run = self.run_with_state({"lane": "light", "models": {}})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        text = self.out.read_text()
+        self.assertIn("ctx-size = 65536", text)
+        self.assertNotIn("ctx-size = 4096", text)
+        saved = json.loads((self.dir / "state" / "big.json").read_text())
+        self.assertEqual(saved["models"]["qwen3-35b"]["settings"], {"ctx-size": "65536"})
+
+    def test_two_lanes_that_disagree_are_refused_and_nothing_is_saved(self):
+        self.assertEqual(self.run_with_state({"lane": "big", "models": {
+            "small": {"settings": {"ctx-size": "4096"}}}}).returncode, 0)
+        before = self.out.read_text()
+        run = self.run_with_state({"lane": "light", "models": {
+            "small": {"settings": {"ctx-size": "8192"}}}})
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("lanes big and light set ctx-size differently", run.stderr)
+        self.assertEqual(self.out.read_text(), before)
+        self.assertFalse((self.dir / "state" / "light.json").exists())
+        # The same value from both lanes is fine.
+        run = self.run_with_state({"lane": "light", "models": {
+            "small": {"settings": {"ctx-size": "4096"}}}})
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_a_pinned_key_refused_with_state_saves_nothing(self):
+        run = self.run_with_state({"lane": "big", "models": {
+            "qwen3-35b": {"settings": {"cache-type-k": "q8_0"}}}})
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("pinned", run.stderr)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(list((self.dir / "state").iterdir()), [])
+
+    def test_state_needs_a_lane_name(self):
+        for overlay in ({"models": {}}, {"lane": "../x", "models": {}}):
+            run = self.run_with_state(overlay)
+            self.assertEqual(run.returncode, 2, overlay)
+            self.assertIn("lane", run.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

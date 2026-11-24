@@ -757,10 +757,104 @@ pub trait SettingsCommandRunner: Send + Sync {
             .await
             .map_err(|why| redact_output(&why, secrets))
     }
+
+    /// A read-only command (a lane's `machine_file_command`): nothing on
+    /// stdin, its whole stdout (at most [`READ_LIMIT`] bytes) on exit 0,
+    /// `Err(why)` (redacted like [`Self::run_scrubbed`]) otherwise. The
+    /// default is `run_scrubbed`'s answer (test runners).
+    async fn read(
+        &self,
+        command: &str,
+        timeout: Duration,
+        secrets: &[String],
+    ) -> Result<String, String> {
+        self.run_scrubbed(command, b"", timeout, secrets).await
+    }
 }
+
+/// The most stdout a read-only command may print.
+pub const READ_LIMIT: usize = 1 << 20;
 
 /// `sh -c COMMAND` with the overlay on stdin, killed at its timeout.
 pub struct ShellSettingsRunner;
+
+/// Run `sh -c COMMAND` in its own process group with `input` on stdin;
+/// killed (the whole group) at `timeout`. `(status, stdout, stderr)`.
+async fn shell_run(
+    command: &str,
+    input: &[u8],
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Its own process group, so the timeout stops what the command
+    // started too (an `ssh`, a script's children), not only `sh`.
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("could not start: {e}"))?;
+    let group = child.id().and_then(|pid| i32::try_from(pid).ok());
+    if let Some(mut stdin) = child.stdin.take() {
+        let input = input.to_vec();
+        // A command that does not read stdin may close it early; that
+        // is its business, not a failure.
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+        });
+    }
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    async fn read_all(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        if let Some(mut pipe) = pipe {
+            // Bounded: past READ_LIMIT the rest is read and dropped, so a
+            // runaway command neither fills the gateway's memory nor
+            // blocks on a full pipe.
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = pipe.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                let room = (READ_LIMIT + 1).saturating_sub(buffer.len());
+                buffer.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+        buffer
+    }
+    let run = async {
+        let (out, err, status) = tokio::join!(read_all(stdout), read_all(stderr), child.wait());
+        (out, err, status)
+    };
+    match tokio::time::timeout(timeout, run).await {
+        Ok((out, err, status)) => {
+            let status = status.map_err(|e| format!("failed: {e}"))?;
+            Ok((status, out, err))
+        }
+        Err(_) => {
+            if let Some(group) = group {
+                // SAFETY: a plain kill(2) of the process group the
+                // command leads; no memory is touched.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            Err(format!("timed out after {} s", timeout.as_secs()))
+        }
+    }
+}
+
+fn exit_words(status: &std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string())
+}
 
 fn tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -788,68 +882,36 @@ impl SettingsCommandRunner for ShellSettingsRunner {
         timeout: Duration,
         secrets: &[String],
     ) -> Result<String, String> {
-        use std::process::Stdio;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        // Its own process group, so the timeout stops what the command
-        // started too (an `ssh`, a script's children), not only `sh`.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("could not start: {e}"))?;
-        let group = child.id().and_then(|pid| i32::try_from(pid).ok());
-        if let Some(mut stdin) = child.stdin.take() {
-            let input = input.to_vec();
-            // A command that does not read stdin may close it early; that
-            // is its business, not a failure.
-            tokio::spawn(async move {
-                let _ = stdin.write_all(&input).await;
-            });
-        }
-        let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-        async fn read_all(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
-            let mut buffer = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buffer).await;
-            }
-            buffer
-        }
-        let run = async {
-            let (out, err, status) = tokio::join!(read_all(stdout), read_all(stderr), child.wait());
-            (out, err, status)
-        };
-        let (out, err, status) = match tokio::time::timeout(timeout, run).await {
-            Ok(done) => done,
-            Err(_) => {
-                if let Some(group) = group {
-                    // SAFETY: a plain kill(2) of the process group the
-                    // command leads; no memory is touched.
-                    unsafe {
-                        libc::kill(-group, libc::SIGKILL);
-                    }
-                }
-                let _ = child.kill().await;
-                return Err(format!("timed out after {} s", timeout.as_secs()));
-            }
-        };
-        let status = status.map_err(|e| format!("failed: {e}"))?;
+        let (status, out, err) = shell_run(command, input, timeout).await?;
         if status.success() {
             Ok(tail(&out))
         } else {
-            let code = status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string());
             Err(format!(
-                "exit {code}: {}",
+                "exit {}: {}",
+                exit_words(&status),
                 refusal_reason(&err, &out, secrets)
             ))
         }
+    }
+
+    async fn read(
+        &self,
+        command: &str,
+        timeout: Duration,
+        secrets: &[String],
+    ) -> Result<String, String> {
+        let (status, out, err) = shell_run(command, b"", timeout).await?;
+        if !status.success() {
+            return Err(format!(
+                "exit {}: {}",
+                exit_words(&status),
+                refusal_reason(&err, &out, secrets)
+            ));
+        }
+        if out.len() > READ_LIMIT {
+            return Err(format!("printed more than {READ_LIMIT} bytes"));
+        }
+        String::from_utf8(out).map_err(|_| "printed text that is not UTF-8".to_string())
     }
 }
 
@@ -1243,7 +1305,27 @@ struct ControlState {
     variants: BTreeMap<String, BTreeMap<String, Variant>>,
     /// Per lane: the engine's build (`GET /props` `build_info`), last seen.
     builds: BTreeMap<String, String>,
+    /// Per lane: the machine file's last reading (`machine_file_command`).
+    machine_files: BTreeMap<String, MachineFile>,
 }
+
+/// One reading of a lane's machine file: the hand-written presets as the
+/// `machine_file_command` printed them, or why it could not.
+#[derive(Debug, Clone, Default)]
+struct MachineFile {
+    /// The last good reading, and when it was taken.
+    ok: Option<(i64, Value)>,
+    /// The last failed reading's reason, and when (cleared by a good one).
+    error: Option<(i64, String)>,
+    /// When a reading was last tried.
+    tried_ms: i64,
+}
+
+/// How old a machine-file reading may be before a settings read takes a
+/// new one (only while the machine is up).
+const MACHINE_FILE_FRESH_MS: i64 = 60_000;
+/// How long the `machine_file_command` may run.
+const MACHINE_FILE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How soon a failed apply is first retried before a request; each failure
 /// in a row doubles it, up to [`APPLY_RETRY_MAX_MS`]. (A lane that comes up
@@ -1394,6 +1476,27 @@ fn lane_gate_wait(state: &EngineCtx, lane: &EngineLane) -> Duration {
 /// How often a settle lists the engine's models.
 const SETTLE_POLL: Duration = Duration::from_millis(100);
 
+/// Whether the gateway runs the power of the lane's machine: a lane on its
+/// host has a `wake_command` or a `poweroff_command`. An always-on machine
+/// (none of them) is never asleep: a lane probe that fails there is a
+/// routing verdict (a memory guard's 503), and the engine still answers.
+fn power_managed(state: &EngineCtx, lane: &EngineLane) -> bool {
+    let snap = state.snapshot();
+    let lanes = &snap.config.local_executors;
+    let Some(own) = lanes.iter().find(|l| l.name == lane.name) else {
+        return true;
+    };
+    let managed =
+        |l: &sb_core::LocalExecutorConfig| l.wake_command.is_some() || l.poweroff_command.is_some();
+    match own.host.as_deref() {
+        Some(host) => lanes
+            .iter()
+            .filter(|l| l.host.as_deref() == Some(host))
+            .any(managed),
+        None => managed(own),
+    }
+}
+
 /// Whether the lane's lifecycle state is offline (`false` for a lane
 /// outside the lifecycle).
 fn lane_offline(state: &EngineCtx, lane: &EngineLane) -> bool {
@@ -1487,11 +1590,15 @@ impl EngineControls {
                 }
                 LaneState::Waking => return Awake::Asleep("waking"),
                 LaneState::PoweringOff => return Awake::Asleep("powering off"),
-                // A lane routing probes: trust what its probe last saw.
+                // A lane routing probes: trust what its probe last saw,
+                // unless the gateway does not run the machine's power: a
+                // failed probe there says the lane is not to be routed to
+                // (a memory guard), not that the machine sleeps, so the
+                // engine itself is asked below.
                 LaneState::Offline => match executor.report().observed_healthy {
                     Some(true) => return Awake::Up,
-                    Some(false) => return Awake::Asleep("asleep"),
-                    None => {}
+                    Some(false) if power_managed(state, lane) => return Awake::Asleep("asleep"),
+                    _ => {}
                 },
                 LaneState::Degraded => {}
             }
@@ -1638,6 +1745,48 @@ impl EngineControls {
                     .insert(lane.name.clone(), build.chars().take(80).collect());
             }
         }
+    }
+
+    /// Take a new reading of the lane's machine file (its
+    /// `machine_file_command`) when the last try is older than
+    /// [`MACHINE_FILE_FRESH_MS`] and the machine is up. Never wakes; a
+    /// failed reading keeps the last good one and notes why.
+    pub(crate) async fn refresh_machine_file(&self, state: &EngineCtx, lane: &EngineLane) {
+        let Some(command) = lane.engine.machine_file_command.clone() else {
+            return;
+        };
+        let due = self
+            .lock()
+            .machine_files
+            .get(&lane.name)
+            .is_none_or(|file| now_ms() - file.tried_ms >= MACHINE_FILE_FRESH_MS);
+        if !due || !matches!(self.awake(state, lane).await, Awake::Up) {
+            return;
+        }
+        let secrets = secret_values(Some(&state.snapshot().config));
+        let read = self
+            .runner
+            .read(&command, MACHINE_FILE_TIMEOUT, &secrets)
+            .await
+            .and_then(|text| parse_machine_file(&text));
+        let now = now_ms();
+        let mut st = self.lock();
+        let file = st.machine_files.entry(lane.name.clone()).or_default();
+        file.tried_ms = now;
+        match read {
+            Ok(value) => {
+                file.ok = Some((now, value));
+                file.error = None;
+            }
+            Err(why) => {
+                tracing::warn!(lane = %lane.name, error = %why, "machine file not read");
+                file.error = Some((now, why));
+            }
+        }
+    }
+
+    fn machine_file(&self, lane: &str) -> Option<MachineFile> {
+        self.lock().machine_files.get(lane).cloned()
     }
 
     pub(crate) fn cached_models(&self, lane: &str) -> Option<(i64, Vec<Value>)> {
@@ -3233,6 +3382,33 @@ impl EngineControls {
                 None,
             ));
         };
+        // A store lock holds for requests too: a request may not change a
+        // locked key through a variant (the machine file's pin would
+        // refuse its section only later, at apply).
+        if let Some(entry) = state.engine.model_settings().get(&target.id) {
+            let ops = kind_ops(lane.engine.kind);
+            let asked: BTreeSet<String> = ops
+                .preset_pairs(load, &Map::new())
+                .keys()
+                .map(|key| lock_name(key))
+                .collect();
+            for (path, reason) in entry.doc.store_locks() {
+                if lock_target(ops, path).is_some_and(|name| asked.contains(&name)) {
+                    return Err(ExecError::new(
+                        400,
+                        "locked",
+                        format!(
+                            "load setting `{path}` of `{}` is locked{}; a request cannot change it",
+                            target.id,
+                            reason
+                                .map(|reason| format!(" ({reason})"))
+                                .unwrap_or_default()
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
         let name = format!("{}~{}", target.model, load_hash(load));
         let key = format!("{}/{name}", lane.name);
         let registry = state.engine.model_settings();
@@ -3606,6 +3782,232 @@ impl sb_runtime::optimize::EngineView for ListingView {
 
 // ---------------------------------------------------------------- settings API hooks
 
+/// A `machine_file_command`'s answer: `{"global": {"keys": {..},
+/// "pinned": [..]}, "models": {NAME: {"keys": {..}, "pinned": [..]}}}`,
+/// every key and value a string.
+fn parse_machine_file(text: &str) -> Result<Value, String> {
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| format!("its answer is not JSON: {e}"))?;
+    let section_ok = |section: &Value| {
+        section.is_object()
+            && section["keys"]
+                .as_object()
+                .is_some_and(|keys| keys.values().all(Value::is_string))
+            && section["pinned"]
+                .as_array()
+                .is_some_and(|pins| pins.iter().all(Value::is_string))
+    };
+    let models_ok = value["models"]
+        .as_object()
+        .is_some_and(|models| models.values().all(section_ok));
+    let global_ok = value["global"].is_null() || section_ok(&value["global"]);
+    if !(models_ok && global_ok) {
+        return Err(
+            "its answer needs {\"models\": {NAME: {\"keys\": {..}, \"pinned\": [..]}}} with \
+             string keys and values"
+                .to_string(),
+        );
+    }
+    Ok(value)
+}
+
+/// The store lock path a machine-file pin becomes: the load key whose
+/// engine argument it is (`ctx-size` -> `load.ctx_size`), else the raw
+/// argument (`model` -> `engine_args.model`).
+fn pin_lock_path(ops: &dyn EngineKindOps, pin: &str) -> String {
+    let name = lock_name(pin);
+    sb_core::LOAD_KEYS
+        .iter()
+        .find(|key| ops.preset_key(key.name).map(lock_name).as_deref() == Some(name.as_str()))
+        .map(|key| format!("load.{}", key.name))
+        .unwrap_or_else(|| format!("engine_args.{pin}"))
+}
+
+/// Every engine key of one model and where it comes from: the machine
+/// file's section (`machine file`) and its `[*]` section (`machine file
+/// [*]`), the store's settings over them (`store`), each with its pin and
+/// store lock. Also the machine file's state (read when, why not).
+fn engine_keys_view(
+    ops: &dyn EngineKindOps,
+    file: Option<&MachineFile>,
+    model: &str,
+    doc: Option<&ModelSettingsDoc>,
+    has_command: bool,
+) -> (Value, Value) {
+    let mut keys: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut pins: Vec<Value> = Vec::new();
+    let reading = file.and_then(|file| file.ok.as_ref());
+    if let Some((_, machine)) = reading {
+        let section = &machine["models"][model];
+        let global = &machine["global"];
+        let mut pinned: BTreeSet<String> = BTreeSet::new();
+        for (part, source) in [(global, "machine file [*]"), (section, "machine file")] {
+            if let Some(found) = part["keys"].as_object() {
+                for (key, value) in found {
+                    let mut row = Map::new();
+                    row.insert("value".into(), value.clone());
+                    row.insert("source".into(), json!(source));
+                    keys.insert(key.clone(), row);
+                }
+            }
+            for pin in part["pinned"].as_array().into_iter().flatten() {
+                if let Some(pin) = pin.as_str() {
+                    pinned.insert(pin.to_string());
+                }
+            }
+        }
+        for pin in &pinned {
+            pins.push(json!({"key": pin, "lock": pin_lock_path(ops, pin)}));
+            let name = lock_name(pin);
+            for (key, row) in keys.iter_mut() {
+                if lock_name(key) == name {
+                    row.insert("pinned".into(), json!(true));
+                }
+            }
+        }
+    }
+    if let Some(doc) = doc {
+        for (key, value) in model_preset(ops, doc) {
+            let row = keys.entry(key).or_default();
+            if let Some(was) = row.remove("value") {
+                row.insert("machine_file_value".into(), was);
+            }
+            row.insert("value".into(), json!(value));
+            row.insert("source".into(), json!("store"));
+        }
+        for (path, reason) in doc.store_locks() {
+            let Some(name) = lock_target(ops, path) else {
+                continue;
+            };
+            let mut found = false;
+            for (key, row) in keys.iter_mut() {
+                if lock_name(key) == name {
+                    found = true;
+                    row.insert("locked".into(), json!(path));
+                    row.insert("lock_reason".into(), json!(reason));
+                }
+            }
+            if !found {
+                // Locked at the engine's own default.
+                let mut row = Map::new();
+                row.insert("value".into(), Value::Null);
+                row.insert("source".into(), json!("engine"));
+                row.insert("locked".into(), json!(path));
+                row.insert("lock_reason".into(), json!(reason));
+                keys.insert(name, row);
+            }
+        }
+    }
+    let state = match (has_command, file) {
+        (false, _) => json!({"read": false, "why": "the lane has no engine.machine_file_command"}),
+        (true, None) => json!({"read": false, "why": "not read yet (the machine was not up)"}),
+        (true, Some(file)) => json!({
+            "read": reading.is_some(),
+            "at_ms": reading.map(|(at, _)| *at),
+            "has_section": reading.is_some_and(|(_, m)| m["models"][model].is_object()),
+            "error": file.error.as_ref().map(|(_, why)| why),
+            "error_at_ms": file.error.as_ref().map(|(at, _)| *at),
+            "pinned": pins,
+        }),
+    };
+    let keys: Map<String, Value> = keys
+        .into_iter()
+        .map(|(key, row)| (key, Value::Object(row)))
+        .collect();
+    (Value::Object(keys), state)
+}
+
+/// Engine arguments a store lock treats as one, beyond [`CHECKED_ARGS`]'s
+/// spellings: a lock on one holds every name in its group.
+const LOCK_ALIASES: &[(&str, &[&str])] = &[
+    ("temp", &["temperature"]),
+    ("mmproj", &["no-mmproj", "mmproj-auto", "no-mmproj-auto"]),
+    ("spec-draft-model", &["model-draft"]),
+];
+
+/// The one name every spelling of an engine argument shares in a store
+/// lock (`gpu-layers` is `n-gpu-layers`, `temperature` is `temp`).
+fn lock_name(key: &str) -> String {
+    let long = format!("--{key}");
+    if let Some((name, _)) = CHECKED_ARGS
+        .iter()
+        .find(|(name, names)| *name == key || names.contains(&long.as_str()))
+    {
+        return name.to_string();
+    }
+    LOCK_ALIASES
+        .iter()
+        .find(|(name, names)| *name == key || names.contains(&key))
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// A document's engine values by lock name: every preset key it writes
+/// (load settings and raw arguments), its spellings folded together.
+fn lock_values(ops: &dyn EngineKindOps, doc: &ModelSettingsDoc) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, value) in model_preset(ops, doc) {
+        out.entry(lock_name(&key))
+            .or_default()
+            .push(format!("{key}={value}"));
+    }
+    out
+}
+
+/// The engine argument a store lock path holds (`load.ctx_size` ->
+/// `ctx-size`, `engine_args.gpu-layers` -> `n-gpu-layers`), by lock name.
+fn lock_target(ops: &dyn EngineKindOps, path: &str) -> Option<String> {
+    if let Some(key) = path.strip_prefix("load.") {
+        return ops.preset_key(key).map(lock_name);
+    }
+    path.strip_prefix("engine_args.").map(lock_name)
+}
+
+/// A write that would change a store-locked key (see
+/// [`ModelSettingsDoc::store_locks`]): the refusal, naming the key, the
+/// lock's reason and how to unlock it. `before` is the document the write
+/// replaces: its locks bind. A lock the write itself adds binds from the
+/// next write on, and a write may take a lock off only while it leaves the
+/// key as it was, so an unlock is a write of its own.
+pub(crate) fn store_lock_refusal(
+    config: &Config,
+    target: &str,
+    before: Option<&ModelSettingsDoc>,
+    after: &ModelSettingsDoc,
+) -> Option<String> {
+    let before = before?;
+    let locks = before.store_locks();
+    if locks.is_empty() {
+        return None;
+    }
+    let ops: &dyn EngineKindOps = split_target(target)
+        .and_then(|(provider, _)| engine_lane(config, provider))
+        .map(|lane| kind_ops(lane.engine.kind))
+        .unwrap_or(&LlamaCppRouter);
+    let (was, now) = (lock_values(ops, before), lock_values(ops, after));
+    for (path, reason) in locks {
+        let raw_changed = match path.split_once('.') {
+            Some(("load", key)) => before.load.get(key) != after.load.get(key),
+            Some(("engine_args", key)) => before.engine_args.get(key) != after.engine_args.get(key),
+            _ => false,
+        };
+        let engine_changed =
+            lock_target(ops, path).is_some_and(|name| was.get(&name) != now.get(&name));
+        if !(raw_changed || engine_changed) {
+            continue;
+        }
+        let key = path.strip_prefix("load.").unwrap_or(path).to_string();
+        return Some(format!(
+            "`{path}` of `{target}` is locked{}: unlock it first with `sb ai unlock {target} \
+             {key}` (nothing was written)",
+            reason
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        ));
+    }
+    None
+}
+
 /// Engine checks of a settings document before it is written: load
 /// settings need an engine control with a `settings_command`; raw
 /// arguments must be the engine's and on its per-model allow list; paths
@@ -3727,6 +4129,35 @@ pub(crate) fn add_load_view(
         "effective": row.as_ref().map(crate::engine_truth::effective).unwrap_or(Value::Null),
         "last_apply": controls.lock().last_apply.get(&lane.name).cloned(),
     });
+    let (keys, machine_file) = engine_keys_view(
+        ops,
+        controls.machine_file(&lane.name).as_ref(),
+        model,
+        doc,
+        lane.engine.machine_file_command.is_some(),
+    );
+    view["load"]["engine_keys"] = keys;
+    view["load"]["machine_file"] = machine_file;
+}
+
+/// Before a settings read: a new machine-file reading for each target's
+/// lane that needs one (see [`EngineControls::refresh_machine_file`]).
+pub(crate) async fn refresh_machine_files(state: &EngineCtx, targets: &[NamedTarget]) {
+    let snap = state.snapshot();
+    let mut lanes: BTreeMap<String, EngineLane> = BTreeMap::new();
+    for named in targets {
+        if let Some(lane) = split_target(&named.target)
+            .and_then(|(provider, _)| engine_lane(&snap.config, provider))
+        {
+            lanes.insert(lane.name.clone(), lane);
+        }
+    }
+    futures::future::join_all(
+        lanes
+            .values()
+            .map(|lane| state.engines.refresh_machine_file(state, lane)),
+    )
+    .await;
 }
 
 /// After a settings write: apply changed load settings (`next_load`: the
@@ -4299,8 +4730,29 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
         "pending_apply": pending_apply,
         "deferred": deferred,
         "settings_command": lane.engine.settings_command.is_some(),
+        "machine_file_command": lane.engine.machine_file_command.is_some(),
         "build": controls.lock().builds.get(&lane.name).cloned(),
     });
+    // The lane's machine and its memory facts (`server.optimize.hosts`),
+    // for `sb ai check`'s margin rule on any client.
+    let snap = state.snapshot();
+    if let Some(host) = snap
+        .config
+        .local_executors
+        .iter()
+        .find(|l| l.name == lane.name)
+        .and_then(|l| l.host.clone())
+    {
+        view["machine"] = snap
+            .config
+            .server
+            .optimize
+            .hosts
+            .get(&host)
+            .and_then(|spec| spec.machine_entry(&host))
+            .unwrap_or(Value::Null);
+        view["host"] = json!(host);
+    }
     if !overlay_known {
         view["note"] = json!(
             "no apply since the gateway started: the first apply writes the whole overlay, and \
@@ -4333,7 +4785,25 @@ pub(crate) async fn engines_endpoint(
     let views =
         futures::future::join_all(lanes.into_iter().map(|lane| engine_lane_view(&state, lane)))
             .await;
-    Json(json!({"object": "list", "data": views})).into_response()
+    Json(json!({
+        "object": "list",
+        "data": views,
+        "machines": machines_of(&snap.config),
+    }))
+    .into_response()
+}
+
+/// Every host's memory facts (`server.optimize.hosts`), each as one entry
+/// of a machine file: what `sb ai check`, `tune` and `fit` judge against
+/// when the client has no machine file of its own.
+pub(crate) fn machines_of(config: &Config) -> Vec<Value> {
+    config
+        .server
+        .optimize
+        .hosts
+        .iter()
+        .filter_map(|(host, spec)| spec.machine_entry(host))
+        .collect()
 }
 
 /// After a hold's wake: load the model the hold named (operator keys).
@@ -5150,6 +5620,137 @@ local_executors:
         let wanted = model_preset(&LlamaCppRouter, &doc);
         let row = args_row(&["llama-server", "-ngl", "40"]);
         assert_eq!(args_mismatch(&wanted, &row), None);
+    }
+
+    #[test]
+    fn a_store_lock_covers_every_spelling_of_its_argument() {
+        assert_eq!(lock_name("gpu-layers"), "n-gpu-layers");
+        assert_eq!(lock_name("-ngl"), "-ngl"); // short flags are not preset keys
+        assert_eq!(lock_name("c"), "c");
+        assert_eq!(lock_name("ctx-size"), "ctx-size");
+        assert_eq!(lock_name("temperature"), "temp");
+        assert_eq!(lock_name("model-draft"), "spec-draft-model");
+        let ops: &dyn EngineKindOps = &LlamaCppRouter;
+        assert_eq!(
+            lock_target(ops, "load.ctx_size").as_deref(),
+            Some("ctx-size")
+        );
+        assert_eq!(
+            lock_target(ops, "load.n_gpu_layers").as_deref(),
+            Some("n-gpu-layers")
+        );
+        assert_eq!(
+            lock_target(ops, "engine_args.gpu-layers").as_deref(),
+            Some("n-gpu-layers")
+        );
+        assert_eq!(pin_lock_path(ops, "ctx-size"), "load.ctx_size");
+        assert_eq!(pin_lock_path(ops, "n-gpu-layers"), "load.n_gpu_layers");
+        assert_eq!(pin_lock_path(ops, "model"), "engine_args.model");
+        assert_eq!(pin_lock_path(ops, "temp"), "load.temp");
+    }
+
+    #[test]
+    fn store_lock_refusal_reads_the_document_it_replaces() {
+        let config = sb_core::Config::from_yaml(
+            "providers:\n  - {id: text, type: openai_compatible, engine: llama_cpp, base_url: \"http://127.0.0.1:1/v1\"}\n\
+             local_executors:\n  - name: text\n    base_url: \"http://127.0.0.1:1\"\n    \
+             health_endpoint: \"http://127.0.0.1:1/health\"\n    engine: {kind: llama_cpp_router}\n",
+        )
+        .unwrap();
+        let locked = doc_of(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
+            "locked": ["load.ctx_size", "engine_args.n-gpu-layers"],
+            "lock_reasons": {"load.ctx_size": "night job uses this"}}));
+        let refused =
+            |after: Value| store_lock_refusal(&config, "text/m", Some(&locked), &doc_of(after));
+        // Unchanged keys pass, and so does another key.
+        assert_eq!(
+            refused(
+                json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99, "batch_size": 512},
+                "locked": ["load.ctx_size", "engine_args.n-gpu-layers"],
+                "lock_reasons": {"load.ctx_size": "night job uses this"}})
+            ),
+            None
+        );
+        // An unlock that leaves the value passes (a write of its own).
+        assert_eq!(
+            refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99}})),
+            None
+        );
+        let message = refused(json!({"load": {"ctx_size": 65536, "n_gpu_layers": 99}})).unwrap();
+        assert!(message.contains("`load.ctx_size` of `text/m` is locked (night job uses this)"));
+        assert!(message.contains("sb ai unlock text/m ctx_size"));
+        // The raw spelling of the same argument.
+        assert!(
+            refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
+            "engine_args": {"ctx-size": 8192}}))
+            .is_some()
+        );
+        // A load key that writes the raw-locked argument.
+        assert!(refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 20}})).is_some());
+        assert!(
+            refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
+            "engine_args": {"gpu-layers": 20}}))
+            .is_some()
+        );
+        // Unset is a change.
+        assert!(refused(json!({"load": {"n_gpu_layers": 99}})).is_some());
+        // No document before: nothing binds yet.
+        assert_eq!(
+            store_lock_refusal(
+                &config,
+                "text/m",
+                None,
+                &doc_of(json!({"load": {"ctx_size": 1}}))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_machine_file_answer_is_checked_and_viewed_with_its_pins() {
+        assert!(parse_machine_file("not json").is_err());
+        assert!(
+            parse_machine_file(r#"{"models": {"m": {"keys": {"a": 1}, "pinned": []}}}"#).is_err()
+        );
+        assert!(parse_machine_file(r#"{"models": []}"#).is_err());
+        let answer = parse_machine_file(
+            r#"{"global": {"keys": {"jinja": "true"}, "pinned": ["n-gpu-layers"]},
+                "models": {"m": {"keys": {"model": "/m.gguf", "ctx-size": "4096",
+                                          "gpu-layers": "99"},
+                                 "pinned": ["model"]}}}"#,
+        )
+        .unwrap();
+        let file = MachineFile {
+            ok: Some((5, answer)),
+            error: None,
+            tried_ms: 5,
+        };
+        let doc = doc_of(json!({"load": {"ctx_size": 8192},
+            "locked": ["load.ctx_size", "load.threads"]}));
+        let (keys, state) = engine_keys_view(&LlamaCppRouter, Some(&file), "m", Some(&doc), true);
+        assert_eq!(
+            keys["ctx-size"],
+            json!({"value": "8192", "source": "store", "machine_file_value": "4096",
+                   "locked": "load.ctx_size", "lock_reason": null})
+        );
+        assert_eq!(keys["model"]["pinned"], json!(true));
+        // A [*] pin under another spelling of the argument.
+        assert_eq!(keys["gpu-layers"]["pinned"], json!(true));
+        assert_eq!(keys["jinja"]["source"], json!("machine file [*]"));
+        // A lock on a key nobody sets: shown at the engine's default.
+        assert_eq!(
+            keys["threads"],
+            json!({"value": null, "source": "engine", "locked": "load.threads",
+                   "lock_reason": null})
+        );
+        assert_eq!(state["has_section"], json!(true));
+        assert_eq!(
+            state["pinned"],
+            json!([{"key": "model", "lock": "engine_args.model"},
+                   {"key": "n-gpu-layers", "lock": "load.n_gpu_layers"}])
+        );
+        let (_, state) = engine_keys_view(&LlamaCppRouter, None, "m", None, false);
+        assert_eq!(state["read"], json!(false));
     }
 
     #[test]

@@ -53,6 +53,8 @@ const MAX_PROFILE_NAME: usize = 64;
 const MAX_PROFILES: usize = 64;
 /// Longest system prompt a settings document may carry (bytes).
 const MAX_SYSTEM_PROMPT: usize = 64 * 1024;
+/// Longest reason a lock may carry (characters).
+const MAX_LOCK_REASON: usize = 200;
 
 /// The type and range of one request-time key.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -601,9 +603,17 @@ pub struct ModelSettingsDoc {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Map<String, Json>>,
     /// Keys a request may not override (`temperature`, `reasoning`,
-    /// `reasoning.enabled`, `extra.mirostat`, ...).
+    /// `reasoning.enabled`, `extra.mirostat`, ...), and store locks of
+    /// load-time keys (`load.ctx_size`, `engine_args.model`): no write may
+    /// change such a key's engine value until a write of its own takes the
+    /// lock off (see [`Self::store_locks`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locked: Vec<String>,
+    /// Why a locked key is locked (`load.ctx_size` -> `night job uses
+    /// this`): shown beside it and in every refusal. Keys are entries of
+    /// `locked`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lock_reasons: BTreeMap<String, String>,
     /// Load-time settings (context size, GPU layers, KV cache type, ...).
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub load: Map<String, Json>,
@@ -646,11 +656,27 @@ impl ModelSettingsDoc {
             validate_layer(layer).map_err(|e| SettingsError(format!("profile `{name}`: {e}")))?;
         }
         for path in &self.locked {
-            // `load.KEY`: a load-time key `sb ai tune` must never change.
+            // `load.KEY`: a store lock of a load-time key (no write and no
+            // `sb ai tune` changes it until it is unlocked).
             if let Some(load) = path.strip_prefix("load.") {
                 if crate::load_settings::load_key(load).is_none() {
                     return err(format!(
                         "locked key `{path}`: `{load}` is not a load setting"
+                    ));
+                }
+                continue;
+            }
+            // `engine_args.NAME`: a store lock of a raw engine argument (a
+            // model file, a projector) that `load` does not type.
+            if let Some(name) = path.strip_prefix("engine_args.") {
+                let ok = !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                if !ok {
+                    return err(format!(
+                        "locked key `{path}`: `{name}` is not an engine argument name"
                     ));
                 }
                 continue;
@@ -670,7 +696,42 @@ impl ModelSettingsDoc {
                 (_, Some(_)) => return err(format!("locked key `{path}`: `{top}` has no fields")),
             }
         }
+        for (path, reason) in &self.lock_reasons {
+            if !self.locked.contains(path) {
+                return err(format!(
+                    "lock_reasons names `{path}`, which is not locked (add it to `locked`)"
+                ));
+            }
+            let reason_ok = !reason.trim().is_empty()
+                && reason.chars().count() <= MAX_LOCK_REASON
+                && !reason.chars().any(char::is_control);
+            if !reason_ok {
+                return err(format!(
+                    "lock reason of `{path}` must be one line of 1 to {MAX_LOCK_REASON} characters"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The store locks: `locked` entries of load-time keys (`load.KEY`,
+    /// `engine_args.NAME`), each with its reason.
+    pub fn store_locks(&self) -> Vec<(&str, Option<&str>)> {
+        self.locked
+            .iter()
+            .filter(|path| path.starts_with("load.") || path.starts_with("engine_args."))
+            .map(|path| {
+                (
+                    path.as_str(),
+                    self.lock_reasons.get(path).map(String::as_str),
+                )
+            })
+            .collect()
+    }
+
+    /// Why `path` is locked, if a reason was given.
+    pub fn lock_reason(&self, path: &str) -> Option<&str> {
+        self.lock_reasons.get(path).map(String::as_str)
     }
 
     /// Validate the whole document (request-time and load-time parts).
@@ -1316,6 +1377,8 @@ pub fn answer_settings_hash(doc: Option<&ModelSettingsDoc>) -> String {
         .unwrap_or_else(|| Json::Object(Map::new()));
     if let Json::Object(map) = &mut value {
         map.remove("ceiling");
+        // Why a key is locked changes no answer.
+        map.remove("lock_reasons");
         sort_set(map.get_mut("locked"));
         if let Some(Json::Object(policy)) = map.get_mut("request_load") {
             sort_set(policy.get_mut("allow"));
@@ -1336,6 +1399,52 @@ mod tests {
     use super::*;
     use crate::Message;
     use serde_json::json;
+
+    #[test]
+    fn store_locks_are_load_and_engine_argument_locks_with_their_reasons() {
+        let doc: ModelSettingsDoc = serde_json::from_value(json!({
+            "defaults": {"temperature": 0.5},
+            "locked": ["temperature", "load.ctx_size", "engine_args.model"],
+            "lock_reasons": {"load.ctx_size": "night job uses this"}
+        }))
+        .unwrap();
+        doc.validate().unwrap();
+        assert_eq!(
+            doc.store_locks(),
+            vec![
+                ("load.ctx_size", Some("night job uses this")),
+                ("engine_args.model", None)
+            ]
+        );
+        assert_eq!(
+            doc.lock_reason("load.ctx_size"),
+            Some("night job uses this")
+        );
+        // Why a key is locked changes no answer.
+        let mut other = doc.clone();
+        other.lock_reasons.clear();
+        assert_eq!(
+            answer_settings_hash(Some(&doc)),
+            answer_settings_hash(Some(&other))
+        );
+    }
+
+    #[test]
+    fn a_lock_reason_needs_its_lock_and_one_short_line() {
+        for bad in [
+            json!({"lock_reasons": {"load.ctx_size": "x"}}),
+            json!({"locked": ["load.ctx_size"], "lock_reasons": {"load.ctx_size": "  "}}),
+            json!({"locked": ["load.ctx_size"], "lock_reasons": {"load.ctx_size": "a\nb"}}),
+            json!({"locked": ["load.ctx_size"],
+                   "lock_reasons": {"load.ctx_size": "x".repeat(201)}}),
+            json!({"locked": ["engine_args.a b"]}),
+            json!({"locked": ["engine_args."]}),
+            json!({"locked": ["load.not_a_key"]}),
+        ] {
+            let doc: ModelSettingsDoc = serde_json::from_value(bad.clone()).unwrap();
+            assert!(doc.validate().is_err(), "{bad}");
+        }
+    }
 
     // Test 21: the quality ledger's staleness key ignores the speed ceiling
     // and follows every answer-affecting change.

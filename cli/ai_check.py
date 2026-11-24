@@ -477,19 +477,42 @@ def measured(memory, pool_ctx=None):
     return None
 
 
+def source_words(machine):
+    """` in the gateway's config` for a machine the gateway served; nothing
+    for one of the local machine file (the words it always had)."""
+    source = getattr(machine, "source", None)
+    return f" in {source}" if source and source != "the machine file" else ""
+
+
+def gateway_machines_of(engines):
+    """The machines a `GET /v1/engines` answer carries (`machines`, one
+    machine-file entry per host); entries that do not read are left out."""
+    out = []
+    for entry in (engines or {}).get("machines") or []:
+        try:
+            out.append(ai_fit.machine_from_entry(entry, "the gateway's machine facts"))
+        except ai_fit.FitError:
+            continue
+    return out
+
+
 def margin_verdict(numbers, min_free):
     """Pass when the card keeps at least `min_free` bytes free."""
     free = numbers["free_bytes"]
-    parts = (f"card {gb(numbers['card_bytes'])} ({numbers['card_from']}) - model "
+    # Unified memory is shared with every program, not a card.
+    card = "memory" if "unified" in str(numbers.get("card_from") or "") else "card"
+    users = "other programs" if card == "memory" else "other users of the card"
+    parts = (f"{card} {gb(numbers['card_bytes'])} ({numbers['card_from']}) - model "
              f"{gb(numbers['model_bytes'])} ({numbers['model_from']})")
     if numbers.get("loaded_bytes"):
         parts += f" - other loaded models {gb(numbers['loaded_bytes'])}"
     if numbers.get("others_bytes"):
-        parts += f" - other users of the card {gb(numbers['others_bytes'])} ({numbers['others_from']})"
+        parts += f" - {users} {gb(numbers['others_bytes'])} ({numbers['others_from']})"
     parts += f" = {gb(free)} free"
     if free < min_free:
         return {"check": "margin", "passed": False, "result": "margin_short",
-                "why": f"{parts}, under the {gb(min_free)} the card must keep free", "margin": numbers}
+                "why": f"{parts}, under the {gb(min_free)} the {'machine' if card == 'memory' else 'card'} "
+                       "must keep free", "margin": numbers}
     return {"check": "margin", "passed": True, "result": "ok",
             "why": f"{parts} (at least {gb(min_free)})", "margin": numbers}
 
@@ -755,6 +778,13 @@ class Checker:
     def lanes(self):
         return self.call("GET", "/v1/workloads/capacity", timeout=15, doing="reading the lanes").get("data") or []
 
+    def locate(self, ident):
+        """The model's host (for its machine facts), with no check of the
+        lane's state: the margin before a write needs nothing else."""
+        lane = next((l for l in self.lanes() if l.get("name") == ident["lane"]), None)
+        if lane is not None:
+            ident.setdefault("host", lane.get("host") or lane.get("name"))
+
     def preflight(self, ident):
         lanes = self.lanes()
         lane = next((l for l in lanes if l.get("name") == ident["lane"]), None)
@@ -875,16 +905,39 @@ class Checker:
     # ------------------------------------------------------------ the card's memory
 
     def machine(self, ident):
-        """The machine file's entry for the model's host (or lane), or None."""
+        """The entry for the model's host (or lane): from the local machine
+        file (--machines, else SB_AI_MACHINES) when there is one, else the
+        gateway's own machine facts (`server.optimize.hosts` in its config,
+        served in `GET /v1/engines`); None when neither knows it."""
         path = getattr(self.args, "machines", None)
-        if not path:
-            return None
-        try:
-            machines = ai_fit.read_machines(path)
-        except ai_fit.FitError as error:
-            raise CheckError(USAGE, error.message) from None
         names = (ident.get("host"), ident.get("lane"))
-        return next((m for m in machines if m.name in names), None)
+        if path:
+            try:
+                machines = ai_fit.read_machines(path)
+            except ai_fit.FitError as error:
+                raise CheckError(USAGE, error.message) from None
+            found = next((m for m in machines if m.name in names), None)
+            if found is not None:
+                found.source = "the machine file"
+                return found
+            # The local file does not name this host: the gateway's facts
+            # still apply.
+        machines = self.gateway_machines()
+        found = next((m for m in machines if m.name in names), None)
+        if found is not None:
+            found.source = "the gateway's config"
+        return found
+
+    def gateway_machines(self):
+        """The gateway's machine facts as machines (empty when it serves
+        none, or this key may not read them)."""
+        if "_gateway_machines" not in self.__dict__:
+            try:
+                answer = self.gw.get("/v1/engines")
+            except self.fail_types:
+                answer = {}
+            self._gateway_machines = gateway_machines_of(answer)
+        return self._gateway_machines
 
     def fit_estimate(self, ident, truth, machine):
         """The model's GPU bytes at its settings from `sb ai fit`'s numbers,
@@ -933,7 +986,39 @@ class Checker:
                + f" + compute {gb(compute)}")
         return {"bytes": total, "n_ctx": int(ctx), "card": None, "how": how}, None
 
-    def check_margin(self, ident, truth):
+    def predicted_margin(self, ident, truth_before, after_doc):
+        """The margin rule at the settings a change asks for, before anything
+        is written, held or loaded: the pool the document asks for (what it
+        leaves out is what the engine runs now), sized from the engine's
+        measurement with its KV cache scaled (same cache types), else from
+        `sb ai fit`'s numbers. None when nothing can size it (the normal
+        checks then judge it after the load)."""
+        if not truth_before:
+            return None
+        if not ident.get("file_quant"):
+            # The quant of the file the engine runs (its listed --model), as
+            # the checks after a load read it.
+            row, _ = self.engine_row(ident)
+            model_arg = arg_value([str(a) for a in (row or {}).get("args") or []], ("--model", "-m"))
+            if model_arg:
+                ident["file_quant"] = ai_fit.quant_label(str(model_arg))
+        pool = doc_pool(after_doc, truth_before)
+        if not pool.get("ctx_size"):
+            return None
+        predicted = dict(truth_before)
+        predicted.update({"ctx_size": pool["ctx_size"], "pool_ctx": pool["ctx_size"],
+                          "cache_type_k": pool["cache_type_k"] or truth_before.get("cache_type_k"),
+                          "cache_type_v": pool["cache_type_v"] or truth_before.get("cache_type_v"),
+                          "kv_unified": pool["kv_unified"],
+                          "slots": pool["parallel"] or truth_before.get("slots")})
+        same_cache = all(str(predicted.get(k) or "f16").lower() == str(truth_before.get(k) or "f16").lower()
+                         for k in ("cache_type_k", "cache_type_v"))
+        verdict = self.check_margin(ident, predicted, use_measurement=same_cache)
+        if verdict.get("passed") is None:
+            return None
+        return verdict
+
+    def check_margin(self, ident, truth, use_measurement=True):
         """Before any request: the card memory the model leaves free at its
         settings, from the engine's own measurement. The card's size is the
         measurement's (when the gateway passes it on), else --card-gb, else
@@ -948,7 +1033,7 @@ class Checker:
         pool_ctx = (truth or {}).get("pool_ctx") or (truth or {}).get("ctx_size")
         machine = self.machine(ident)
         where = f"host {ident.get('host') or ident['lane']}"
-        mine = measured((row or {}).get("memory"), pool_ctx)
+        mine = measured((row or {}).get("memory"), pool_ctx) if use_measurement else None
         if mine is None:
             mine, why = self.fit_estimate(ident, truth, machine)
             if mine is None:
@@ -959,15 +1044,19 @@ class Checker:
             card, card_from = int(float(card_flag) * GB), "--card-gb"
         elif mine["card"]:
             card, card_from = mine["card"], "the engine's measurement"
-        elif machine is not None and machine.kind == "gpu" and machine.budget:
-            card, card_from = int(machine.budget), f"vram_gb of {where} in the machine file"
+        elif machine is not None and machine.budget:
+            name = "vram_gb" if machine.kind == "gpu" else "usable_gb (unified memory)"
+            card, card_from = int(machine.budget), f"{name} of {where} in " \
+                f"{getattr(machine, 'source', None) or 'the machine file'}"
         else:
             return {"check": "margin", "passed": None, "result": "skipped",
                     "why": (f"the card's size is unknown: the gateway does not pass it on, so set "
-                            f"vram_gb for {where} in the machine file (SB_AI_MACHINES) or pass "
-                            "--card-gb")}
+                            f"vram_gb for {where} in the gateway's server.optimize.hosts or in a "
+                            "machine file (SB_AI_MACHINES), or pass --card-gb")}
         loaded, unknown = 0, []
         for other in rows:
+            # A sleeping model's process holds no weights (llama.cpp frees
+            # them while it sleeps), so only loaded and loading ones count.
             if other is row or other.get("status") not in ("loaded", "loading"):
                 continue
             theirs = measured(other.get("memory"))
@@ -975,6 +1064,12 @@ class Checker:
                 unknown.append(str(other.get("id")))
             else:
                 loaded += theirs["bytes"]
+        in_others = []
+        if unknown and machine is not None and machine.kind == "unified" and machine.others:
+            # On unified memory, others_gb is everything but this model at the
+            # machine's normal state, measured with its small always-loaded
+            # models in: an unmeasured loaded model is counted there (and named).
+            in_others, unknown = unknown, []
         if unknown:
             # Their share of the card is not known: the room left is not either.
             return {"check": "margin", "passed": None, "result": "skipped",
@@ -985,20 +1080,24 @@ class Checker:
         if others_flag is not None:
             others, others_from = int(float(others_flag) * GB), "--others"
         elif machine is not None and machine.others:
-            others, others_from = int(machine.others), f"others_gb of {where}"
+            others, others_from = int(machine.others), f"others_gb of {where}{source_words(machine)}"
+            if in_others:
+                others_from += f", with {', '.join(in_others[:3])} loaded"
         else:
             others, others_from = 0, "none named"
         free_flag = getattr(self.args, "min_free", None)
         if free_flag is not None:
-            min_free = int(float(free_flag) * GB)
+            min_free, min_free_from = int(float(free_flag) * GB), "--min-free"
         elif machine is not None and getattr(machine, "min_free", None) is not None:
             min_free = int(machine.min_free)
+            min_free_from = f"min_free_gb of {where}{source_words(machine)}"
         else:
-            min_free = MIN_FREE_BYTES
+            min_free, min_free_from = MIN_FREE_BYTES, "the default"
         numbers = {"card_bytes": card, "card_from": card_from, "model_bytes": mine["bytes"],
                    "model_from": mine["how"], "measured_ctx": mine["n_ctx"], "loaded_bytes": loaded,
                    "others_bytes": others, "others_from": others_from,
-                   "free_bytes": card - mine["bytes"] - loaded - others, "min_free_bytes": min_free}
+                   "free_bytes": card - mine["bytes"] - loaded - others, "min_free_bytes": min_free,
+                   "min_free_from": min_free_from}
         return margin_verdict(numbers, min_free)
 
     # ------------------------------------------------------------ requests
@@ -1744,6 +1843,22 @@ def guard(gw, args, fail_types, target_view, write, after_doc=None, poll_secs=No
         checks = checker.wanted()
         ident = checker.resolve(target_view["target"])
         before_revision, before_doc = ident["revision"], ident["document"]
+        row, _ = checker.engine_row(ident)
+        truth_before = truth_of(row or {})
+        growth = pool_growth(before_doc, after_doc, truth_before) if after_doc is not None else []
+        if growth:
+            # The margin needs no request and no load: a change that leaves too
+            # little free is refused before anything is written, held, woken
+            # or loaded (on a work machine, a too-big model would otherwise load
+            # first and squeeze everything else until the check puts it back).
+            checker.locate(ident)
+            early = checker.predicted_margin(ident, truth_before, after_doc)
+            if early is not None:
+                checker.log(f"{ident['target']}: at the new settings ({', '.join(growth)}), before any "
+                            f"write: {verdict_line(early)}")
+                if early.get("passed") is False:
+                    raise CheckError(FAIL, f"{ident['target']}: the change would leave too little memory "
+                                           "free; nothing was written, held, woken or loaded")
         try:
             checker.preflight(ident)
         except CheckError as error:
@@ -1751,9 +1866,6 @@ def guard(gw, args, fail_types, target_view, write, after_doc=None, poll_secs=No
                 raise CheckError(MACHINE_OFF, f"{error.message}, or --no-check to keep the change "
                                               "for the next load, unchecked") from None
             raise
-        row, _ = checker.engine_row(ident)
-        truth_before = truth_of(row or {})
-        growth = pool_growth(before_doc, after_doc, truth_before) if after_doc is not None else []
         repeats = pool_repeats_for(args, growth)
         runs = int(getattr(args, "runs", None) or PICTURE_RUNS)
         need = need_s(checks, repeats, runs, projector=(truth_before or {}).get("projector"))

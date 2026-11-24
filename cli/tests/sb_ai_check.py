@@ -177,6 +177,8 @@ class Fake:
         self.lock_refused = None  # new locks are refused with this reason (409)
         self.load_fails = False  # loads answer 502
         self.others = []        # other models the engine lists
+        self.machines = []      # the gateway's machine facts (GET /v1/engines `machines`)
+        self.experiments = True  # the lane's `experiments` flag
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -273,6 +275,13 @@ class Fake:
         if method == "PUT" and path == base + "/settings":
             if body.get("revision") != self.revision:
                 return 409, {"error": {"message": "stale", "type": "revision_conflict"}}
+            # A store lock, as the gateway refuses it: 423 when a locked
+            # load key would change.
+            for locked in self.doc.get("locked") or []:
+                key = locked[5:] if locked.startswith("load.") else None
+                if key and (body.get("load") or {}).get(key) != (self.doc.get("load") or {}).get(key):
+                    return 423, {"error": {"message": f"`{locked}` of {TARGET} is locked (gateway)",
+                                           "type": "locked"}}
             doc = dict(body)
             apply = doc.pop("apply", None)
             note = doc.pop("note", None)
@@ -307,10 +316,11 @@ class Fake:
             if self.effective:
                 row["effective"] = ai_check.truth_from_args(row["args"])
             return 200, {"object": "list", "data": [{"lane": "box", "build": "b100",
-                                                     "models": [row] + self.others}]}
+                                                     "models": [row] + self.others}],
+                         "machines": self.machines}
         if method == "GET" and path == "/v1/workloads/capacity":
             return 200, {"object": "list", "data": [{"name": "box", "host": "gpu-box", "state": "healthy",
-                                                     "experiments": True}]}
+                                                     "experiments": self.experiments}]}
         if method == "POST" and path == "/v1/hosts/gpu-box/holds":
             hold_id = f"hold-{len(self.holds) + 1}"
             self.holds[hold_id] = body
@@ -901,16 +911,20 @@ class MarginTests(Base):
                                    "card": 24e9}
         self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
         before = json.loads(json.dumps(self.fake.doc))
+        revision = self.fake.revision
         run = self.sb("set", TARGET, "ctx_size=49152", "--load", "--checks", "long,pool")
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        # Judged from the measurement with its KV cache scaled, before any
+        # write: nothing written, held, loaded or sent.
         self.assertEqual(self.fake.doc, before)
-        self.assertEqual(self.fake.chats(), [])  # refused before any request
-        self.assertIn("margin failed (margin_short)", self.fake.history[-1]["action"])
+        self.assertEqual(self.fake.revision, revision)
+        self.assertEqual(self.fake.chats(), [])
+        self.assertIn("before any write: margin   FAIL", run.stdout)
         self.assertIn("1.04 GB free, under the 1.50 GB", run.stdout)
-        row = [r for r in self.fake.ledger if r["suite"] == "check-margin"][-1]
-        self.assertEqual((row["passed"], row["stop_reason"], row["settings_revision"]), (0, "margin_short", 2))
-        self.assertEqual((row["card_bytes"], row["free_bytes"]), (24_000_000_000, 1_042_400_000))
-        self.released()
+        self.assertIn("nothing was written, held, woken or loaded", run.stderr)
+        self.assertEqual(self.fake.holds, {})
+        self.assertEqual(self.fake.locks, {})
+        self.assertEqual(self.fake.engine.status, "loaded")  # never reloaded
 
     def test_the_same_change_with_room_to_spare_passes(self):
         self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9,
@@ -982,6 +996,154 @@ class MarginTests(Base):
         self.assertEqual(self.fake.doc["load"]["ctx_size"], 24576)
 
 
+class GatewayMachineTests(Base):
+    """The machine facts live in the gateway: a client with no machine file
+    gets the same margin verdict, and a local file still wins."""
+
+    ENTRY = {"name": "gpu-box", "kind": "gpu", "vram_gb": 24, "others_gb": 2, "min_free_gb": 1.5}
+
+    def margin(self, *extra):
+        self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9}
+        self.fake.write({"load": {"ctx_size": 49152, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        run = self.sb("check", TARGET, "--checks", "margin", "--json", *extra)
+        self.assertIn(run.returncode, (0, 1), run.stderr)
+        return self.by_check(json.loads(run.stdout))["margin"]
+
+    def test_without_a_machine_file_the_gateway_facts_give_the_same_verdict(self):
+        path = self.root / "machines.json"
+        path.write_text(json.dumps({"machines": [self.ENTRY]}))
+        self.env["SB_AI_MACHINES"] = str(path)
+        local = self.margin()
+        del self.env["SB_AI_MACHINES"]
+        none = self.margin()
+        self.assertIsNone(none["passed"])  # nothing knows the card: skipped
+        self.fake.machines = [dict(self.ENTRY, source="gateway")]
+        served = self.margin()
+        self.assertEqual(local["passed"], False)
+        self.assertEqual((served["passed"], served["margin"]["free_bytes"]),
+                         (local["passed"], local["margin"]["free_bytes"]))
+        self.assertIn("in the gateway's config", served["margin"]["card_from"])
+        self.assertIn("in the gateway's config", served["margin"]["min_free_from"])
+
+    def test_a_local_machine_file_overrides_the_gateway(self):
+        self.fake.machines = [dict(self.ENTRY, vram_gb=48)]
+        served = self.margin()
+        self.assertEqual(served["passed"], True)
+        path = self.root / "machines.json"
+        path.write_text(json.dumps({"machines": [self.ENTRY]}))
+        self.env["SB_AI_MACHINES"] = str(path)
+        local = self.margin()
+        self.assertEqual(local["passed"], False)
+        self.assertIn("in the machine file", local["margin"]["card_from"])
+
+    def test_on_unified_memory_an_unmeasured_small_model_is_part_of_others(self):
+        self.fake.others = [{"id": "embed", "status": "loaded", "args": [], "memory": None}]
+        self.fake.machines = [{"name": "gpu-box", "kind": "unified", "usable_gb": 40,
+                               "others_gb": 12, "min_free_gb": 6}]
+        margin = self.margin()
+        self.assertEqual(margin["passed"], True, margin)
+        self.assertIn("with embed loaded", margin["margin"]["others_from"])
+        # On a card the same model makes the room unknown.
+        self.fake.machines = [dict(self.ENTRY)]
+        self.assertIsNone(self.margin()["passed"])
+
+    def test_a_too_big_change_is_refused_with_its_numbers_on_a_lane_without_experiments(self):
+        # A work machine: no checks may run there, but the margin needs none.
+        self.fake.experiments = False
+        self.fake.machines = [{"name": "gpu-box", "kind": "unified", "usable_gb": 40,
+                               "others_gb": 12, "min_free_gb": 6}]
+        self.fake.engine.memory = {"weights": 18e9, "kv_per_token": 50_000, "compute": 0.5e9}
+        self.fake.write({"load": {"ctx_size": 49152, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        revision = self.fake.revision
+        run = self.sb("set", TARGET, "ctx_size=196608", "--load")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("before any write: margin   FAIL", run.stdout)
+        self.assertIn("usable_gb (unified memory) of host gpu-box in the gateway's config", run.stdout)
+        self.assertEqual(self.fake.revision, revision)
+        # One that fits still meets the lane's own refusal: no checks there.
+        run = self.sb("set", TARGET, "ctx_size=65536", "--load")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("before any write: margin   PASS", run.stdout)
+        self.assertIn("does not allow experiments", run.stderr)
+        self.assertEqual(self.fake.revision, revision)
+
+    def test_a_unified_memory_host_is_judged_on_its_usable_memory(self):
+        self.fake.machines = [{"name": "gpu-box", "kind": "unified", "usable_gb": 40,
+                               "others_gb": 12, "min_free_gb": 6}]
+        margin = self.margin()
+        self.assertEqual(margin["passed"], True, margin)
+        self.assertIn("usable_gb (unified memory)", margin["margin"]["card_from"])
+
+
+class StoreLockTests(Base):
+    """A store lock on a load key: refused at set time with its reason,
+    before any hold or write; lock and unlock are writes of their own."""
+
+    def locked_doc(self):
+        self.fake.write({"load": {"ctx_size": 32768}, "locked": ["load.ctx_size"],
+                         "lock_reasons": {"load.ctx_size": "night job uses this"}})
+
+    def test_a_locked_load_key_is_refused_before_anything_is_held_or_written(self):
+        self.locked_doc()
+        revision = self.fake.revision
+        run = self.sb("set", TARGET, "ctx_size=65536", "--load")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("is locked (night job uses this)", run.stderr)
+        self.assertIn(f"sb ai unlock {TARGET} ctx_size", run.stderr)
+        self.assertEqual(self.fake.revision, revision)
+        self.assertEqual(self.fake.holds, {})
+        self.assertEqual(self.fake.locks, {})
+        self.assertEqual(self.fake.chats(), [])
+        # unset of the key changes it too.
+        run = self.sb("unset", TARGET, "ctx_size", "--load")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("is locked", run.stderr)
+        self.assertEqual(self.fake.revision, revision)
+        # Another load key is not locked.
+        run = self.sb("set", TARGET, "batch_size=1024", "--load", "--no-check")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.revision, revision + 1)
+
+    def test_lock_and_unlock_are_writes_of_their_own(self):
+        self.fake.write({"load": {"ctx_size": 32768}})
+        run = self.sb("lock", TARGET, "ctx_size", "--reason", "night job uses this")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc["locked"], ["load.ctx_size"])
+        self.assertEqual(self.fake.doc["lock_reasons"], {"load.ctx_size": "night job uses this"})
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 32768})
+        run = self.sb("lock", TARGET, "engine_args.model")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc["locked"], ["load.ctx_size", "engine_args.model"])
+        run = self.sb("unlock", TARGET, "ctx_size")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.fake.doc["locked"], ["engine_args.model"])
+        self.assertNotIn("lock_reasons", self.fake.doc)
+        self.assertEqual(self.fake.doc["load"], {"ctx_size": 32768})
+        run = self.sb("unlock", TARGET, "ctx_size")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("not locked", run.stderr)
+        for bad in (["lock", TARGET, "nonsense_key"], ["lock", TARGET, "engine_args.a b"],
+                    ["lock", TARGET, "ctx_size", "--reason", ""]):
+            self.assertEqual(self.sb(*bad).returncode, 2, bad)
+
+    def test_the_gateway_refusal_is_shown_as_it_says(self):
+        # A lock the client does not see (another spelling of the argument)
+        # is still refused by the gateway, with its own words.
+        self.fake.write({"load": {"ctx_size": 32768}, "locked": ["load.ctx_size"]})
+        self.fake.doc["locked"] = []  # the client reads no lock ...
+        view = self.fake.view
+
+        def locked_view():
+            answer = view()
+            answer["document"] = dict(answer["document"], locked=[])
+            return answer
+        self.fake.view = locked_view
+        self.fake.doc["locked"] = ["load.ctx_size"]  # ... the gateway has one
+        run = self.sb("set", TARGET, "ctx_size=65536", "--load", "--no-check")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("is locked (gateway)", run.stderr)
+
+
 class FitMarginTests(Base):
     """Without an engine measurement, the margin sizes the model with `sb ai
     fit`: the running file's weights, the pool's KV cache from the file
@@ -1020,6 +1182,7 @@ class FitMarginTests(Base):
                       "+ compute 0.85 GB", run.stdout)
         self.assertIn("= 1.12 GB free", run.stdout)
         kept = json.loads(json.dumps(self.fake.doc))
+        revision = self.fake.revision
         sent = len(self.fake.chats())
         run = self.sb("set", TARGET, "ctx_size=131072", "--load", "--checks", "long,pool")
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
@@ -1027,7 +1190,7 @@ class FitMarginTests(Base):
         self.assertIn("0.38 GB free, under the 0.50 GB", run.stdout)
         self.assertEqual(len(self.fake.chats()), sent)  # no request at 131,072
         self.assertEqual(self.fake.doc, kept)
-        self.assertIn("margin failed (margin_short)", self.fake.history[-1]["action"])
+        self.assertEqual(self.fake.revision, revision)  # refused before the write
         # The model index was read once per pool size.
         listings = [r for r in self.index.seen if r["path"].startswith("/api/models/")]
         self.assertEqual(len(listings), 2)

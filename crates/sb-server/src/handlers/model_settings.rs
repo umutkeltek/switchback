@@ -338,6 +338,16 @@ pub(crate) fn target_view(
         view["document"] = doc
             .map(|doc| serde_json::to_value(doc).unwrap_or(Value::Null))
             .unwrap_or_else(|| json!({}));
+        // Store locks of load-time keys, each with why (operator view only).
+        view["store_locks"] = doc
+            .map(|doc| {
+                doc.store_locks()
+                    .into_iter()
+                    .map(|(path, reason)| json!({"key": path, "reason": reason}))
+                    .collect::<Vec<_>>()
+            })
+            .map(Value::from)
+            .unwrap_or_else(|| json!([]));
         crate::engine_control::add_load_view(
             &crate::engine_control::EngineCtx::from(state),
             named,
@@ -366,6 +376,18 @@ pub(crate) async fn get(
 ) -> Response {
     match parse_model_path(&tail) {
         Some(ModelPath::Settings(name)) => {
+            // Operator views show the machine file's keys: read it again
+            // first when the last reading is old and the machine is up
+            // (never wakes; bounded).
+            if principal.is_operator_or_admin() {
+                if let Ok(targets) = resolve_for(&state, &principal, &name) {
+                    crate::engine_control::refresh_machine_files(
+                        &crate::engine_control::EngineCtx::from(&state),
+                        &targets,
+                    )
+                    .await;
+                }
+            }
             get_settings(&state, &principal, &name, query.profile.as_deref())
         }
         Some(ModelPath::History(name)) => {
@@ -657,12 +679,27 @@ async fn commit_write(
     wake: bool,
 ) -> Response {
     let ctx = crate::engine_control::EngineCtx::from(state);
+    let registry = state.engine.model_settings();
+    // A store lock binds before anything else runs: a refused write never
+    // reaches the engine checks, the store or a machine.
+    if let Some(message) = crate::engine_control::store_lock_refusal(
+        &state.snapshot().config,
+        &named.target,
+        registry
+            .get(&named.target)
+            .map(|entry| entry.doc)
+            .as_deref(),
+        &doc,
+    ) {
+        let mut body = json!({"error": {"message": message, "type": "locked"}});
+        body["error"]["current_revision"] = json!(registry.revision(&named.target));
+        return (StatusCode::LOCKED, Json(body)).into_response();
+    }
     if let Err(message) =
         crate::engine_control::validate_for_target(&ctx, &named.target, &doc).await
     {
         return error(StatusCode::BAD_REQUEST, "invalid_settings", message);
     }
-    let registry = state.engine.model_settings();
     let before = registry.get(&named.target).map(|entry| entry.doc.clone());
     let actor = actor_for(principal, headers);
     let entry = match registry.write(&named.target, doc, expected, &actor, action) {
