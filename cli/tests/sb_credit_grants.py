@@ -271,7 +271,7 @@ class CreditGrantTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fixture = Fixture(tmp, grants=[dict(GRANT, operator_field="keep me"), other])
             (fixture.runtime / "manifest.json").write_text("{}")
-            ok = self.observe(fixture, "openai", "--balance", "61.25", "--expires", "2026-02-28", "--reserve", "5")
+            ok = self.observe(fixture, "openai", "--balance", "61.25", "--expires", "2026-01-31", "--reserve", "5")
             self.assertEqual((ok.returncode, ok.stderr), (0, ""))
             self.assertEqual(stat.S_IMODE(fixture.grants_path.stat().st_mode), 0o600)
             saved = json.loads(fixture.grants_path.read_text())
@@ -279,7 +279,7 @@ class CreditGrantTests(unittest.TestCase):
             first = saved["grants"][0]
             self.assertEqual((first["observed_balance_usd"], first["expires_at"], first["reserve_usd"],
                               first["received_at"], first["amount_usd"], first["operator_field"]),
-                             (61.25, "2026-02-28", 5.0, "2026-01-01", 100.0, "keep me"))
+                             (61.25, "2026-01-31", 5.0, "2026-01-01", 100.0, "keep me"))
             self.assertLess(abs(at(first["observed_at"]) - datetime.now(timezone.utc).timestamp()), 120)
             before = (fixture.grants_path.read_bytes(), fixture.grants_path.stat().st_mtime_ns)
             for argv in (["OpenAI!", "--balance", "1", "--expires", "2026-02-28"],
@@ -449,6 +449,82 @@ class BillingReadingTests(unittest.TestCase):
             for bad in ("not a name", 7, "sk-looks-like-a-key"):
                 fixture = Fixture(tmp + f"/{abs(hash(str(bad)))}", grants=({**GRANT, "usage_credential_ref": bad},))
                 self.assertEqual(credit.view(fixture.runtime, NOW, fixture.registry), ([], "credit_grants_invalid"))
+
+
+class ReviewFixTests(unittest.TestCase):
+    """Defects a second reviewer found on 2026-11-24."""
+    observe = CreditGrantTests.observe
+
+    def test_a_later_expiry_is_a_new_grant_not_the_old_one_extended(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=[dict(BILLED, operator_field="keep me")])
+            (fixture.runtime / "manifest.json").write_text("{}")
+            ok = self.observe(fixture, "openai", "--balance", "150", "--expires", "2099-01-01")
+            self.assertEqual((ok.returncode, ok.stderr), (0, ""))
+            saved = json.loads(fixture.grants_path.read_text())["grants"][0]
+            # The old grant (100, received 2026-01-01) must not survive: its whole bill would be subtracted again.
+            self.assertEqual((saved["received_at"], saved["amount_usd"], saved["observed_balance_usd"], saved["operator_field"]),
+                             (today, 150.0, 150.0, "keep me"))
+            self.assertIn("New grant", ok.stdout)
+            # With the provider's billing since the NEW date (2 spent), 148 is left; the old rule gave 150 - 99 = 51.
+            g = credit.grant(saved)
+            since = []
+            rows, problem = credit.view(fixture.runtime, at("2098-06-01T00:00:00Z"), fixture.registry,
+                                        {"FIXTURE_USAGE_KEY": "k"}, lambda grant, token: since.append(grant["received"]) or 2.0)
+            self.assertIsNone(problem)
+            self.assertEqual(since, [g["received"]])
+            self.assertAlmostEqual(rows[0]["balances"][0]["balance"], 148.0)
+            # Explicit values win over the defaults.
+            ok = self.observe(fixture, "openai", "--balance", "250", "--expires", "2199-01-01",
+                              "--received", "2198-12-01", "--amount", "300")
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            saved = json.loads(fixture.grants_path.read_text())["grants"][0]
+            self.assertEqual((saved["received_at"], saved["amount_usd"]), ("2198-12-01", 300.0))
+
+    def test_a_balance_above_the_grant_amount_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            (fixture.runtime / "manifest.json").write_text("{}")
+            before = fixture.grants_path.read_bytes()
+            bad = self.observe(fixture, "openai", "--balance", "250", "--expires", "2026-01-31")  # grant is 100
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertEqual(len(bad.stderr.splitlines()), 1)
+            self.assertEqual(fixture.grants_path.read_bytes(), before)
+
+    def test_the_expired_note_names_the_received_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = Fixture(tmp).one(at("2026-02-01T00:00:00Z"))
+            self.assertIn("--expires YYYY-MM-DD --received YYYY-MM-DD", row["notes"][0])
+
+    def test_a_huge_number_is_an_invalid_file_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp)
+            fixture.write(None, raw=json.dumps({"schema": credit.SCHEMA, "grants": [GRANT]}).replace("100.0", "1" + "0" * 400))
+            self.assertEqual(credit.view(fixture.runtime, NOW, fixture.registry), ([], "credit_grants_invalid"))
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,))
+            (fixture.runtime / "state/credit-grant-billing.json").write_text(
+                '{"openai-api--credit-grant@%d": {"billed_usd": 1, "read_at": 1%s}}' % (at("2026-01-01T00:00:00Z"), "0" * 400))
+            rows, problem = credit.view(fixture.runtime, NOW, fixture.registry, {"FIXTURE_USAGE_KEY": "k"}, lambda g, token: 3.0)
+            self.assertIsNone(problem)
+            self.assertEqual(rows[0]["balances"][0]["billedSinceGrant"], 3.0)  # the bad cache entry is dropped, a fresh read is used
+
+    def test_a_dated_model_behind_a_provider_prefix_is_priced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = Fixture(tmp, rows=[("openai", "openai/fixture-mini-2026-01-05", 1_000_000, 0, 0, READING_MS + 1)]).one()
+            self.assertEqual(row["balances"][0]["unpricedRequests"], 0)
+            self.assertAlmostEqual(row["balances"][0]["spentSinceObserved"], 1.0)
+
+    def test_a_failed_billing_read_is_named_in_the_row(self):
+        def refused(g, token):
+            raise credit.GrantError("billing_authentication_required")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,))
+            rows, _ = credit.view(fixture.runtime, NOW, fixture.registry, {"FIXTURE_USAGE_KEY": "k"}, refused)
+            self.assertEqual((rows[0]["estimated"], rows[0]["billing_error"]), (True, "billing_authentication_required"))
+            rows, _ = credit.view(fixture.runtime, NOW + 1000, fixture.registry, {"FIXTURE_USAGE_KEY": "k"}, lambda g, token: 1.0)
+            self.assertNotIn("billing_error", rows[0])
 
 
 if __name__ == "__main__":

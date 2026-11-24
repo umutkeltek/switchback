@@ -75,7 +75,10 @@ def day(epoch):
 
 def money(value, positive=False):
     """A finite non-negative JSON number (above zero when positive)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            return None
+    except OverflowError:  # an integer too large for a float
         return None
     if value == 0:
         return None if positive else 0.0
@@ -165,8 +168,9 @@ def price_table(path):
 
 def rates(table, provider, model):
     model = model if isinstance(model, str) else ""
-    for name in (model, model[len(provider) + 1:] if model.startswith(provider + "/") else None,
-                 re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)):
+    bare = model[len(provider) + 1:] if model.startswith(provider + "/") else model
+    undated = lambda name: re.sub(r"-\d{4}-\d{2}-\d{2}$", "", name)
+    for name in (model, bare, undated(model), undated(bare)):
         found = table.get((provider, name))
         if found and found[0] is not None and found[1] is not None:
             return found
@@ -293,7 +297,7 @@ def row(g, ordinal, now, store, registry, billing=None):
         # Unused credit is gone at expiry; the store is not needed to know that.
         balance, used, per_day, state, elapsed = 0.0, 1.0, 0.0, "expired", 1.0
         notes = [f"Credit expired on {day(g['expires'])}; nothing is left. Record the new grant: "
-                 f"sb credits observe {p} --balance USD --expires YYYY-MM-DD"]
+                 f"sb credits observe {p} --balance USD --expires YYYY-MM-DD --received YYYY-MM-DD"]
     else:
         try:
             spent, unpriced = estimate(g, store, registry)
@@ -353,6 +357,8 @@ def row(g, ordinal, now, store, registry, billing=None):
         result["renews"] = g["renews"]
     if error:
         result["refresh_error"] = error
+    if isinstance(billing, str):
+        result["billing_error"] = billing
     return result
 
 
@@ -451,10 +457,21 @@ def observe(argv, runtime, now=None):
     raw = dict(data["grants"][matches[0]]) if matches else {
         "provider": provider, "credential_ref": provider.upper().replace("-", "_") + "_API_KEY",
         "amount_usd": numbers["--balance"], "received_at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")}
+    # A later expiry than the stored one is a new grant. Keeping the old received date and amount
+    # would subtract the old grant's whole bill from the new one.
+    old_expiry = instant(raw.get("expires_at")) if matches else None
+    renewed = old_expiry is not None and instant(options["--expires"]) > old_expiry
+    if renewed and "--received" not in options:
+        raw["received_at"] = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+    if renewed and "--amount" not in options:
+        raw["amount_usd"] = numbers["--balance"]
     raw.update(observed_balance_usd=numbers["--balance"], observed_at=iso(int(now)), expires_at=options["--expires"])
     for key, field in (("--received", "received_at"), ("--amount", "amount_usd"), ("--reserve", "reserve_usd")):
         if key in options:
             raw[field] = numbers.get(key, options[key])
+    amount = money(raw.get("amount_usd"), True)
+    if amount is not None and numbers["--balance"] > amount:
+        return fail("the balance cannot be above the grant amount; pass --amount for a larger grant; nothing changed")
     received = instant(raw.get("received_at"))
     if received is not None and instant(raw["expires_at"]) <= received:
         return fail("expiry must be after the received date; nothing changed")
@@ -485,7 +502,8 @@ def observe(argv, runtime, now=None):
         if os.path.exists(name):
             os.unlink(name)
     print(f"Recorded {provider} credit reading: ${numbers['--balance']:.2f} at {raw['observed_at']}, "
-          f"expires {day(instant(raw['expires_at']))}.")
+          f"expires {day(instant(raw['expires_at']))}." + (
+              f" New grant: ${raw['amount_usd']:.2f} received {raw['received_at']}." if renewed else ""))
     return 0
 
 
