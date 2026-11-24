@@ -4827,6 +4827,7 @@ mod tests {
             engine: None,
             poweroff_min_uptime_secs: 0,
             experiments: true,
+            pool_admission: None,
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(host.clone());
         let probe: Arc<dyn HealthProbe> = Arc::new(host.clone());
@@ -4997,6 +4998,7 @@ mod tests {
             engine: None,
             poweroff_min_uptime_secs: 0,
             experiments: true,
+            pool_admission: None,
         };
         let executor = LocalExecutor::new(cfg, FakeClock::new(), Arc::new(host), probe, true);
         let activator = activator_of(&executor);
@@ -5512,6 +5514,7 @@ local_executors:
             engine: None,
             poweroff_min_uptime_secs: 0,
             experiments: true,
+            pool_admission: None,
         };
         LocalExecutor::new(
             cfg,

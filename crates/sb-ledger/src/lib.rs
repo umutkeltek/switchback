@@ -145,6 +145,12 @@ pub struct RequestSpeed {
     pub decode_tps: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_tps_source: Option<SpeedSource>,
+    /// How long the request waited for room in a local engine model's
+    /// token pool before it was sent (token-pool admission). Absent when it
+    /// was sent at once or no pool applied. Kept in the in-memory ledger and
+    /// the JSONL usage log; the durable store has no column for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_wait_ms: Option<u64>,
 }
 
 impl RequestSpeed {
@@ -179,6 +185,7 @@ impl RequestSpeed {
             prompt_tps_source,
             decode_tps,
             decode_tps_source,
+            pool_wait_ms: None,
         }
     }
 
@@ -1192,6 +1199,7 @@ fn event_to_record(event: sb_store::UsageEvent) -> UsageRecord {
                 .decode_tps_source
                 .as_deref()
                 .and_then(SpeedSource::parse),
+            pool_wait_ms: None,
         },
     }
 }
@@ -2221,6 +2229,7 @@ mod tests {
             } else {
                 SpeedSource::Gateway
             }),
+            pool_wait_ms: None,
         })
     }
 

@@ -31,6 +31,7 @@ mod native_cli;
 mod native_history_cli;
 mod optimize;
 mod otel;
+mod pool_view;
 mod provider_cli;
 mod provider_preset;
 mod schema_cli;

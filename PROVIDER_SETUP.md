@@ -683,6 +683,79 @@ Each lane in `GET /v1/workloads/capacity` shows its places:
           "on_full": "spill", "queue_timeout_secs": 60}
 ```
 
+**Token-pool admission (llama.cpp router lanes).** A llama.cpp model started
+with `--kv-unified` gives all its `--parallel` slots one shared pool of
+`--ctx-size` tokens. Requests that run at the same time and together need more
+tokens than that pool (prompt plus generated) all fail at once ("Context size
+has been exceeded"), so a request count such as `max_in_flight` cannot prevent
+it. A lane whose `engine.kind` is `llama_cpp_router` therefore admits requests
+by tokens, per engine model, on by default:
+
+```yaml
+local_executors:
+  - name: llamacpp
+    # ... engine: {kind: llama_cpp_router, ...} ...
+    queue_timeout_secs: 60          # also the longest wait for room in a pool
+    on_full: spill                  # also what a full pool does
+    pool_admission:                 # optional; these are the defaults
+      enabled: true                 # false = off for this lane
+      default_reserve_tokens: 8192  # generation reserve when a request sets no max_tokens
+      count_above_tokens: 8192      # prompts estimated this large are counted by the engine
+```
+
+Before a request is sent to a model, it reserves its need in that model's
+pool: its prompt tokens plus a generation reserve (`max_tokens` or
+`max_completion_tokens` when the request sets one, else
+`default_reserve_tokens`), capped at what one request may use. The prompt is
+estimated from its text without any call; the estimate is at least the real
+count on code, prose, JSON, CJK and other scripts, hex, base64 and UUIDs, and
+about 1.4 to 1.7 times the real count on English prose and code. A prompt
+whose estimate reaches `count_above_tokens` is counted by the engine's own
+tokenizer (`POST /tokenize`, bounded at 5 s; the estimate is used when it
+fails) plus the chat template's overhead, so a large prompt is neither under-
+nor over-counted. A short request never waits for a count.
+
+- Room in the pool: the request is sent at once.
+- No room: like a full lane (`on_full`). With `spill` it goes to the route's
+  next target that can serve it, and waits only when there is none; with
+  `queue` the route's first choice waits. Waiters are let in oldest first, a
+  large request is never passed by smaller ones, and a wait lasts at most
+  `queue_timeout_secs` (then the next target, or a retryable 503
+  `local_lane_queue_timeout`).
+- A prompt that alone fills one request's context is refused at once with a
+  400 `context_length_exceeded` and never sent to the engine (when no other
+  target of the route can serve it).
+- A request alone in an empty pool is always admitted, with or without
+  `max_tokens`.
+
+The reservation is given back when the answer is complete, the stream ends,
+the client goes away (waiting or running), or the attempt fails. The pool size
+is the engine's own, read from its model listing (`--ctx-size` is the pool;
+one request may use all of it with `--kv-unified`, else `ctx-size / parallel`),
+so a settings change or a reload updates it; requests already running are
+never cut by a smaller pool, new ones wait for room under it. A model the
+engine has not listed loaded yet uses its settings document's load settings;
+when neither knows the context size the request is sent unchecked (as without
+admission) and counted, so later requests see it. Hedging skips targets with a
+token pool. Embeddings and audio requests are not admitted by tokens.
+
+Each lane in `GET /v1/workloads/capacity` lists its pools in `token_pools`
+(`sb ai status` prints one line per model):
+
+```json
+"token_pools": [{"lane": "llamacpp", "model": "qwen", "pool_tokens": 98304,
+  "per_request_tokens": 98304, "slots": 3, "kv_unified": true, "source": "engine",
+  "reserved_tokens": 86144, "running": 2, "waiting": 1, "waiting_tokens": 43072,
+  "admitted_total": 12, "waited_total": 1, "last_wait_ms": 21400, "max_wait_ms": 21400,
+  "refused_total": 0, "timed_out_total": 0, "unchecked_total": 0}]
+```
+
+A request's trace carries `pool_admission` (pool, tokens reserved, prompt
+tokens and whether the engine counted them, reserve and its source, pool size,
+`waited_ms`), and its usage record `pool_wait_ms` when it waited (in the
+in-memory ledger and the JSONL usage log; the durable store keeps no column
+for it).
+
 **Measured speed of each target.** Every text usage record carries how fast
 it was served, each number with its source:
 

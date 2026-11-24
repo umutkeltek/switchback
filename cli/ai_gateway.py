@@ -798,6 +798,42 @@ def lane_line(lane, holds=None):
     return f"  {lane.get('name', '?')}: " + ", ".join(parts)
 
 
+def tokens_words(n):
+    return f"{int(n):,}"
+
+
+def pool_line(pool):
+    """One engine model's token pool in plain words (token-pool admission)."""
+    size = pool.get("pool_tokens")
+    if size is None:
+        head = "pool size unknown (model not loaded), requests go unchecked"
+    else:
+        per = pool.get("per_request_tokens")
+        slots = pool.get("slots")
+        if pool.get("kv_unified") is False and per:
+            head = f"pool {tokens_words(size)} tokens, {tokens_words(per)} per request"
+        else:
+            head = f"pool {tokens_words(size)} tokens"
+        if slots:
+            head += f" ({slots} slot{'s' if slots != 1 else ''}"
+            head += ", shared)" if pool.get("kv_unified") else ")"
+    parts = [head]
+    running = pool.get("running") or 0
+    parts.append(f"{tokens_words(pool.get('reserved_tokens') or 0)} reserved by {running} running")
+    waiting = pool.get("waiting") or 0
+    if waiting:
+        parts.append(f"{waiting} waiting for {tokens_words(pool.get('waiting_tokens') or 0)}")
+    else:
+        parts.append("0 waiting")
+    if pool.get("last_wait_ms") is not None:
+        parts.append(f"last wait {pool['last_wait_ms'] / 1000:.1f}s ({pool.get('waited_total', 0)} waited)")
+    if pool.get("refused_total"):
+        parts.append(f"{pool['refused_total']} refused as too large")
+    if pool.get("timed_out_total"):
+        parts.append(f"{pool['timed_out_total']} timed out")
+    return f"    {pool.get('model', '?')}: " + ", ".join(parts)
+
+
 def cmd_status(gw, args):
     report = capacity(gw)
     lanes = report.get("data") or []
@@ -813,6 +849,8 @@ def cmd_status(gw, args):
         for lane in lanes:
             if machine_of(lane) == machine["machine"]:
                 print(lane_line(lane, held[machine["machine"]]))
+                for pool in lane.get("token_pools") or []:
+                    print(pool_line(pool))
     return OK
 
 

@@ -3,7 +3,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
@@ -499,6 +499,7 @@ pub(crate) async fn capacity(
     Extension(principal): Extension<tenancy::Principal>,
 ) -> Response {
     let reports = state.capacity.reports();
+    let pools = state.engine.token_pools().reports();
     if !principal.is_operator_or_admin() {
         let data: Vec<_> = reports
             .iter()
@@ -519,6 +520,7 @@ pub(crate) async fn capacity(
                     "poweroff_in_secs": report.poweroff_in_secs,
                     "wake_duration_ms": report.wake_duration_ms,
                     "wake_duration_ewma_ms": report.wake_duration_ewma_ms,
+                    "token_pools": pools_of(&pools, &report.name),
                     "holds": holds,
                 })
             })
@@ -528,7 +530,7 @@ pub(crate) async fn capacity(
     let holds = state.capacity.holds();
     Json(json!({
         "object": "list",
-        "data": reports,
+        "data": with_pools(&reports, &pools),
         "artifacts": state.workloads.artifacts().status(),
         "holds": {
             "durable": holds.durable(),
@@ -538,6 +540,36 @@ pub(crate) async fn capacity(
         "alerts": state.capacity.alerts().status(),
     }))
     .into_response()
+}
+
+/// The token pools of `lane` (token-pool admission), for the capacity
+/// report: per engine model, its size, what running requests reserved and
+/// who waits. Counts only.
+fn pools_of(pools: &[sb_runtime::token_pool::PoolReport], lane: &str) -> Value {
+    Value::Array(
+        pools
+            .iter()
+            .filter(|pool| pool.lane == lane)
+            .map(|pool| serde_json::to_value(pool).unwrap_or(Value::Null))
+            .collect(),
+    )
+}
+
+/// The operator view's lanes, each with its `token_pools`.
+fn with_pools(
+    reports: &[crate::activator::LocalLaneReport],
+    pools: &[sb_runtime::token_pool::PoolReport],
+) -> Vec<Value> {
+    reports
+        .iter()
+        .map(|report| {
+            let mut lane = serde_json::to_value(report).unwrap_or(Value::Null);
+            if let Some(fields) = lane.as_object_mut() {
+                fields.insert("token_pools".to_string(), pools_of(pools, &report.name));
+            }
+            lane
+        })
+        .collect()
 }
 
 fn not_found(message: &str) -> Response {

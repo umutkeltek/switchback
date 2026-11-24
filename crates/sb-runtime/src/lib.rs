@@ -40,6 +40,7 @@ pub mod scorecard;
 mod scorecard_runtime;
 mod snapshot;
 mod stream;
+pub mod token_pool;
 mod trace_persist;
 mod usage;
 
@@ -283,6 +284,9 @@ pub struct Engine {
     /// Speed-trick state (stickiness, loaded models, per-target evidence
     /// for the speed report). State, not config: survives a publish.
     optimize: Arc<optimize::OptimizeState>,
+    /// Token pools of local engine models (token-pool admission). State,
+    /// not config: reservations and queues survive a publish.
+    token_pools: Arc<token_pool::TokenPools>,
 }
 
 /// Outcome of an optimistic-concurrency publish ([`Engine::publish_with_audit`]).

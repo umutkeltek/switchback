@@ -80,6 +80,7 @@ impl Engine {
             },
             model_variants: OnceLock::new(),
             optimize: Arc::new(crate::optimize::OptimizeState::new()),
+            token_pools: Arc::new(crate::token_pool::TokenPools::default()),
         })
     }
 

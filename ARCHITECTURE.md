@@ -250,6 +250,30 @@ the engine's live resolver through `LaneCredentials`, and only to a
 wake. `scheme_auth` attaches that credential with the adapters'
 `SchemeSigner`, for ComfyUI calls, the probe and the provider doctor.
 
+A lane with a `llama_cpp_router` engine control also admits by tokens
+(`pool_admission`, on by default). The pools live in
+`sb-runtime::token_pool::TokenPools` on the `Engine` (state, kept across
+reloads), one `TokenPool` per `provider/engine-model`: the size, the tokens
+admitted requests reserved, and a FIFO queue of (ticket, need). In the
+dispatch loop, after the model admission and the lane's busy guard and before
+`settings_plan.dispatch`, `Engine::pool_admission` estimates the attempt's
+prompt (`PromptText::quick_tokens`, or the engine's own count through
+`PoolView::count_tokens` when the estimate reaches `count_above_tokens`),
+adds the generation reserve, caps it at one request's context (`need_for`),
+and reserves it: at once when the pool has room and nobody waits, else it
+waits (only as an `on_full: queue` first choice or when no later target can
+serve; bounded by `queue_timeout_secs` on the pool's clock seam) or the
+target is skipped as spilled. The `PoolReservation` joins the attempt's
+`LaneBusy` guard, so the answer's or stream's end, a client gone and a
+failed attempt all give it back. A prompt that alone fills one request's
+context skips the target; with nothing else to serve the plan answers 400
+`context_length_exceeded`; a wait that runs out answers 503
+`local_lane_queue_timeout`. The size comes from `sb-server::pool_view`
+(`PoolView`): the engine control's cached listing through `engine_truth`,
+read again (bounded, once a second per lane, never a wake) when the model is
+not listed loaded, else the model's settings document. Hedging skips targets
+with a pool.
+
 A lane may set `max_in_flight` (with `queue_timeout_secs` and `on_full`).
 Its places live in `sb-server::lane_slots::LaneSlots`, owned by the lane's
 executor (kept across reloads): a counter and a FIFO queue of tickets on the

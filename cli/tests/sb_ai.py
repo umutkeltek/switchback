@@ -580,6 +580,37 @@ class SbAi(unittest.TestCase):
         self.assertNotIn("countdown", run.stdout)
         self.assertNotIn("power", run.stdout.split("\n", 1)[1])
 
+    def test_status_shows_each_models_token_pool(self):
+        pools = [
+            {"lane": "lane-text", "model": "qwen-a", "pool_tokens": 98304, "per_request_tokens": 98304,
+             "slots": 3, "kv_unified": True, "source": "engine", "reserved_tokens": 86144, "running": 2,
+             "waiting": 1, "waiting_tokens": 43072, "admitted_total": 5, "waited_total": 1,
+             "last_wait_ms": 21400, "max_wait_ms": 21400, "refused_total": 1, "timed_out_total": 0,
+             "unchecked_total": 0},
+            {"lane": "lane-text", "model": "qwen-b", "pool_tokens": 131072, "per_request_tokens": 32768,
+             "slots": 4, "kv_unified": False, "source": "settings", "reserved_tokens": 0, "running": 0,
+             "waiting": 0, "waiting_tokens": 0, "admitted_total": 0, "waited_total": 0,
+             "last_wait_ms": None, "max_wait_ms": 0, "refused_total": 0, "timed_out_total": 0,
+             "unchecked_total": 0},
+            {"lane": "lane-text", "model": "qwen-c", "pool_tokens": None, "per_request_tokens": None,
+             "slots": None, "kv_unified": None, "source": None, "reserved_tokens": 9000, "running": 1,
+             "waiting": 0, "waiting_tokens": 0, "admitted_total": 1, "waited_total": 0,
+             "last_wait_ms": None, "max_wait_ms": 0, "refused_total": 0, "timed_out_total": 0,
+             "unchecked_total": 1},
+        ]
+        self.fake.lanes = [lane("lane-text", "draining", in_flight=3, token_pools=pools)]
+        run = self.sb("status")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.splitlines()[1:], [
+            "  lane-text: busy, level ok, queue 0, running 3",
+            "    qwen-a: pool 98,304 tokens (3 slots, shared), 86,144 reserved by 2 running, "
+            "1 waiting for 43,072, last wait 21.4s (1 waited), 1 refused as too large",
+            "    qwen-b: pool 131,072 tokens, 32,768 per request (4 slots), 0 reserved by 0 running, 0 waiting",
+            "    qwen-c: pool size unknown (model not loaded), requests go unchecked, "
+            "9,000 reserved by 1 running, 0 waiting",
+        ])
+        self.assertEqual([(r["method"], r["path"]) for r in self.fake.seen], [("GET", "/v1/workloads/capacity")])
+
     def test_status_json_stays_the_raw_report(self):
         held = lane("lane-img", "idle_countdown", poweroff_in_secs=None,
                     holds=[{"id": "hold-9", "reason": "render", "state": "active", "expires_at_ms": 1}])

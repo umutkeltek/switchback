@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sb_core::{EvaluationEvent, RouteDecision, Usage};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const NATIVE_EXECUTION_LANE_ID_META: &str = "switchback_lane_id";
@@ -212,6 +212,35 @@ pub struct TraceRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
     pub cost_micros: u64,
+    /// The token-pool admission of the attempt that was sent to a local
+    /// engine model: what it reserved, how the prompt was counted, and how
+    /// long it waited for room. Absent when no attempt went through one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_admission: Option<PoolAdmissionTrace>,
+}
+
+/// One request's token-pool admission (see [`TraceRecord::pool_admission`]).
+/// Counts and times only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolAdmissionTrace {
+    /// `provider/model` of the engine model whose pool was reserved.
+    pub pool: String,
+    /// Tokens reserved: prompt plus generation reserve, capped at what one
+    /// request may use.
+    pub need_tokens: u64,
+    pub prompt_tokens: u64,
+    /// `engine` (counted by the engine's tokenizer) or `estimate`.
+    pub prompt_source: String,
+    pub reserve_tokens: u64,
+    /// `max_tokens` (the request's own) or `default` (the lane's
+    /// `default_reserve_tokens`).
+    pub reserve_source: String,
+    /// The pool's size when admitted; absent when it was not known (the
+    /// request was sent unchecked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_tokens: Option<u64>,
+    /// How long the request waited for room (0 = admitted at once).
+    pub waited_ms: u64,
 }
 
 /// Accumulates a [`TraceRecord`] across a request's execution. The server holds
@@ -235,6 +264,7 @@ pub struct RequestTrace {
     usage: Option<Usage>,
     cost_micros: u64,
     ttft_ms: Option<u64>,
+    pool_admission: Option<PoolAdmissionTrace>,
 }
 
 impl RequestTrace {
@@ -263,6 +293,15 @@ impl RequestTrace {
             usage: None,
             cost_micros: 0,
             ttft_ms: None,
+            pool_admission: None,
+        }
+    }
+
+    /// Record the token-pool admission of the attempt being sent (see
+    /// [`TraceRecord::pool_admission`]); a later attempt's replaces it.
+    pub fn set_pool_admission(&mut self, admission: Option<PoolAdmissionTrace>) {
+        if admission.is_some() {
+            self.pool_admission = admission;
         }
     }
 
@@ -367,6 +406,7 @@ impl RequestTrace {
             streamed,
             usage: self.usage,
             cost_micros: self.cost_micros,
+            pool_admission: self.pool_admission,
         }
     }
 }

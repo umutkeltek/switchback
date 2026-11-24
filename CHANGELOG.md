@@ -8,6 +8,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 ## [Unreleased]
 
 ### Added
+- **Token-pool admission for llama.cpp router lanes** (on by default; lane
+  key `local_executors[].pool_admission`, `enabled: false` turns it off).
+  A llama.cpp model with `--kv-unified` shares one pool of `--ctx-size`
+  tokens among its slots, and requests that overflow it together all fail.
+  Each request now reserves its prompt plus generation reserve in its engine
+  model's pool before it is sent, waits for room (FIFO, bounded by the lane's
+  `queue_timeout_secs`) or spills (`on_full`), and a prompt that alone fills
+  one request's context is refused with a 400 `context_length_exceeded`
+  without reaching the engine. The pool size is the engine's own (its model
+  listing), else the settings document; large prompts are counted by the
+  engine's tokenizer. The capacity report and `sb ai status` show each
+  model's pool, tokens reserved and waiters; traces carry `pool_admission`
+  and usage records `pool_wait_ms`. Hedging skips targets with a token pool.
 - **Answer quality: `sb ai eval`** (speed tricks, layer 4): replays a suite
   of requests (`suite.json`, `cases.jsonl`, optional labels and `score.py`
   plug-in) through the gateway byte for byte, `repeats` times at the suite's

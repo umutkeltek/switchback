@@ -266,6 +266,75 @@ pub struct LocalExecutorConfig {
     /// anything. Default `true`.
     #[serde(default = "default_true")]
     pub experiments: bool,
+    /// Token-pool admission for the lane's engine models (see
+    /// [`PoolAdmissionConfig`]). Absent = the defaults: on for a lane whose
+    /// `engine.kind` is `llama_cpp_router`, off for any other lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_admission: Option<PoolAdmissionConfig>,
+}
+
+impl LocalExecutorConfig {
+    /// The lane's token-pool admission settings when it is on: a lane with
+    /// a llama.cpp router engine control, unless `pool_admission.enabled`
+    /// is `false`. `None` = off.
+    pub fn pool_admission(&self) -> Option<PoolAdmissionConfig> {
+        let engine = self.engine.as_ref()?;
+        if engine.kind != EngineControlKind::LlamaCppRouter {
+            return None;
+        }
+        let settings = self.pool_admission.clone().unwrap_or_default();
+        settings.enabled.then_some(settings)
+    }
+}
+
+/// Token-pool admission (`local_executors[].pool_admission`).
+///
+/// A llama.cpp model started with `--kv-unified` gives all its `--parallel`
+/// slots one shared pool of `--ctx-size` tokens. Requests that run at the
+/// same time and together need more than the pool (prompt plus generated
+/// tokens) all fail at once. With admission on, each request to the lane
+/// reserves its estimated need in its model's pool before it is sent: it is
+/// sent while the pool has room, waits (FIFO, up to the lane's
+/// `queue_timeout_secs`) or spills to the route's next target (`on_full`)
+/// while it has not, and is refused with a 400 when it alone is larger
+/// than one request may be. The pool size is the engine's own (its last
+/// model listing), else the model's settings document; when neither is
+/// known the request is sent unchecked, as without admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolAdmissionConfig {
+    /// `false` turns admission off for the lane. Default `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The generation reserve of a request that sets no `max_tokens` (or
+    /// `max_completion_tokens`): the tokens it may generate, capped at what
+    /// is left of one request's context after its prompt. Default 8192.
+    #[serde(default = "default_pool_reserve_tokens")]
+    pub default_reserve_tokens: u32,
+    /// A prompt whose quick estimate is at least this many tokens is
+    /// counted by the engine's own tokenizer before admission (one bounded
+    /// call to the loaded model); smaller prompts use the quick estimate
+    /// only, so a short request never waits for a count. Default 8192.
+    #[serde(default = "default_pool_count_above_tokens")]
+    pub count_above_tokens: u32,
+}
+
+impl Default for PoolAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_reserve_tokens: default_pool_reserve_tokens(),
+            count_above_tokens: default_pool_count_above_tokens(),
+        }
+    }
+}
+
+fn default_pool_reserve_tokens() -> u32 {
+    8192
+}
+
+fn default_pool_count_above_tokens() -> u32 {
+    8192
 }
 
 /// Which engine control a lane's engine speaks.
@@ -1344,6 +1413,21 @@ impl Config {
                 problems.push(format!(
                     "local_executors[{i}].max_in_flight must be at least 1 (remove it for no limit)"
                 ));
+            }
+            if let Some(pool) = &executor.pool_admission {
+                if pool.default_reserve_tokens == 0 {
+                    problems.push(format!(
+                        "local_executors[{i}].pool_admission.default_reserve_tokens must be at least 1"
+                    ));
+                }
+                if pool.enabled
+                    && executor.engine.as_ref().map(|engine| engine.kind)
+                        != Some(EngineControlKind::LlamaCppRouter)
+                {
+                    problems.push(format!(
+                        "local_executors[{i}].pool_admission needs an engine control of kind llama_cpp_router (engine: {{kind: llama_cpp_router}}); set enabled: false or remove it"
+                    ));
+                }
             }
             if let Some(group) = &executor.exclusive_group {
                 if group.trim().is_empty() {

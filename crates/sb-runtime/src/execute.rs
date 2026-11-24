@@ -581,6 +581,11 @@ impl Engine {
         let mut quality_capture = self.quality_eval.begin(&req, snap);
         let mut last_err: Option<AdapterError> = None;
         let mut unavailable_retry_after: Option<Duration> = None;
+        // Token-pool admission outcomes that end the request when no other
+        // target serves it: a prompt too large alone (400) and a wait for
+        // room that ran out (503).
+        let mut pool_too_large: Option<String> = None;
+        let mut pool_timed_out: Option<String> = None;
 
         // One trace per request: the route decision + every attempt + outcome + cost
         // + the egress path each attempt took. Metadata only (sb-trace upholds the
@@ -628,11 +633,17 @@ impl Engine {
         // the normal sequential fallback loop below.
         // A target that still needs a wake (`prefer_awake`) is never raced: a
         // hedge would dispatch into a machine that is not up.
+        // Nor is a target whose model has a token pool (`pool_admission`):
+        // a racer would reserve tokens a sequential attempt needs, and a
+        // racer cannot wait for room.
         let hedgeable = !plan
             .candidates
             .iter()
             .take(snap.config.server.hedge.max_parallel.max(1) as usize)
-            .any(|candidate| candidate.wake.is_some());
+            .any(|candidate| {
+                candidate.wake.is_some()
+                    || crate::token_pool::lane_admission(snap, &candidate.provider_id).is_some()
+            });
         if scope.is_none()
             && rt.hedge_enabled
             && !req.stream
@@ -894,6 +905,73 @@ impl Engine {
                     lane_busy.take(),
                     model_busy,
                 ));
+            }
+            // Token-pool admission (`pool_admission`, on for llama.cpp router
+            // lanes): reserve this attempt's tokens in its engine model's
+            // pool, held with the lane's busy guard to the answer's or the
+            // stream's end. After the dispatch on the engine model, so a
+            // request waiting for room counts as dispatched there: an
+            // unload or `apply: now` waits for it (bounded) instead of
+            // pulling the model from under it. It waits for room (FIFO,
+            // bounded) only as the route's first choice on an
+            // `on_full: queue` lane, or when no later target could serve
+            // instead; otherwise a full pool spills.
+            let mut pool_wait_ms: Option<u64> = None;
+            {
+                let later_usable = plan.candidates.iter().skip(index + 1).any(|other| {
+                    (other.provider_id != target.provider_id || other.model != target.model)
+                        && other.wake.is_none()
+                        && snap.registry.adapter(&other.provider_id).is_some()
+                        && snap.resolver.circuit_allows(&other.provider_id)
+                });
+                let queue_first = index == 0
+                    && snap.config.local_executors.iter().any(|lane| {
+                        lane.name == target.provider_id
+                            && lane.on_full == sb_core::LaneOnFull::Queue
+                    });
+                let (attempt_req, _) = settings_plan.prepare(&req, target);
+                let engine_model = settings_plan.engine_model(target);
+                match self
+                    .pool_admission(
+                        snap,
+                        &attempt_req,
+                        &target.provider_id,
+                        &engine_model,
+                        queue_first || !later_usable,
+                    )
+                    .await
+                {
+                    crate::token_pool::PoolStep::Off => {}
+                    crate::token_pool::PoolStep::Admitted { reservation, note } => {
+                        if note.waited_ms > 0 || note.pool_tokens.is_none() {
+                            trace.warning(crate::token_pool::admitted_line(&note));
+                        }
+                        pool_wait_ms = Some(note.waited_ms).filter(|ms| *ms > 0);
+                        trace.set_pool_admission(Some(note));
+                        lane_busy = Some(match lane_busy.take() {
+                            Some(busy) => Box::new((busy, reservation)),
+                            None => Box::new(reservation),
+                        });
+                    }
+                    crate::token_pool::PoolStep::TooLarge(detail) => {
+                        trace.warning(format!("target {} skipped: {detail}", target.id));
+                        pool_too_large = Some(detail);
+                        continue 'targets;
+                    }
+                    crate::token_pool::PoolStep::Full(detail) => {
+                        trace.warning(format!(
+                            "target {} skipped: {detail}; spilled to the route's next target, \
+                             not counted as a failure",
+                            target.id
+                        ));
+                        continue 'targets;
+                    }
+                    crate::token_pool::PoolStep::TimedOut(detail) => {
+                        trace.warning(format!("target {} skipped: {detail}", target.id));
+                        pool_timed_out = Some(detail);
+                        continue 'targets;
+                    }
+                }
             }
             let mut tried_accounts: HashSet<String> = HashSet::new();
             let allowed_accounts = req
@@ -1232,12 +1310,13 @@ impl Engine {
                                                 StreamFinish::Clean => {
                                                     let mut usage = usage;
                                                     usage.fill_cached_from_timings();
-                                                    let speed = attempt_speed(
+                                                    let mut speed = attempt_speed(
                                                         &usage,
                                                         &first_token,
                                                         attempt_started,
                                                         Instant::now(),
                                                     );
+                                                    speed.pool_wait_ms = pool_wait_ms;
                                                     observer.served(
                                                         &usage,
                                                         speed.prompt_tps,
@@ -1474,12 +1553,13 @@ impl Engine {
                                                 cost_micros: Some(cost),
                                             },
                                         );
-                                        let speed = attempt_speed(
+                                        let mut speed = attempt_speed(
                                             &response.usage,
                                             &first_token,
                                             attempt_started,
                                             Instant::now(),
                                         );
+                                        speed.pool_wait_ms = pool_wait_ms;
                                         self.observer(
                                             snap,
                                             target,
@@ -1689,6 +1769,32 @@ impl Engine {
                 false,
             ));
             return ExecOutcome::Error(ExecError::upstream(&error, &summary));
+        }
+
+        if let Some(detail) = pool_timed_out {
+            self.record_trace(trace.finish(503, started.elapsed().as_millis() as u64, false));
+            return ExecOutcome::Error(
+                ExecError::new(
+                    503,
+                    "local_lane_queue_timeout",
+                    format!("{detail}; no other target can serve; retry later"),
+                    Some(summary),
+                )
+                .with_retry_after(crate::LANE_QUEUE_RETRY_AFTER),
+            );
+        }
+
+        if let (Some(detail), None) = (&pool_too_large, unavailable_retry_after) {
+            self.record_trace(trace.finish(400, started.elapsed().as_millis() as u64, false));
+            return ExecOutcome::Error(ExecError::new(
+                400,
+                "context_length_exceeded",
+                format!(
+                    "request too large for the model's context: {detail}; it was not sent \
+                     (shorten the prompt or use a model with a larger context)"
+                ),
+                Some(summary),
+            ));
         }
 
         if let Some(retry_after) = unavailable_retry_after {

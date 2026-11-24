@@ -1644,6 +1644,71 @@ impl EngineControls {
         self.lock().models.get(lane).cloned()
     }
 
+    /// The engine's model listing read now (bounded by `timeout`) for
+    /// token-pool admission, when a model's numbers are not known yet. It
+    /// is not kept as the engine control's listing: the engine control's own
+    /// decisions (applies, loads, the loaded-model view) see only the
+    /// listings they and the poller take. The caller checks that the
+    /// machine is up.
+    pub(crate) async fn read_listing_for_pool(
+        &self,
+        state: &EngineCtx,
+        lane: &EngineLane,
+        timeout: Duration,
+    ) -> Result<Vec<Value>, String> {
+        let listing = self
+            .call(state, lane, reqwest::Method::GET, "/models", None, timeout)
+            .await?;
+        Ok(listing
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// The engine's own token count of `text` for engine model `model`
+    /// (llama.cpp `POST /tokenize`, routed by the router to the model),
+    /// bounded by `timeout`. `None` when the call failed or answered no
+    /// token list.
+    pub(crate) async fn count_tokens(
+        &self,
+        state: &EngineCtx,
+        lane: &EngineLane,
+        model: &str,
+        text: String,
+        timeout: Duration,
+    ) -> Option<u64> {
+        let body = json!({"model": model, "content": text, "add_special": false});
+        match self
+            .call(
+                state,
+                lane,
+                reqwest::Method::POST,
+                "/tokenize",
+                Some(body),
+                timeout,
+            )
+            .await
+        {
+            Ok(answer) => answer["tokens"]
+                .as_array()
+                .map(|tokens| tokens.len() as u64),
+            Err(e) => {
+                tracing::debug!(lane = %lane.name, model, error = %e, "engine token count failed; using the estimate");
+                None
+            }
+        }
+    }
+
+    /// A model's preset section as the overlay writes it (`key -> value`,
+    /// without dashes) from its settings document.
+    pub(crate) fn preset_of(
+        kind: EngineControlKind,
+        doc: &ModelSettingsDoc,
+    ) -> BTreeMap<String, String> {
+        model_preset(kind_ops(kind), doc)
+    }
+
     /// The managed overlay of a lane: every managed load-time setting of
     /// its models, and its variants (base section plus their keys).
     pub(crate) fn overlay(&self, state: &EngineCtx, lane: &EngineLane) -> Value {

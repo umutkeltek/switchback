@@ -84,6 +84,16 @@ impl AppState {
             .set_engine_view(Arc::new(crate::engine_control::ListingView(
                 engines.clone(),
             )));
+        // Token-pool admission reads each engine model's real pool from the
+        // same listing (else its settings document) and counts large
+        // prompts with the engine's own tokenizer.
+        engine
+            .token_pools()
+            .set_view(Arc::new(crate::pool_view::EnginePoolView::new(
+                Arc::downgrade(&engine),
+                capacity.clone(),
+                engines.clone(),
+            )));
         AppState {
             ledger: engine.ledger(),
             traces: engine.traces(),
