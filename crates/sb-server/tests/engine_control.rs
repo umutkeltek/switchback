@@ -1712,14 +1712,15 @@ async fn a_refused_settings_change_shows_the_commands_reason() {
         "{view}"
     );
 
-    // The same through the CLI.
+    // The same through the CLI (unchecked: this is about the refusal's
+    // reason, and the checks need a lane this stub does not report).
     let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cli/ai_gateway.py");
     let home = temp("cli-home");
     std::fs::create_dir_all(&home).unwrap();
     let run = tokio::process::Command::new("python3")
         .arg("-B")
         .arg(&cli)
-        .args(["set", "text/m", "ctx_size=16384", "--load"])
+        .args(["set", "text/m", "ctx_size=16384", "--load", "--no-check"])
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", &home)
