@@ -806,6 +806,35 @@ pub trait StateStore: Send + Sync {
         Ok(0)
     }
 
+    // ---- route roles ---------------------------------------------------
+    // The same revisioned shape as the model settings: `target` of the
+    // records is the role's name.
+
+    /// Write a role's document if its stored revision is still
+    /// `change.revision - 1` (0 = none stored), and record the change in
+    /// its history, in one transaction.
+    fn route_role_write(&self, _change: &ModelSettingsChange) -> Result<ModelSettingsWrite> {
+        Err(StoreError(
+            "route role persistence is not supported".to_string(),
+        ))
+    }
+
+    /// Every stored role document.
+    fn route_role_list(&self) -> Result<Vec<ModelSettingsRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// A role's changes, newest first.
+    fn route_role_history(&self, _name: &str, _limit: usize) -> Result<Vec<ModelSettingsChange>> {
+        Ok(Vec::new())
+    }
+
+    /// Keep only a role's newest `keep` history rows; `Ok` is how many were
+    /// removed.
+    fn route_role_prune(&self, _name: &str, _keep: usize) -> Result<usize> {
+        Ok(0)
+    }
+
     // ---- tuning experiments --------------------------------------------
 
     /// Append one experiment row; answers its id.
@@ -1520,6 +1549,33 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
                 );
                 CREATE INDEX IF NOT EXISTS quality_runs_target_suite
                     ON quality_runs (target, suite, at_ms);",
+            )?;
+            Ok(())
+        })?;
+        Self::apply_migration(&mut conn, 24, "route_roles", |tx| {
+            // Route roles (which targets answer a public name), revisioned,
+            // and their change history: the same shape as the model
+            // settings tables. New tables only: an older binary never
+            // reads them, so a rollback routes by its config again.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS route_roles (
+                    name TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    doc TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS route_roles_history (
+                    name TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    doc TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    changed TEXT NOT NULL,
+                    at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (name, revision)
+                );",
             )?;
             Ok(())
         })?;
@@ -2320,6 +2376,160 @@ impl sb_eval::EvalStore for SqliteStore {
     fn report(&self, query: sb_eval::EvalReportQuery) -> sb_eval::Result<sb_eval::EvalReport> {
         self.eval_report(query)
             .map_err(|err| sb_eval::EvalStoreError(err.0))
+    }
+}
+
+/// One family of revisioned documents: the table of current documents,
+/// its history table and their key column (model settings: `target`; route
+/// roles: `name`). Every name is a fixed identifier, never input.
+#[derive(Debug, Clone, Copy)]
+struct DocTable {
+    current: &'static str,
+    history: &'static str,
+    key: &'static str,
+}
+
+impl DocTable {
+    const MODEL_SETTINGS: DocTable = DocTable {
+        current: "model_settings",
+        history: "model_settings_history",
+        key: "target",
+    };
+    const ROUTE_ROLES: DocTable = DocTable {
+        current: "route_roles",
+        history: "route_roles_history",
+        key: "name",
+    };
+}
+
+impl SqliteStore {
+    /// Compare-and-set write of one document plus its history row.
+    fn doc_write(
+        &self,
+        table: DocTable,
+        change: &ModelSettingsChange,
+    ) -> Result<ModelSettingsWrite> {
+        let DocTable {
+            current: cur,
+            history,
+            key,
+        } = table;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: u64 = tx
+            .query_row(
+                &format!("SELECT revision FROM {cur} WHERE {key} = ?1"),
+                [&change.target],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|revision| revision as u64)
+            .unwrap_or(0);
+        if change.revision != current + 1 {
+            return Ok(ModelSettingsWrite::Conflict { current });
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO {cur} ({key}, revision, doc, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT({key}) DO UPDATE SET
+                   revision = excluded.revision, doc = excluded.doc,
+                   updated_at_ms = excluded.updated_at_ms"
+            ),
+            params![
+                change.target,
+                change.revision as i64,
+                change.doc,
+                change.at_ms
+            ],
+        )?;
+        let changed = serde_json::to_string(&change.changed)
+            .map_err(|e| StoreError(format!("{cur} change list: {e}")))?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {history}
+                   ({key}, revision, doc, actor, role, source, action, changed, at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+            ),
+            params![
+                change.target,
+                change.revision as i64,
+                change.doc,
+                change.actor,
+                change.role,
+                change.source,
+                change.action,
+                changed,
+                change.at_ms
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ModelSettingsWrite::Written)
+    }
+
+    fn doc_list(&self, table: DocTable) -> Result<Vec<ModelSettingsRecord>> {
+        let DocTable { current, key, .. } = table;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {key}, revision, doc, updated_at_ms FROM {current} ORDER BY {key}"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ModelSettingsRecord {
+                    target: row.get(0)?,
+                    revision: row.get::<_, i64>(1)? as u64,
+                    doc: row.get(2)?,
+                    updated_at_ms: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn doc_history(
+        &self,
+        table: DocTable,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<ModelSettingsChange>> {
+        let DocTable { history, key, .. } = table;
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {key}, revision, doc, actor, role, source, action, changed, at_ms
+             FROM {history} WHERE {key} = ?1
+             ORDER BY revision DESC LIMIT ?2"
+        ))?;
+        let rows = stmt
+            .query_map(params![name, limit.min(i64::MAX as usize) as i64], |row| {
+                let changed: String = row.get(7)?;
+                Ok(ModelSettingsChange {
+                    target: row.get(0)?,
+                    revision: row.get::<_, i64>(1)? as u64,
+                    doc: row.get(2)?,
+                    actor: row.get(3)?,
+                    role: row.get(4)?,
+                    source: row.get(5)?,
+                    action: row.get(6)?,
+                    changed: serde_json::from_str(&changed).unwrap_or_default(),
+                    at_ms: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn doc_prune(&self, table: DocTable, name: &str, keep: usize) -> Result<usize> {
+        let DocTable { history, key, .. } = table;
+        let conn = self.conn()?;
+        let removed = conn.execute(
+            &format!(
+                "DELETE FROM {history} WHERE {key} = ?1 AND revision NOT IN (
+                   SELECT revision FROM {history} WHERE {key} = ?1
+                   ORDER BY revision DESC LIMIT ?2)"
+            ),
+            params![name, keep.clamp(1, i64::MAX as usize) as i64],
+        )?;
+        Ok(removed)
     }
 }
 
@@ -3379,71 +3589,11 @@ impl StateStore for SqliteStore {
     }
 
     fn model_settings_write(&self, change: &ModelSettingsChange) -> Result<ModelSettingsWrite> {
-        let mut conn = self.conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: u64 = tx
-            .query_row(
-                "SELECT revision FROM model_settings WHERE target = ?1",
-                [&change.target],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|revision| revision as u64)
-            .unwrap_or(0);
-        if change.revision != current + 1 {
-            return Ok(ModelSettingsWrite::Conflict { current });
-        }
-        tx.execute(
-            "INSERT INTO model_settings (target, revision, doc, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(target) DO UPDATE SET
-               revision = excluded.revision, doc = excluded.doc,
-               updated_at_ms = excluded.updated_at_ms",
-            params![
-                change.target,
-                change.revision as i64,
-                change.doc,
-                change.at_ms
-            ],
-        )?;
-        let changed = serde_json::to_string(&change.changed)
-            .map_err(|e| StoreError(format!("model settings change list: {e}")))?;
-        tx.execute(
-            "INSERT INTO model_settings_history
-               (target, revision, doc, actor, role, source, action, changed, at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                change.target,
-                change.revision as i64,
-                change.doc,
-                change.actor,
-                change.role,
-                change.source,
-                change.action,
-                changed,
-                change.at_ms
-            ],
-        )?;
-        tx.commit()?;
-        Ok(ModelSettingsWrite::Written)
+        self.doc_write(DocTable::MODEL_SETTINGS, change)
     }
 
     fn model_settings_list(&self) -> Result<Vec<ModelSettingsRecord>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT target, revision, doc, updated_at_ms FROM model_settings ORDER BY target",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(ModelSettingsRecord {
-                    target: row.get(0)?,
-                    revision: row.get::<_, i64>(1)? as u64,
-                    doc: row.get(2)?,
-                    updated_at_ms: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        self.doc_list(DocTable::MODEL_SETTINGS)
     }
 
     fn model_settings_history(
@@ -3451,43 +3601,27 @@ impl StateStore for SqliteStore {
         target: &str,
         limit: usize,
     ) -> Result<Vec<ModelSettingsChange>> {
-        let conn = self.conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT target, revision, doc, actor, role, source, action, changed, at_ms
-             FROM model_settings_history WHERE target = ?1
-             ORDER BY revision DESC LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(
-                params![target, limit.min(i64::MAX as usize) as i64],
-                |row| {
-                    let changed: String = row.get(7)?;
-                    Ok(ModelSettingsChange {
-                        target: row.get(0)?,
-                        revision: row.get::<_, i64>(1)? as u64,
-                        doc: row.get(2)?,
-                        actor: row.get(3)?,
-                        role: row.get(4)?,
-                        source: row.get(5)?,
-                        action: row.get(6)?,
-                        changed: serde_json::from_str(&changed).unwrap_or_default(),
-                        at_ms: row.get(8)?,
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        self.doc_history(DocTable::MODEL_SETTINGS, target, limit)
     }
 
     fn model_settings_prune(&self, target: &str, keep: usize) -> Result<usize> {
-        let conn = self.conn()?;
-        let removed = conn.execute(
-            "DELETE FROM model_settings_history WHERE target = ?1 AND revision NOT IN (
-               SELECT revision FROM model_settings_history WHERE target = ?1
-               ORDER BY revision DESC LIMIT ?2)",
-            params![target, keep.clamp(1, i64::MAX as usize) as i64],
-        )?;
-        Ok(removed)
+        self.doc_prune(DocTable::MODEL_SETTINGS, target, keep)
+    }
+
+    fn route_role_write(&self, change: &ModelSettingsChange) -> Result<ModelSettingsWrite> {
+        self.doc_write(DocTable::ROUTE_ROLES, change)
+    }
+
+    fn route_role_list(&self) -> Result<Vec<ModelSettingsRecord>> {
+        self.doc_list(DocTable::ROUTE_ROLES)
+    }
+
+    fn route_role_history(&self, name: &str, limit: usize) -> Result<Vec<ModelSettingsChange>> {
+        self.doc_history(DocTable::ROUTE_ROLES, name, limit)
+    }
+
+    fn route_role_prune(&self, name: &str, keep: usize) -> Result<usize> {
+        self.doc_prune(DocTable::ROUTE_ROLES, name, keep)
     }
 
     fn optimize_experiment_append(&self, record: &ExperimentRecord) -> Result<u64> {
@@ -3998,12 +4132,13 @@ mod tests {
         {
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24,
             ]
         }
         #[cfg(not(feature = "eval"))]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             ]
         }
     }
@@ -5766,6 +5901,59 @@ mod model_settings_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // Route roles keep their own revisions and history, apart from the
+    // model settings of a target with the same key, and survive a reopen.
+    #[test]
+    fn route_roles_are_revisioned_apart_from_model_settings() {
+        let dir = std::env::temp_dir().join(format!("sb-roles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = SqliteStore::open(path.to_str().unwrap()).unwrap();
+            let role = |revision, doc: &str| ModelSettingsChange {
+                changed: vec!["targets".to_string()],
+                action: "set".to_string(),
+                ..change("fast", revision, doc)
+            };
+            assert_eq!(
+                store
+                    .route_role_write(&role(1, "{\"targets\":[\"a/x\"]}"))
+                    .unwrap(),
+                ModelSettingsWrite::Written
+            );
+            assert_eq!(
+                store.route_role_write(&role(1, "{}")).unwrap(),
+                ModelSettingsWrite::Conflict { current: 1 }
+            );
+            assert_eq!(
+                store.route_role_write(&role(2, "{}")).unwrap(),
+                ModelSettingsWrite::Written
+            );
+            store
+                .model_settings_write(&change("fast", 1, "{}"))
+                .unwrap();
+        }
+        let store = SqliteStore::open(path.to_str().unwrap()).unwrap();
+        let rows = store.route_role_list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].target.as_str(), rows[0].revision), ("fast", 2));
+        assert_eq!(
+            store
+                .route_role_history("fast", 10)
+                .unwrap()
+                .iter()
+                .map(|c| (c.revision, c.action.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "set"), (1, "set")]
+        );
+        assert_eq!(store.model_settings_list().unwrap()[0].revision, 1);
+        assert_eq!(store.route_role_prune("fast", 1).unwrap(), 1);
+        assert_eq!(store.route_role_history("fast", 10).unwrap().len(), 1);
+        assert_eq!(store.model_settings_history("fast", 10).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn history_keeps_the_newest_revisions() {
         let store = SqliteStore::in_memory().unwrap();
@@ -6001,11 +6189,61 @@ mod model_settings_tests {
                     r.get(0)
                 })
                 .unwrap();
-            assert_eq!(max, 23);
+            // Migration 24 (route roles) ran too: the newest one.
+            assert_eq!(max, 24);
         }
         // And reopening is a no-op (idempotent migrations).
         let store = SqliteStore::open(&path).unwrap();
         assert_eq!(store.quality_run_list(None, None, 10).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A file as the binary before route roles left it (migrations 1..23):
+    // the new binary adds the role tables and keeps every settings row, and
+    // the old binary's statements still run on the migrated file (a
+    // rollback routes by its config again; the role rows wait unread).
+    #[test]
+    fn store_at_migration_23_gains_route_roles_and_a_rollback_keeps_working() {
+        let dir = std::env::temp_dir().join(format!(
+            "sb-store-m24-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.sqlite").display().to_string();
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .model_settings_write(&change("text/m", 1, "{}"))
+                .unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE route_roles; DROP TABLE route_roles_history;
+                 DELETE FROM schema_migrations WHERE version = 24;",
+            )
+            .unwrap();
+        }
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            assert!(store.schema_versions().unwrap().contains(&24));
+            assert_eq!(store.model_settings_list().unwrap().len(), 1);
+            store
+                .route_role_write(&change("fast", 1, "{\"targets\":[\"a/x\"]}"))
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO model_settings_history
+                   (target, revision, doc, actor, role, source, action, changed, at_ms)
+                 VALUES ('text/m', 2, '{}', 'a', 'admin', 'api', 'put', '[]', 2)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.route_role_list().unwrap().len(), 1);
+        assert_eq!(store.model_settings_history("text/m", 10).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
