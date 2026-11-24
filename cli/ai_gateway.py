@@ -306,7 +306,7 @@ Its pool check runs --pool-repeats times (3 by default), each after
 the first on a fresh process (unload, load); one failure fails it. The
 machine file is the one `fit` reads (--machines, else SB_AI_MACHINES in the
 environment or ai.env), matched by host name, then lane name:
-{"machines":[{"name":"box","kind":"gpu","vram_gb":25.7,"others_gb":2.1,"compute_gb":0.85,
+{"machines":[{"name":"box","kind":"gpu","vram_gb":25.7,"others_gb":2.1,"compute_gb":2.2,
 "min_free_gb":0.5}]} (card size, other users, the runtime's own buffers and the
 room to keep, measured on the card at its normal state).
 
