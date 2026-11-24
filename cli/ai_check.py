@@ -1021,6 +1021,12 @@ class Checker:
                 unknown.append(str(other.get("id")))
             else:
                 loaded += theirs["bytes"]
+        in_others = []
+        if unknown and machine is not None and machine.kind == "unified" and machine.others:
+            # On unified memory, others_gb is everything but this model at the
+            # machine's normal state, measured with its small always-loaded
+            # models in: an unmeasured loaded model is counted there (and named).
+            in_others, unknown = unknown, []
         if unknown:
             # Their share of the card is not known: the room left is not either.
             return {"check": "margin", "passed": None, "result": "skipped",
@@ -1032,6 +1038,8 @@ class Checker:
             others, others_from = int(float(others_flag) * GB), "--others"
         elif machine is not None and machine.others:
             others, others_from = int(machine.others), f"others_gb of {where}{source_words(machine)}"
+            if in_others:
+                others_from += f", with {', '.join(in_others[:3])} loaded"
         else:
             others, others_from = 0, "none named"
         free_flag = getattr(self.args, "min_free", None)

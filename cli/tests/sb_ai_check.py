@@ -1031,6 +1031,17 @@ class GatewayMachineTests(Base):
         self.assertEqual(local["passed"], False)
         self.assertIn("in the machine file", local["margin"]["card_from"])
 
+    def test_on_unified_memory_an_unmeasured_small_model_is_part_of_others(self):
+        self.fake.others = [{"id": "embed", "status": "loaded", "args": [], "memory": None}]
+        self.fake.machines = [{"name": "gpu-box", "kind": "unified", "usable_gb": 40,
+                               "others_gb": 12, "min_free_gb": 6}]
+        margin = self.margin()
+        self.assertEqual(margin["passed"], True, margin)
+        self.assertIn("with embed loaded", margin["margin"]["others_from"])
+        # On a card the same model makes the room unknown.
+        self.fake.machines = [dict(self.ENTRY)]
+        self.assertIsNone(self.margin()["passed"])
+
     def test_a_unified_memory_host_is_judged_on_its_usable_memory(self):
         self.fake.machines = [{"name": "gpu-box", "kind": "unified", "usable_gb": 40,
                                "others_gb": 12, "min_free_gb": 6}]
