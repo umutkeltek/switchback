@@ -547,8 +547,11 @@ struct Opts<'a> {
     /// A settings command writing the overlay JSON, with `{marker}` (the
     /// machine-up marker) and `{overlay}` filled in.
     command_template: Option<&'a str>,
-    /// The lane's wake command, with `{marker}` filled in (default: touch it).
+    /// The lane's wake command, with `{marker}` filled in (default: touch it;
+    /// `Some("")`: none, an always-on machine).
     wake_template: Option<&'a str>,
+    /// The lane's health probe path on the stub (default `/health`).
+    health_path: Option<&'a str>,
     /// More `server:` keys, each on its own line, indented two spaces.
     server: &'a str,
     /// The `text` provider's credential keys, each on its own line,
@@ -570,6 +573,7 @@ impl Default for Opts<'_> {
             load_timeout_secs: 5,
             command_template: None,
             wake_template: None,
+            health_path: None,
             server: "",
             text_auth: None,
             require: None,
@@ -623,8 +627,8 @@ providers:
 local_executors:
   - name: text
     base_url: "{stub_url}"
-    health_endpoint: "{stub_url}/health"
-    wake_command: "{wake}"
+    health_endpoint: "{stub_url}{health_path}"
+{wake}
     boot_timeout_secs: 10
     health_poll_interval_ms: 50
 {lane}
@@ -635,10 +639,14 @@ local_executors:
       load_timeout_secs: {load_timeout}
 {extra}
 "#,
-        wake = opts
-            .wake_template
-            .unwrap_or("touch {marker}")
-            .replace("{marker}", &quoted(&stub.up_marker)),
+        wake = match opts.wake_template.unwrap_or("touch {marker}") {
+            "" => String::new(),
+            template => format!(
+                "    wake_command: \"{}\"",
+                template.replace("{marker}", &quoted(&stub.up_marker))
+            ),
+        },
+        health_path = opts.health_path.unwrap_or("/health"),
         command = command.replace('"', "\\\""),
         lane = opts.lane.replace("{marker}", &quoted(&stub.up_marker)),
         server = opts.server,
@@ -1639,7 +1647,7 @@ async fn revert_to_zero_applies_like_an_unset_of_the_load_settings() {
             &s.gw,
             "text/m",
             0,
-            json!({"load": {"ctx_size": 8192}, "locked": ["load.ctx_size"]}),
+            json!({"load": {"ctx_size": 8192}, "locked": ["temperature"]}),
         )
         .await;
         assert_eq!(status, 200);
@@ -3126,5 +3134,250 @@ async fn a_power_off_ends_a_loads_wait_without_another_listing() {
         !s.stub.calls().contains(&"POST /models/load m".to_string()),
         "{:?}",
         s.stub.calls()
+    );
+}
+
+// ---------------------------------------------------------------- store locks and the machine file
+
+/// The settings command's calls, counted by the file it appends to.
+fn command_runs(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .map(|text| text.lines().count())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn a_store_locked_load_key_is_refused_at_write_time_and_nothing_runs() {
+    let log = temp("command-log");
+    let (s, _) = setup_with(Opts {
+        command_template: Some(&format!(
+            "cat > {{overlay}}; echo run >> {}",
+            quoted(&log)
+        )),
+        ..Opts::default()
+    })
+    .await;
+    s.stub.inner.lock().unwrap().overlay_path = Some(s.overlay.clone());
+    // Revision 1: the value and its lock, with a reason.
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"ctx_size": 32768}, "locked": ["load.ctx_size", "engine_args.model"],
+               "lock_reasons": {"load.ctx_size": "night job uses this"}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    let runs = command_runs(&log);
+    let overlay = std::fs::read(&s.overlay).unwrap();
+    let reloads_before = reloads(&s.stub);
+
+    // A change of the locked key, by its own name or another spelling, is
+    // refused with the reason; the revision, the overlay and the engine are
+    // untouched.
+    for body in [
+        json!({"load": {"ctx_size": 65536}, "locked": ["load.ctx_size", "engine_args.model"],
+               "lock_reasons": {"load.ctx_size": "night job uses this"}}),
+        json!({"load": {"ctx_size": 32768}, "engine_args": {"ctx-size": 65536},
+               "locked": ["load.ctx_size", "engine_args.model"],
+               "lock_reasons": {"load.ctx_size": "night job uses this"}}),
+        // Taking the lock off in the same write as the change: refused too.
+        json!({"load": {"ctx_size": 65536}, "locked": ["engine_args.model"]}),
+        // Unset of the locked key.
+        json!({"locked": ["load.ctx_size", "engine_args.model"],
+               "lock_reasons": {"load.ctx_size": "night job uses this"}}),
+    ] {
+        let (status, answer) = put(&s.gw, "text/m", 1, body.clone()).await;
+        assert_eq!(status, 423, "{body} -> {answer}");
+        assert_eq!(answer["error"]["type"], json!("locked"), "{answer}");
+        let message = answer["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("night job uses this"), "{message}");
+        assert!(message.contains("sb ai unlock text/m ctx_size"), "{message}");
+        assert_eq!(answer["error"]["current_revision"], json!(1), "{answer}");
+    }
+    // A revert that would change the locked key is refused the same way.
+    let r = reqwest::Client::new()
+        .post(format!("{}/v1/models/text/m/settings/revert", s.gw))
+        .header("if-match", "1")
+        .json(&json!({"revision": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 423);
+    let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;
+    assert_eq!(view["targets"][0]["revision"], json!(1), "{view}");
+    assert_eq!(
+        view["targets"][0]["store_locks"],
+        json!([{"key": "load.ctx_size", "reason": "night job uses this"},
+               {"key": "engine_args.model", "reason": null}]),
+        "{view}"
+    );
+    assert_eq!(command_runs(&log), runs, "the settings command ran");
+    assert_eq!(std::fs::read(&s.overlay).unwrap(), overlay);
+    assert_eq!(reloads(&s.stub), reloads_before);
+
+    // Another key is not locked.
+    let (status, answer) = put(
+        &s.gw,
+        "text/m",
+        1,
+        json!({"load": {"ctx_size": 32768, "batch_size": 1024},
+               "locked": ["load.ctx_size", "engine_args.model"],
+               "lock_reasons": {"load.ctx_size": "night job uses this"}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    // An unlock that leaves the value is a write of its own (no apply),
+    // after which the change goes through.
+    let (status, answer) = put(
+        &s.gw,
+        "text/m",
+        2,
+        json!({"load": {"ctx_size": 32768, "batch_size": 1024}, "locked": ["engine_args.model"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    let (status, answer) = put(
+        &s.gw,
+        "text/m",
+        3,
+        json!({"load": {"ctx_size": 65536, "batch_size": 1024}, "locked": ["engine_args.model"]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    // A lock reason needs its lock, and is one short line.
+    for body in [
+        json!({"lock_reasons": {"load.ctx_size": "x"}}),
+        json!({"locked": ["load.ctx_size"], "lock_reasons": {"load.ctx_size": "two\nlines"}}),
+        json!({"locked": ["engine_args.a b"]}),
+    ] {
+        let (status, answer) = put(&s.gw, "text/m", 4, body.clone()).await;
+        assert_eq!(status, 400, "{body} -> {answer}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_cannot_change_a_store_locked_key_through_a_variant() {
+    let s = setup(true, "", None).await;
+    let policy: Value = serde_json::from_str(POLICY).unwrap();
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"ctx_size": 8192}, "request_load": policy, "locked": ["load.ctx_size"],
+               "lock_reasons": {"load.ctx_size": "night job uses this"}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    let reloads_before = reloads(&s.stub);
+    let (status, body, _) = chat_with_load(&s, None, json!({"ctx_size": 65536})).await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("is locked (night job uses this)"), "{body}");
+    assert_eq!(reloads(&s.stub), reloads_before);
+}
+
+#[tokio::test]
+async fn settings_show_the_machine_files_keys_pins_and_store_locks() {
+    let base = temp("base.ini");
+    let out = temp("models.ini");
+    std::fs::write(
+        &base,
+        "version = 1\n\n[*]\njinja = true\n\n[m]\nmodel = /models/m.gguf\nmmproj = /models/p.gguf\n\
+         ctx-size = 4096\ntemp = 0.6\n; switchback-pinned: model, ctx-size\n",
+    )
+    .unwrap();
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/llamacpp-preset-overlay.py");
+    let command = format!(
+        "python3 -I {} --base {} --out {}",
+        quoted(&script),
+        quoted(&base),
+        quoted(&out)
+    );
+    let show = format!("python3 -I {} --base {} --show", quoted(&script), quoted(&base));
+    let extra = format!("      machine_file_command: \"{}\"", show.replace('"', "\\\""));
+    let s = setup(true, &extra, Some(command)).await;
+    let (status, view) = put(
+        &s.gw,
+        "text/m",
+        0,
+        json!({"load": {"batch_size": 1024}, "locked": ["load.ctx_size"],
+               "lock_reasons": {"load.ctx_size": "pinned in the machine file"}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;
+    let load = &view["targets"][0]["load"];
+    assert_eq!(load["machine_file"]["read"], json!(true), "{load}");
+    assert_eq!(load["machine_file"]["has_section"], json!(true), "{load}");
+    let keys = &load["engine_keys"];
+    assert_eq!(
+        keys["model"],
+        json!({"value": "/models/m.gguf", "source": "machine file", "pinned": true}),
+        "{keys}"
+    );
+    assert_eq!(keys["mmproj"]["source"], json!("machine file"), "{keys}");
+    assert_eq!(keys["temp"]["value"], json!("0.6"), "{keys}");
+    assert_eq!(keys["jinja"]["source"], json!("machine file [*]"), "{keys}");
+    assert_eq!(
+        keys["ctx-size"],
+        json!({"value": "4096", "source": "machine file", "pinned": true,
+               "locked": "load.ctx_size", "lock_reason": "pinned in the machine file"}),
+        "{keys}"
+    );
+    assert_eq!(
+        keys["batch-size"],
+        json!({"value": "1024", "source": "store"}),
+        "{keys}"
+    );
+    // The pins, as the store locks they become.
+    assert_eq!(
+        load["machine_file"]["pinned"],
+        json!([{"key": "ctx-size", "lock": "load.ctx_size"},
+               {"key": "model", "lock": "engine_args.model"}]),
+        "{load}"
+    );
+    // The machine file is never written by a read.
+    assert!(std::fs::read_to_string(&base).unwrap().contains("ctx-size = 4096"));
+}
+
+#[tokio::test]
+async fn a_failed_machine_file_reading_is_shown_not_hidden() {
+    let extra = "      machine_file_command: \"echo not json; exit 0\"";
+    let s = setup(true, extra, None).await;
+    let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;
+    let file = &view["targets"][0]["load"]["machine_file"];
+    assert_eq!(file["read"], json!(false), "{file}");
+    assert!(
+        file["error"].as_str().unwrap_or_default().contains("not JSON"),
+        "{file}"
+    );
+}
+
+#[tokio::test]
+async fn an_always_on_machine_whose_probe_fails_still_gets_its_settings() {
+    // No wake or power-off command: the gateway does not run the machine's
+    // power, so a lane probe that fails (a memory guard closing the lane to
+    // routing) says nothing about sleep; the engine itself answers and the
+    // apply runs at once instead of waiting for a wake that never comes.
+    let (s, _) = setup_with(Opts {
+        wake_template: Some(""),
+        health_path: Some("/guard-says-no"),
+        lane: "    route_health: true",
+        ..Opts::default()
+    })
+    .await;
+    s.stub.inner.lock().unwrap().overlay_path = Some(s.overlay.clone());
+    // Let the lane's probe see its 404 first.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let before = reloads(&s.stub);
+    let (status, view) = put(&s.gw, "text/m", 0, json!({"load": {"ctx_size": 16384}})).await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["apply"]["ok"], json!(true), "{view}");
+    assert_eq!(reloads(&s.stub), before + 1, "{:?}", s.stub.calls());
+    assert_eq!(
+        overlay_of(&s)["models"]["m"]["settings"]["ctx-size"],
+        json!("16384")
     );
 }

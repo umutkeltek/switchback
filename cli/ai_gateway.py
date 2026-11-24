@@ -105,6 +105,13 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  remove settings (and their locks)
   sb ai revert MODEL REVISION    put back the settings of an earlier revision
                                  (0: no saved settings and no locks, the engine's own values)
+  sb ai lock MODEL KEY... [--reason TEXT] [--load]
+  sb ai lock MODEL --pins [--reason TEXT]
+                                 lock keys in the store: no write and no request changes a
+                                 locked load key until `sb ai unlock`; --pins locks every key
+                                 the machine file pins for the model
+  sb ai unlock MODEL KEY... [--load]
+                                 take locks off (a write of its own; the values stay)
   sb ai set MODEL key=value ... --load [--apply next-load|now] [--wake] [--no-check]
                                  change load settings (ctx_size=65536 cache_type_k=q8_0); a
                                  memory or context change is checked at once and the old
@@ -1954,6 +1961,28 @@ def cmd_fit_target(gw, args, environ):
     return ai_fit.run(args, environ)
 
 
+def fit_gateway_machines(args, environ):
+    """The gateway's machine facts for `sb ai fit`, when it has no local
+    machine source (--machines, SB_AI_MACHINES, --vram, --ram); [] when the
+    gateway is not configured, does not answer, or serves none."""
+    if getattr(args, "machines", None) or args.vram is not None or args.ram is not None:
+        return []
+    try:
+        config = load_config(environ)
+    except Fail:
+        return []
+    if config.get("SB_AI_MACHINES"):
+        # A local machine file wins (also when only ai.env names it).
+        args.machines = config["SB_AI_MACHINES"]
+        return []
+    try:
+        answer = Gateway(config["SWITCHBACK_AI_URL"], config["SWITCHBACK_AI_KEY"]).call(
+            "GET", "/v1/engines", timeout=10)
+    except (GatewayError, Fail, OSError):
+        return []
+    return [entry for entry in (answer or {}).get("machines") or [] if isinstance(entry, dict)]
+
+
 def cmd_fit_store(gw, args):
     try:
         report = ai_fit.build_report(args, os.environ)
@@ -2125,9 +2154,15 @@ def print_settings(view):
         for name, layer in sorted(profiles.items()):
             keys = ", ".join(f"{k}={value_words(v)}" for k, v in sorted(layer.items()))
             print(f"  profile {name}: {keys or '(empty)'}")
+        locks = target.get("store_locks") or []
+        if locks:
+            words = ", ".join(row.get("key", "?") + (f" ({row['reason']})" if row.get("reason") else "")
+                              for row in locks)
+            print(f"  store locks: {words}")
         load = target.get("load")
         if isinstance(load, dict):
             print_load(load, target.get("_truth"))
+            print_engine_keys(load)
         for line in target.get("_checks") or []:
             print(line)
 
@@ -2151,6 +2186,49 @@ def print_load(load, truth=None):
             part = memory.get(name)
             if isinstance(part, dict):
                 print(f"  memory {name}: {part.get('bytes', 0) / 2**30:.1f} GiB at ctx {part.get('n_ctx', '?')}")
+
+
+def print_engine_keys(load):
+    """Every engine key of the model and where it comes from: the store,
+    the machine file's section, its [*] section; pins and store locks."""
+    keys = load.get("engine_keys")
+    state = load.get("machine_file")
+    if not isinstance(keys, dict):
+        return
+    if isinstance(state, dict):
+        if state.get("read"):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime((state.get("at_ms") or 0) / 1000))
+            head = f"  engine keys (machine file read {when}"
+            if not state.get("has_section"):
+                head += ", no section for this model"
+            if state.get("error"):
+                head += f"; last reading failed: {state['error']}"
+            print(head + "):")
+        else:
+            why = state.get("error") or state.get("why") or "not read"
+            print(f"  engine keys (machine file not read: {why}):")
+    if not keys:
+        print("    (none)")
+        return
+    rows = []
+    for key, row in sorted(keys.items()):
+        source = row.get("source") or ""
+        if row.get("machine_file_value") is not None:
+            source += f" (machine file {value_words(row['machine_file_value'])})"
+        marks = []
+        if row.get("pinned"):
+            marks.append("pinned")
+        if row.get("locked"):
+            reason = f": {row['lock_reason']}" if row.get("lock_reason") else ""
+            marks.append(f"locked{reason}")
+        value = "-" if row.get("value") is None else value_words(row.get("value"))
+        rows.append((key, value, source, ", ".join(marks)))
+    width = max(len(r[0]) for r in rows)
+    vwidth = max(len(r[1]) for r in rows)
+    swidth = max(len(r[2]) for r in rows)
+    for key, value, source, marks in rows:
+        line = f"    {key.ljust(width)}  {value.ljust(vwidth)}  {source.ljust(swidth)}"
+        print((line + "  " + marks).rstrip())
 
 
 def cmd_settings(gw, args):
@@ -2255,6 +2333,8 @@ def write_settings(gw, model, change, extra=None, target=None):
         if error.status == 409:
             raise Fail(GATEWAY_ERROR, f"the settings changed meanwhile ({error.message}); "
                                       "run the command again") from None
+        if error.status == 423:
+            raise Fail(GATEWAY_ERROR, error.message) from None
         raise gateway_fail(error, "writing the settings") from None
 
 
@@ -2275,6 +2355,119 @@ def clean_empty(doc):
         doc.pop("profiles")
     if "locked" in doc and not doc["locked"]:
         doc.pop("locked")
+    if "lock_reasons" in doc:
+        doc["lock_reasons"] = {k: v for k, v in doc["lock_reasons"].items()
+                               if k in (doc.get("locked") or [])}
+        if not doc["lock_reasons"]:
+            doc.pop("lock_reasons")
+
+
+def store_locks(doc):
+    """{lock path: reason or None} of a document's load-time locks
+    (`load.KEY`, `engine_args.NAME`)."""
+    reasons = doc.get("lock_reasons") or {}
+    return {path: reasons.get(path) for path in doc.get("locked") or []
+            if path.startswith(("load.", "engine_args."))}
+
+
+def lock_refusal(doc, pairs, target):
+    """The refusal of a load change that a store lock forbids, before
+    anything is held, woken or written; None when no lock is in the way.
+    The gateway refuses it too (and knows every spelling of an argument)."""
+    locks = store_locks(doc)
+    for key, value in pairs:
+        if key.startswith("engine_args."):
+            path = key
+        else:
+            path = f"load.{key}"
+        if path not in locks:
+            continue
+        current = (doc.get("engine_args") or {}).get(key.partition(".")[2]) \
+            if key.startswith("engine_args.") else (doc.get("load") or {}).get(key)
+        if current == value:
+            continue
+        reason = f" ({locks[path]})" if locks[path] else ""
+        short = key if not key.startswith("engine_args.") else key
+        return (f"`{path}` of `{target}` is locked{reason}: unlock it first with "
+                f"`sb ai unlock {target} {short}` (nothing was written)")
+    return None
+
+
+def lock_path(key, load=False):
+    """The `locked` entry a key of `sb ai lock` / `unlock` names."""
+    if key.startswith("load."):
+        if key[5:] not in LOAD_KEYS:
+            raise Fail(USAGE, f"{key}: {key[5:]} is not a load setting ({', '.join(LOAD_KEYS)})")
+        return key
+    if key.startswith("engine_args."):
+        name = key.partition(".")[2]
+        if not re.match(r"^[A-Za-z0-9_-]{1,64}$", name):
+            raise Fail(USAGE, f"{key}: `{name}` is not an engine argument name")
+        return key
+    top = key.partition(".")[0]
+    if key in LOAD_KEYS and (load or key not in REQUEST_KEYS):
+        return f"load.{key}"
+    if top in REQUEST_KEYS and not load:
+        return key
+    raise Fail(USAGE, f"{key} is not a setting: say a request key, load.KEY ({', '.join(LOAD_KEYS[:6])}, "
+                      "...) or engine_args.NAME")
+
+
+def cmd_lock(gw, args):
+    target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
+    paths = [lock_path(key, args.load) for key in args.keys]
+    if args.pins:
+        pinned = ((target.get("load") or {}).get("machine_file") or {}).get("pinned")
+        if pinned is None:
+            raise Fail(GATEWAY_ERROR, f"{target.get('target')}: the gateway shows no machine file for "
+                                      "this model (its lane needs engine.machine_file_command, and the "
+                                      "machine must have been up once)")
+        paths += [row.get("lock") for row in pinned if row.get("lock")]
+    if not paths:
+        raise Fail(USAGE, "name the keys to lock, or --pins")
+    reason = args.reason
+    if reason is not None and (not reason.strip() or len(reason) > 200 or "\n" in reason):
+        raise Fail(USAGE, "--reason is one line of 1 to 200 characters")
+    if args.pins and reason is None:
+        reason = "pinned in the machine file"
+
+    def change(doc):
+        locked = doc.setdefault("locked", [])
+        reasons = doc.setdefault("lock_reasons", {})
+        for path in paths:
+            if path not in locked:
+                locked.append(path)
+            if reason:
+                reasons[path] = reason
+        if not reasons:
+            doc.pop("lock_reasons")
+
+    answer = write_settings(gw, target["target"], change, target=target)
+    print(f"{answer.get('target')}: revision {answer.get('revision')}: locked {', '.join(paths)}"
+          + (f" ({reason})" if reason else ""))
+    return OK
+
+
+def cmd_unlock(gw, args):
+    target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
+    paths = [lock_path(key, args.load) for key in args.keys]
+    doc = target.get("document") or {}
+    missing = [path for path in paths if path not in (doc.get("locked") or [])]
+    if missing:
+        raise Fail(USAGE, f"{target.get('target')}: {', '.join(missing)} not locked")
+
+    def change(doc):
+        doc["locked"] = [path for path in doc.get("locked") or [] if path not in paths]
+        reasons = doc.get("lock_reasons") or {}
+        for path in paths:
+            reasons.pop(path, None)
+        if "lock_reasons" in doc and not reasons:
+            doc.pop("lock_reasons")
+        clean_empty(doc)
+
+    answer = write_settings(gw, target["target"], change, target=target)
+    print(f"{answer.get('target')}: revision {answer.get('revision')}: unlocked {', '.join(paths)}")
+    return OK
 
 
 def cmd_set(gw, args, poll_secs=None):
@@ -2325,6 +2518,11 @@ def cmd_set(gw, args, poll_secs=None):
         # next load could go live unchecked), or with --no-check on the
         # model's next `sb ai load`.
         target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
+        # A store lock refuses the change here, before a hold, a wake or a
+        # write.
+        refusal = lock_refusal(target.get("document") or {}, pairs, target.get("target"))
+        if refusal:
+            raise Fail(GATEWAY_ERROR, refusal)
         before = json.loads(json.dumps(target.get("document") or {}))
         after = json.loads(json.dumps(before))
         change(after)
@@ -2363,6 +2561,15 @@ def cmd_set(gw, args, poll_secs=None):
 
 
 def cmd_unset(gw, args):
+    target = one_target(settings_view(gw, args.model, "reading the settings"), args.model)
+    doc = target.get("document") or {}
+    load_pairs = [(key, None) for key in args.keys
+                  if key.startswith("engine_args.") or getattr(args, "load", False)
+                  or (key.partition(".")[0] in LOAD_KEYS and key.partition(".")[0] not in REQUEST_KEYS)]
+    refusal = lock_refusal(doc, load_pairs, target.get("target"))
+    if refusal:
+        raise Fail(GATEWAY_ERROR, refusal)
+
     def change(doc):
         for key in args.keys:
             top = key.partition(".")[0]
@@ -2370,8 +2577,6 @@ def cmd_unset(gw, args):
                 set_key(doc, key, None)
             elif getattr(args, "load", False) or (top in LOAD_KEYS and top not in REQUEST_KEYS):
                 set_key(doc.setdefault("load", {}), key, None)
-                if f"load.{key}" in doc.get("locked", []):
-                    doc["locked"].remove(f"load.{key}")
             elif key.startswith("engine_args."):
                 set_key(doc.setdefault("engine_args", {}), key.partition(".")[2], None)
             else:
@@ -2382,7 +2587,7 @@ def cmd_unset(gw, args):
             doc.get("profiles", {}).pop(args.profile, None)
         clean_empty(doc)
 
-    answer = write_settings(gw, args.model, change)
+    answer = write_settings(gw, target["target"], change, target=target)
     print(f"{answer.get('target')}: revision {answer.get('revision')}")
     return OK
 
@@ -2406,6 +2611,8 @@ def cmd_revert(gw, args):
         elif error.status == 409:
             raise Fail(GATEWAY_ERROR, f"the settings changed meanwhile ({error.message}); "
                                       "run the command again") from None
+        elif error.status == 423:
+            raise Fail(GATEWAY_ERROR, error.message) from None
         else:
             raise gateway_fail(error, "reverting the settings") from None
     what = ("no saved settings: the engine's own values" if args.revision == 0
@@ -2698,6 +2905,16 @@ def parser():
     revert = sub.add_parser("revert", add_help=False, allow_abbrev=False)
     revert.add_argument("model")
     revert.add_argument("revision", type=int)
+    lock = sub.add_parser("lock", add_help=False, allow_abbrev=False)
+    lock.add_argument("model")
+    lock.add_argument("keys", nargs="*")
+    lock.add_argument("--reason")
+    lock.add_argument("--pins", action="store_true")
+    lock.add_argument("--load", action="store_true")
+    unlock = sub.add_parser("unlock", add_help=False, allow_abbrev=False)
+    unlock.add_argument("model")
+    unlock.add_argument("keys", nargs="+")
+    unlock.add_argument("--load", action="store_true")
     load = sub.add_parser("load", add_help=False, allow_abbrev=False)
     load.add_argument("model")
     load.add_argument("--wake", action="store_true")
@@ -2733,7 +2950,10 @@ def main(argv=None, environ=None):
         return OK
     args = parser().parse_args(argv)
     if args.command == "fit" and not args.store and not args.target:
-        # fit reads the model index, not the gateway: it needs no key.
+        # fit reads the model index, not the gateway: it needs no key. With
+        # no machine file and no machine flags it judges against the
+        # gateway's machine facts when a gateway is configured and answers.
+        args.gateway_machines = fit_gateway_machines(args, environ)
         return ai_fit.run(args)
     if args.command == "eval" and not ai_eval.needs_gateway(args):
         # eval --list (and --rescore --no-store) read local files only.
@@ -2777,6 +2997,10 @@ def main(argv=None, environ=None):
             return cmd_unset(gw, args)
         if args.command == "revert":
             return cmd_revert(gw, args)
+        if args.command == "lock":
+            return cmd_lock(gw, args)
+        if args.command == "unlock":
+            return cmd_unlock(gw, args)
         if args.command == "chat":
             return cmd_chat(gw, args)
         if args.command == "load":

@@ -294,6 +294,14 @@ pub struct LaneEngineConfig {
     /// a machine itself. Absent = load settings are refused for this lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_command: Option<String>,
+    /// Read-only shell command that prints the machine's hand-written
+    /// presets as JSON (the reference overlay script's `--show`):
+    /// `{"global": {"keys": {..}, "pinned": [..]}, "models": {NAME: {"keys":
+    /// {..}, "pinned": [..]}}}`. `GET /v1/models/{m}/settings` shows those
+    /// keys with source `machine file`. Run only while the machine is up
+    /// (never wakes it); the last answer is kept for when it sleeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_file_command: Option<String>,
     /// Let load settings and engine arguments name file paths (draft
     /// model, projector, ...). Default `false`.
     #[serde(default)]
