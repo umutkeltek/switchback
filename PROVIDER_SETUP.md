@@ -722,6 +722,10 @@ nor over-counted. A short request never waits for a count.
   large request is never passed by smaller ones, and a wait lasts at most
   `queue_timeout_secs` (then the next target, or a retryable 503
   `local_lane_queue_timeout`).
+  A target counts as able to serve only when its known context could take the
+  prompt, so a full pool never spills a large request to a smaller model that
+  would refuse it; it waits for room instead. If a spill still ends at a target
+  too small for it, the answer is a retryable 503 `local_lane_busy`, not a 400.
 - A prompt that alone fills one request's context is refused at once with a
   400 `context_length_exceeded` and never sent to the engine (when no other
   target of the route can serve it).

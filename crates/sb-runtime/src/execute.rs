@@ -585,6 +585,9 @@ impl Engine {
         // target serves it: a prompt too large alone (400) and a wait for
         // room that ran out (503).
         let mut pool_too_large: Option<String> = None;
+        // A target skipped because its pool was full (spilled): the request
+        // was not too large for it, so the end is a retryable 503, never a 400.
+        let mut pool_spilled = false;
         let mut pool_timed_out: Option<String> = None;
 
         // One trace per request: the route decision + every attempt + outcome + cost
@@ -923,6 +926,12 @@ impl Engine {
                         && other.wake.is_none()
                         && snap.registry.adapter(&other.provider_id).is_some()
                         && snap.resolver.circuit_allows(&other.provider_id)
+                        && self.pool_could_take(
+                            snap,
+                            &req,
+                            &other.provider_id,
+                            &settings_plan.engine_model(other),
+                        )
                 });
                 let queue_first = index == 0
                     && snap.config.local_executors.iter().any(|lane| {
@@ -964,6 +973,7 @@ impl Engine {
                              not counted as a failure",
                             target.id
                         ));
+                        pool_spilled = true;
                         continue 'targets;
                     }
                     crate::token_pool::PoolStep::TimedOut(detail) => {
@@ -1778,6 +1788,21 @@ impl Engine {
                     503,
                     "local_lane_queue_timeout",
                     format!("{detail}; no other target can serve; retry later"),
+                    Some(summary),
+                )
+                .with_retry_after(crate::LANE_QUEUE_RETRY_AFTER),
+            );
+        }
+
+        if pool_spilled && pool_too_large.is_some() && unavailable_retry_after.is_none() {
+            self.record_trace(trace.finish(503, started.elapsed().as_millis() as u64, false));
+            return ExecOutcome::Error(
+                ExecError::new(
+                    503,
+                    "local_lane_busy",
+                    "the model that can take this request has its shared context full and the \
+                     route's other targets are too small for it; retry later"
+                        .to_string(),
                     Some(summary),
                 )
                 .with_retry_after(crate::LANE_QUEUE_RETRY_AFTER),

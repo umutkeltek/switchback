@@ -907,6 +907,40 @@ impl crate::Engine {
         self.token_pools.clone()
     }
 
+    /// Whether `provider_id`'s pool for `engine_model` could ever take
+    /// `req`, as far as the gateway knows without a call: false only when
+    /// the lane admits by tokens, the model's size is known and the prompt
+    /// alone is surely over what one request may use. A full pool's request
+    /// spills only to a later target that could take it; otherwise it waits
+    /// for room where it is, instead of ending as "too large" at a smaller
+    /// model when the full one would have served it after a short wait.
+    pub(crate) fn pool_could_take(
+        &self,
+        snap: &crate::Snapshot,
+        req: &AiRequest,
+        provider_id: &str,
+        engine_model: &str,
+    ) -> bool {
+        let Some((config, _)) = lane_admission(snap, provider_id) else {
+            return true;
+        };
+        let Some(truth) = self
+            .token_pools
+            .view()
+            .and_then(|view| view.cached(provider_id, engine_model))
+        else {
+            return true;
+        };
+        need_for(
+            PromptText::of(req).quick_tokens(),
+            PromptSource::Estimate,
+            requested_max_tokens(req),
+            u64::from(config.default_reserve_tokens),
+            Some(&truth),
+        )
+        .is_ok()
+    }
+
     /// Reserve the need of `req` (the request as sent to `target`) in the
     /// pool of engine model `engine_model`. Waits (FIFO, bounded by the
     /// lane's `queue_timeout_secs`) only when `may_wait`; otherwise a full

@@ -613,3 +613,104 @@ async fn the_capacity_report_shows_the_pool() {
     // A small prompt is never counted by the engine (no call on the way).
     assert_eq!(fake.get(|e| e.tokenize_calls), 0);
 }
+
+// A full pool spills only to a later target that could take the request.
+// Route [big, small]: the big pool is full and the prompt alone is over the
+// small model's context, so spilling would end as a 400 "too large" at the
+// small one although the big one serves it after a short wait. It waits for
+// room on the big one instead and is answered there.
+#[tokio::test]
+async fn a_full_pool_never_spills_to_a_target_too_small_for_the_request() {
+    let (big_url, big) = start_fake(3000).await;
+    let (small_url, small) = start_fake(200).await;
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: text
+    type: openai_compatible
+    engine: llama_cpp
+    base_url: "{big_url}/v1"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+  - id: small
+    type: openai_compatible
+    engine: llama_cpp
+    base_url: "{small_url}/v1"
+    accounts:
+      - id: a
+        auth: {{ kind: api_key, inline: "k" }}
+routes:
+  - name: mix
+    match: {{ model: mix }}
+    pin_order: true
+    targets: [text/qwen, small/qwen]
+local_executors:
+  - name: text
+    base_url: "{big_url}"
+    health_endpoint: "{big_url}/health"
+    queue_timeout_secs: 5
+    engine:
+      kind: llama_cpp_router
+  - name: small
+    base_url: "{small_url}"
+    health_endpoint: "{small_url}/health"
+    engine:
+      kind: llama_cpp_router
+"#
+    );
+    let cfg = sb_core::Config::from_yaml(&cfg).unwrap();
+    sb_runtime::Engine::validate_config(&cfg).expect("valid test config");
+    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
+    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
+    let state = sb_server::AppState::new(
+        Arc::new(cfg),
+        Arc::new(registry),
+        Arc::new(resolver),
+        Arc::new(sb_ledger::UsageLedger::in_memory()),
+    );
+    let app = sb_server::build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}");
+    let engines = reqwest::get(format!("{url}/v1/engines")).await.unwrap();
+    assert!(engines.status().is_success());
+
+    let mut running = Vec::new();
+    for code in ["A", "B"] {
+        let url = url.clone();
+        running.push(tokio::spawn(async move {
+            send(&url, "text/qwen", prompt(code, 950), Some(100)).await
+        }));
+    }
+    until("A and B running", || big.get(|e| e.running) == 2).await;
+    let waiter = {
+        let url = url.clone();
+        tokio::spawn(async move { send(&url, "mix", prompt("C", 950), Some(100)).await })
+    };
+    until("C waiting for room on the big pool", || {
+        state
+            .engine
+            .token_pools()
+            .reports()
+            .into_iter()
+            .any(|pool| pool.lane == "text" && pool.waiting == 1)
+    })
+    .await;
+    assert_eq!(
+        small.get(|e| e.all_chats.len()),
+        0,
+        "nothing reached the small model"
+    );
+    big.release(3);
+    let (status, answer) = waiter.await.unwrap();
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(content(&answer), "C");
+    assert_eq!(big.get(|e| e.overflowed), 0);
+    for task in running {
+        assert_eq!(task.await.unwrap().0, 200);
+    }
+}
