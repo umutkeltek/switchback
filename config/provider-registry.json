@@ -31,11 +31,11 @@
   "note": "Direct first-party authoritative layer. Complements config/model-registry.json (OpenRouter-derived). On conflict, this layer's official-page citations win. Cross-check `flags` rows before treating any price as billing-grade. See docs/registry/RECONCILIATION.md for cross-source agreement + discrepancies.",
   "counts": {
     "providers": 30,
-    "models": 122,
+    "models": 132,
     "multi_hosted": 9,
     "free_models": 37,
     "benchmarked_models": 14,
-    "enriched_models": 114,
+    "enriched_models": 124,
     "probed_models": 6,
     "probe_receipts": 8,
     "enriched_providers": 10
@@ -7338,6 +7338,807 @@
       }
     },
     {
+      "provider_id": "openai",
+      "model_id": "gpt-6.2-astra",
+      "tier": "R",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 8000000,
+      "output_micros_per_mtok": 40000000,
+      "cached_input_micros_per_mtok": 400000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6.2-sol",
+      "tier": "G",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6.1-sol",
+      "tier": "G",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 100000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6.1-terra",
+      "tier": "G",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 1000000,
+      "output_micros_per_mtok": 5000000,
+      "cached_input_micros_per_mtok": 50000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6-astra",
+      "tier": "R",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 10000000,
+      "output_micros_per_mtok": 50000000,
+      "cached_input_micros_per_mtok": 1000000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6-sol",
+      "tier": "G",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 10000000,
+      "cached_input_micros_per_mtok": 200000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-6-luna",
+      "tier": "F",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 100000,
+      "output_micros_per_mtok": 500000,
+      "cached_input_micros_per_mtok": 10000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.6-sol",
+      "tier": "G",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 4000000,
+      "output_micros_per_mtok": 20000000,
+      "cached_input_micros_per_mtok": 400000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output",
+        "pricing page notes a GPT-5.6 Sol promotion until 2026-11-30: re-check after that date"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.6-terra",
+      "tier": "G",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 2000000,
+      "output_micros_per_mtok": 12000000,
+      "cached_input_micros_per_mtok": 200000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
+      "provider_id": "openai",
+      "model_id": "gpt-5.6-luna",
+      "tier": "F",
+      "context_window": null,
+      "vision": true,
+      "tool_calling": true,
+      "json_schema": "native",
+      "input_micros_per_mtok": 200000,
+      "output_micros_per_mtok": 1200000,
+      "cached_input_micros_per_mtok": 20000,
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "flags": [
+        "long context (272K+): 2x input, 1.5x output"
+      ],
+      "capabilities": {
+        "declared_by": "openai_pricing_page",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "text_input": true,
+        "text_output": true,
+        "image_input": true,
+        "video_input": false,
+        "audio_input": false,
+        "embeddings_output": false,
+        "rerank_output": false,
+        "tool_calling": true,
+        "json_schema": "native",
+        "streaming": true,
+        "max_tokens": true,
+        "reasoning": true,
+        "structured_outputs": true,
+        "supported_tools": [
+          "functions",
+          "web_search",
+          "file_search",
+          "computer_use"
+        ],
+        "reasoning_controls": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "determinism": {
+        "seed_supported": false,
+        "temperature_supported": true,
+        "top_p_supported": true,
+        "note": "Provider supports sampling controls; deterministic repeatability needs Switchback probe receipt."
+      },
+      "limits": {
+        "context_window": null,
+        "provider_context_window": null,
+        "max_completion_tokens": null
+      },
+      "architecture": {
+        "source": "openai_pricing_page",
+        "architecture_type": "proprietary frontier reasoning model"
+      },
+      "provenance": [
+        {
+          "kind": "pricing_page",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "fetched_at": "2026-11-24T03:05:00.000Z",
+          "note": "OpenAI pricing page, Standard tier, short-context rates per 1M tokens."
+        }
+      ],
+      "verification": {
+        "declared": true,
+        "probed": false,
+        "probes": {}
+      }
+    },
+    {
       "provider_id": "opencode-go",
       "model_id": "glm-5.2",
       "tier": "G (code)",
@@ -12261,20 +13062,100 @@
         "source": "direct",
         "note": "NVIDIA Build free endpoint"
       }
+    ],
+    "gpt-6.2-astra": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 8000000,
+        "output_micros_per_mtok": 40000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-6.2-sol": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 2000000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-6.1-sol": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 2000000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-6.1-terra": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 1000000,
+        "output_micros_per_mtok": 5000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-6-astra": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 10000000,
+        "output_micros_per_mtok": 50000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-6-sol": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 2000000,
+        "output_micros_per_mtok": 10000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-6-luna": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 100000,
+        "output_micros_per_mtok": 500000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.6-sol": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 4000000,
+        "output_micros_per_mtok": 20000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.6-terra": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 2000000,
+        "output_micros_per_mtok": 12000000,
+        "source": "direct"
+      }
+    ],
+    "gpt-5.6-luna": [
+      {
+        "provider_id": "openai",
+        "input_micros_per_mtok": 200000,
+        "output_micros_per_mtok": 1200000,
+        "source": "direct"
+      }
     ]
   },
   "metadata_contract": {
     "status": "declared provider facts + optional Switchback probe receipts",
     "money": "integer micro-USD per 1M tokens (USD/Mtok * 1e6); null = not offered / priced-per-host",
-      "fields": {
+    "fields": {
       "capabilities": "Provider/catalog-declared modalities and API parameters.",
       "determinism": "Declared knobs such as seed; deterministic behavior still needs probe receipt.",
       "architecture": "Dense/MoE/parameter facts with source; absent means unknown, not dense.",
       "benchmarks": "Vendor or third-party benchmark values, never treated as local certification.",
       "verification": "Switchback probe receipts go here; declared facts alone are not proof.",
       "freshness": "Catalog, provenance, and probe timestamps are evidence freshness; model availability, prices, and capabilities can change.",
-    "provider_research": "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows.",
-    "capacity_calibration": "Observed provider throughput cohorts, recommendation, provenance, and explicit unknown quota dimensions; a calibration is evidence for autonomous pacing, never a gate on operator traffic."
+      "provider_research": "Provider-level official docs cross-checks for hosts that do not yet have ingested model rows.",
+      "capacity_calibration": "Observed provider throughput cohorts, recommendation, provenance, and explicit unknown quota dimensions; a calibration is evidence for autonomous pacing, never a gate on operator traffic."
     }
   },
   "provider_catalogs": {
