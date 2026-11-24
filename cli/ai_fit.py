@@ -904,7 +904,20 @@ def load_machines(args, environ):
         return machines
     if args.vram is not None or args.ram is not None:
         return [ad_hoc_machine(args)]
-    return []
+    # No local machine file and no flags: the gateway's own machine facts
+    # (`server.optimize.hosts`), when the caller fetched them.
+    machines = []
+    for entry in getattr(args, "gateway_machines", None) or []:
+        try:
+            machine = machine_from_entry(entry, "the gateway's machine facts")
+        except FitError:
+            continue
+        if getattr(args, "others", None) is not None:
+            machine.others = others_of(args)
+        if getattr(args, "compute", None) is not None:
+            machine.compute = compute_of(args)
+        machines.append(machine)
+    return machines
 
 
 # ---------------------------------------------------------------- the fit

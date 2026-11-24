@@ -96,6 +96,64 @@ impl OptimizeConfig {
                     ));
                 }
             }
+            for (name, value) in [
+                ("vram_gb", spec.vram_gb),
+                ("usable_gb", spec.usable_gb),
+            ] {
+                if value.is_some_and(|v| !(v.is_finite() && v > 0.0 && v <= 100_000.0)) {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}.{name} must be a positive number of GB"
+                    ));
+                }
+            }
+            for (name, value) in [
+                ("others_gb", spec.others_gb),
+                ("compute_gb", spec.compute_gb),
+                ("min_free_gb", spec.min_free_gb),
+            ] {
+                if value.is_some_and(|v| !(v.is_finite() && (0.0..=100_000.0).contains(&v))) {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}.{name} must be a number of GB, 0 or more"
+                    ));
+                }
+            }
+            match (spec.kind, spec.vram_gb, spec.usable_gb) {
+                (Some(HostMemoryKind::Gpu), None, _) => {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}: kind gpu needs vram_gb (the card's size)"
+                    ))
+                }
+                (Some(HostMemoryKind::Unified), _, None) => {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}: kind unified needs usable_gb (memory \
+                         models may use)"
+                    ))
+                }
+                (Some(HostMemoryKind::Gpu), _, Some(_)) => {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}: usable_gb is for kind unified; a card's \
+                         size is vram_gb"
+                    ))
+                }
+                (Some(HostMemoryKind::Unified), Some(_), _) => {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}: vram_gb is for kind gpu; unified memory \
+                         is usable_gb"
+                    ))
+                }
+                (None, Some(_), Some(_)) => {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}: vram_gb or usable_gb, not both (set kind)"
+                    ))
+                }
+                (None, None, None) if spec.has_memory_facts() => {
+                    return Err(format!(
+                        "server.optimize.hosts.{host}: memory facts need vram_gb (kind gpu) or \
+                         usable_gb (kind unified)"
+                    ))
+                }
+                _ => {}
+            }
         }
         if self.sticky_max_conversations == 0 {
             return Err("server.optimize.sticky_max_conversations must be at least 1".into());
@@ -214,6 +272,88 @@ pub struct HostSpec {
     /// Peak matrix compute in TFLOPS (prefill is bound by it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_tflops: Option<f64>,
+    /// The machine's memory for models: `gpu` (a card: `vram_gb`) or
+    /// `unified` (memory shared with every program: `usable_gb`). The
+    /// memory facts below are what `sb ai check`, `tune` and `fit` judge
+    /// a memory or context change against; a client's own machine file
+    /// (`SB_AI_MACHINES`) overrides them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<HostMemoryKind>,
+    /// A card's size in GB (`kind: gpu`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vram_gb: Option<f64>,
+    /// Memory models may use in GB (`kind: unified`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usable_gb: Option<f64>,
+    /// GB that other programs hold at the machine's normal state (a
+    /// desktop, an image server, a person's own apps): never a model's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub others_gb: Option<f64>,
+    /// GB the engine's compute buffers take beside weights and KV cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_gb: Option<f64>,
+    /// GB a memory or context change must leave free.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_free_gb: Option<f64>,
+}
+
+/// What kind of memory a host's models use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostMemoryKind {
+    Gpu,
+    Unified,
+}
+
+impl HostSpec {
+    /// Whether any memory fact is set.
+    pub fn has_memory_facts(&self) -> bool {
+        self.kind.is_some()
+            || self.vram_gb.is_some()
+            || self.usable_gb.is_some()
+            || self.others_gb.is_some()
+            || self.compute_gb.is_some()
+            || self.min_free_gb.is_some()
+    }
+
+    /// The host as one entry of a machine file (`sb ai fit --machines`'s
+    /// shape: `name`, `kind`, `vram_gb` or `usable_gb`, `others_gb`,
+    /// `compute_gb`, `min_free_gb`, `bandwidth_gbs`), or `None` when it
+    /// carries no memory facts.
+    pub fn machine_entry(&self, host: &str) -> Option<serde_json::Value> {
+        if !self.has_memory_facts() {
+            return None;
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("name".into(), host.into());
+        let kind = self.kind.unwrap_or(if self.usable_gb.is_some() {
+            HostMemoryKind::Unified
+        } else {
+            HostMemoryKind::Gpu
+        });
+        entry.insert(
+            "kind".into(),
+            match kind {
+                HostMemoryKind::Gpu => "gpu",
+                HostMemoryKind::Unified => "unified",
+            }
+            .into(),
+        );
+        for (name, value) in [
+            ("vram_gb", self.vram_gb),
+            ("usable_gb", self.usable_gb),
+            ("others_gb", self.others_gb),
+            ("compute_gb", self.compute_gb),
+            ("min_free_gb", self.min_free_gb),
+            ("bandwidth_gbs", self.bandwidth_gbs),
+        ] {
+            if let Some(value) = value {
+                entry.insert(name.into(), value.into());
+            }
+        }
+        entry.insert("source".into(), "gateway".into());
+        Some(serde_json::Value::Object(entry))
+    }
 }
 
 /// When the speed report raises a finding.
@@ -709,8 +849,46 @@ mod tests {
             HostSpec {
                 bandwidth_gbs: Some(0.0),
                 peak_tflops: None,
+                ..HostSpec::default()
             },
         );
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn host_memory_facts_validate_and_become_a_machine_entry() {
+        let cfg: OptimizeConfig = serde_yaml::from_str(
+            "hosts:\n  box: {bandwidth_gbs: 1008, kind: gpu, vram_gb: 25.757, others_gb: 2.13, \
+             compute_gb: 2.2, min_free_gb: 0.5}\n  mac: {kind: unified, usable_gb: 48, \
+             others_gb: 20, min_free_gb: 8}\n  bare: {bandwidth_gbs: 400}\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let entry = cfg.hosts["box"].machine_entry("box").unwrap();
+        assert_eq!(
+            entry,
+            serde_json::json!({"name": "box", "kind": "gpu", "vram_gb": 25.757,
+                               "others_gb": 2.13, "compute_gb": 2.2, "min_free_gb": 0.5,
+                               "bandwidth_gbs": 1008.0, "source": "gateway"})
+        );
+        assert_eq!(
+            cfg.hosts["mac"].machine_entry("mac").unwrap()["kind"],
+            serde_json::json!("unified")
+        );
+        // Bandwidth alone is no memory fact.
+        assert!(cfg.hosts["bare"].machine_entry("bare").is_none());
+        for bad in [
+            "hosts: {b: {kind: gpu}}",
+            "hosts: {b: {kind: unified, vram_gb: 24}}",
+            "hosts: {b: {kind: gpu, vram_gb: 24, usable_gb: 20}}",
+            "hosts: {b: {vram_gb: 24, usable_gb: 20}}",
+            "hosts: {b: {others_gb: 2}}",
+            "hosts: {b: {kind: gpu, vram_gb: -1}}",
+            "hosts: {b: {kind: gpu, vram_gb: 24, min_free_gb: -0.5}}",
+        ] {
+            let cfg: OptimizeConfig = serde_yaml::from_str(bad).unwrap();
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+        assert!(serde_yaml::from_str::<OptimizeConfig>("hosts: {b: {vram: 24}}").is_err());
     }
 }

@@ -477,6 +477,25 @@ def measured(memory, pool_ctx=None):
     return None
 
 
+def source_words(machine):
+    """` in the gateway's config` for a machine the gateway served; nothing
+    for one of the local machine file (the words it always had)."""
+    source = getattr(machine, "source", None)
+    return f" in {source}" if source and source != "the machine file" else ""
+
+
+def gateway_machines_of(engines):
+    """The machines a `GET /v1/engines` answer carries (`machines`, one
+    machine-file entry per host); entries that do not read are left out."""
+    out = []
+    for entry in (engines or {}).get("machines") or []:
+        try:
+            out.append(ai_fit.machine_from_entry(entry, "the gateway's machine facts"))
+        except ai_fit.FitError:
+            continue
+    return out
+
+
 def margin_verdict(numbers, min_free):
     """Pass when the card keeps at least `min_free` bytes free."""
     free = numbers["free_bytes"]
@@ -875,16 +894,39 @@ class Checker:
     # ------------------------------------------------------------ the card's memory
 
     def machine(self, ident):
-        """The machine file's entry for the model's host (or lane), or None."""
+        """The entry for the model's host (or lane): from the local machine
+        file (--machines, else SB_AI_MACHINES) when there is one, else the
+        gateway's own machine facts (`server.optimize.hosts` in its config,
+        served in `GET /v1/engines`); None when neither knows it."""
         path = getattr(self.args, "machines", None)
-        if not path:
-            return None
-        try:
-            machines = ai_fit.read_machines(path)
-        except ai_fit.FitError as error:
-            raise CheckError(USAGE, error.message) from None
         names = (ident.get("host"), ident.get("lane"))
-        return next((m for m in machines if m.name in names), None)
+        if path:
+            try:
+                machines = ai_fit.read_machines(path)
+            except ai_fit.FitError as error:
+                raise CheckError(USAGE, error.message) from None
+            found = next((m for m in machines if m.name in names), None)
+            if found is not None:
+                found.source = "the machine file"
+                return found
+            # The local file does not name this host: the gateway's facts
+            # still apply.
+        machines = self.gateway_machines()
+        found = next((m for m in machines if m.name in names), None)
+        if found is not None:
+            found.source = "the gateway's config"
+        return found
+
+    def gateway_machines(self):
+        """The gateway's machine facts as machines (empty when it serves
+        none, or this key may not read them)."""
+        if "_gateway_machines" not in self.__dict__:
+            try:
+                answer = self.gw.get("/v1/engines")
+            except self.fail_types:
+                answer = {}
+            self._gateway_machines = gateway_machines_of(answer)
+        return self._gateway_machines
 
     def fit_estimate(self, ident, truth, machine):
         """The model's GPU bytes at its settings from `sb ai fit`'s numbers,
@@ -959,15 +1001,19 @@ class Checker:
             card, card_from = int(float(card_flag) * GB), "--card-gb"
         elif mine["card"]:
             card, card_from = mine["card"], "the engine's measurement"
-        elif machine is not None and machine.kind == "gpu" and machine.budget:
-            card, card_from = int(machine.budget), f"vram_gb of {where} in the machine file"
+        elif machine is not None and machine.budget:
+            name = "vram_gb" if machine.kind == "gpu" else "usable_gb (unified memory)"
+            card, card_from = int(machine.budget), f"{name} of {where} in " \
+                f"{getattr(machine, 'source', None) or 'the machine file'}"
         else:
             return {"check": "margin", "passed": None, "result": "skipped",
                     "why": (f"the card's size is unknown: the gateway does not pass it on, so set "
-                            f"vram_gb for {where} in the machine file (SB_AI_MACHINES) or pass "
-                            "--card-gb")}
+                            f"vram_gb for {where} in the gateway's server.optimize.hosts or in a "
+                            "machine file (SB_AI_MACHINES), or pass --card-gb")}
         loaded, unknown = 0, []
         for other in rows:
+            # A sleeping model's process holds no weights (llama.cpp frees
+            # them while it sleeps), so only loaded and loading ones count.
             if other is row or other.get("status") not in ("loaded", "loading"):
                 continue
             theirs = measured(other.get("memory"))
@@ -985,20 +1031,22 @@ class Checker:
         if others_flag is not None:
             others, others_from = int(float(others_flag) * GB), "--others"
         elif machine is not None and machine.others:
-            others, others_from = int(machine.others), f"others_gb of {where}"
+            others, others_from = int(machine.others), f"others_gb of {where}{source_words(machine)}"
         else:
             others, others_from = 0, "none named"
         free_flag = getattr(self.args, "min_free", None)
         if free_flag is not None:
-            min_free = int(float(free_flag) * GB)
+            min_free, min_free_from = int(float(free_flag) * GB), "--min-free"
         elif machine is not None and getattr(machine, "min_free", None) is not None:
             min_free = int(machine.min_free)
+            min_free_from = f"min_free_gb of {where}{source_words(machine)}"
         else:
-            min_free = MIN_FREE_BYTES
+            min_free, min_free_from = MIN_FREE_BYTES, "the default"
         numbers = {"card_bytes": card, "card_from": card_from, "model_bytes": mine["bytes"],
                    "model_from": mine["how"], "measured_ctx": mine["n_ctx"], "loaded_bytes": loaded,
                    "others_bytes": others, "others_from": others_from,
-                   "free_bytes": card - mine["bytes"] - loaded - others, "min_free_bytes": min_free}
+                   "free_bytes": card - mine["bytes"] - loaded - others, "min_free_bytes": min_free,
+                   "min_free_from": min_free_from}
         return margin_verdict(numbers, min_free)
 
     # ------------------------------------------------------------ requests

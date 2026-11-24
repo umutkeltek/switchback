@@ -1982,6 +1982,7 @@ mod tests {
             HostSpec {
                 bandwidth_gbs: Some(400.0),
                 peak_tflops: None,
+                ..HostSpec::default()
             },
         );
         let report = build_report(&inp);
