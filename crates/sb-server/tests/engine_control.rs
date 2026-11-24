@@ -751,6 +751,9 @@ async fn next_load_writes_the_overlay_reloads_presets_and_shows_pending() {
     assert_eq!(m["pending"], json!(false));
     assert_eq!(m["memory"]["min"]["bytes"], json!(1110));
     assert_eq!(m["memory"]["min"]["host_bytes"], json!(6));
+    // The KV part of the GPU bytes, and the card size the measurement saw.
+    assert_eq!(m["memory"]["min"]["context_bytes"], json!(100));
+    assert_eq!(m["memory"]["min"]["total_bytes"], json!(24u64 << 30));
     assert_eq!(lane["pending_apply"], json!(false));
     assert!(lane.get("note").is_none(), "{lane}");
     let view = get_json(format!("{}/v1/models/text/m/settings", s.gw)).await;

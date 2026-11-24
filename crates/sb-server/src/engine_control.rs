@@ -2855,7 +2855,10 @@ fn speculative_view(doc: Option<&ModelSettingsDoc>, row: &Value) -> Value {
 }
 
 /// `memory` of a model row, summed per measurement: bytes on GPU devices
-/// and on the host, and the context it was measured at.
+/// and on the host, and the context it was measured at. `context_bytes` is
+/// the GPU part of `bytes` that grows with the context (the KV cache), and
+/// `total_bytes` the memory of the GPU devices the measurement saw (the
+/// cards' size, so a client can tell how much room a setting leaves).
 fn memory_summary(memory: &Value) -> Value {
     if !memory.is_object() {
         return Value::Null;
@@ -2867,6 +2870,8 @@ fn memory_summary(memory: &Value) -> Value {
         };
         let mut device = 0u64;
         let mut host = 0u64;
+        let mut context = 0u64;
+        let mut total = 0u64;
         for row in part["devices"].as_array().into_iter().flatten() {
             let bytes = ["model", "context", "compute"]
                 .iter()
@@ -2876,9 +2881,12 @@ fn memory_summary(memory: &Value) -> Value {
                 host += bytes;
             } else {
                 device += bytes;
+                context += row["context"].as_u64().unwrap_or(0);
+                total += row["total"].as_u64().unwrap_or(0);
             }
         }
-        out[name] = json!({"n_ctx": part["n_ctx"], "bytes": device, "host_bytes": host});
+        out[name] = json!({"n_ctx": part["n_ctx"], "bytes": device, "host_bytes": host,
+                           "context_bytes": context, "total_bytes": total});
     }
     out
 }
