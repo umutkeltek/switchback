@@ -1163,6 +1163,30 @@ impl LocalExecutor {
                 detail: slot_note,
             };
         }
+        // A lane that wakes on request and is not known up (a gateway that
+        // just started has no evidence yet, and its machine may be off):
+        // make it up before the GPU hand-over, so a release command never
+        // runs against a machine that is off. A fresh probe comes first, so
+        // a machine that is up gets no wake.
+        let mut wake_note = None;
+        if cfg.wake_on_request && !self.known_up() {
+            match self.wake_for_request().await {
+                LaneWake::Ready { detail } => wake_note = Some(detail),
+                LaneWake::NotReady {
+                    detail,
+                    retry_after,
+                } => {
+                    return LaneAcquire::NotReady {
+                        detail: format!("could not be made ready ({detail})"),
+                        retry_after,
+                    }
+                }
+            }
+        }
+        let slot_note = match wake_note {
+            Some(woken) => Some(join_notes(slot_note, woken)),
+            None => slot_note,
+        };
         let wait_ms = cfg.group_wait_secs.saturating_mul(1000);
         let queued = QueuedSlot::new(self.clone());
         let taken = self.take_group(wait_ms).await;
@@ -1178,6 +1202,21 @@ impl LocalExecutor {
         };
         drop(queued);
         outcome
+    }
+
+    /// The lane is known up: its lifecycle has it up, or its last probe got
+    /// an answer (an engine started outside Switchback), and nothing says it
+    /// went down since. Waking, powering off or last probed down is not up;
+    /// neither is a lane nobody has looked at yet (a gateway that just
+    /// started). Answers from state already held; never waits.
+    fn known_up(&self) -> bool {
+        let rt = self.lock();
+        match rt.state {
+            LaneState::PoweringOff | LaneState::Waking => false,
+            _ if rt.observed_healthy == Some(false) => false,
+            state if Self::is_ready(state) => true,
+            _ => rt.observed_healthy == Some(true) || rt.answered_up,
+        }
     }
 
     /// Take a place under `max_in_flight` without waiting: only while the
@@ -1347,15 +1386,28 @@ impl LocalExecutor {
                     return Ok((GroupPermit { host, group }, detail));
                 }
                 GroupStep::Release { from, lanes } => {
-                    let giver = from.clone().unwrap_or_else(|| lanes.join(","));
-                    tracing::info!(lane = %giver, taker = %self.name, group = %group, "taking the gpu group: releasing its holder");
-                    let released = host.release(&lanes).await;
+                    // A machine known off holds nothing on its GPU: after
+                    // its next boot no engine has GPU memory, and a release
+                    // command could not reach it anyway (a remote shell to
+                    // an unreachable host fails), so none runs.
+                    let machine_off = host.known_off_with(false);
+                    let released = if machine_off {
+                        tracing::info!(taker = %self.name, group = %group, "taking the gpu group: machine off, nothing to release");
+                        Ok(())
+                    } else {
+                        let giver = from.clone().unwrap_or_else(|| lanes.join(","));
+                        tracing::info!(lane = %giver, taker = %self.name, group = %group, "taking the gpu group: releasing its holder");
+                        host.release(&lanes).await
+                    };
                     claim.claimed = false;
                     host.finish_switch(&group, &self.name, released.is_ok());
                     let waited = self.clock.now_ms().saturating_sub(started);
                     return match released {
                         Ok(()) => {
                             let how = match from {
+                                _ if machine_off => {
+                                    "took it (machine off: nothing to release)".to_string()
+                                }
                                 Some(holder) => format!("took it from lane `{holder}`"),
                                 None if lanes.is_empty() => "took it".to_string(),
                                 None => format!(
@@ -2825,6 +2877,15 @@ impl Host {
     /// whose state the gateway or routing has not seen yet, an engine that
     /// answers with an error status) is probed as before.
     pub(crate) fn known_off(&self) -> bool {
+        self.known_off_with(true)
+    }
+
+    /// [`Self::known_off`], where `count_waiting: false` does not let work
+    /// that only waits (queued for a place, the GPU group or a wake) say
+    /// the machine may be on: the GPU hand-over asks while its own request
+    /// waits. A wake under way still does (the lane is waking, or a wake
+    /// of ours may still land).
+    fn known_off_with(&self, count_waiting: bool) -> bool {
         if self.wake_command().is_none() {
             return false;
         }
@@ -2836,7 +2897,7 @@ impl Host {
             let rt = lane.lock();
             if rt.state != LaneState::Offline
                 || rt.in_flight > 0
-                || rt.waiting > 0
+                || (count_waiting && rt.waiting > 0)
                 || rt.request_wake_running
                 || rt.answered_up
                 || rt.wake_may_still_land(now, boot_timeout_ms)
@@ -4623,6 +4684,9 @@ mod tests {
         /// While off, the health endpoint still answers with an error
         /// status (an engine that answers 503) instead of no answer at all.
         error_status_while_off: bool,
+        /// A release command reaches the machine over a remote shell: while
+        /// the machine is off (`healthy: false`) it fails with exit 255.
+        release_needs_machine: bool,
     }
 
     #[derive(Default, Clone, Copy)]
@@ -4676,6 +4740,9 @@ mod tests {
             }
             let mut sim = self.sim.lock().unwrap();
             if command.contains("release") {
+                if sim.release_needs_machine && !sim.healthy {
+                    return Err("exit 255".to_string());
+                }
                 sim.releases.push(command.to_string());
                 if sim.fail_release {
                     return Err("exit 1".to_string());
@@ -7369,10 +7436,14 @@ local_executors:
             "{job_note:?}"
         );
         let (busy, detail) = ready(request.await.unwrap());
+        // The text lane was never looked at: one fresh probe finds it up
+        // (no wake), then it waits for the group.
         assert_eq!(
             detail,
-            "waited 12 s for gpu group `gpu0`, took it from lane `comfy`"
+            "answered a fresh probe after 0 ms, used without a wake; \
+             waited 12 s for gpu group `gpu0`, took it from lane `comfy`"
         );
+        assert_eq!(host.sim().wake, 0);
         assert_eq!(
             releases(&host),
             [RELEASE_TEXT, RELEASE_COMFY],
@@ -7695,6 +7766,58 @@ local_executors:
             detail.ends_with("took it (holder unknown, released lane `comfy`)"),
             "{detail}"
         );
+    }
+
+    // After a gateway restart nobody is known to hold the GPU and the lane
+    // has no evidence yet. With the machine off, a text request wakes it
+    // first; the hand-over then runs on a machine that is up. Before, the
+    // other lane's release command ran against the machine that was off,
+    // failed (exit 255) and answered not ready without a wake.
+    #[tokio::test]
+    async fn after_a_restart_a_text_request_wakes_an_off_machine_before_the_hand_over() {
+        let host = FakeHost::new(Sim {
+            healthy: false,
+            wake_makes_healthy: true,
+            release_needs_machine: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = shared_activator(&gpu_group_config(), &host, clock.clone());
+        let (_busy, detail) = ready(acquire(&activator, "text").await.unwrap());
+        assert_eq!(host.sim().wake, 1, "one wake");
+        assert_eq!(
+            releases(&host),
+            vec!["ssh gateway release-gpu comfy".to_string()],
+            "one release, on the woken machine"
+        );
+        assert!(detail.contains("woken for this request"), "{detail}");
+        assert!(
+            detail.ends_with("took it (holder unknown, released lane `comfy`)"),
+            "{detail}"
+        );
+    }
+
+    // A machine known off holds nothing on its GPU: the hand-over runs no
+    // release command (it could not reach the machine) and the taker holds
+    // the group.
+    #[tokio::test]
+    async fn a_machine_known_off_runs_no_release_command() {
+        let host = FakeHost::new(Sim {
+            healthy: false,
+            release_needs_machine: true,
+            ..Default::default()
+        });
+        let clock = ManualClock::new();
+        let activator = shared_activator(&gpu_group_config(), &host, clock.clone());
+        activator.observe_all().await;
+        assert!(activator.executor("text").unwrap().machine_known_off());
+        let (_busy, detail) = ready(acquire(&activator, "comfy").await.unwrap());
+        assert!(
+            detail.ends_with("took it (machine off: nothing to release)"),
+            "{detail}"
+        );
+        assert!(releases(&host).is_empty(), "{:?}", releases(&host));
+        assert_eq!(host.sim().wake, 0, "this lane does not wake on request");
     }
 
     // Opt-out: lanes without `exclusive_group` never touch a GPU group and

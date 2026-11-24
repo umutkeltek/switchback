@@ -1169,3 +1169,107 @@ local_executors:
     let _ = std::fs::remove_file(&up);
     let _ = std::fs::remove_file(&released);
 }
+
+/// After a gateway restart while the GPU machine is off, nobody is known to
+/// hold the machine's GPU group. A text request must wake the machine, not
+/// first run the other lane's release command against a machine that is
+/// off (which fails like a remote shell to an unreachable host, exit 255,
+/// and used to answer a 503 every retry, without ever waking it).
+async fn restart_with_gpu_machine_off(
+    observe_first: bool,
+) -> (reqwest::StatusCode, String, usize, usize) {
+    let (url, host) = spawn_powered_host(if observe_first {
+        "gpu-off-seen"
+    } else {
+        "gpu-off"
+    })
+    .await;
+    let released = host.marker.with_extension("released");
+    let marker = host.marker.display();
+    let cfg = format!(
+        r#"
+server:
+  bind: "127.0.0.1:0"
+providers:
+  - id: text
+    type: openai_compatible
+    base_url: "{url}"
+    engine: llama_cpp
+    accounts:
+      - {{ id: a1, auth: {{ kind: none }} }}
+  - id: media
+    type: openai_compatible
+    base_url: "{url}"
+    accounts:
+      - {{ id: a1, auth: {{ kind: none }} }}
+routes:
+  - name: large
+    match: {{ model: "large" }}
+    pin_order: true
+    targets:
+      - "text/qwen3"
+local_executors:
+  - name: text
+    host: gpu-box
+    base_url: "{url}"
+    health_endpoint: "{url}/health"
+    route_health: true
+    wake_on_request: true
+    wake_wait_secs: 10
+    adopt_external_wake: true
+    wake_command: "echo wake >> '{wakes}'; touch '{marker}'"
+    boot_timeout_secs: 10
+    health_poll_interval_ms: 20
+    exclusive_group: gpu0
+    release_command: "test -e '{marker}' || exit 255; echo release-text >> '{released}'"
+    group_wait_secs: 5
+  - name: media
+    host: gpu-box
+    base_url: "{url}"
+    health_endpoint: "{url}/health"
+    exclusive_group: gpu0
+    release_command: "test -e '{marker}' || exit 255; echo release-media >> '{released}'"
+    group_wait_secs: 5
+"#,
+        wakes = host.wakes_log.display(),
+        released = released.display(),
+    );
+    let state = build_state(&cfg);
+    let capacity = state.capacity.clone();
+    let sb = serve(state).await;
+    if observe_first {
+        // A supervisor pass ran before the first request.
+        capacity.observe_all().await;
+    }
+    let response = chat(
+        &sb,
+        json!({"model":"large","messages":[{"role":"user","content":"hi"}]}),
+    )
+    .await;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let releases = lines_in(&released, "release-media");
+    let wakes = host.wakes();
+    let _ = std::fs::remove_file(&host.marker);
+    let _ = std::fs::remove_file(&host.wakes_log);
+    let _ = std::fs::remove_file(&released);
+    (status, body, wakes, releases)
+}
+
+#[tokio::test]
+async fn after_a_restart_with_the_gpu_machine_off_a_text_request_wakes_it() {
+    let (status, body, wakes, releases) = restart_with_gpu_machine_off(false).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("served=lane"), "{body}");
+    assert_eq!(wakes, 1, "one wake");
+    assert!(releases <= 1, "at most one release, on the woken machine");
+}
+
+#[tokio::test]
+async fn after_a_restart_and_a_supervisor_pass_with_the_gpu_machine_off_a_text_request_wakes_it() {
+    let (status, body, wakes, releases) = restart_with_gpu_machine_off(true).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("served=lane"), "{body}");
+    assert_eq!(wakes, 1, "one wake");
+    assert!(releases <= 1, "at most one release, on the woken machine");
+}
