@@ -52,7 +52,8 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  measure the text models: first token, prompt and decode speed
   sb ai status [--json]          lanes and machine power; never wakes anything
   sb ai models [--all] [--json]  what the gateway offers, by job (text, image, video,
-                                 segment, audio); --all also shows internal provider ids
+                                 segment, audio), each text name with the targets that answer
+                                 it now; --all also shows internal provider ids
   sb ai hold DURATION [REASON] [--wake] [--host NAME] [--load MODEL]
                                  keep the machine on for direct work (30m, 2h, 1h30m)
   sb ai release [ID | --all] [--host NAME]
@@ -125,6 +126,19 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  (and puts the old settings back when they fail or stop)
   sb ai unload MODEL             unload a model; refused while it serves a request
   sb ai engines [--json]         what each engine has loaded, with memory and pending settings
+  sb ai roles [--json]           which targets answer each name (default, fast, vision, ...):
+                                 the targets now, from the role store or the config, revision
+  sb ai role NAME [--json]       one name: its targets, the config's route, its lock, history
+  sb ai role set NAME TARGET[,TARGET...] [--check] [--wake] [--pin-order|--no-pin-order]
+                                 answer NAME with these targets, first choice first; live at
+                                 once, kept over config reloads and restarts; --check first
+                                 sends one short request through the first target (never wakes
+                                 a machine without --wake)
+  sb ai role revert NAME REVISION
+                                 put back the targets of an earlier revision (0: the config's
+                                 route answers again)
+  sb ai role lock NAME [--reason TEXT]
+  sb ai role unlock NAME         no set or revert changes a locked name until it is unlocked
 
 image and video print the saved file path on stdout; progress goes to stderr.
 They wait up to --timeout SECS (default 900). hold takes --json for the raw answer.
@@ -867,17 +881,39 @@ def cmd_status(gw, args):
     return OK
 
 
+def role_targets_by_name(gw):
+    """{name: row} of the targets answering each name now; {} from a gateway
+    without a role store or a key that may not read it."""
+    try:
+        answer = gw.get("/v1/roles")
+    except GatewayError as error:
+        if error.status in (401, 403, 404):
+            return {}
+        raise gateway_fail(error, "reading the roles") from None
+    return {row.get("name"): row for row in answer.get("data") or [] if row.get("name")}
+
+
 def cmd_models(gw, args):
     cat = catalog(gw, every_id=args.all)
     groups = {name: cat[name] for name in ("text",) + MODEL_GROUPS}
+    roles = role_targets_by_name(gw)
     if args.json:
+        if roles:
+            groups = dict(groups)
+            groups["routes"] = {name: {"targets": row.get("targets") or [], "source": row.get("source")}
+                                for name, row in roles.items()}
         print(json.dumps(groups, indent=2))
         return OK
     for name, ids in groups.items():
         print(f"{name}:")
+        width = max([len(i) for i in ids if i in roles] + [0])
         for model_id in ids:
             note = " (test)" if model_id in cat["test"] else ""
             note += " (speech)" if model_id in cat["speech"] else ""
+            row = roles.get(model_id)
+            if row and row.get("targets"):
+                where = " (role store)" if row.get("source") == "store" else ""
+                note += " " * (width - len(model_id)) + f"  -> {', '.join(row['targets'])}{where}"
             print(f"  {model_id}{note}")
         if not ids:
             print("  (none)")
@@ -2668,6 +2704,201 @@ def cmd_revert(gw, args):
     return OK
 
 
+ROLE_ACTIONS = ("set", "revert", "lock", "unlock")
+
+
+def role_path(name, suffix=""):
+    return "/v1/roles/" + urllib.parse.quote(name, safe="") + suffix
+
+
+def role_source_words(row):
+    """Where a name's targets come from, in words."""
+    source = row.get("source")
+    if source == "store":
+        return f"role store, revision {row.get('revision', 0)}"
+    if source == "config":
+        return "config"
+    return "no route"
+
+
+def role_error(error, doing):
+    """A role write the gateway refused, in words."""
+    if error.status == 409:
+        return Fail(GATEWAY_ERROR, f"the role changed meanwhile ({error.message}); run the command again")
+    if error.status in (400, 404, 422, 423):
+        return Fail(GATEWAY_ERROR, error.message)
+    return gateway_fail(error, doing)
+
+
+def roles_list(gw):
+    try:
+        return gw.get("/v1/roles")
+    except GatewayError as error:
+        if error.status == 404:
+            raise Fail(GATEWAY_ERROR, "this gateway has no role store (update it)") from None
+        raise gateway_fail(error, "reading the roles") from None
+
+
+def cmd_roles(gw, args):
+    answer = roles_list(gw)
+    if args.json:
+        print(json.dumps(answer, indent=2))
+        return OK
+    rows = answer.get("data") or []
+    if not rows:
+        print("no named routes")
+        return OK
+    width = max(len(row.get("name", "")) for row in rows)
+    for row in rows:
+        targets = ", ".join(row.get("targets") or []) or "(none)"
+        line = f"{row.get('name', '').ljust(width)}  {targets}  ({role_source_words(row)})"
+        if row.get("source") == "store" and row.get("config_targets"):
+            line += f"  config: {', '.join(row['config_targets'])}"
+        if row.get("locked"):
+            line += "  locked" + (f": {row['lock_reason']}" if row.get("lock_reason") else "")
+        if row.get("unknown_targets"):
+            line += f"  unknown now: {', '.join(row['unknown_targets'])}"
+        print(line)
+    if "durable" in answer and not answer.get("durable"):
+        print("(the gateway has no state store: role changes last until it restarts)")
+    return OK
+
+
+def role_detail(gw, name):
+    """One name's row and history; None when the gateway knows no such name."""
+    try:
+        return gw.get(role_path(name))
+    except GatewayError as error:
+        if error.status == 404 and error.error_type == "role_not_found":
+            return None
+        if error.status == 404:
+            raise Fail(GATEWAY_ERROR, "this gateway has no role store (update it)") from None
+        if error.status == 400:
+            raise Fail(USAGE, error.message) from None
+        raise gateway_fail(error, "reading the role") from None
+
+
+def print_role(row):
+    print(f"{row.get('name')}: {', '.join(row.get('targets') or []) or '(no targets)'}")
+    when = ""
+    if row.get("updated_at_ms"):
+        when = time.strftime(" (%Y-%m-%d %H:%M)", time.localtime(row["updated_at_ms"] / 1000))
+    print(f"  from: {role_source_words(row)}{when}")
+    config = row.get("config_targets")
+    print(f"  config route: {', '.join(config) if config else '(none)'}")
+    pin = row.get("pin_order")
+    awake = (row.get("prefer_awake") or {}).get("enabled")
+    if pin is not None:
+        print(f"  first choice first: {'always (pinned order)' if pin else 'unless another target scores better'}"
+              + ("; prefers a machine that is awake for small requests" if awake else ""))
+    if row.get("locked"):
+        print("  locked" + (f": {row['lock_reason']}" if row.get("lock_reason") else ""))
+    if row.get("unknown_targets"):
+        print(f"  unknown now: {', '.join(row['unknown_targets'])} (the gateway knows no such target)")
+    history = row.get("history") or []
+    if history:
+        print("  history:")
+    for change in history[:20]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime((change.get("at_ms") or 0) / 1000))
+        targets = ", ".join(change.get("targets") or []) or "config route"
+        print(f"  {change.get('revision'):>4}  {when}  {change.get('role', '')} {change.get('actor', '')}"
+              f"  {change.get('action', '')}: {targets}" + ("  (locked)" if change.get("locked") else ""))
+
+
+def role_targets(words):
+    targets = []
+    for word in words:
+        targets += [part.strip() for part in word.split(",") if part.strip()]
+    if not targets:
+        raise Fail(USAGE, "name the targets: sb ai role set NAME lane/model[,lane/model...]")
+    for target in targets:
+        if "/" not in target:
+            raise Fail(USAGE, f"{target} is not a target (lane/model, like text/qwen38-35b)")
+    return targets
+
+
+def role_write(gw, method, path, body, revision, doing):
+    try:
+        return gw.call(method, path, body=body, headers={"If-Match": str(revision)}, timeout=300)
+    except GatewayError as error:
+        raise role_error(error, doing) from None
+
+
+def cmd_role(gw, args):
+    words = list(args.words)
+    action = words[0] if words and words[0] in ROLE_ACTIONS and len(words) > 1 else None
+    if action is None:
+        if len(words) != 1:
+            raise Fail(USAGE, "sb ai role NAME, or sb ai role set|revert|lock|unlock NAME ...")
+        row = role_detail(gw, words[0])
+        if row is None:
+            raise Fail(GATEWAY_ERROR, f"no name {words[0]}: the config routes no such name and the "
+                                      "role store has none (sb ai roles lists them)")
+        if args.json:
+            print(json.dumps(row, indent=2))
+        else:
+            print_role(row)
+        return OK
+    name, rest = words[1], words[2:]
+
+    def say(*parts, **kw):
+        if not args.json or kw.get("file") is sys.stderr:
+            print(*parts, **kw)
+
+    row = role_detail(gw, name)
+    revision = (row or {}).get("revision", 0)
+    if action == "set":
+        targets = role_targets(rest)
+        body = {"targets": targets}
+        if args.pin_order is not None:
+            body["pin_order"] = args.pin_order
+        if args.check:
+            body["check"] = True
+        if args.wake:
+            if not args.check:
+                raise Fail(USAGE, "--wake only goes with --check (it lets the check wake a machine)")
+            body["wake"] = True
+        answer = role_write(gw, "PUT", role_path(name), body, revision, "setting the role")
+        check = answer.get("check")
+        if isinstance(check, dict) and check.get("ok"):
+            say(f"check: {check.get('target')} answered in {check.get('ms', 0)} ms")
+        say(f"{name}: revision {answer.get('revision')}: {', '.join(answer.get('targets') or [])} "
+              f"(was {', '.join((row or {}).get('targets') or []) or 'no route'}; "
+              f"undo: sb ai role revert {name} {revision})")
+    elif action == "revert":
+        if len(rest) != 1 or not rest[0].isdigit():
+            raise Fail(USAGE, "sb ai role revert NAME REVISION (0: the config's route)")
+        to = int(rest[0])
+        if row is None:
+            raise Fail(GATEWAY_ERROR, f"no name {name} (sb ai roles lists them)")
+        answer = role_write(gw, "POST", role_path(name, "/revert"), {"to": to}, revision,
+                            "reverting the role")
+        what = "the config's route" if to == 0 else f"the targets of revision {to}"
+        say(f"{name}: revision {answer.get('revision')} ({what}): "
+              f"{', '.join(answer.get('targets') or []) or '(no targets)'}")
+        if answer.get("unknown_targets"):
+            say(f"warning: the gateway knows no {', '.join(answer['unknown_targets'])} now; "
+                  "routing uses the config's route until they exist", file=sys.stderr)
+    elif action == "lock":
+        if rest:
+            raise Fail(USAGE, "sb ai role lock NAME [--reason TEXT]")
+        reason = args.reason
+        if reason is not None and (not reason.strip() or len(reason) > 200 or "\n" in reason):
+            raise Fail(USAGE, "--reason is one line of 1 to 200 characters")
+        body = {"reason": reason} if reason else {}
+        answer = role_write(gw, "POST", role_path(name, "/lock"), body, revision, "locking the role")
+        say(f"{name}: revision {answer.get('revision')}: locked"
+              + (f" ({answer['lock_reason']})" if answer.get("lock_reason") else ""))
+    else:
+        if rest:
+            raise Fail(USAGE, "sb ai role unlock NAME")
+        answer = role_write(gw, "POST", role_path(name, "/unlock"), {}, revision, "unlocking the role")
+        say(f"{name}: revision {answer.get('revision')}: unlocked")
+    if args.json:
+        print(json.dumps(answer, indent=2))
+    return OK
+
+
 def cmd_load(gw, args, poll_secs=None):
     try:
         answer = gw.call("POST", model_path(args.model, "load"), body={"wake": bool(args.wake)},
@@ -2973,6 +3204,15 @@ def parser():
     unload_cmd.add_argument("model")
     unload_cmd.add_argument("--timeout", type=float, default=None)
     sub.add_parser("engines", add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
+    sub.add_parser("roles", add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
+    role = sub.add_parser("role", add_help=False, allow_abbrev=False)
+    role.add_argument("words", nargs="+")
+    role.add_argument("--json", action="store_true")
+    role.add_argument("--check", action="store_true")
+    role.add_argument("--wake", action="store_true")
+    role.add_argument("--reason")
+    role.add_argument("--pin-order", dest="pin_order", action="store_true", default=None)
+    role.add_argument("--no-pin-order", dest="pin_order", action="store_false")
     chat = sub.add_parser("chat", add_help=False, allow_abbrev=False)
     chat.add_argument("model")
     chat.add_argument("prompt")
@@ -3053,6 +3293,10 @@ def main(argv=None, environ=None):
             return cmd_unload(gw, args)
         if args.command == "engines":
             return cmd_engines(gw, args)
+        if args.command == "roles":
+            return cmd_roles(gw, args)
+        if args.command == "role":
+            return cmd_role(gw, args)
         if args.command == "fit" and args.target and not args.store:
             return cmd_fit_target(gw, args, environ)
         if args.command == "fit":

@@ -671,6 +671,132 @@ class SbAi(unittest.TestCase):
         run = self.sb("models")
         self.assertIn("audio:\n  transcribe\n  speak (speech)\n", run.stdout)
 
+    # ------------------------------------------------------------ roles
+
+    def role_gateway(self, locked=None):
+        """A gateway with a role store: `fast` routed by the config, writes
+        kept in `self.role_rows` and checked for the revision they edited."""
+        rows = {"fast": {"name": "fast", "targets": ["text/a", "mac/b"], "source": "config",
+                         "revision": 0, "config_targets": ["text/a", "mac/b"], "pin_order": True,
+                         "prefer_awake": {"enabled": True}, "locked": False, "lock_reason": None,
+                         "unknown_targets": [], "durable": True, "history": []}}
+        if locked:
+            rows["fast"].update(locked=True, lock_reason=locked)
+        self.role_rows = rows
+
+        def listing(request):
+            return Fake.json({"object": "list", "durable": True,
+                              "data": [dict(r, history=None) for r in rows.values()]})
+
+        def detail(request):
+            return Fake.json(rows["fast"])
+
+        def edited(request):
+            return int(request["headers"].get("If-Match", "-1")) == rows["fast"]["revision"]
+
+        def put(request):
+            if rows["fast"]["locked"]:
+                return Fake.json({"error": {"message": "role `fast` is locked (night job): unlock it "
+                                            "first with `sb ai role unlock fast` (nothing was written)",
+                                            "type": "locked"}}, 423)
+            if not edited(request):
+                return Fake.json({"error": {"message": "stale", "type": "revision_conflict"}}, 409)
+            row = rows["fast"]
+            row.update(targets=request["json"]["targets"], source="store", revision=row["revision"] + 1)
+            answer = dict(row)
+            if request["json"].get("check"):
+                answer["check"] = {"target": row["targets"][0], "ok": True, "ms": 412, "reply": "OK"}
+            return Fake.json(answer)
+
+        def revert(request):
+            if not edited(request):
+                return Fake.json({"error": {"message": "stale", "type": "revision_conflict"}}, 409)
+            row = rows["fast"]
+            row.update(targets=row["config_targets"], source="config", revision=row["revision"] + 1)
+            return Fake.json(row)
+
+        def lock(request):
+            row = rows["fast"]
+            row.update(locked=True, lock_reason=(request["json"] or {}).get("reason"),
+                       revision=row["revision"] + 1)
+            return Fake.json(row)
+
+        self.fake.routes[("GET", "/v1/roles")] = listing
+        self.fake.routes[("GET", "/v1/roles/fast")] = detail
+        self.fake.routes[("PUT", "/v1/roles/fast")] = put
+        self.fake.routes[("POST", "/v1/roles/fast/revert")] = revert
+        self.fake.routes[("POST", "/v1/roles/fast/lock")] = lock
+        self.fake.routes[("GET", "/v1/roles/fa%2Fst")] = lambda r: Fake.json(
+            {"error": {"message": "`fa/st` is not a role name", "type": "invalid_role"}}, 400)
+
+    def test_roles_list_names_targets_and_where_they_come_from(self):
+        self.role_gateway()
+        run = self.sb("roles")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "fast  text/a, mac/b  (config)\n")
+        run = self.sb("role", "fast")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("fast: text/a, mac/b\n  from: config\n  config route: text/a, mac/b\n", run.stdout)
+
+    def test_role_set_writes_the_revision_read_and_says_how_to_undo(self):
+        self.role_gateway()
+        run = self.sb("role", "set", "fast", "mac/b,text/a")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "fast: revision 1: mac/b, text/a (was text/a, mac/b; "
+                                     "undo: sb ai role revert fast 0)\n")
+        put = self.requests("PUT", "/v1/roles/fast")[0]
+        self.assertEqual(put["json"], {"targets": ["mac/b", "text/a"]})
+        self.assertEqual(put["headers"]["If-Match"], "0")
+        # Live at once: the list shows the store's targets.
+        run = self.sb("roles")
+        self.assertEqual(run.stdout, "fast  mac/b, text/a  (role store, revision 1)  config: text/a, mac/b\n")
+        # Undo: revert 0 hands the name back to the config's route.
+        run = self.sb("role", "revert", "fast", "0")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "fast: revision 2 (the config's route): text/a, mac/b\n")
+        self.assertEqual(self.requests("POST", "/v1/roles/fast/revert")[0]["json"], {"to": 0})
+        self.assertEqual(self.requests("POST", "/v1/roles/fast/revert")[0]["headers"]["If-Match"], "1")
+
+    def test_role_set_check_and_wake(self):
+        self.role_gateway()
+        run = self.sb("role", "set", "fast", "mac/b", "--wake")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("--wake only goes with --check", run.stderr)
+        self.assertEqual(self.requests("PUT"), [])
+        run = self.sb("role", "set", "fast", "mac/b", "--check")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(run.stdout.startswith("check: mac/b answered in 412 ms\n"), run.stdout)
+        self.assertEqual(self.requests("PUT")[0]["json"], {"targets": ["mac/b"], "check": True})
+
+    def test_a_locked_role_refuses_with_its_reason_and_writes_nothing(self):
+        self.role_gateway(locked="night job")
+        run = self.sb("role", "set", "fast", "mac/b")
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("role `fast` is locked (night job)", run.stderr)
+        self.assertEqual(self.role_rows["fast"]["targets"], ["text/a", "mac/b"])
+
+    def test_role_usage_errors_send_nothing(self):
+        self.role_gateway()
+        for args in (("role", "set", "fast", "nolane"), ("role", "revert", "fast", "x")):
+            run = self.sb(*args)
+            self.assertEqual(run.returncode, 2, args)
+        self.assertEqual([r for r in self.fake.seen if r["method"] != "GET"], [])
+        run = self.sb("role", "fa/st")
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("not a role name", run.stderr)
+
+    def test_models_show_the_targets_answering_each_name(self):
+        self.role_gateway()
+        self.fake.models.append({"id": "fast"})
+        run = self.sb("models")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("  fast  -> text/a, mac/b\n", run.stdout)
+        self.sb("role", "set", "fast", "mac/b")
+        run = self.sb("models", "--json")
+        self.assertEqual(json.loads(run.stdout)["routes"]["fast"], {"targets": ["mac/b"], "source": "store"})
+        run = self.sb("models")
+        self.assertIn("  fast  -> mac/b (role store)\n", run.stdout)
+
     # ------------------------------------------------------------ audio
 
     def wav(self, name="talk.wav", data=WAV):
