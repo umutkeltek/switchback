@@ -7,4 +7,5 @@ pub(crate) mod hosts;
 pub(crate) mod meta;
 pub(crate) mod model_settings;
 pub(crate) mod openai;
+pub(crate) mod route_roles;
 pub(crate) mod workloads;

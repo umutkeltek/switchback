@@ -1204,6 +1204,25 @@ impl LocalExecutor {
         outcome
     }
 
+    /// For a check that must not wake the machine: `Ok` when the lane is
+    /// known up or its engine answers a fresh health probe now; `Err` says
+    /// why not. Never runs a wake; a machine known off is not probed.
+    pub async fn up_without_wake(&self) -> Result<(), String> {
+        if self.known_up() {
+            return Ok(());
+        }
+        if self.machine_known_off() {
+            return Err(format!("lane `{}`: its machine is off", self.name));
+        }
+        if self.probe_health().await {
+            return Ok(());
+        }
+        Err(format!(
+            "lane `{}`: its engine did not answer a health probe (asleep or down)",
+            self.name
+        ))
+    }
+
     /// The lane is known up: its lifecycle has it up, or its last probe got
     /// an answer (an engine started outside Switchback), and nothing says it
     /// went down since. Waking, powering off or last probed down is not up;

@@ -135,7 +135,9 @@ pub(crate) fn resolve_for(
     name: &str,
 ) -> Result<Vec<NamedTarget>, Response> {
     let snap = state.snapshot();
-    let scoped = crate::controlplane::scoped_config_for_principal(&snap.config, principal);
+    // A name's targets as routing sees them: store roles over the config.
+    let effective = state.engine.route_roles().effective_config(&snap.config);
+    let scoped = crate::controlplane::scoped_config_for_principal(&effective, principal);
     targets_for_name(&scoped, name).ok_or_else(|| {
         error(
             StatusCode::NOT_FOUND,

@@ -4806,6 +4806,39 @@ pub(crate) fn machines_of(config: &Config) -> Vec<Value> {
         .collect()
 }
 
+/// The model ids a lane's engine lists, without waking its machine: a
+/// fresh listing (3 s) while the lane is up, else the last listing the
+/// gateway kept. `None` when the lane has no engine control or its engine
+/// was never listed.
+pub(crate) async fn engine_model_ids(app: &AppState, lane: &str) -> Option<Vec<String>> {
+    let state = EngineCtx::from(app);
+    let snap = state.snapshot();
+    let lane = engine_lane(&snap.config, lane)?;
+    let cached = || {
+        state
+            .engines
+            .cached_models(&lane.name)
+            .map(|(_, models)| models)
+    };
+    let models = match state.engines.awake(&state, &lane).await {
+        Awake::Up => match state
+            .engines
+            .models_within(&state, &lane, Duration::from_secs(3))
+            .await
+        {
+            Ok(models) => Some(models),
+            Err(_) => cached(),
+        },
+        Awake::Asleep(_) => cached(),
+    }?;
+    Some(
+        models
+            .iter()
+            .filter_map(|row| row["id"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
 /// After a hold's wake: load the model the hold named (operator keys).
 pub(crate) fn preload_after_hold(app: &AppState, target: String, wake: bool) {
     let state = EngineCtx::from(app);

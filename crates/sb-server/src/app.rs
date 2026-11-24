@@ -21,6 +21,15 @@ pub fn build_app(state: AppState) -> Router {
                 .patch(handlers::model_settings::patch)
                 .post(handlers::model_settings::post),
         )
+        .route("/v1/roles", get(handlers::route_roles::list))
+        .route(
+            "/v1/roles/{name}",
+            get(handlers::route_roles::get).put(handlers::route_roles::put),
+        )
+        .route(
+            "/v1/roles/{name}/{action}",
+            post(handlers::route_roles::post),
+        )
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .route(
             "/v1/audio/transcriptions",

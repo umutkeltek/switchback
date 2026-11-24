@@ -40,6 +40,24 @@ fn model_control_write(method: &Method, path: &str) -> bool {
             && (named("/settings/revert") || named("/load") || named("/unload")))
 }
 
+/// Route role writes: `PUT /v1/roles/{name}`, `POST
+/// /v1/roles/{name}/{revert,lock,unlock}`. Operator and admin keys only.
+fn role_write(method: &Method, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/v1/roles/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts.as_slice() {
+        [name] => method == Method::PUT && !name.is_empty(),
+        [name, action] => {
+            method == Method::POST
+                && !name.is_empty()
+                && matches!(*action, "revert" | "lock" | "unlock")
+        }
+        _ => false,
+    }
+}
+
 /// `/v1/hosts/{host}/power` — a machine's power is the operator's
 /// business: operator and admin keys only, never a client key.
 fn power_path(path: &str) -> bool {
@@ -64,6 +82,7 @@ fn client_surface(method: &Method, path: &str) -> bool {
     }
     (method == Method::GET
         && (path == "/v1/models"
+            || path == "/v1/roles"
             || model_settings_path(path)
             || path == "/v1/workloads/capacity"
             || path == "/v1/targets/stats"
@@ -96,7 +115,7 @@ fn operator_surface(method: &Method, path: &str) -> bool {
     if method == Method::GET && (path.starts_with("/v1/") || path.starts_with("/cp/v1")) {
         return true;
     }
-    if model_control_write(method, path) {
+    if model_control_write(method, path) || role_write(method, path) {
         return true;
     }
     // `sb ai tune` / `sb ai eval`: tuning locks, the experiment ledger and

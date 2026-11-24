@@ -1931,7 +1931,9 @@ pub(crate) async fn models(
     Extension(principal): Extension<Principal>,
 ) -> Json<serde_json::Value> {
     let snap = state.snapshot();
-    let scoped = crate::controlplane::scoped_config_for_principal(&snap.config, &principal);
+    // The names and targets routing answers to: store roles over the config.
+    let effective = state.engine.route_roles().effective_config(&snap.config);
+    let scoped = crate::controlplane::scoped_config_for_principal(&effective, &principal);
     let ids = model_ids_for_config(&scoped);
 
     let data: Vec<serde_json::Value> = ids
