@@ -499,16 +499,20 @@ def gateway_machines_of(engines):
 def margin_verdict(numbers, min_free):
     """Pass when the card keeps at least `min_free` bytes free."""
     free = numbers["free_bytes"]
-    parts = (f"card {gb(numbers['card_bytes'])} ({numbers['card_from']}) - model "
+    # Unified memory is shared with every program, not a card.
+    card = "memory" if "unified" in str(numbers.get("card_from") or "") else "card"
+    users = "other programs" if card == "memory" else "other users of the card"
+    parts = (f"{card} {gb(numbers['card_bytes'])} ({numbers['card_from']}) - model "
              f"{gb(numbers['model_bytes'])} ({numbers['model_from']})")
     if numbers.get("loaded_bytes"):
         parts += f" - other loaded models {gb(numbers['loaded_bytes'])}"
     if numbers.get("others_bytes"):
-        parts += f" - other users of the card {gb(numbers['others_bytes'])} ({numbers['others_from']})"
+        parts += f" - {users} {gb(numbers['others_bytes'])} ({numbers['others_from']})"
     parts += f" = {gb(free)} free"
     if free < min_free:
         return {"check": "margin", "passed": False, "result": "margin_short",
-                "why": f"{parts}, under the {gb(min_free)} the card must keep free", "margin": numbers}
+                "why": f"{parts}, under the {gb(min_free)} the {'machine' if card == 'memory' else 'card'} "
+                       "must keep free", "margin": numbers}
     return {"check": "margin", "passed": True, "result": "ok",
             "why": f"{parts} (at least {gb(min_free)})", "margin": numbers}
 
