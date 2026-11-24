@@ -52,6 +52,12 @@ jobs:
         run: python3 -B cli/tests/sb_ai.py
       - name: sb ai fit against a fake model index
         run: python3 -B cli/tests/sb_ai_fit.py
+      - name: sb ai check, set and load checks against a fake engine
+        run: python3 -B cli/tests/sb_ai_check.py
+      - name: sb ai eval against a fake gateway
+        run: python3 -B cli/tests/sb_ai_eval.py
+      - name: sb ai tune against a fake engine
+        run: python3 -B cli/tests/sb_ai_optimize.py
 
       - name: Native account and usage integration
         run: |
