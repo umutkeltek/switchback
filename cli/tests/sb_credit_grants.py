@@ -527,5 +527,52 @@ class ReviewFixTests(unittest.TestCase):
             self.assertNotIn("billing_error", rows[0])
 
 
+class LastGoodReadingTests(unittest.TestCase):
+    """One failed billing read must not throw the last good reading away."""
+
+    def view(self, fixture, fetch, now):
+        rows, problem = credit.view(fixture.runtime, now, fixture.registry, {"FIXTURE_USAGE_KEY": SECRET}, fetch)
+        assert problem is None and len(rows) == 1, (problem, rows)
+        return rows[0]
+
+    def test_a_failed_read_keeps_the_last_good_reading_for_an_hour(self):
+        def down(g, token):
+            raise credit.GrantError("billing_timeout")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,), rows=[("openai", "fixture-mini", 2_000_000, 0, 0, READING_MS + 1)])
+            self.assertEqual(self.view(fixture, lambda g, token: 30.0, NOW)["balances"][0]["balance"], 70.0)
+            late = self.view(fixture, down, NOW + 700)          # the ten-minute cache has run out, the read fails
+            self.assertEqual((late["estimated"], late["billing_error"]), (False, "billing_timeout"))
+            self.assertEqual((late["balances"][0]["balance"], late["balances"][0]["billingReadAt"]), (70.0, usage.iso(NOW)))
+            self.assertTrue(any("could not be read just now" in n and usage.iso(NOW) in n for n in late["notes"]))
+            calls = []
+            again = self.view(fixture, lambda g, token: calls.append(1) or 99.0, NOW + 760)   # inside the two-minute retry gap
+            self.assertEqual((calls, again["balances"][0]["balance"], again["billing_error"]), ([], 70.0, "billing_timeout"))
+            fixed = self.view(fixture, lambda g, token: 41.0, NOW + 900)
+            self.assertEqual(fixed["balances"][0]["balance"], 59.0)
+            self.assertNotIn("billing_error", fixed)
+
+    def test_an_old_reading_is_not_kept(self):
+        def down(g, token):
+            raise credit.GrantError("billing_timeout")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,), rows=[("openai", "fixture-mini", 2_000_000, 0, 0, READING_MS + 1)])
+            self.view(fixture, lambda g, token: 30.0, NOW)
+            self.view(fixture, down, NOW + 700)                  # failure, last good reading still young
+            old = self.view(fixture, down, NOW + 3700)           # more than an hour after the good reading
+            self.assertEqual((old["estimated"], old["billing_error"]), (True, "billing_timeout"))
+            self.assertAlmostEqual(old["balances"][0]["balance"], 88.0)   # the gateway estimate, said to be one
+            self.assertNotIn("billedSinceGrant", old["balances"][0])
+
+    def test_a_cache_entry_written_before_this_change_is_still_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,))
+            key = "openai-api--credit-grant@%d" % at("2026-01-01T00:00:00Z")
+            (fixture.runtime / "state/credit-grant-billing.json").write_text(json.dumps({key: {"billed_usd": 12.0, "read_at": NOW - 60}}))
+            def never(g, token):
+                raise AssertionError("a fresh cached reading needs no call")
+            self.assertEqual(self.view(fixture, never, NOW)["balances"][0]["billedSinceGrant"], 12.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,7 @@ BILLING = {"openai": ("api.openai.com", "/v1/organization/costs")}
 ROW_PROVIDER = {"openai": "openai-api"}
 BILLING_BASIS = "the provider's own billing since the grant date; it can lag by some minutes"
 BILLING_TTL, BILLING_RETRY, BILLING_KEEP = 600, 120, 90 * 86400
+BILLING_LAST_GOOD = 3600  # a failed read falls back on the last good reading for this long
 UNKNOWN = {"usage_store_unavailable": "the gateway usage store could not be read",
            "price_registry_unavailable": "the price registry could not be read"}
 USAGE = ("usage: sb credits [--json] | sb credits observe PROVIDER --balance USD --expires DATE"
@@ -235,10 +236,12 @@ def billed_fetch(g, token, timeout=6):
 
 
 def billed(g, slot, runtime, now, environment=None, fetch=billed_fetch):
-    """None without a usage-read key; else (USD billed, read epoch) or a fixed failure code.
+    """None without a usage-read key; else (USD billed, read epoch[, failure code]) or a fixed failure code.
 
     Successes are cached ten minutes and failures two, so `sb limits` stays quick
-    and an offline machine does not wait on every call. The cache holds no secret.
+    and an offline machine does not wait on every call. One failed read does not
+    throw the bill away: for an hour the last good reading is returned with the
+    failure code as a third value. The cache holds no secret.
     """
     environment = os.environ if environment is None else environment
     token = environment.get(g["usage_ref"]) if g["usage_ref"] else None
@@ -253,17 +256,21 @@ def billed(g, slot, runtime, now, environment=None, fetch=billed_fetch):
         cache = {}
     cache = {k: v for k, v in cache.items() if isinstance(v, dict) and money(v.get("read_at")) is not None
              and 0 <= now - v["read_at"] < BILLING_KEEP} if isinstance(cache, dict) else {}
-    entry = cache.get(key)
-    if entry and isinstance(entry.get("error"), str) and now - entry["read_at"] < BILLING_RETRY:
-        return entry["error"][:64]
-    if entry and money(entry.get("billed_usd")) is not None and now - entry["read_at"] < BILLING_TTL:
-        return float(entry["billed_usd"]), float(entry["read_at"])
+    entry = cache.get(key) or {}
+    failed = entry.get("error") if isinstance(entry.get("error"), str) else None
+    good_at = money(entry.get("good_at", None if failed else entry.get("read_at")))
+    last = (float(entry["billed_usd"]), good_at) if (
+        money(entry.get("billed_usd")) is not None and good_at is not None and 0 <= now - good_at < BILLING_LAST_GOOD) else None
+    if failed and now - entry["read_at"] < BILLING_RETRY:
+        return (*last, failed[:64]) if last else failed[:64]
+    if last and not failed and now - last[1] < BILLING_TTL:
+        return last
     try:
         outcome = (fetch(g, token), now)
-        cache[key] = {"billed_usd": outcome[0], "read_at": now}
+        cache[key] = {"billed_usd": outcome[0], "good_at": now, "read_at": now}
     except GrantError as failure:
-        outcome = str(failure)
-        cache[key] = {"error": outcome, "read_at": now}
+        cache[key] = {"error": str(failure), "read_at": now, **({"billed_usd": last[0], "good_at": last[1]} if last else {})}
+        outcome = (*last, str(failure)) if last else str(failure)
     try:
         fd, name = tempfile.mkstemp(prefix=".credit-grant-billing-", dir=path.parent)
         try:
@@ -325,6 +332,9 @@ def row(g, ordinal, now, store, registry, billing=None):
                      f"Spending is {state.replace('_', ' ')}{'' if state == 'on_pace' else ' pace'}."]
             if isinstance(billing, str):
                 notes.append(f"The provider's billing could not be read ({billing}); this is the gateway estimate.")
+            elif exact and len(billing) > 2:
+                notes.append(f"The provider's billing could not be read just now ({billing[2]}); "
+                             f"this is its reading of {iso(billing[1])}.")
             if unpriced and not exact:
                 notes.append(f"{unpriced} request{' had' if unpriced == 1 else 's had'} no known price and "
                              f"{'is' if unpriced == 1 else 'are'} not in the estimate.")
@@ -357,8 +367,8 @@ def row(g, ordinal, now, store, registry, billing=None):
         result["renews"] = g["renews"]
     if error:
         result["refresh_error"] = error
-    if isinstance(billing, str):
-        result["billing_error"] = billing
+    if isinstance(billing, str) or (exact and len(billing) > 2):
+        result["billing_error"] = billing if isinstance(billing, str) else billing[2]
     return result
 
 
