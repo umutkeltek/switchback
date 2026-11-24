@@ -685,7 +685,10 @@ async fn commit_write(
     if let Some(message) = crate::engine_control::store_lock_refusal(
         &state.snapshot().config,
         &named.target,
-        registry.get(&named.target).map(|entry| entry.doc).as_deref(),
+        registry
+            .get(&named.target)
+            .map(|entry| entry.doc)
+            .as_deref(),
         &doc,
     ) {
         let mut body = json!({"error": {"message": message, "type": "locked"}});

@@ -3150,10 +3150,7 @@ fn command_runs(log: &Path) -> usize {
 async fn a_store_locked_load_key_is_refused_at_write_time_and_nothing_runs() {
     let log = temp("command-log");
     let (s, _) = setup_with(Opts {
-        command_template: Some(&format!(
-            "cat > {{overlay}}; echo run >> {}",
-            quoted(&log)
-        )),
+        command_template: Some(&format!("cat > {{overlay}}; echo run >> {}", quoted(&log))),
         ..Opts::default()
     })
     .await;
@@ -3192,7 +3189,10 @@ async fn a_store_locked_load_key_is_refused_at_write_time_and_nothing_runs() {
         assert_eq!(answer["error"]["type"], json!("locked"), "{answer}");
         let message = answer["error"]["message"].as_str().unwrap_or_default();
         assert!(message.contains("night job uses this"), "{message}");
-        assert!(message.contains("sb ai unlock text/m ctx_size"), "{message}");
+        assert!(
+            message.contains("sb ai unlock text/m ctx_size"),
+            "{message}"
+        );
         assert_eq!(answer["error"]["current_revision"], json!(1), "{answer}");
     }
     // A revert that would change the locked key is refused the same way.
@@ -3273,7 +3273,10 @@ async fn a_request_cannot_change_a_store_locked_key_through_a_variant() {
     let (status, body, _) = chat_with_load(&s, None, json!({"ctx_size": 65536})).await;
     assert_eq!(status, 400, "{body}");
     let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("is locked (night job uses this)"), "{body}");
+    assert!(
+        message.contains("is locked (night job uses this)"),
+        "{body}"
+    );
     assert_eq!(reloads(&s.stub), reloads_before);
 }
 
@@ -3295,8 +3298,15 @@ async fn settings_show_the_machine_files_keys_pins_and_store_locks() {
         quoted(&base),
         quoted(&out)
     );
-    let show = format!("python3 -I {} --base {} --show", quoted(&script), quoted(&base));
-    let extra = format!("      machine_file_command: \"{}\"", show.replace('"', "\\\""));
+    let show = format!(
+        "python3 -I {} --base {} --show",
+        quoted(&script),
+        quoted(&base)
+    );
+    let extra = format!(
+        "      machine_file_command: \"{}\"",
+        show.replace('"', "\\\"")
+    );
     let s = setup(true, &extra, Some(command)).await;
     let (status, view) = put(
         &s.gw,
@@ -3339,7 +3349,9 @@ async fn settings_show_the_machine_files_keys_pins_and_store_locks() {
         "{load}"
     );
     // The machine file is never written by a read.
-    assert!(std::fs::read_to_string(&base).unwrap().contains("ctx-size = 4096"));
+    assert!(std::fs::read_to_string(&base)
+        .unwrap()
+        .contains("ctx-size = 4096"));
 }
 
 #[tokio::test]
@@ -3350,7 +3362,10 @@ async fn a_failed_machine_file_reading_is_shown_not_hidden() {
     let file = &view["targets"][0]["load"]["machine_file"];
     assert_eq!(file["read"], json!(false), "{file}");
     assert!(
-        file["error"].as_str().unwrap_or_default().contains("not JSON"),
+        file["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not JSON"),
         "{file}"
     );
 }

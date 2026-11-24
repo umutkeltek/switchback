@@ -1416,11 +1416,17 @@ mod tests {
                 ("engine_args.model", None)
             ]
         );
-        assert_eq!(doc.lock_reason("load.ctx_size"), Some("night job uses this"));
+        assert_eq!(
+            doc.lock_reason("load.ctx_size"),
+            Some("night job uses this")
+        );
         // Why a key is locked changes no answer.
         let mut other = doc.clone();
         other.lock_reasons.clear();
-        assert_eq!(answer_settings_hash(Some(&doc)), answer_settings_hash(Some(&other)));
+        assert_eq!(
+            answer_settings_hash(Some(&doc)),
+            answer_settings_hash(Some(&other))
+        );
     }
 
     #[test]

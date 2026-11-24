@@ -96,10 +96,7 @@ impl OptimizeConfig {
                     ));
                 }
             }
-            for (name, value) in [
-                ("vram_gb", spec.vram_gb),
-                ("usable_gb", spec.usable_gb),
-            ] {
+            for (name, value) in [("vram_gb", spec.vram_gb), ("usable_gb", spec.usable_gb)] {
                 if value.is_some_and(|v| !(v.is_finite() && v > 0.0 && v <= 100_000.0)) {
                     return Err(format!(
                         "server.optimize.hosts.{host}.{name} must be a positive number of GB"

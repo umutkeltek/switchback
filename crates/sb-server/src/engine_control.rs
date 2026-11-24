@@ -1486,9 +1486,8 @@ fn power_managed(state: &EngineCtx, lane: &EngineLane) -> bool {
     let Some(own) = lanes.iter().find(|l| l.name == lane.name) else {
         return true;
     };
-    let managed = |l: &sb_core::LocalExecutorConfig| {
-        l.wake_command.is_some() || l.poweroff_command.is_some()
-    };
+    let managed =
+        |l: &sb_core::LocalExecutorConfig| l.wake_command.is_some() || l.poweroff_command.is_some();
     match own.host.as_deref() {
         Some(host) => lanes
             .iter()
@@ -3924,9 +3923,7 @@ pub(crate) fn store_lock_refusal(
     for (path, reason) in locks {
         let raw_changed = match path.split_once('.') {
             Some(("load", key)) => before.load.get(key) != after.load.get(key),
-            Some(("engine_args", key)) => {
-                before.engine_args.get(key) != after.engine_args.get(key)
-            }
+            Some(("engine_args", key)) => before.engine_args.get(key) != after.engine_args.get(key),
             _ => false,
         };
         let engine_changed =
@@ -3934,10 +3931,7 @@ pub(crate) fn store_lock_refusal(
         if !(raw_changed || engine_changed) {
             continue;
         }
-        let key = path
-            .strip_prefix("load.")
-            .unwrap_or(path)
-            .to_string();
+        let key = path.strip_prefix("load.").unwrap_or(path).to_string();
         return Some(format!(
             "`{path}` of `{target}` is locked{}: unlock it first with `sb ai unlock {target} \
              {key}` (nothing was written)",
@@ -3948,7 +3942,6 @@ pub(crate) fn store_lock_refusal(
     }
     None
 }
-
 
 /// Engine checks of a settings document before it is written: load
 /// settings need an engine control with a `settings_command`; raw
@@ -5573,7 +5566,10 @@ local_executors:
         assert_eq!(lock_name("temperature"), "temp");
         assert_eq!(lock_name("model-draft"), "spec-draft-model");
         let ops: &dyn EngineKindOps = &LlamaCppRouter;
-        assert_eq!(lock_target(ops, "load.ctx_size").as_deref(), Some("ctx-size"));
+        assert_eq!(
+            lock_target(ops, "load.ctx_size").as_deref(),
+            Some("ctx-size")
+        );
         assert_eq!(
             lock_target(ops, "load.n_gpu_layers").as_deref(),
             Some("n-gpu-layers")
@@ -5599,14 +5595,15 @@ local_executors:
         let locked = doc_of(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
             "locked": ["load.ctx_size", "engine_args.n-gpu-layers"],
             "lock_reasons": {"load.ctx_size": "night job uses this"}}));
-        let refused = |after: Value| {
-            store_lock_refusal(&config, "text/m", Some(&locked), &doc_of(after))
-        };
+        let refused =
+            |after: Value| store_lock_refusal(&config, "text/m", Some(&locked), &doc_of(after));
         // Unchanged keys pass, and so does another key.
         assert_eq!(
-            refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99, "batch_size": 512},
+            refused(
+                json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99, "batch_size": 512},
                 "locked": ["load.ctx_size", "engine_args.n-gpu-layers"],
-                "lock_reasons": {"load.ctx_size": "night job uses this"}})),
+                "lock_reasons": {"load.ctx_size": "night job uses this"}})
+            ),
             None
         );
         // An unlock that leaves the value passes (a write of its own).
@@ -5614,24 +5611,32 @@ local_executors:
             refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99}})),
             None
         );
-        let message =
-            refused(json!({"load": {"ctx_size": 65536, "n_gpu_layers": 99}})).unwrap();
+        let message = refused(json!({"load": {"ctx_size": 65536, "n_gpu_layers": 99}})).unwrap();
         assert!(message.contains("`load.ctx_size` of `text/m` is locked (night job uses this)"));
         assert!(message.contains("sb ai unlock text/m ctx_size"));
         // The raw spelling of the same argument.
-        assert!(refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
+        assert!(
+            refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
             "engine_args": {"ctx-size": 8192}}))
-        .is_some());
+            .is_some()
+        );
         // A load key that writes the raw-locked argument.
         assert!(refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 20}})).is_some());
-        assert!(refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
+        assert!(
+            refused(json!({"load": {"ctx_size": 32768, "n_gpu_layers": 99},
             "engine_args": {"gpu-layers": 20}}))
-        .is_some());
+            .is_some()
+        );
         // Unset is a change.
         assert!(refused(json!({"load": {"n_gpu_layers": 99}})).is_some());
         // No document before: nothing binds yet.
         assert_eq!(
-            store_lock_refusal(&config, "text/m", None, &doc_of(json!({"load": {"ctx_size": 1}}))),
+            store_lock_refusal(
+                &config,
+                "text/m",
+                None,
+                &doc_of(json!({"load": {"ctx_size": 1}}))
+            ),
             None
         );
     }
@@ -5639,7 +5644,9 @@ local_executors:
     #[test]
     fn the_machine_file_answer_is_checked_and_viewed_with_its_pins() {
         assert!(parse_machine_file("not json").is_err());
-        assert!(parse_machine_file(r#"{"models": {"m": {"keys": {"a": 1}, "pinned": []}}}"#).is_err());
+        assert!(
+            parse_machine_file(r#"{"models": {"m": {"keys": {"a": 1}, "pinned": []}}}"#).is_err()
+        );
         assert!(parse_machine_file(r#"{"models": []}"#).is_err());
         let answer = parse_machine_file(
             r#"{"global": {"keys": {"jinja": "true"}, "pinned": ["n-gpu-layers"]},
