@@ -7302,11 +7302,13 @@ PY_MENUBAR_STATUS
       for usage_env in ZAI_API_KEY Z_AI_API_KEY MINIMAX_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY NEURALWATT_API_KEY SB_ZAI_USAGE_REGION SB_MINIMAX_USAGE_REGION; do
         [[ -n "${parameters[$usage_env]-}" ]] && export "$usage_env"
       done
+      export SB_PROVIDER_REGISTRY  # credit grant rows price gateway spend from it
     fi
     [[ "$cmd" == limits ]] && set -- usage "$@"
     exec python3 -B "${0:A:h}/native-accounts.py" "$@" ;;
   costs)          sb_costs "$@" ;;
-  ai)             exec python3 -B "${SB_CLI_PATH:h}/ai_gateway.py" "$@" ;;
+  credits)        export SB_PROVIDER_REGISTRY; exec python3 -B "${0:A:h}/credit_grants.py" "$@" ;;
+  ai)           exec python3 -B "${SB_CLI_PATH:h}/ai_gateway.py" "$@" ;;
   menu|ui|tui|"") sb_menu ;;
   status)         sb_status ;;
   pulse)          sb_pulse "$@" ;;
@@ -7562,6 +7564,8 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
                              --refresh-if-due uses Rust timing, backoff and a shared refresh lock
   sb costs [on|off|status] | sb costs [--json]
                              estimated token cost per Claude/Codex account from local logs (off by default)
+  sb credits [--json] | sb credits observe PROVIDER --balance USD --expires DATE [--received DATE] [--amount USD] [--reserve USD]
+                             prepaid credit grants: estimated balance, expiry and daily pace (also in sb limits)
   sb ai image|video|status|models|hold|release
                              images, video and machine status through a Switchback gateway (sb ai help)
   sb profile pools capacity POOL --json
