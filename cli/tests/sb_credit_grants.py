@@ -109,7 +109,7 @@ class CreditGrantTests(unittest.TestCase):
             self.assertEqual((balance["observedBalance"], balance["observedAt"]), (90.0, READING))
             self.assertIn("2026-01-31", balance["period"])
             self.assertEqual((row["provider"], row["source"], row["state"], row["estimated"]),
-                             ("openai", "credit-grant/openai", "fresh", True))
+                             ("openai-api", "credit-grant/openai", "fresh", True))
 
     def test_created_at_is_milliseconds_not_seconds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,7 +163,9 @@ class CreditGrantTests(unittest.TestCase):
             self.assertAlmostEqual(pace["days_left"], 20.0, places=3)
             self.assertAlmostEqual(pace["used_fraction"], 0.11, places=6)
             self.assertAlmostEqual(pace["elapsed_fraction"], 1 / 3, places=6)
-            w = row["windows"][0]
+            self.assertEqual(row["windows"], [])  # a quota window would make the menu bar draw "no reading"
+            w = row["grant_window"]
+            self.assertEqual(row["pace"]["expires_at"], "2026-01-31T00:00:00Z")
             self.assertEqual((w["name"], w["state"], w["resets_at"], w["estimated"]),
                              ("credit_grant", "fresh", "2026-01-31T00:00:00Z", True))
             self.assertAlmostEqual(w["used_percent"], 11.0, places=6)
@@ -193,13 +195,13 @@ class CreditGrantTests(unittest.TestCase):
                 filtered = self.limits_json(fixture.runtime, ["--provider", "deepseek"])
             self.assertEqual(result["accounts"][:2], SNAPSHOT["accounts"])
             self.assertEqual(result["coverage"], SNAPSHOT["coverage"])
-            self.assertEqual([r["slot"] for r in result["accounts"][2:]], ["openai--credit-grant"])
+            self.assertEqual([r["slot"] for r in result["accounts"][2:]], ["openai-api--credit-grant"])
             self.assertEqual(filtered, SNAPSHOT)
             text = io.StringIO()
             with redirect_stdout(text):
                 usage.render(result)
             self.assertIn("Estimated $", text.getvalue())
-            self.assertIn("credit_grant", text.getvalue())
+            self.assertIn("expires 2026-01-31", text.getvalue())  # the note carries the expiry; the row has no quota window
 
     def test_missing_or_unreadable_store_is_unknown_not_unspent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,7 +215,7 @@ class CreditGrantTests(unittest.TestCase):
                 self.assertEqual((row["state"], row["refresh_error"]), ("unknown", "usage_store_unavailable"), name)
                 self.assertIsNone(balance["balance"], name)
                 self.assertIsNone(balance["spentSinceObserved"], name)
-                self.assertIsNone(row["windows"][0]["used_percent"], name)
+                self.assertIsNone(row["grant_window"]["used_percent"], name)
                 self.assertEqual((row["pace"]["state"], row["pace"]["allowed_per_day_usd"]), ("unknown", None), name)
                 self.assertTrue(row["notes"][0].startswith("Balance unknown"), name)
                 self.assertIn("not known", row["notes"][0], name)
@@ -257,7 +259,7 @@ class CreditGrantTests(unittest.TestCase):
                 self.assertEqual(row["pace"]["state"], "expired")
                 self.assertEqual(row["pace"]["allowed_per_day_usd"], 0)
                 self.assertEqual(row["balances"][0]["balance"], 0)
-                self.assertEqual(row["windows"][0]["remaining_percent"], 0)
+                self.assertEqual(row["grant_window"]["remaining_percent"], 0)
                 self.assertIn("expired on 2026-01-31", row["notes"][0])
             (fixture.runtime / "state/scout.sqlite").unlink()
             self.assertEqual(fixture.one(at("2026-02-01T00:00:00Z"))["balances"][0]["balance"], 0)
@@ -318,6 +320,135 @@ class CreditGrantTests(unittest.TestCase):
              patch.dict(os.environ, env), redirect_stdout(out):
             self.assertEqual(native.main(), 0)
         return json.loads(out.getvalue())
+
+
+BILLED = {**GRANT, "usage_credential_ref": "FIXTURE_USAGE_KEY"}
+SECRET = "fixture-usage-key-value"
+
+
+def costs(*values, more=False):
+    return {"object": "page", "has_more": more, "data": [
+        {"object": "bucket", "results": [{"amount": {"value": v, "currency": "usd"}}] if v is not None else []}
+        for v in values]}
+
+
+class BillingReadingTests(unittest.TestCase):
+    """The provider's own billing, when a usage-read key is named, replaces the gateway estimate."""
+
+    def view(self, fixture, fetch, now=NOW, key=SECRET):
+        rows, problem = credit.view(fixture.runtime, now, fixture.registry,
+                                    {"FIXTURE_USAGE_KEY": key} if key is not None else {}, fetch)
+        assert problem is None and len(rows) == 1, (problem, rows)
+        return rows[0]
+
+    def test_billing_replaces_the_estimate_and_counts_from_the_grant_amount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The gateway saw $2 since the reading; the provider billed $37.25 in all (calls outside the gateway).
+            fixture = Fixture(tmp, grants=(BILLED,), rows=[("openai", "fixture-mini", 2_000_000, 0, 0, READING_MS + 1)])
+            seen = []
+            row = self.view(fixture, lambda g, token: seen.append((g["received"], token)) or 37.25)
+            self.assertEqual(seen, [(at("2026-01-01T00:00:00Z"), SECRET)])
+            balance = row["balances"][0]
+            self.assertAlmostEqual(balance["balance"], 62.75)  # 100 - 37.25, not 90 - 2
+            self.assertEqual((row["estimated"], balance["estimated"], row["grant_window"]["estimated"]), (False, False, False))
+            self.assertEqual(balance["billedSinceGrant"], 37.25)
+            self.assertAlmostEqual(balance["spentSinceObserved"], 2.0)  # the estimate stays as detail
+            self.assertAlmostEqual(row["grant_window"]["used_percent"], 37.25)
+            self.assertAlmostEqual(row["pace"]["allowed_per_day_usd"], (62.75 - 10) / 20, places=3)
+            self.assertIn("by the provider's billing", row["notes"][0])
+            self.assertNotIn("Estimated", row["notes"][0])
+
+    def test_no_key_or_no_named_key_makes_no_call_and_stays_an_estimate(self):
+        def never(g, token):
+            raise AssertionError("no usage-read key: the provider must not be called")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,), rows=[("openai", "fixture-mini", 2_000_000, 0, 0, READING_MS + 1)])
+            for key in (None, "", "   "):
+                row = self.view(fixture, never, key=key)
+                self.assertTrue(row["estimated"])
+                self.assertAlmostEqual(row["balances"][0]["balance"], 88.0)
+            self.assertFalse((fixture.runtime / "state/credit-grant-billing.json").exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.view(Fixture(tmp), never)  # the grant names no usage key at all
+            self.assertTrue(row["estimated"])
+
+    def test_failed_billing_read_falls_back_to_the_estimate_and_says_so(self):
+        def refused(g, token):
+            raise credit.GrantError("billing_authentication_required")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,), rows=[("openai", "fixture-mini", 2_000_000, 0, 0, READING_MS + 1)])
+            row = self.view(fixture, refused)
+            self.assertTrue(row["estimated"])
+            self.assertAlmostEqual(row["balances"][0]["balance"], 88.0)
+            self.assertNotIn("billedSinceGrant", row["balances"][0])
+            self.assertTrue(any("billing_authentication_required" in n and "gateway estimate" in n for n in row["notes"]))
+
+    def test_readings_are_cached_ten_minutes_and_failures_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture, calls = Fixture(tmp, grants=(BILLED,)), []
+            def fetch(g, token):
+                calls.append(1)
+                return float(len(calls))
+            self.assertEqual(self.view(fixture, fetch)["balances"][0]["billedSinceGrant"], 1.0)
+            later = self.view(fixture, fetch, now=NOW + 599)
+            self.assertEqual((later["balances"][0]["billedSinceGrant"], len(calls)), (1.0, 1))
+            self.assertEqual(later["observed_at"], usage.iso(NOW))  # the row shows when the billing was read
+            self.assertEqual(self.view(fixture, fetch, now=NOW + 601)["balances"][0]["billedSinceGrant"], 2.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture, calls = Fixture(tmp, grants=(BILLED,)), []
+            def down(g, token):
+                calls.append(1)
+                raise credit.GrantError("billing_source_unavailable")
+            self.view(fixture, down)
+            self.view(fixture, down, now=NOW + 119)
+            self.assertEqual(len(calls), 1)
+            self.view(fixture, down, now=NOW + 121)
+            self.assertEqual(len(calls), 2)
+
+    def test_the_key_never_reaches_the_row_or_the_cache_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=(BILLED,))
+            row = self.view(fixture, lambda g, token: 5.0)
+            cache = fixture.runtime / "state/credit-grant-billing.json"
+            self.assertNotIn(SECRET, json.dumps(row))
+            self.assertNotIn(SECRET, cache.read_text())
+            self.assertEqual(stat.S_IMODE(cache.stat().st_mode), 0o600)
+
+    def test_billing_payload_is_summed_strictly(self):
+        g = credit.grant(BILLED)
+        def fetch_with(payload):
+            with patch("provider_account_usage.https_json", lambda host, path, token, timeout: payload):
+                return credit.billed_fetch(g, SECRET)
+        self.assertAlmostEqual(fetch_with(costs(1.5, None, 0.25)), 1.75)
+        for bad in (costs(1.5, more=True),                      # a second page would be an undercount
+                    {"data": [{"results": [{"amount": {"value": "1.5", "currency": "usd"}}]}], "has_more": False},
+                    {"data": [{"results": [{"amount": {"value": 1.5, "currency": "eur"}}]}], "has_more": False},
+                    {"data": [{"results": None}], "has_more": False}, {"data": None, "has_more": False}, {}):
+            with self.assertRaises(credit.GrantError):
+                fetch_with(bad)
+
+    def test_billing_request_is_one_fixed_host_read_from_the_grant_date(self):
+        seen = []
+        def transport(host, path, token, timeout):
+            seen.append((host, path, token))
+            return costs(0.5)
+        with patch("provider_account_usage.https_json", transport):
+            credit.billed_fetch(credit.grant(BILLED), SECRET)
+        start = int(at("2026-01-01T00:00:00Z"))
+        self.assertEqual(seen, [("api.openai.com", f"/v1/organization/costs?start_time={start}&bucket_width=1d&limit=180", SECRET)])
+
+    def test_expired_grant_makes_no_billing_call(self):
+        def never(g, token):
+            raise AssertionError("an expired grant needs no reading")
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.view(Fixture(tmp, grants=(BILLED,)), never, now=at("2026-02-01T00:00:00Z"))
+            self.assertEqual((row["pace"]["state"], row["balances"][0]["balance"]), ("expired", 0.0))
+
+    def test_a_bad_usage_key_name_is_an_invalid_grants_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in ("not a name", 7, "sk-looks-like-a-key"):
+                fixture = Fixture(tmp + f"/{abs(hash(str(bad)))}", grants=({**GRANT, "usage_credential_ref": bad},))
+                self.assertEqual(credit.view(fixture.runtime, NOW, fixture.registry), ([], "credit_grants_invalid"))
 
 
 if __name__ == "__main__":

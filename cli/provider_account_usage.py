@@ -27,7 +27,9 @@ HOSTS = {"zai": {"global": "api.z.ai", "cn": "open.bigmodel.cn"},
          "minimax": {"global": "api.minimax.io", "cn": "api.minimaxi.com"},
          "deepseek": {"global": "api.deepseek.com"},
          "openrouter": {"global": "openrouter.ai"},
-         "neuralwatt": {"global": "api.neuralwatt.com"}}
+         "neuralwatt": {"global": "api.neuralwatt.com"},
+         # Billing-only host for credit grants (credit_grants.py); no usage collector is discovered for it.
+         "openai": {"global": "api.openai.com"}}
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 MAX_BODY = 131072
 

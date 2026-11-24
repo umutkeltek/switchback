@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Prepaid credit grants: the operator's last true reading, less gateway spend since it.
+"""Prepaid credit grants: what is left, when it expires, and how fast it may be spent.
 
-No network call and no credential. Grant facts are operator-supplied in
-<runtime>/config/credit-grants.json (an API key cannot read its own balance).
-Spend comes from the gateway's own usage store, opened read-only, and is priced
-here from the provider registry rows: the store's cost_micros bills cached input
-at the full input rate and is not used.
+Grant facts are operator-supplied in <runtime>/config/credit-grants.json (an
+ordinary API key cannot read its own balance). Two readings of the spend:
+
+1. Exact: when the grant names a usage-read key (usage_credential_ref) the
+   provider's own billing since the grant date is read, one fixed-host call,
+   cached ten minutes. It sees every call on the account.
+2. Estimate, the fallback: the gateway's own usage store, opened read-only,
+   priced here from the provider registry rows. The store's cost_micros bills
+   cached input at the full input rate and is not used.
 
 Stored usage (crates/sb-ledger record_to_event): input_tokens excludes cached
 tokens, cached_input_tokens holds them, and output_tokens is the provider's own
 output count, which for OpenAI includes reasoning tokens. So each token is
 priced once: input, cached (cached rate, else input rate) and output.
-The result is an estimate: list prices, and calls outside the gateway are unseen.
+The estimate uses list prices, and calls outside the gateway are unseen.
 """
 from datetime import datetime, timezone
 import hashlib
@@ -33,6 +37,12 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LIMIT = 65536
 PACE_BAND = 0.15
 BASIS = "gateway requests since the reading at registry list prices; calls outside the gateway are not seen"
+BILLING = {"openai": ("api.openai.com", "/v1/organization/costs")}
+# Readers of `sb limits` treat provider `openai` as the Codex subscription. The API credit is a
+# different account, so its row carries its own provider name.
+ROW_PROVIDER = {"openai": "openai-api"}
+BILLING_BASIS = "the provider's own billing since the grant date; it can lag by some minutes"
+BILLING_TTL, BILLING_RETRY, BILLING_KEEP = 600, 120, 90 * 86400
 UNKNOWN = {"usage_store_unavailable": "the gateway usage store could not be read",
            "price_registry_unavailable": "the price registry could not be read"}
 USAGE = ("usage: sb credits [--json] | sb credits observe PROVIDER --balance USD --expires DATE"
@@ -80,18 +90,19 @@ def grant(raw):
     """One validated grant, or None."""
     if not isinstance(raw, dict):
         return None
-    provider, ref = raw.get("provider"), raw.get("credential_ref")
+    provider, ref, usage_ref = raw.get("provider"), raw.get("credential_ref"), raw.get("usage_credential_ref")
     amount, balance = money(raw.get("amount_usd"), True), money(raw.get("observed_balance_usd"))
     reserve = money(raw["reserve_usd"]) if raw.get("reserve_usd") is not None else 0.0
     received, expires, observed = (instant(raw.get(k)) for k in ("received_at", "expires_at", "observed_at"))
     if (not isinstance(provider, str) or not PROVIDER.fullmatch(provider) or not isinstance(ref, str)
             or not ENV_NAME.fullmatch(ref) or None in (amount, balance, reserve, received, expires, observed)
             or expires <= received
+            or (usage_ref is not None and (not isinstance(usage_ref, str) or not ENV_NAME.fullmatch(usage_ref)))
             or any(raw.get(k) is not None and not isinstance(raw[k], str) for k in ("observed_from", "renews"))):
         return None
     return {"provider": provider, "credential_ref": ref, "amount": amount, "balance": balance,
             "reserve": reserve, "received": received, "expires": expires, "observed": observed,
-            "observed_from": text(raw.get("observed_from")), "renews": text(raw.get("renews"))}
+            "usage_ref": usage_ref, "observed_from": text(raw.get("observed_from")), "renews": text(raw.get("renews"))}
 
 
 def parse(data):
@@ -193,12 +204,89 @@ def estimate(g, store, registry):
     return spent / 1e12, unpriced
 
 
-def row(g, ordinal, now, store, registry):
-    from native_account_usage import window
+def billed_fetch(g, token, timeout=6):
+    """USD the provider billed since the grant date: one bounded fixed-host read."""
+    from provider_account_usage import https_json, json_number, UsageError
+    host, path = BILLING[g["provider"]]
+    try:
+        payload = https_json(host, f"{path}?start_time={int(g['received'])}&bucket_width=1d&limit=180", token, timeout)
+    except UsageError as failure:
+        raise GrantError("billing_" + str(failure)) from None
+    buckets = payload.get("data")
+    # A further page would mean an undercount; a grant period fits in one.
+    if not isinstance(buckets, list) or payload.get("has_more") is not False:
+        raise GrantError("billing_invalid_response")
+    total = 0.0
+    for bucket in buckets:
+        results = bucket.get("results") if isinstance(bucket, dict) else None
+        if not isinstance(results, list):
+            raise GrantError("billing_invalid_response")
+        for result in results:
+            amount = result.get("amount") if isinstance(result, dict) else None
+            value = json_number(amount.get("value")) if isinstance(amount, dict) else None
+            if value is None or str(amount.get("currency")).lower() != "usd":
+                raise GrantError("billing_invalid_response")
+            total += value
+    return max(0.0, total)
+
+
+def billed(g, slot, runtime, now, environment=None, fetch=billed_fetch):
+    """None without a usage-read key; else (USD billed, read epoch) or a fixed failure code.
+
+    Successes are cached ten minutes and failures two, so `sb limits` stays quick
+    and an offline machine does not wait on every call. The cache holds no secret.
+    """
+    environment = os.environ if environment is None else environment
+    token = environment.get(g["usage_ref"]) if g["usage_ref"] else None
+    token = token.strip() if isinstance(token, str) else ""
+    if g["provider"] not in BILLING or not token:
+        return None
+    path, key = Path(runtime) / "state/credit-grant-billing.json", f"{slot}@{int(g['received'])}"
+    try:
+        with open(path, encoding="utf-8") as stream:
+            cache = json.load(stream)
+    except (OSError, ValueError, RecursionError):
+        cache = {}
+    cache = {k: v for k, v in cache.items() if isinstance(v, dict) and money(v.get("read_at")) is not None
+             and 0 <= now - v["read_at"] < BILLING_KEEP} if isinstance(cache, dict) else {}
+    entry = cache.get(key)
+    if entry and isinstance(entry.get("error"), str) and now - entry["read_at"] < BILLING_RETRY:
+        return entry["error"][:64]
+    if entry and money(entry.get("billed_usd")) is not None and now - entry["read_at"] < BILLING_TTL:
+        return float(entry["billed_usd"]), float(entry["read_at"])
+    try:
+        outcome = (fetch(g, token), now)
+        cache[key] = {"billed_usd": outcome[0], "read_at": now}
+    except GrantError as failure:
+        outcome = str(failure)
+        cache[key] = {"error": outcome, "read_at": now}
+    try:
+        fd, name = tempfile.mkstemp(prefix=".credit-grant-billing-", dir=path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(cache, stream)
+            os.replace(name, path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+    except OSError:
+        pass  # A reading that cannot be cached is still a reading.
+    return outcome
+
+
+def grant_slot(provider, ordinal):
     from provider_account_usage import slot_name
+    return slot_name(provider, "credit-grant" if ordinal == 1 else f"credit-grant-{ordinal}")
+
+
+def row(g, ordinal, now, store, registry, billing=None):
+    from native_account_usage import window
     p, amount, reserve = g["provider"], g["amount"], g["reserve"]
-    slot = slot_name(p, "credit-grant" if ordinal == 1 else f"credit-grant-{ordinal}")
+    shown = ROW_PROVIDER.get(p, p)
+    slot = grant_slot(shown, ordinal)
     error, spent, unpriced = None, None, None
+    exact = isinstance(billing, tuple)
     elapsed = min(1.0, max(0.0, (now - g["received"]) / (g["expires"] - g["received"])))
     days_left = max(0.0, (g["expires"] - now) / 86400)
     if now >= g["expires"]:
@@ -211,6 +299,9 @@ def row(g, ordinal, now, store, registry):
             spent, unpriced = estimate(g, store, registry)
         except GrantError as failure:
             error = str(failure)
+        if exact:
+            # The provider's billing sees every call; the gateway estimate is then only extra detail.
+            error = None
         if error:
             # Unknown is not zero: never present the last reading as the current balance.
             balance = used = per_day = None
@@ -218,39 +309,46 @@ def row(g, ordinal, now, store, registry):
             notes = [f"Balance unknown: {UNKNOWN[error]}. Last true reading ${g['balance']:.2f} at "
                      f"{iso(g['observed'])}; spending since then is not known."]
         else:
-            balance = max(0.0, g["balance"] - spent)
+            balance = max(0.0, amount - billing[0]) if exact else max(0.0, g["balance"] - spent)
             used = min(1.0, max(0.0, (amount - balance) / amount))
             per_day = max(0.0, balance - reserve) / max(days_left, 1.0)
             state = "over" if used > elapsed + PACE_BAND else "under" if used < elapsed - PACE_BAND else "on_pace"
             keep = f", keeping ${reserve:.2f} back" if reserve else ""
-            notes = [f"Estimated ${balance:.2f} of ${amount:.2f} left, expires {day(g['expires'])} "
+            lead = f"${balance:.2f} of ${amount:.2f} left by the provider's billing" if exact else (
+                f"Estimated ${balance:.2f} of ${amount:.2f} left")
+            notes = [f"{lead}, expires {day(g['expires'])} "
                      f"({days_left:.1f} days). May spend about ${per_day:.2f} a day{keep}. "
                      f"Spending is {state.replace('_', ' ')}{'' if state == 'on_pace' else ' pace'}."]
-            if unpriced:
+            if isinstance(billing, str):
+                notes.append(f"The provider's billing could not be read ({billing}); this is the gateway estimate.")
+            if unpriced and not exact:
                 notes.append(f"{unpriced} request{' had' if unpriced == 1 else 's had'} no known price and "
                              f"{'is' if unpriced == 1 else 'are'} not in the estimate.")
-    sampled = None if error else now
+    sampled = None if error else billing[1] if exact and now < g["expires"] else now
     w = {**window("credit_grant", None if used is None else round(100 * used, 4), g["expires"], sampled, now,
-                  (g["expires"] - g["received"]) / 60), "scope": "generation", "estimated": True}
+                  (g["expires"] - g["received"]) / 60), "scope": "generation", "estimated": not exact}
     facts = {k: g[k] for k in ("provider", "credential_ref", "amount", "received", "expires", "observed", "balance")}
     balance_row = {"kind": "prepaid", "balance": None if balance is None else round(balance, 8),
-                   "currencyCode": "USD", "period": f"{p} credit, expires {day(g['expires'])}",
-                   "estimated": True, "observedBalance": g["balance"], "observedAt": iso(g["observed"]),
+                   "currencyCode": "USD", "period": f"{shown} credit, expires {day(g['expires'])}",
+                   "estimated": not exact, "observedBalance": g["balance"], "observedAt": iso(g["observed"]),
                    "spentSinceObserved": None if spent is None else round(spent, 8),
-                   "unpricedRequests": unpriced, "grantAmount": amount, "basis": BASIS}
+                   "unpricedRequests": unpriced, "grantAmount": amount, "basis": BILLING_BASIS if exact else BASIS}
+    if exact:
+        balance_row.update(billedSinceGrant=round(billing[0], 8), billingReadAt=iso(billing[1]))
     if g["observed_from"]:
         balance_row["observedFrom"] = g["observed_from"]
-    result = {"provider": p, "slot": slot, "source": "credit-grant/" + p, "credential_ref": g["credential_ref"],
+    result = {"provider": shown, "slot": slot, "source": "credit-grant/" + p, "credential_ref": g["credential_ref"],
               "account_label": "credit grant",
               "account_id": {"kind": "credit_grant", "value": slot,
                              "revision": hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()},
-              "windows": [w], "notes": notes, "balances": [balance_row],
+              "windows": [], "grant_window": w, "notes": notes, "balances": [balance_row],
               "observed_at": None if sampled is None else iso(sampled), "relogin_required": False,
-              "estimated": True, "state": "unknown" if sampled is None else "fresh",
+              "estimated": not exact, "state": "unknown" if sampled is None else "fresh",
               "pace": {"state": state, "days_left": round(days_left, 3),
                        "allowed_per_day_usd": None if per_day is None else round(per_day, 4),
                        "used_fraction": None if used is None else round(used, 6),
-                       "elapsed_fraction": round(elapsed, 6), "reserve_usd": reserve}}
+                       "elapsed_fraction": round(elapsed, 6), "reserve_usd": reserve,
+                       "expires_at": iso(g["expires"])}}
     if g["renews"]:
         result["renews"] = g["renews"]
     if error:
@@ -258,8 +356,8 @@ def row(g, ordinal, now, store, registry):
     return result
 
 
-def view(runtime, now=None, registry=None):
-    """(one estimated account row per grant, fixed diagnostic or None). A missing file is no rows."""
+def view(runtime, now=None, registry=None, environment=None, fetch=billed_fetch):
+    """(one account row per grant, fixed diagnostic or None). A missing file is no rows."""
     now = time.time() if now is None else now
     try:
         data = read(Path(runtime) / "config/credit-grants.json")
@@ -271,7 +369,10 @@ def view(runtime, now=None, registry=None):
     seen, rows = {}, []
     for g in grants:
         seen[g["provider"]] = seen.get(g["provider"], 0) + 1
-        rows.append(row(g, seen[g["provider"]], now, Path(runtime) / "state/scout.sqlite", registry or registry_path()))
+        ordinal = seen[g["provider"]]
+        slot = grant_slot(ROW_PROVIDER.get(g["provider"], g["provider"]), ordinal)
+        billing = billed(g, slot, runtime, now, environment, fetch) if now < g["expires"] else None
+        rows.append(row(g, ordinal, now, Path(runtime) / "state/scout.sqlite", registry or registry_path(), billing))
     return rows, None
 
 
@@ -291,15 +392,16 @@ def render(rows, problem):
         print("No credit grants recorded. Record one: sb credits observe PROVIDER --balance USD --expires YYYY-MM-DD")
     for r in rows:
         b = r["balances"][0]
-        print(f'{r["provider"]}/{r["slot"]} [{r["state"]}; {r["source"]}; estimate at {r.get("observed_at") or "unknown"}]')
+        kind = "estimate" if r["estimated"] else "billing read"
+        print(f'{r["provider"]}/{r["slot"]} [{r["state"]}; {r["source"]}; {kind} at {r.get("observed_at") or "unknown"}]')
         for note in r["notes"]:
             print("  " + note)
         if b["spentSinceObserved"] is not None:
             source = f' ({b["observedFrom"]})' if b.get("observedFrom") else ""
             print(f'  Last true reading ${b["observedBalance"]:.2f} at {b["observedAt"]}{source}; '
                   f'gateway spend since: ${b["spentSinceObserved"]:.4f}.')
-    if rows:
-        print("Estimates only: list prices, and calls that do not pass through the gateway are not seen.")
+    if any(r["estimated"] for r in rows):
+        print("Estimates use list prices, and calls that do not pass through the gateway are not seen.")
 
 
 def fail(message, code=2):
