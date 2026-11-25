@@ -221,6 +221,7 @@ impl Engine {
             &self.scorecard,
             self.lanes.as_deref(),
             &self.route_roles,
+            &self.engine_models,
         ) {
             Ok(resolved) => resolved,
             Err(error) => return self.audio_denied(snap, &req, error, started),

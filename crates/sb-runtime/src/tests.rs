@@ -475,7 +475,10 @@ fn publish_if_match_is_monotonic_and_rejects_stale() {
         engine
             .publish_with_audit(cfg(), crate::AuditContext::new("t", "x"), Some(1))
             .unwrap(),
-        2
+        crate::ConfigPublication {
+            revision: 2,
+            unchanged: false
+        }
     );
     // The now-stale expected → Conflict (no silent overwrite).
     assert!(matches!(
@@ -485,12 +488,15 @@ fn publish_if_match_is_monotonic_and_rejects_stale() {
             current: 2
         })
     ));
-    // No If-Match → always swaps.
+    // Identical content without If-Match also keeps the current revision.
     assert_eq!(
         engine
             .publish_with_audit(cfg(), crate::AuditContext::new("t", "x"), None)
             .unwrap(),
-        3
+        crate::ConfigPublication {
+            revision: 2,
+            unchanged: true
+        }
     );
 }
 
@@ -1868,7 +1874,7 @@ async fn structural_reload_preserves_scorecard_state() {
 
     let revision_before = engine.revision();
     engine
-        .reload(Config::from_yaml(BASIC_CONFIG).unwrap())
+        .reload(Config::from_yaml(&BASIC_CONFIG.replace("mock/echo", "mock/next")).unwrap())
         .expect("reload should succeed");
     assert_eq!(
         engine.revision(),

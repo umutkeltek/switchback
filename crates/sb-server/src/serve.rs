@@ -146,9 +146,7 @@ pub(crate) async fn serve_gateway(
     // start-up, then daily only when an optimizer feature is configured or
     // rows are left.
     state.spawn_experiment_pruner();
-    if !state.spawn_engine_listing_poller(crate::engine_control::LISTING_POLL) {
-        tracing::debug!("no lane has an engine control: the engine listing poller is not started");
-    }
+    state.spawn_engine_listing_poller(crate::engine_control::LISTING_POLL);
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(%bind, "switchback listening");

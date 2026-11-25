@@ -1,0 +1,37 @@
+server:
+  bind: "127.0.0.1:8765"
+  state_store:
+    path: "./engine-model-names.sqlite"
+    required: true
+
+providers:
+  - id: always-on
+    type: openai_compatible
+    engine: llama_cpp
+    base_url: "http://always-on.example.invalid:8080/v1"
+    accounts: [{id: local, auth: {kind: none}}]
+  - id: on-demand
+    type: openai_compatible
+    engine: llama_cpp
+    base_url: "http://on-demand.example.invalid:8080/v1"
+    accounts: [{id: local, auth: {kind: none}}]
+
+local_executors:
+  - name: always-on
+    base_url: "http://always-on.example.invalid:8080"
+    health_endpoint: "http://always-on.example.invalid:8080/health"
+    route_health: true
+    engine:
+      kind: llama_cpp_router
+      model_names: bare
+  - name: on-demand
+    base_url: "http://on-demand.example.invalid:8080"
+    health_endpoint: "http://on-demand.example.invalid:8080/health"
+    route_health: true
+    wake_on_request: true
+    wake_command: "wakeonlan 02:00:00:00:00:01"
+    poweroff_command: "ssh on-demand.example.invalid sudo poweroff"
+    idle_timeout_secs: 600
+    engine:
+      kind: llama_cpp_router
+      model_names: bare

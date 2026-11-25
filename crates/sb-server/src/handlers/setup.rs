@@ -18,7 +18,7 @@ use sb_runtime::route_roles::RouteRoles;
 use super::model_settings::{
     actor_for, error, lock_problem, mutate, write_error, LockPolicy, SettingsMutation,
 };
-use super::route_roles::{check_target, role_names, validate_targets_with};
+use super::route_roles::{check_target, engine_source, role_names, validate_targets_with};
 use crate::engine_control::{validate_for_target, EngineCtx};
 use crate::tenancy::Principal;
 use crate::AppState;
@@ -95,7 +95,8 @@ pub(crate) async fn export(
     if !principal.is_operator_or_admin() {
         return crate::tenancy::forbidden();
     }
-    let config = &state.snapshot().config;
+    let snap = state.snapshot();
+    let config = &snap.config;
     let roles = state.engine.route_roles();
     let entries = match roles.snapshot_entries() {
         Ok(entries) => entries,
@@ -114,6 +115,15 @@ pub(crate) async fn export(
                     value
                 });
             }
+        }
+    }
+    if query.effective {
+        let (_, discovered) = state.effective_routing_config(&snap);
+        for (name, model) in discovered {
+            let entry = names.entry(name).or_insert_with(|| json!({}));
+            entry["targets"] = json!(model.targets);
+            entry["pin_order"] = json!(true);
+            engine_source(entry, &model, &model.targets);
         }
     }
     let models: BTreeMap<_, _> = match state.engine.model_settings().snapshot_entries() {
@@ -431,6 +441,11 @@ impl Run<'_> {
 
     async fn name(&self, name: &str, mut value: Value, planned_models: &BTreeSet<String>) -> Item {
         let mut item = Item::new("name", name.to_string());
+        if value["source"] == "engine" {
+            item.source = Some("engine");
+            item.status = Status::Unchanged;
+            return item;
+        }
         let roles = self.state.engine.route_roles();
         let current = match roles.current(name) {
             Ok(entry) => entry,

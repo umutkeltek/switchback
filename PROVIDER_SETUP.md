@@ -2164,3 +2164,36 @@ and `chat_stream`.
 - `provider doctor` may execute small upstream chat/stream checks. Use
   `route-preview`, `schema`, and MCP config tools when you need dry-run-only
   inspection.
+
+### Names from a local engine
+
+Use [the two-machine example](config/engine-model-names.example.yaml) for an
+always-on llama.cpp router and a machine that wakes on demand. Replace the
+example hostnames, Wake-on-LAN address, and power-off command with your own.
+Run `switchback serve --config config/engine-model-names.example.yaml` while
+both engines are reachable so Switchback can learn their models.
+
+Set `local_executors[].engine.model_names: bare` to serve models by their
+engine ID and by `lane/model`. Use `qualified` to publish only `lane/model`.
+The default is `disabled`. A store role wins first, then a configured route,
+then an engine name, then the catch-all `*` route. Existing combos and
+built-in execution profiles keep their names. When two engines report the
+same bare ID, their targets follow `providers` order. A store role can pin
+the name to a different order or target.
+
+Switchback reads `GET /models` at startup, every 30 seconds while the engine
+is up, and after load, unload, and settings apply. A failed listing keeps the
+last good one. A successful listing removes names for models the engine
+dropped. Configured routes and store roles remain visible with their
+targets, including targets the engine stopped listing. With a SQLite
+`server.state_store`, Switchback restores the last successful list on
+restart. A request can then use the usual wake path for a sleeping lane.
+Without a state store, the list lasts for the life of the gateway process.
+
+`sb ai roles`, `sb ai models`, `sb ai engines`, and
+`GET /v1/setup?effective=true` show engine names and when the gateway last saw
+them. Effective setup exports include engine names for inspection. Applying
+an export leaves those names under engine control. Use `sb ai role set` to
+pin a name. Repeating a reload or draft publish with the same config returns
+`unchanged: true` and the current revision. To turn off discovery, remove
+`model_names` or set it to `disabled` and restore any routes you still need.

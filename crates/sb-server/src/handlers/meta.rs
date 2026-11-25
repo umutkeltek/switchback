@@ -1932,7 +1932,7 @@ pub(crate) async fn models(
 ) -> Json<serde_json::Value> {
     let snap = state.snapshot();
     // The names and targets routing answers to: store roles over the config.
-    let effective = state.engine.route_roles().effective_config(&snap.config);
+    let (effective, discovered) = state.effective_routing_config(&snap);
     let scoped = crate::controlplane::scoped_config_for_principal(&effective, &principal);
     let ids = model_ids_for_config(&scoped);
 
@@ -1941,6 +1941,9 @@ pub(crate) async fn models(
         .map(|id| {
             let mut row =
                 serde_json::json!({"id": id, "object": "model", "owned_by": "switchback"});
+            if let (Some(model), Some(route)) = (discovered.get(&id), scoped.exact_route_for(&id)) {
+                super::route_roles::engine_source(&mut row, model, &route.targets);
+            }
             if let Some(kind) = audio_kind(&scoped, &snap.registry, &id) {
                 row["kind"] = serde_json::Value::from(kind);
             }

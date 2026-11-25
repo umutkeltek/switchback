@@ -347,11 +347,28 @@ pub enum EngineControlKind {
     LlamaCppRouter,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineModelNames {
+    #[default]
+    Disabled,
+    Qualified,
+    Bare,
+}
+
+impl EngineModelNames {
+    fn is_disabled(&self) -> bool {
+        *self == Self::Disabled
+    }
+}
+
 /// A lane's engine control (`local_executors[].engine`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaneEngineConfig {
     pub kind: EngineControlKind,
+    #[serde(default, skip_serializing_if = "EngineModelNames::is_disabled")]
+    pub model_names: EngineModelNames,
     /// The engine's own root URL (llama.cpp: where `/models` answers).
     /// Default: the lane provider's `base_url` without a trailing `/v1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1327,6 +1344,16 @@ impl Config {
                 problems.push(format!(
                     "local_executors[{i}].name `{}` does not match a provider id",
                     executor.name
+                ));
+            }
+            if executor
+                .engine
+                .as_ref()
+                .is_some_and(|engine| !engine.model_names.is_disabled())
+                && self.engine_base_url(executor).is_none_or(str::is_empty)
+            {
+                problems.push(format!(
+                    "local_executors[{i}].engine.model_names needs an engine base URL"
                 ));
             }
             if executor.base_url.trim().is_empty() {
@@ -4023,6 +4050,21 @@ impl Config {
         let s = std::fs::read_to_string(path)
             .map_err(|e| crate::CoreError::Config(format!("read {}: {e}", path.display())))?;
         Self::from_yaml(&s)
+    }
+
+    pub fn engine_base_url<'a>(&'a self, lane: &'a LocalExecutorConfig) -> Option<&'a str> {
+        let base = lane.engine.as_ref()?.base_url.as_deref().or_else(|| {
+            let provider = self
+                .providers
+                .iter()
+                .find(|provider| provider.id == lane.name)?;
+            match &provider.kind {
+                ProviderKind::OpenaiCompatible { base_url, .. } => Some(base_url.as_str()),
+                _ => None,
+            }
+        })?;
+        let base = base.trim_end_matches('/');
+        Some(base.strip_suffix("/v1").unwrap_or(base))
     }
 
     /// Find the route whose `match.model` exactly equals the requested model.
