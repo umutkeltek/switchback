@@ -429,7 +429,9 @@ async fn draft_publish_audit_source_is_draft_publish() {
     let yaml = config_yaml_with_server("  persist_secret_bearing_drafts: true", "");
     let sb = spawn_with_store(&yaml, &dbs).await;
     let client = reqwest::Client::new();
-    let body = serde_json::to_value(sb_core::Config::from_yaml(&yaml).unwrap()).unwrap();
+    let mut updated = sb_core::Config::from_yaml(&yaml).unwrap();
+    updated.routes[0].targets = vec!["mock/other".to_string()];
+    let body = serde_json::to_value(updated).unwrap();
 
     let created: Value = client
         .post(format!("{sb}/cp/v1/drafts"))
@@ -451,6 +453,7 @@ async fn draft_publish_audit_source_is_draft_publish() {
         .await
         .unwrap();
     assert_eq!(published["ok"], true);
+    assert_eq!(published["unchanged"], false);
 
     let audit: Value = client
         .get(format!("{sb}/v1/audit"))
