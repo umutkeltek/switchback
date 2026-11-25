@@ -2195,5 +2195,6 @@ Without a state store, the list lasts for the life of the gateway process.
 them. Effective setup exports include engine names for inspection. Applying
 an export leaves those names under engine control. Use `sb ai role set` to
 pin a name. Repeating a reload or draft publish with the same config returns
-`unchanged: true` and the current revision. To turn off discovery, remove
+`unchanged: true` and the current revision. An explicit reload still
+activates newly published evaluation evidence. To turn off discovery, remove
 `model_names` or set it to `disabled` and restore any routes you still need.
