@@ -1,0 +1,17 @@
+schema: switchback/setup@1
+names:
+  quick:
+    targets: [local-text/small, backup-text/general]
+    pin_order: true
+models:
+  local-text/small:
+    defaults:
+      temperature: 0.3
+    profiles:
+      concise:
+        max_tokens: 512
+    load:
+      ctx_size: 8192
+    locked: [load.ctx_size]
+    lock_reasons:
+      load.ctx_size: Keep enough context for document summaries

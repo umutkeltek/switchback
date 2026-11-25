@@ -566,6 +566,19 @@ async fn revisions_conflicts_patch_history_and_revert() {
             .status(),
         200
     );
+    let retry = put_settings(
+        &gw,
+        "text/m",
+        0,
+        json!({"defaults": {"temperature": 0.5}, "locked": []}),
+    )
+    .await;
+    assert_eq!(retry.status(), 200);
+    assert_eq!(retry.headers()["etag"], "\"1\"");
+    let retried: Value = retry.json().await.unwrap();
+    assert_eq!(retried["unchanged"], true, "{retried}");
+    assert!(retried.get("apply").is_none(), "{retried}");
+
     // Two writers edited revision 0: the second gets 409.
     let r = put_settings(&gw, "text/m", 0, json!({"defaults": {"temperature": 0.9}})).await;
     assert_eq!(r.status(), 409);

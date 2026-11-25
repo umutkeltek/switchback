@@ -45,6 +45,17 @@ impl DocFamily {
         }
     }
 
+    fn get(
+        self,
+        store: &dyn StateStore,
+        key: &str,
+    ) -> sb_store::Result<Option<ModelSettingsRecord>> {
+        match self {
+            DocFamily::ModelSettings => store.model_settings_get(key),
+            DocFamily::RouteRoles => store.route_role_get(key),
+        }
+    }
+
     fn list(self, store: &dyn StateStore) -> sb_store::Result<Vec<ModelSettingsRecord>> {
         match self {
             DocFamily::ModelSettings => store.model_settings_list(),
@@ -83,6 +94,10 @@ pub trait RevisionedDoc:
 
     /// The key paths that differ between two documents, for the history.
     fn changed(before: &Self, after: &Self) -> Vec<String>;
+
+    fn equivalent(&self, other: &Self) -> bool {
+        self == other
+    }
 }
 
 /// One key's current document.
@@ -91,6 +106,20 @@ pub struct DocEntry<D> {
     pub revision: u64,
     pub doc: Arc<D>,
     pub updated_at_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct DocWrite<D> {
+    pub entry: DocEntry<D>,
+    pub unchanged: bool,
+}
+
+impl<D> std::ops::Deref for DocWrite<D> {
+    type Target = DocEntry<D>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
 }
 
 /// The documents of one family, by key, revisioned.
@@ -197,6 +226,69 @@ impl<D: RevisionedDoc> DocRegistry<D> {
             .unwrap_or_default()
     }
 
+    pub fn snapshot_entries(&self) -> Result<Vec<(String, DocEntry<D>)>, SettingsWriteError> {
+        let Some(store) = self.store() else {
+            return Ok(self.all());
+        };
+        D::FAMILY
+            .list(store.as_ref())
+            .map_err(|e| SettingsWriteError::Store(e.0))?
+            .into_iter()
+            .map(|record| {
+                let doc = serde_json::from_str(&record.doc).map_err(|e| {
+                    SettingsWriteError::Store(format!("reading {}: {e}", record.target))
+                })?;
+                Ok((
+                    record.target,
+                    DocEntry {
+                        revision: record.revision,
+                        doc: Arc::new(doc),
+                        updated_at_ms: record.updated_at_ms,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub fn current(&self, key: &str) -> Result<Option<DocEntry<D>>, SettingsWriteError> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.read_current(key, self.store().as_deref())
+    }
+
+    fn read_current(
+        &self,
+        key: &str,
+        store: Option<&dyn StateStore>,
+    ) -> Result<Option<DocEntry<D>>, SettingsWriteError> {
+        let Some(store) = store else {
+            return Ok(self.get(key));
+        };
+        let Some(record) = D::FAMILY
+            .get(store, key)
+            .map_err(|e| SettingsWriteError::Store(e.0))?
+        else {
+            return Ok(None);
+        };
+        if let Some(entry) = self
+            .get(key)
+            .filter(|entry| entry.revision == record.revision)
+        {
+            return Ok(Some(entry));
+        }
+        let doc = serde_json::from_str(&record.doc)
+            .map_err(|e| SettingsWriteError::Store(format!("reading {key}: {e}")))?;
+        let entry = DocEntry {
+            revision: record.revision,
+            doc: Arc::new(doc),
+            updated_at_ms: record.updated_at_ms,
+        };
+        self.entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), entry.clone());
+        Ok(Some(entry))
+    }
+
     /// Replace a key's document if the writer edited the current revision.
     pub fn write(
         &self,
@@ -205,14 +297,21 @@ impl<D: RevisionedDoc> DocRegistry<D> {
         expected: u64,
         actor: &SettingsActor,
         action: &str,
-    ) -> Result<DocEntry<D>, SettingsWriteError> {
-        doc.check().map_err(SettingsWriteError::Invalid)?;
+    ) -> Result<DocWrite<D>, SettingsWriteError> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = self.get(key);
+        let store = self.store();
+        let previous = self.read_current(key, store.as_deref())?;
+        if let Some(entry) = previous.as_ref().filter(|entry| entry.doc.equivalent(&doc)) {
+            return Ok(DocWrite {
+                entry: entry.clone(),
+                unchanged: true,
+            });
+        }
         let current = previous.as_ref().map(|entry| entry.revision).unwrap_or(0);
         if expected != current {
             return Err(SettingsWriteError::Conflict { expected, current });
         }
+        doc.check().map_err(SettingsWriteError::Invalid)?;
         let before = previous
             .as_ref()
             .map(|entry| (*entry.doc).clone())
@@ -231,7 +330,7 @@ impl<D: RevisionedDoc> DocRegistry<D> {
             changed: D::changed(&before, &doc),
             at_ms: now,
         };
-        match self.store() {
+        match store {
             Some(store) => match D::FAMILY.write(store.as_ref(), &change) {
                 Ok(ModelSettingsWrite::Written) => {
                     // The write stands; a failed prune only leaves older rows.
@@ -240,12 +339,16 @@ impl<D: RevisionedDoc> DocRegistry<D> {
                     }
                 }
                 Ok(ModelSettingsWrite::Conflict { current: stored }) => {
-                    // Another gateway sharing the store wrote first: take
-                    // its document so the next read is current.
-                    self.refresh_from_store(key, store.as_ref());
+                    let fresh = self.read_current(key, Some(store.as_ref()))?;
+                    if let Some(entry) = fresh.as_ref().filter(|entry| entry.doc.equivalent(&doc)) {
+                        return Ok(DocWrite {
+                            entry: entry.clone(),
+                            unchanged: true,
+                        });
+                    }
                     return Err(SettingsWriteError::Conflict {
                         expected,
-                        current: stored,
+                        current: fresh.map_or(stored, |entry| entry.revision),
                     });
                 }
                 Err(e) => return Err(SettingsWriteError::Store(e.0)),
@@ -273,29 +376,10 @@ impl<D: RevisionedDoc> DocRegistry<D> {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.to_string(), entry.clone());
-        Ok(entry)
-    }
-
-    fn refresh_from_store(&self, key: &str, store: &dyn StateStore) {
-        let Ok(records) = D::FAMILY.list(store) else {
-            return;
-        };
-        let Some(record) = records.into_iter().find(|record| record.target == key) else {
-            return;
-        };
-        if let Ok(doc) = serde_json::from_str::<D>(&record.doc) {
-            self.entries
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    key.to_string(),
-                    DocEntry {
-                        revision: record.revision,
-                        doc: Arc::new(doc),
-                        updated_at_ms: record.updated_at_ms,
-                    },
-                );
-        }
+        Ok(DocWrite {
+            entry,
+            unchanged: false,
+        })
     }
 
     /// The key's changes, newest first.

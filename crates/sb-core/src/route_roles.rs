@@ -140,7 +140,7 @@ impl RouteRoleDoc {
 }
 
 /// Why `target` is not a `provider/model` id, if it is not.
-fn target_shape_problem(target: &str) -> Option<&'static str> {
+pub fn target_shape_problem(target: &str) -> Option<&'static str> {
     let Some((provider, model)) = target.split_once('/') else {
         return Some("is not provider/model");
     };

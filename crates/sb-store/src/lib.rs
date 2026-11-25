@@ -787,6 +787,13 @@ pub trait StateStore: Send + Sync {
     }
 
     /// Every stored settings document.
+    fn model_settings_get(&self, target: &str) -> Result<Option<ModelSettingsRecord>> {
+        Ok(self
+            .model_settings_list()?
+            .into_iter()
+            .find(|record| record.target == target))
+    }
+
     fn model_settings_list(&self) -> Result<Vec<ModelSettingsRecord>> {
         Ok(Vec::new())
     }
@@ -820,6 +827,13 @@ pub trait StateStore: Send + Sync {
     }
 
     /// Every stored role document.
+    fn route_role_get(&self, name: &str) -> Result<Option<ModelSettingsRecord>> {
+        Ok(self
+            .route_role_list()?
+            .into_iter()
+            .find(|record| record.target == name))
+    }
+
     fn route_role_list(&self) -> Result<Vec<ModelSettingsRecord>> {
         Ok(Vec::new())
     }
@@ -2467,6 +2481,25 @@ impl SqliteStore {
         Ok(ModelSettingsWrite::Written)
     }
 
+    fn doc_get(&self, table: DocTable, name: &str) -> Result<Option<ModelSettingsRecord>> {
+        let DocTable { current, key, .. } = table;
+        Ok(self
+            .conn()?
+            .query_row(
+                &format!("SELECT revision, doc, updated_at_ms FROM {current} WHERE {key} = ?1"),
+                [name],
+                |row| {
+                    Ok(ModelSettingsRecord {
+                        target: name.to_string(),
+                        revision: row.get::<_, i64>(0)? as u64,
+                        doc: row.get(1)?,
+                        updated_at_ms: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     fn doc_list(&self, table: DocTable) -> Result<Vec<ModelSettingsRecord>> {
         let DocTable { current, key, .. } = table;
         let conn = self.conn()?;
@@ -3592,6 +3625,10 @@ impl StateStore for SqliteStore {
         self.doc_write(DocTable::MODEL_SETTINGS, change)
     }
 
+    fn model_settings_get(&self, target: &str) -> Result<Option<ModelSettingsRecord>> {
+        self.doc_get(DocTable::MODEL_SETTINGS, target)
+    }
+
     fn model_settings_list(&self) -> Result<Vec<ModelSettingsRecord>> {
         self.doc_list(DocTable::MODEL_SETTINGS)
     }
@@ -3610,6 +3647,10 @@ impl StateStore for SqliteStore {
 
     fn route_role_write(&self, change: &ModelSettingsChange) -> Result<ModelSettingsWrite> {
         self.doc_write(DocTable::ROUTE_ROLES, change)
+    }
+
+    fn route_role_get(&self, name: &str) -> Result<Option<ModelSettingsRecord>> {
+        self.doc_get(DocTable::ROUTE_ROLES, name)
     }
 
     fn route_role_list(&self) -> Result<Vec<ModelSettingsRecord>> {

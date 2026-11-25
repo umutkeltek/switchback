@@ -214,6 +214,20 @@ async fn a_role_set_routes_now_and_survives_reload_and_restart_until_reverted() 
     assert_eq!(status, 200, "{row}");
     assert_eq!(row["source"], "store");
     assert_eq!(row["revision"], 1);
+    let retry = reqwest::Client::new()
+        .put(format!("{}/v1/roles/fast", gw.url))
+        .bearer_auth("sk-admin")
+        .header("if-match", "0")
+        .json(&json!({"targets": ["two/m"], "check": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), 200);
+    assert_eq!(retry.headers()["etag"], "\"1\"");
+    let retried: Value = retry.json().await.unwrap();
+    assert_eq!(retried["unchanged"], true, "{retried}");
+    assert_eq!(retried["check"], Value::Null);
+
     let (served, reasons) = answered_by(&gw, "fast").await;
     assert_eq!(served, "served=two", "the next request, no restart");
     assert!(
@@ -456,4 +470,176 @@ async fn a_failed_check_writes_nothing() {
     assert_eq!(gw.state.engine.route_roles().revision("fast"), 0);
     assert_eq!(answered_by(&gw, "fast").await.0, "served=one");
     let _ = std::fs::remove_dir_all(cfg_path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn setup_plans_and_partially_applies_with_lock_protection_and_cas_undo() {
+    let (one, _) = spawn_engine("one").await;
+    let (two, _) = spawn_engine("two").await;
+    let (config_path, db) = temp_paths("setup");
+    std::fs::write(&config_path, config(&one, &two, "one/m")).unwrap();
+    let gw = spawn_gateway(&config_path, &db).await;
+    let post = |path: &'static str, document: Value| {
+        send(
+            &gw,
+            reqwest::Method::POST,
+            path,
+            "sk-admin",
+            None,
+            Some(document),
+        )
+    };
+    let schema = "switchback/setup@1";
+    let setup = json!({
+        "schema": schema,
+        "names": {"fast": {"targets": ["one/m"]}, "new": {"targets": ["two/m"]}},
+        "models": {"one/m": {"defaults": {"temperature": 0.4}, "locked": ["temperature"],
+            "lock_reasons": {"temperature": "keep reports stable"}}},
+    });
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/setup"),
+        (reqwest::Method::POST, "/v1/setup/plan"),
+        (reqwest::Method::POST, "/v1/setup/apply"),
+    ] {
+        assert_eq!(
+            send(&gw, method, path, "sk-client", None, Some(setup.clone()))
+                .await
+                .0,
+            403
+        );
+    }
+    let (status, planned) = post("/v1/setup/plan", setup.clone()).await;
+    assert_eq!(status, 200, "{planned}");
+    assert_eq!(planned["items"][0]["status"], "create", "{planned}");
+    assert_eq!(planned["items"][1]["status"], "unchanged", "{planned}");
+    assert_eq!(planned["not_in_file"][0]["name"], "spare");
+    assert_eq!(gw.state.engine.model_settings().revision("one/m"), 0);
+    assert_eq!(gw.state.engine.route_roles().revision("new"), 0);
+    let (status, applied) = post("/v1/setup/apply", setup.clone()).await;
+    assert_eq!(status, 200, "{applied}");
+    assert_eq!(applied["items"][0]["revision_after"], 1);
+    assert_eq!(applied["items"][1]["revision_after"], 0);
+    assert_eq!(applied["items"][2]["revision_after"], 1);
+    let (_, retry) = post("/v1/setup/apply", setup).await;
+    assert!(
+        retry["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["status"] == "unchanged"),
+        "{retry}"
+    );
+
+    let change = json!({
+        "schema": schema,
+        "names": {"new": {"targets": ["one/m"]}},
+        "models": {"one/m": {"defaults": {"temperature": 0.4}}, "two/m": {"bogus": true}},
+    });
+    let (_, refused) = post("/v1/setup/apply", change.clone()).await;
+    assert_eq!(refused["items"][0]["status"], "refused");
+    assert!(refused["items"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("keep reports stable"));
+    assert_eq!(refused["items"][1]["status"], "invalid");
+    assert_eq!(refused["items"][2]["revision_after"], 2);
+    assert_eq!(gw.state.engine.model_settings().revision("one/m"), 1);
+    let mut authorized = change;
+    authorized["unlock"] = json!(["one/m"]);
+    let (_, unlocked) = post("/v1/setup/apply", authorized).await;
+    assert_eq!(unlocked["items"][0]["revision_after"], 2);
+    let undo = unlocked["items"][0]["undo"].clone();
+    assert_eq!(undo["if_match"]["models"]["one/m"], 2);
+    let (_, restored) = post("/v1/setup/apply", undo.clone()).await;
+    assert_eq!(restored["items"][0]["revision_after"], 3, "{restored}");
+    assert_eq!(
+        gw.state
+            .engine
+            .model_settings()
+            .get("one/m")
+            .unwrap()
+            .doc
+            .lock_reason("temperature"),
+        Some("keep reports stable")
+    );
+
+    let (status, exported) = send(
+        &gw,
+        reqwest::Method::GET,
+        "/v1/setup?effective=true",
+        "sk-admin",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(exported["names"]["fast"]["source"], "config");
+    assert_eq!(exported["names"]["new"]["targets"], json!(["one/m"]));
+    assert_eq!(
+        exported["models"]["one/m"]["locked"],
+        json!(["temperature"])
+    );
+    let (_, plan_export) = post("/v1/setup/plan", exported).await;
+    assert!(
+        plan_export["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["status"] == "unchanged"),
+        "{plan_export}"
+    );
+
+    let svc = reqwest::Client::new()
+        .post(format!("{}/v1/setup/plan", gw.url))
+        .bearer_auth("sk-admin")
+        .header("content-type", "application/yaml")
+        .body("schema: switchback/setup@1\nnames:\n  fast:\n    targets: [one/m]\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(svc.status(), 200);
+    let yaml_plan: Value = svc.json().await.unwrap();
+    assert_eq!(yaml_plan["items"][0]["status"], "unchanged", "{yaml_plan}");
+
+    let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn setup_failed_model_check_restores_even_a_newly_locked_document() {
+    let (one, _) = spawn_engine("one").await;
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let (config_path, db) = temp_paths("setup-check");
+    std::fs::write(&config_path, config(&one, &closed, "one/m")).unwrap();
+    let gw = spawn_gateway(&config_path, &db).await;
+    let (status, report) = send(
+        &gw,
+        reqwest::Method::POST,
+        "/v1/setup/apply",
+        "sk-admin",
+        None,
+        Some(json!({
+            "schema": "switchback/setup@1", "check": true,
+            "models": {"two/m": {"defaults": {"temperature": 0.4}, "locked": ["temperature"]}},
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(report["items"][0]["status"], "refused", "{report}");
+    assert_eq!(
+        report["items"][0]["check"]["restored"]["revision"], 2,
+        "{report}"
+    );
+    let entry = gw.state.engine.model_settings().get("two/m").unwrap();
+    assert!(entry.doc.is_empty());
+    let rows = gw
+        .state
+        .engine
+        .model_settings()
+        .history("two/m", 10)
+        .unwrap();
+    assert_eq!(rows[0].action, "setup:check_failed");
+    let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
 }

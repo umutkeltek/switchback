@@ -36,6 +36,10 @@ use serde::Serialize;
 // Seams (injected; real impls below, fakes in tests)
 // ---------------------------------------------------------------------------
 
+tokio::task_local! {
+    pub(crate) static NO_REQUEST_WAKE: ();
+}
+
 /// Runs an operator-configured shell command string (wake / poweroff / restart).
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
@@ -1536,6 +1540,17 @@ impl LocalExecutor {
     /// stops waiting. It starts with a fresh probe, so a lane that is only
     /// believed down is used at once, with no wake command.
     pub async fn wake_for_request(self: &Arc<Self>) -> LaneWake {
+        if NO_REQUEST_WAKE.try_with(|_| ()).is_ok() {
+            return match self.up_without_wake().await {
+                Ok(()) => LaneWake::Ready {
+                    detail: "up without a wake".to_string(),
+                },
+                Err(detail) => LaneWake::NotReady {
+                    detail,
+                    retry_after: Duration::from_secs(1),
+                },
+            };
+        }
         let cfg = self.cfg();
         let wait_ms = cfg.wake_wait_secs.saturating_mul(1000);
         let started = self.clock.now_ms();

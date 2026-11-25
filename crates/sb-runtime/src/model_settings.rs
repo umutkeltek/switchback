@@ -488,6 +488,14 @@ impl ModelSettingsRegistry {
         self.docs.revision(target)
     }
 
+    pub fn current(&self, target: &str) -> Result<Option<SettingsEntry>, SettingsWriteError> {
+        self.docs.current(target)
+    }
+
+    pub fn snapshot_entries(&self) -> Result<Vec<(String, SettingsEntry)>, SettingsWriteError> {
+        self.docs.snapshot_entries()
+    }
+
     pub fn all(&self) -> Vec<(String, SettingsEntry)> {
         self.docs.all()
     }
@@ -511,7 +519,7 @@ impl ModelSettingsRegistry {
         expected: u64,
         actor: &SettingsActor,
         action: &str,
-    ) -> Result<SettingsEntry, SettingsWriteError> {
+    ) -> Result<crate::revisioned::DocWrite<ModelSettingsDoc>, SettingsWriteError> {
         self.docs.write(target, doc, expected, actor, action)
     }
 
@@ -541,7 +549,7 @@ impl ModelSettingsRegistry {
         to: u64,
         expected: u64,
         actor: &SettingsActor,
-    ) -> Result<SettingsEntry, SettingsWriteError> {
+    ) -> Result<crate::revisioned::DocWrite<ModelSettingsDoc>, SettingsWriteError> {
         let doc = self.revision_doc(target, to)?;
         self.write(target, doc, expected, actor, &format!("revert:{to}"))
     }
@@ -552,6 +560,19 @@ impl crate::revisioned::RevisionedDoc for ModelSettingsDoc {
 
     fn check(&self) -> Result<(), String> {
         self.validate().map_err(|e| e.0)
+    }
+
+    fn equivalent(&self, other: &Self) -> bool {
+        if self.locked == other.locked {
+            return self == other;
+        }
+        let mut left = self.clone();
+        let mut right = other.clone();
+        for doc in [&mut left, &mut right] {
+            doc.locked.sort_unstable();
+            doc.locked.dedup();
+        }
+        left == right
     }
 
     fn changed(before: &Self, after: &Self) -> Vec<String> {

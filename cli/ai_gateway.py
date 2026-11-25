@@ -126,6 +126,11 @@ sb ai: images, video, audio and machine status through a Switchback gateway
                                  (and puts the old settings back when they fail or stop)
   sb ai unload MODEL             unload a model; refused while it serves a request
   sb ai engines [--json]         what each engine has loaded, with memory and pending settings
+  sb ai export [--effective] [--out FILE] [--json]
+                                 write a reusable setup document
+  sb ai plan FILE [--json]       show what a JSON or YAML setup would change
+  sb ai apply FILE [--check] [--wake] [--unlock TARGET] [--json]
+                                 apply the changes and report an undo per item
   sb ai roles [--json]           which targets answer each name (default, fast, vision, ...):
                                  the targets now, from the role store or the config, revision
   sb ai role NAME [--json]       one name: its targets, the config's route, its lock, history
@@ -2707,6 +2712,67 @@ def cmd_revert(gw, args):
 ROLE_ACTIONS = ("set", "revert", "lock", "unlock")
 
 
+def cmd_setup(gw, args):
+    if args.command == "export":
+        path = "/v1/setup" + ("?effective=true" if args.effective else "")
+        document = gw.get(path)
+        data = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+        if args.out:
+            try:
+                with open(args.out, "w", encoding="utf-8") as output:
+                    output.write(data)
+            except OSError as error:
+                raise Fail(USAGE, f"could not write setup file {args.out}: {error}") from None
+            if not args.json:
+                print(f"Exported setup to {args.out}")
+                return OK
+        print(data, end="")
+        return OK
+
+    try:
+        with open(args.file, encoding="utf-8") as source:
+            document = source.read()
+    except (OSError, UnicodeError) as error:
+        raise Fail(USAGE, f"could not read setup file {args.file}: {error}") from None
+    applying = args.command == "apply"
+    body = {"setup": document}
+    if applying:
+        body.update(check=args.check, wake=args.wake, unlock=args.unlock)
+    try:
+        answer = gw.post(f"/v1/setup/{args.command}", body, timeout=900 if applying else 120)
+    except GatewayError as error:
+        raise Fail(GATEWAY_ERROR, error.message) from None
+    rows = answer["items"]
+    if args.json:
+        print(json.dumps(answer, indent=2, ensure_ascii=False))
+    else:
+        if applying and all(row["status"] == "unchanged" for row in rows):
+            print("nothing to change")
+        if rows:
+            width = max(len("Item"), *(len(row["name"]) for row in rows))
+            print(f"{'Item':<{width}}  {'Type':<5}  {'Status':<9}  Details")
+            for row in rows:
+                details = ", ".join(row["changed"])
+                if row.get("reason"):
+                    details = f"{details} | {row['reason']}" if details else row["reason"]
+                if applying and row.get("revision_before") is not None:
+                    revision = f"revision {row['revision_before']} → {row['revision_after']}"
+                    details = f"{details} | {revision}" if details else revision
+                if row.get("pending"):
+                    details = f"{details} | pending" if details else "pending"
+                if (row.get("apply") or {}).get("ok") is False:
+                    details += " | engine apply failed: " + (row["apply"].get("error") or "see gateway")
+                print(f"{row['name']:<{width}}  {row['kind']:<5}  {row['status']:<9}  {details}")
+        for row in answer["not_in_file"]:
+            print(f"{row['kind']} {row['name']}: not in file ({row['source']})")
+        for row in rows:
+            if row.get("undo"):
+                print(f"Undo {row['name']}: {json.dumps(row['undo'], ensure_ascii=False)}")
+    failed = any(row["status"] in ("invalid", "refused")
+                 or (row.get("apply") or {}).get("ok") is False for row in rows)
+    return GATEWAY_ERROR if failed else OK
+
+
 def role_path(name, suffix=""):
     return "/v1/roles/" + urllib.parse.quote(name, safe="") + suffix
 
@@ -3204,6 +3270,18 @@ def parser():
     unload_cmd.add_argument("model")
     unload_cmd.add_argument("--timeout", type=float, default=None)
     sub.add_parser("engines", add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
+    export = sub.add_parser("export", add_help=False, allow_abbrev=False)
+    export.add_argument("--out")
+    export.add_argument("--effective", action="store_true")
+    for name in ("plan", "apply"):
+        setup = sub.add_parser(name, add_help=False, allow_abbrev=False)
+        setup.add_argument("file")
+        setup.add_argument("--json", action="store_true")
+        if name == "apply":
+            setup.add_argument("--check", action="store_true")
+            setup.add_argument("--wake", action="store_true")
+            setup.add_argument("--unlock", action="append", default=[])
+    export.add_argument("--json", action="store_true")
     sub.add_parser("roles", add_help=False, allow_abbrev=False).add_argument("--json", action="store_true")
     role = sub.add_parser("role", add_help=False, allow_abbrev=False)
     role.add_argument("words", nargs="+")
@@ -3293,6 +3371,8 @@ def main(argv=None, environ=None):
             return cmd_unload(gw, args)
         if args.command == "engines":
             return cmd_engines(gw, args)
+        if args.command in ("export", "plan", "apply"):
+            return cmd_setup(gw, args)
         if args.command == "roles":
             return cmd_roles(gw, args)
         if args.command == "role":

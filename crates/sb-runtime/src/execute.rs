@@ -62,6 +62,13 @@ impl Engine {
         (revision, outcome)
     }
 
+    pub async fn execute_exact_target(&self, req: AiRequest, started: Instant) -> ExecOutcome {
+        let allow = HashSet::from([req.model.clone()]);
+        self.execute_scoped(self.snapshot(), req, started, allow)
+            .await
+            .outcome
+    }
+
     /// Execute against one already-pinned snapshot while fail-closed filtering
     /// every route candidate not explicitly allowed. This is the body-privacy
     /// seam used only by the internal quality evaluator: filtering happens

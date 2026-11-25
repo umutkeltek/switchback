@@ -21,6 +21,9 @@ pub fn build_app(state: AppState) -> Router {
                 .patch(handlers::model_settings::patch)
                 .post(handlers::model_settings::post),
         )
+        .route("/v1/setup", get(handlers::setup::export))
+        .route("/v1/setup/plan", post(handlers::setup::plan))
+        .route("/v1/setup/apply", post(handlers::setup::apply))
         .route("/v1/roles", get(handlers::route_roles::list))
         .route(
             "/v1/roles/{name}",

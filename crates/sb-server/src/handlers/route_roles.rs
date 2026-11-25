@@ -27,10 +27,11 @@ use serde_json::{json, Value};
 use sb_core::{
     config_route_for_role, role_name_problem, Config, PreferAwakeOverride, RouteRoleDoc,
 };
+use sb_runtime::model_settings::SettingsWriteError;
 use sb_runtime::route_roles::{RoleEntry, RouteRoles};
 use sb_runtime::ExecOutcome;
 
-use super::model_settings::{actor_for, error, write_error};
+use super::model_settings::{actor_for, error, with_etag, write_error};
 use crate::tenancy::Principal;
 use crate::AppState;
 
@@ -38,7 +39,7 @@ use crate::AppState;
 const HISTORY_LIMIT: usize = 50;
 
 /// Every role name: the config's routes (not `*`) and the stored roles.
-fn role_names(config: &Config, roles: &RouteRoles) -> Vec<String> {
+pub(super) fn role_names(config: &Config, roles: &RouteRoles) -> Vec<String> {
     let mut names: BTreeSet<String> = config
         .routes
         .iter()
@@ -142,7 +143,7 @@ pub(crate) struct DetailQuery {
 
 /// The store key of `name`, after the name checks. `Err` is the answer.
 #[allow(clippy::result_large_err)]
-fn role_key(config: &Config, name: &str) -> Result<String, Response> {
+pub(super) fn role_key(config: &Config, name: &str) -> Result<String, Response> {
     if let Some(problem) = role_name_problem(config, name) {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_role", problem));
     }
@@ -305,7 +306,11 @@ async fn target_problem(state: &AppState, config: &Config, target: &str) -> Opti
 /// Send one fresh short request through `target`. Without `wake` a managed
 /// lane must be up already (known up, or answering a probe now): the check
 /// never wakes a machine on its own.
-async fn check_target(state: &AppState, target: &str, wake: bool) -> Result<Value, String> {
+pub(super) async fn check_target(
+    state: &AppState,
+    target: &str,
+    wake: bool,
+) -> Result<Value, String> {
     let provider = target.split_once('/').map(|(p, _)| p).unwrap_or(target);
     if !wake {
         if let Some(lane) = state.capacity.executor(provider) {
@@ -324,7 +329,12 @@ async fn check_target(state: &AppState, target: &str, wake: bool) -> Result<Valu
     req.max_output_tokens = Some(64);
     req.temperature = Some(0.0);
     let started = Instant::now();
-    let (_revision, outcome) = state.engine.execute(req, started).await;
+    let execution = state.engine.execute_exact_target(req, started);
+    let outcome = if wake {
+        execution.await
+    } else {
+        crate::activator::NO_REQUEST_WAKE.scope((), execution).await
+    };
     let ms = started.elapsed().as_millis() as u64;
     match outcome {
         ExecOutcome::Collected { response, .. } => {
@@ -355,24 +365,29 @@ pub(crate) struct SetBody {
     pub wake: bool,
 }
 
-fn locked_refusal(name: &str, entry: Option<&RoleEntry>) -> Option<Response> {
-    let doc = entry?.doc.as_ref();
-    if !doc.locked {
-        return None;
+pub(super) async fn validate_targets_with(
+    state: &AppState,
+    config: &Config,
+    doc: &RouteRoleDoc,
+    planned_models: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut problems = Vec::new();
+    for target in &doc.targets {
+        if planned_models.contains(target) {
+            continue;
+        }
+        if let Some(problem) = target_problem(state, config, target).await {
+            problems.push(problem);
+        }
     }
-    let why = doc
-        .lock_reason
-        .as_deref()
-        .map(|reason| format!(" ({reason})"))
-        .unwrap_or_default();
-    Some(error(
-        StatusCode::LOCKED,
-        "locked",
-        format!(
-            "role `{name}` is locked{why}: unlock it first with `sb ai role unlock {name}` \
-             (nothing was written)"
-        ),
-    ))
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "nothing was written: {} (sb ai engines lists each lane's models)",
+            problems.join("; ")
+        ))
+    }
 }
 
 /// `PUT /v1/roles/{name}`: set the targets.
@@ -416,42 +431,50 @@ pub(crate) async fn put(
             ),
         );
     }
-    let doc = RouteRoleDoc {
-        targets: body.targets.clone(),
-        pin_order: body.pin_order,
-        prefer_awake: body.prefer_awake,
-        ..RouteRoleDoc::default()
+    let entry = match roles.current(&key) {
+        Ok(entry) => entry,
+        Err(e) => return write_error(e),
     };
-    if let Err(e) = doc.validate() {
-        return error(StatusCode::BAD_REQUEST, "invalid_role", e.0);
-    }
-    let entry = roles.get(&key);
-    if let Some(refusal) = locked_refusal(&key, entry.as_ref()) {
-        return refusal;
-    }
-    let current = entry.as_ref().map(|entry| entry.revision).unwrap_or(0);
+    let current = entry.as_ref().map_or(0, |entry| entry.revision);
     let expected = match expected_revision(&headers, body.revision, current, true) {
         Ok(expected) => expected,
         Err(response) => return response,
     };
-    let mut problems = Vec::new();
-    for target in &body.targets {
-        if let Some(problem) = target_problem(&state, &snap.config, target).await {
-            problems.push(problem);
-        }
-    }
-    if !problems.is_empty() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "unknown_target",
-            format!(
-                "nothing was written: {} (`sb ai engines` lists each lane's models)",
-                problems.join("; ")
-            ),
+    let prior = entry.as_ref().map(|entry| entry.doc.as_ref());
+    let doc = RouteRoleDoc {
+        targets: body.targets,
+        pin_order: body.pin_order,
+        prefer_awake: body.prefer_awake,
+        locked: prior.is_some_and(|doc| doc.locked),
+        lock_reason: prior.and_then(|doc| doc.lock_reason.clone()),
+    };
+    if prior == Some(&doc) {
+        let mut row = role_row(
+            &snap.config,
+            &snap.registry,
+            &key,
+            entry.as_ref(),
+            roles.durable(),
         );
+        row["unchanged"] = json!(true);
+        row["check"] = Value::Null;
+        return with_etag(row, current);
+    }
+    if expected != current {
+        return write_error(SettingsWriteError::Conflict { expected, current });
+    }
+    if let Some(why) = prior.and_then(|doc| RouteRoles::lock_refusal(&key, doc)) {
+        return write_error(SettingsWriteError::Locked(why));
+    }
+    if let Err(e) = doc.validate() {
+        return error(StatusCode::BAD_REQUEST, "invalid_role", e.0);
+    }
+    if let Err(message) = validate_targets_with(&state, &snap.config, &doc, &BTreeSet::new()).await
+    {
+        return error(StatusCode::BAD_REQUEST, "unknown_target", message);
     }
     let check = if body.check {
-        match check_target(&state, &body.targets[0], body.wake).await {
+        match check_target(&state, &doc.targets[0], body.wake).await {
             Ok(check) => Some(check),
             Err(why) => {
                 return error(
@@ -465,14 +488,7 @@ pub(crate) async fn put(
         None
     };
     let actor = actor_for(&principal, &headers);
-    match roles.set(
-        &key,
-        body.targets,
-        body.pin_order,
-        body.prefer_awake,
-        expected,
-        &actor,
-    ) {
+    match roles.replace(&key, doc, expected, &actor, "set", false) {
         Ok(entry) => {
             let mut row = role_row(
                 &snap.config,
@@ -482,8 +498,8 @@ pub(crate) async fn put(
                 roles.durable(),
             );
             row["check"] = check.unwrap_or(Value::Null);
-            tracing::info!(role = %key, revision = entry.revision, "route role set");
-            (StatusCode::OK, Json(row)).into_response()
+            row["unchanged"] = json!(entry.unchanged);
+            with_etag(row, entry.revision)
         }
         Err(e) => write_error(e),
     }
@@ -534,7 +550,10 @@ pub(crate) async fn post(
         Ok(key) => key,
         Err(response) => return response,
     };
-    let entry = roles.get(&key);
+    let entry = match roles.current(&key) {
+        Ok(entry) => entry,
+        Err(e) => return write_error(e),
+    };
     let current = entry.as_ref().map(|entry| entry.revision).unwrap_or(0);
     let known = entry.is_some() || config_route_for_role(&snap.config, &key).is_some();
     if !known {
@@ -554,9 +573,6 @@ pub(crate) async fn post(
                     "a revert names the revision to write again: {\"to\": N} (0 = the config's route)",
                 );
             };
-            if let Some(refusal) = locked_refusal(&key, entry.as_ref()) {
-                return refusal;
-            }
             let expected = match expected_revision(&headers, body.revision, current, true) {
                 Ok(expected) => expected,
                 Err(response) => return response,
@@ -583,12 +599,10 @@ pub(crate) async fn post(
             roles.lock(&key, body.reason.clone(), expected, &actor)
         }
         "unlock" => {
-            if !entry.as_ref().is_some_and(|entry| entry.doc.locked) {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "not_locked",
-                    format!("role `{name}` is not locked"),
-                );
+            if entry.is_none() {
+                let mut row = role_row(&snap.config, &snap.registry, &key, None, roles.durable());
+                row["unchanged"] = json!(true);
+                return with_etag(row, current);
             }
             let expected = match expected_revision(&headers, body.revision, current, false) {
                 Ok(expected) => expected,
@@ -606,15 +620,15 @@ pub(crate) async fn post(
     };
     match written {
         Ok(entry) => {
-            tracing::info!(role = %key, revision = entry.revision, %action, "route role written");
-            let row = role_row(
+            let mut row = role_row(
                 &snap.config,
                 &snap.registry,
                 &key,
                 Some(&entry),
                 roles.durable(),
             );
-            Json(row).into_response()
+            row["unchanged"] = json!(entry.unchanged);
+            with_etag(row, entry.revision)
         }
         Err(e) => write_error(e),
     }

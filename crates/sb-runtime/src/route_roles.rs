@@ -14,7 +14,7 @@ use sb_core::{config_route_for_role, Config, PreferAwakeOverride, RouteConfig, R
 use sb_store::{ModelSettingsChange, StateStore};
 
 use crate::model_settings::{SettingsActor, SettingsWriteError};
-use crate::revisioned::{DocEntry, DocFamily, DocRegistry, RevisionedDoc};
+use crate::revisioned::{DocEntry, DocFamily, DocRegistry, DocWrite, RevisionedDoc};
 
 /// One role's current document.
 pub type RoleEntry = DocEntry<RouteRoleDoc>;
@@ -110,6 +110,10 @@ impl RouteRoles {
         self.docs.revision(name)
     }
 
+    pub fn snapshot_entries(&self) -> Result<Vec<(String, RoleEntry)>, SettingsWriteError> {
+        self.docs.snapshot_entries()
+    }
+
     pub fn all(&self) -> Vec<(String, RoleEntry)> {
         self.docs.all()
     }
@@ -129,23 +133,55 @@ impl RouteRoles {
         self.get(name).filter(|entry| entry.doc.overrides())
     }
 
-    fn refuse_if_locked(&self, name: &str) -> Result<RouteRoleDoc, SettingsWriteError> {
-        let current = self
-            .get(name)
-            .map(|entry| (*entry.doc).clone())
-            .unwrap_or_default();
-        if current.locked {
-            let why = current
-                .lock_reason
-                .as_deref()
-                .map(|reason| format!(" ({reason})"))
-                .unwrap_or_default();
-            return Err(SettingsWriteError::Locked(format!(
-                "role `{name}` is locked{why}: unlock it first with `sb ai role unlock {name}` \
-                 (nothing was written)"
-            )));
+    pub fn current(&self, name: &str) -> Result<Option<RoleEntry>, SettingsWriteError> {
+        self.docs.current(name)
+    }
+
+    pub fn lock_refusal(name: &str, current: &RouteRoleDoc) -> Option<String> {
+        if !current.locked {
+            return None;
         }
-        Ok(current)
+        let why = current
+            .lock_reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default();
+        Some(format!(
+            "role `{name}` locked{why}: unlock it first with `sb ai role unlock {name}` (nothing was written)"
+        ))
+    }
+
+    pub fn replace(
+        &self,
+        name: &str,
+        doc: RouteRoleDoc,
+        expected: u64,
+        actor: &SettingsActor,
+        action: &str,
+        unlock: bool,
+    ) -> Result<DocWrite<RouteRoleDoc>, SettingsWriteError> {
+        let before = self.current(name)?;
+        if let Some(entry) = before.as_ref().filter(|entry| entry.doc.equivalent(&doc)) {
+            return Ok(DocWrite {
+                entry: entry.clone(),
+                unchanged: true,
+            });
+        }
+        {
+            let current = before.as_ref().map_or(0, |entry| entry.revision);
+            if expected != current {
+                return Err(SettingsWriteError::Conflict { expected, current });
+            }
+            if !unlock {
+                if let Some(why) = before
+                    .as_ref()
+                    .and_then(|entry| Self::lock_refusal(name, &entry.doc))
+                {
+                    return Err(SettingsWriteError::Locked(why));
+                }
+            }
+        }
+        self.docs.write(name, doc, expected, actor, action)
     }
 
     /// Set a role's targets (and, when given, `pin_order` and
@@ -159,15 +195,18 @@ impl RouteRoles {
         prefer_awake: Option<PreferAwakeOverride>,
         expected: u64,
         actor: &SettingsActor,
-    ) -> Result<RoleEntry, SettingsWriteError> {
-        let current = self.refuse_if_locked(name)?;
+    ) -> Result<DocWrite<RouteRoleDoc>, SettingsWriteError> {
+        let current = self
+            .current(name)?
+            .map(|entry| (*entry.doc).clone())
+            .unwrap_or_default();
         let doc = RouteRoleDoc {
             targets,
             pin_order,
             prefer_awake,
             ..current
         };
-        self.docs.write(name, doc, expected, actor, "set")
+        self.replace(name, doc, expected, actor, "set", false)
     }
 
     /// Write revision `to`'s targets again as a new revision (0 = no store
@@ -179,8 +218,11 @@ impl RouteRoles {
         to: u64,
         expected: u64,
         actor: &SettingsActor,
-    ) -> Result<RoleEntry, SettingsWriteError> {
-        let current = self.refuse_if_locked(name)?;
+    ) -> Result<DocWrite<RouteRoleDoc>, SettingsWriteError> {
+        let current = self
+            .current(name)?
+            .map(|entry| (*entry.doc).clone())
+            .unwrap_or_default();
         let old = self.revision_doc(name, to)?;
         let doc = RouteRoleDoc {
             targets: old.targets,
@@ -189,8 +231,7 @@ impl RouteRoles {
             locked: current.locked,
             lock_reason: current.lock_reason,
         };
-        self.docs
-            .write(name, doc, expected, actor, &format!("revert:{to}"))
+        self.replace(name, doc, expected, actor, &format!("revert:{to}"), false)
     }
 
     /// Lock a role (its targets stay as they are) with an optional reason.
@@ -200,9 +241,9 @@ impl RouteRoles {
         reason: Option<String>,
         expected: u64,
         actor: &SettingsActor,
-    ) -> Result<RoleEntry, SettingsWriteError> {
+    ) -> Result<DocWrite<RouteRoleDoc>, SettingsWriteError> {
         let current = self
-            .get(name)
+            .current(name)?
             .map(|entry| (*entry.doc).clone())
             .unwrap_or_default();
         let doc = RouteRoleDoc {
@@ -219,9 +260,9 @@ impl RouteRoles {
         name: &str,
         expected: u64,
         actor: &SettingsActor,
-    ) -> Result<RoleEntry, SettingsWriteError> {
+    ) -> Result<DocWrite<RouteRoleDoc>, SettingsWriteError> {
         let current = self
-            .get(name)
+            .current(name)?
             .map(|entry| (*entry.doc).clone())
             .unwrap_or_default();
         let doc = RouteRoleDoc {

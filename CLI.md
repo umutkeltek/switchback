@@ -591,3 +591,39 @@ mutation can change enumeration, so offsets are hints: an exhausted pass starts
 again at zero, and the report never certifies a complete unindexed filesystem
 inventory. Root replacement, unsafe cursor paths or an oversized cursor refuse.
 Every selected recovery still rechecks its source, custody, limits and locks.
+
+## Reuse a gateway setup
+
+Export the saved route names and model settings with an operator key. JSON exports and
+[the YAML example](config/setup.example.yaml) use the same `switchback/setup@1` schema.
+
+```sh
+sb ai export --out setup.json
+sb ai plan setup.json
+sb ai apply setup.json
+```
+
+`names` maps each route name to its ordered targets and optional route settings.
+`models` maps exact `lane/model` targets to their settings documents, including locks and
+reasons. The gateway keeps items absent from the file. Plan lists those items and the
+changed keys without writing. Reapplying the same setup keeps the current revisions.
+
+`--effective` includes config-only route defaults marked `source: config`. Applying a route
+already supplied by the config leaves it there. Set `--unlock TARGET` for each model whose
+lock the apply should remove or change. Use the route name to authorize changing a locked
+route. Existing load locks still protect values while those locks are present.
+
+`--check` checks changed items. A failed check refuses the route or restores the model's
+previous settings. A sleeping executor stays asleep unless you supply `--wake`. Changes
+saved for a sleeping executor report pending engine apply or checks.
+
+`--json` exposes per-item status, revision before and after, and an undo request for each
+write. Save an item's `undo` document and apply it with `--unlock TARGET`, or POST it
+directly to `/v1/setup/apply`. Undo uses the recorded revision to protect newer edits.
+Undo of a first write restores the empty document so the effective defaults take over,
+and the revision history preserves both operations.
+
+The operator API exposes `GET /v1/setup` (optionally `?effective=true`) and
+`POST /v1/setup/plan` or `POST /v1/setup/apply`. The POST endpoints accept the document as
+JSON or YAML. To apply with options, send a JSON document with top-level `check`, `wake`,
+and `unlock` fields as needed.

@@ -23,6 +23,7 @@ use sb_core::{
     REQUEST_KEYS,
 };
 use sb_runtime::model_settings::{SettingsActor, SettingsEntry, SettingsWriteError};
+use sb_runtime::revisioned::{DocWrite, RevisionedDoc};
 
 use crate::tenancy::Principal;
 use crate::AppState;
@@ -613,7 +614,10 @@ async fn write(
         Err(response) => return response,
     };
     let registry = state.engine.model_settings();
-    let current = registry.get(&named.target);
+    let current = match registry.current(&named.target) {
+        Ok(entry) => entry,
+        Err(e) => return write_error(e),
+    };
     let current_revision = current.as_ref().map(|e| e.revision).unwrap_or(0);
     let expected = match expected_revision(headers, body.revision, current_revision, true) {
         Ok(expected) => expected,
@@ -660,16 +664,125 @@ async fn write(
     .await
 }
 
-/// A settings `ETag`: the revision, quoted.
 fn etag(revision: u64) -> String {
     format!("\"{revision}\"")
 }
 
-/// The one write path of PUT, PATCH and revert: the engine checks, the
-/// revisioned write, then the apply of changed load settings. The write
-/// stands whatever the engine does; the `apply` part of the answer says
-/// what that was (a busy model is `reloaded: false, reason: model_busy,
-/// pending: true`, still a 200).
+pub(super) fn with_etag(body: Value, revision: u64) -> Response {
+    let mut response = Json(body).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&etag(revision)) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::ETAG, value);
+    }
+    response
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum LockPolicy {
+    Standard,
+    Setup { unlock: bool },
+    Restore,
+}
+
+pub(super) fn lock_problem(
+    config: &Config,
+    target: &str,
+    before: &ModelSettingsDoc,
+    after: &ModelSettingsDoc,
+    policy: LockPolicy,
+) -> Option<String> {
+    match policy {
+        LockPolicy::Standard => {
+            crate::engine_control::store_lock_refusal(config, target, Some(before), after)
+        }
+        LockPolicy::Setup { unlock } => {
+            let mut protected = before.clone();
+            if unlock {
+                protected.locked.retain(|path| after.locked.contains(path));
+            } else if let Some(path) = before.locked.iter().find(|path| {
+                !after.locked.contains(path) || before.lock_reason(path) != after.lock_reason(path)
+            }) {
+                let reason = before
+                    .lock_reason(path)
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default();
+                return Some(format!(
+                    "`{path}` of `{target}` is locked{reason}: name `{target}` in unlock to change its lock"
+                ));
+            }
+            crate::engine_control::store_lock_refusal(config, target, Some(&protected), after)
+        }
+        LockPolicy::Restore => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SettingsMutation<'a> {
+    pub expected: u64,
+    pub actor: &'a SettingsActor,
+    pub action: &'a str,
+    pub apply: sb_core::ApplyMode,
+    pub wake: bool,
+    pub locks: LockPolicy,
+}
+
+pub(super) async fn mutate(
+    state: &AppState,
+    target: &str,
+    doc: ModelSettingsDoc,
+    options: SettingsMutation<'_>,
+) -> Result<(DocWrite<ModelSettingsDoc>, Option<Value>), SettingsWriteError> {
+    let ctx = crate::engine_control::EngineCtx::from(state);
+    let registry = state.engine.model_settings();
+    let before = registry.current(target)?;
+    let prior = before.as_ref().map(|entry| entry.doc.as_ref());
+    if let Some(entry) = before.as_ref().filter(|entry| entry.doc.equivalent(&doc)) {
+        return Ok((
+            DocWrite {
+                entry: entry.clone(),
+                unchanged: true,
+            },
+            None,
+        ));
+    }
+    {
+        let current = before.as_ref().map_or(0, |entry| entry.revision);
+        if options.expected != current {
+            return Err(SettingsWriteError::Conflict {
+                expected: options.expected,
+                current,
+            });
+        }
+        if let Some(message) = prior.and_then(|old| {
+            lock_problem(&state.snapshot().config, target, old, &doc, options.locks)
+        }) {
+            return Err(SettingsWriteError::Locked(message));
+        }
+        if !matches!(options.locks, LockPolicy::Restore) {
+            doc.check().map_err(SettingsWriteError::Invalid)?;
+            crate::engine_control::validate_for_target(&ctx, target, &doc)
+                .await
+                .map_err(SettingsWriteError::Invalid)?;
+        }
+    }
+    let written = registry.write(target, doc, options.expected, options.actor, options.action)?;
+    let applied = if written.unchanged {
+        None
+    } else {
+        crate::engine_control::after_settings_write(
+            &ctx,
+            target,
+            prior,
+            &written,
+            options.apply,
+            options.wake,
+        )
+        .await
+    };
+    Ok((written, applied))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_write(
     state: &AppState,
@@ -682,56 +795,42 @@ async fn commit_write(
     apply: sb_core::ApplyMode,
     wake: bool,
 ) -> Response {
-    let ctx = crate::engine_control::EngineCtx::from(state);
-    let registry = state.engine.model_settings();
-    // A store lock binds before anything else runs: a refused write never
-    // reaches the engine checks, the store or a machine.
-    if let Some(message) = crate::engine_control::store_lock_refusal(
-        &state.snapshot().config,
-        &named.target,
-        registry
-            .get(&named.target)
-            .map(|entry| entry.doc)
-            .as_deref(),
-        &doc,
-    ) {
-        let mut body = json!({"error": {"message": message, "type": "locked"}});
-        body["error"]["current_revision"] = json!(registry.revision(&named.target));
-        return (StatusCode::LOCKED, Json(body)).into_response();
-    }
-    if let Err(message) =
-        crate::engine_control::validate_for_target(&ctx, &named.target, &doc).await
-    {
-        return error(StatusCode::BAD_REQUEST, "invalid_settings", message);
-    }
-    let before = registry.get(&named.target).map(|entry| entry.doc.clone());
     let actor = actor_for(principal, headers);
-    let entry = match registry.write(&named.target, doc, expected, &actor, action) {
-        Ok(entry) => entry,
+    let (written, applied) = match mutate(
+        state,
+        &named.target,
+        doc,
+        SettingsMutation {
+            expected,
+            actor: &actor,
+            action,
+            apply,
+            wake,
+            locks: LockPolicy::Standard,
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(SettingsWriteError::Locked(message)) => {
+            return (
+                StatusCode::LOCKED,
+                Json(json!({"error": {
+                    "message": message, "type": "locked",
+                    "current_revision": state.engine.model_settings().revision(&named.target),
+                }})),
+            )
+                .into_response()
+        }
         Err(e) => return write_error(e),
     };
-    let applied = crate::engine_control::after_settings_write(
-        &ctx,
-        &named.target,
-        before.as_deref(),
-        &entry,
-        apply,
-        wake,
-    )
-    .await;
-    let mut view = target_view(state, named, Some(&entry), None, true);
+    let mut view = target_view(state, named, Some(&written), None, true);
+    view["unchanged"] = json!(written.unchanged);
     if let Some(applied) = applied {
         view["apply"] = applied;
     }
-    let mut response = Json(view).into_response();
-    if let Ok(value) = axum::http::HeaderValue::from_str(&etag(entry.revision)) {
-        response
-            .headers_mut()
-            .insert(axum::http::header::ETAG, value);
-    }
-    response
+    with_etag(view, written.revision)
 }
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevertBody {
@@ -807,7 +906,10 @@ async fn revert(
         }
     };
     let registry = state.engine.model_settings();
-    let current = registry.revision(&named.target);
+    let current = match registry.current(&named.target) {
+        Ok(entry) => entry.map_or(0, |entry| entry.revision),
+        Err(e) => return write_error(e),
+    };
     let expected = match expected_revision(headers, None, current, true) {
         Ok(expected) => expected,
         Err(response) => return response,

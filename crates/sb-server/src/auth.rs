@@ -127,8 +127,13 @@ fn operator_surface(method: &Method, path: &str) -> bool {
         return matches!(*method, Method::POST | Method::PATCH | Method::DELETE);
     }
     method == Method::POST
-        && (matches!(path, "/cp/v1/route-preview" | "/cp/v1/admission-preview")
-            || (path.starts_with("/v1/jobs/") && path.ends_with("/cancel"))
+        && (matches!(
+            path,
+            "/v1/setup/plan"
+                | "/v1/setup/apply"
+                | "/cp/v1/route-preview"
+                | "/cp/v1/admission-preview"
+        ) || (path.starts_with("/v1/jobs/") && path.ends_with("/cancel"))
             || power_path(path)
             || (path.starts_with("/cp/v1/drafts/") && path.ends_with("/validate")))
 }

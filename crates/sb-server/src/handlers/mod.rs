@@ -9,3 +9,5 @@ pub(crate) mod model_settings;
 pub(crate) mod openai;
 pub(crate) mod route_roles;
 pub(crate) mod workloads;
+
+pub(crate) mod setup;
