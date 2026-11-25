@@ -47,7 +47,7 @@ BILLING_LAST_GOOD = 3600  # a failed read falls back on the last good reading fo
 UNKNOWN = {"usage_store_unavailable": "the gateway usage store could not be read",
            "price_registry_unavailable": "the price registry could not be read"}
 USAGE = ("usage: sb credits [--json] | sb credits observe PROVIDER --balance USD --expires DATE"
-         " [--received DATE] [--amount USD] [--reserve USD]")
+         " [--received DATE] [--amount USD] [--reserve USD] [--assumed]")
 
 
 class GrantError(Exception):
@@ -102,11 +102,13 @@ def grant(raw):
             or not ENV_NAME.fullmatch(ref) or None in (amount, balance, reserve, received, expires, observed)
             or expires <= received
             or (usage_ref is not None and (not isinstance(usage_ref, str) or not ENV_NAME.fullmatch(usage_ref)))
-            or any(raw.get(k) is not None and not isinstance(raw[k], str) for k in ("observed_from", "renews"))):
+            or any(raw.get(k) is not None and not isinstance(raw[k], str) for k in ("observed_from", "renews"))
+            or not (raw.get("assumed") is None or isinstance(raw.get("assumed"), bool))):
         return None
     return {"provider": provider, "credential_ref": ref, "amount": amount, "balance": balance,
             "reserve": reserve, "received": received, "expires": expires, "observed": observed,
-            "usage_ref": usage_ref, "observed_from": text(raw.get("observed_from")), "renews": text(raw.get("renews"))}
+            "usage_ref": usage_ref, "observed_from": text(raw.get("observed_from")), "renews": text(raw.get("renews")),
+            "assumed": raw.get("assumed") is True}
 
 
 def parse(data):
@@ -338,6 +340,11 @@ def row(g, ordinal, now, store, registry, billing=None):
             if unpriced and not exact:
                 notes.append(f"{unpriced} request{' had' if unpriced == 1 else 's had'} no known price and "
                              f"{'is' if unpriced == 1 else 'are'} not in the estimate.")
+    if g["assumed"] and now < g["expires"]:
+        # Nobody read these numbers: a call succeeded after the old grant expired, on an account without a card.
+        notes.append(f"The amount and the expiry are assumed, not read: a renewal was seen by a live call. Record the "
+                     f"true numbers from the billing page: sb credits observe {p} --balance USD --expires YYYY-MM-DD "
+                     f"--received YYYY-MM-DD --amount USD")
     sampled = None if error else billing[1] if exact and now < g["expires"] else now
     w = {**window("credit_grant", None if used is None else round(100 * used, 4), g["expires"], sampled, now,
                   (g["expires"] - g["received"]) / 60), "scope": "generation", "estimated": not exact}
@@ -365,6 +372,8 @@ def row(g, ordinal, now, store, registry, billing=None):
                        "expires_at": iso(g["expires"])}}
     if g["renews"]:
         result["renews"] = g["renews"]
+    if g["assumed"]:
+        result["assumed"] = True
     if error:
         result["refresh_error"] = error
     if isinstance(billing, str) or (exact and len(billing) > 2):
@@ -431,6 +440,8 @@ def observe(argv, runtime, now=None):
     if not argv or not PROVIDER.fullmatch(argv[0]):
         return fail("invalid provider id; nothing changed")
     provider, options, rest = argv[0], {}, argv[1:]
+    assumed = "--assumed" in rest
+    rest = [value for value in rest if value != "--assumed"]
     names = {"--balance", "--expires", "--received", "--amount", "--reserve"}
     while rest:
         if len(rest) < 2 or rest[0] not in names or rest[0] in options:
@@ -476,6 +487,10 @@ def observe(argv, runtime, now=None):
     if renewed and "--amount" not in options:
         raw["amount_usd"] = numbers["--balance"]
     raw.update(observed_balance_usd=numbers["--balance"], observed_at=iso(int(now)), expires_at=options["--expires"])
+    if assumed:
+        raw.update(assumed=True, observed_from="assumed after a live call")
+    elif raw.pop("assumed", None):
+        raw.pop("observed_from", None)  # the assumption's source line must not label a true reading
     for key, field in (("--received", "received_at"), ("--amount", "amount_usd"), ("--reserve", "reserve_usd")):
         if key in options:
             raw[field] = numbers.get(key, options[key])
@@ -513,7 +528,8 @@ def observe(argv, runtime, now=None):
             os.unlink(name)
     print(f"Recorded {provider} credit reading: ${numbers['--balance']:.2f} at {raw['observed_at']}, "
           f"expires {day(instant(raw['expires_at']))}." + (
-              f" New grant: ${raw['amount_usd']:.2f} received {raw['received_at']}." if renewed else ""))
+              f" New grant: ${raw['amount_usd']:.2f} received {raw['received_at']}." if renewed else "") + (
+              " Amount and expiry are assumed, not read from the billing page." if assumed else ""))
     return 0
 
 

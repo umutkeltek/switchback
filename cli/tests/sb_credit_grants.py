@@ -574,5 +574,87 @@ class LastGoodReadingTests(unittest.TestCase):
             self.assertEqual(self.view(fixture, never, NOW)["balances"][0]["billedSinceGrant"], 12.0)
 
 
+class AssumedRenewalTests(unittest.TestCase):
+    """A renewal seen by a live call is recorded with assumed numbers, and the meter says so until someone reads them."""
+
+    observe = CreditGrantTests.observe
+
+    def test_an_assumed_renewal_is_marked_in_the_file_the_row_and_the_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=[BILLED])
+            (fixture.runtime / "manifest.json").write_text("{}")
+            ok = self.observe(fixture, "openai", "--balance", "50", "--amount", "50", "--received", "2098-01-01",
+                              "--expires", "2098-01-29", "--assumed")
+            self.assertEqual((ok.returncode, ok.stderr), (0, ""))
+            self.assertIn("assumed", ok.stdout)
+            saved = json.loads(fixture.grants_path.read_text())["grants"][0]
+            self.assertEqual((saved["assumed"], saved["observed_from"], saved["amount_usd"], saved["renews"]),
+                             (True, "assumed after a live call", 50.0, "monthly"))
+            rows, problem = credit.view(fixture.runtime, at("2098-01-10T00:00:00Z"), fixture.registry,
+                                        {"FIXTURE_USAGE_KEY": "k"}, lambda grant, token: 4.0)
+            self.assertIsNone(problem)
+            row = rows[0]
+            self.assertIs(row["assumed"], True)
+            self.assertAlmostEqual(row["balances"][0]["balance"], 46.0)
+            self.assertTrue(any("assumed, not read" in note and "sb credits observe openai" in note for note in row["notes"]),
+                            row["notes"])
+            # The first note stays the money line: readers take notes[0] as the balance sentence.
+            self.assertIn("$46.00 of $50.00 left", row["notes"][0])
+
+    def test_a_true_reading_clears_the_assumption_and_its_source_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=[BILLED])
+            (fixture.runtime / "manifest.json").write_text("{}")
+            self.assertEqual(self.observe(fixture, "openai", "--balance", "50", "--amount", "50", "--received",
+                                          "2098-01-01", "--expires", "2098-01-29", "--assumed").returncode, 0)
+            ok = self.observe(fixture, "openai", "--balance", "187.5", "--amount", "200", "--received", "2098-01-01",
+                              "--expires", "2098-01-31")
+            self.assertEqual((ok.returncode, ok.stderr), (0, ""))
+            self.assertNotIn("assumed", ok.stdout)
+            saved = json.loads(fixture.grants_path.read_text())["grants"][0]
+            self.assertNotIn("assumed", saved)
+            self.assertNotIn("observed_from", saved)
+            self.assertEqual((saved["amount_usd"], saved["observed_balance_usd"]), (200.0, 187.5))
+            rows, _ = credit.view(fixture.runtime, at("2098-01-10T00:00:00Z"), fixture.registry,
+                                  {"FIXTURE_USAGE_KEY": "k"}, lambda grant, token: 12.5)
+            self.assertNotIn("assumed", rows[0])
+            self.assertFalse(any("assumed" in note for note in rows[0]["notes"]), rows[0]["notes"])
+
+    def test_an_ordinary_reading_keeps_its_source_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=[BILLED])
+            (fixture.runtime / "manifest.json").write_text("{}")
+            self.assertEqual(self.observe(fixture, "openai", "--balance", "80", "--expires", "2026-01-31").returncode, 0)
+            saved = json.loads(fixture.grants_path.read_text())["grants"][0]
+            self.assertEqual(saved["observed_from"], "fixture page")
+            self.assertNotIn("assumed", saved)
+
+    def test_an_expired_assumed_grant_is_just_expired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=[dict(BILLED, assumed=True)])
+            row = fixture.one(at("2026-03-01T00:00:00Z"))
+            self.assertEqual(row["pace"]["state"], "expired")
+            self.assertFalse(any("assumed, not read" in note for note in row["notes"]), row["notes"])
+
+    def test_assumed_must_be_true_or_false(self):
+        for bad in ("yes", 1, 0, [], {}):
+            with tempfile.TemporaryDirectory() as tmp:
+                fixture = Fixture(tmp, grants=[dict(GRANT, assumed=bad)])
+                rows, problem = credit.view(fixture.runtime, NOW, fixture.registry)
+                self.assertEqual((rows, problem), ([], "credit_grants_invalid"), bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=[dict(GRANT, assumed=False)])
+            self.assertNotIn("assumed", fixture.one())
+
+    def test_assumed_takes_no_value_and_cannot_stand_in_for_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Fixture(tmp, grants=[BILLED])
+            (fixture.runtime / "manifest.json").write_text("{}")
+            before = fixture.grants_path.read_text()
+            bad = self.observe(fixture, "openai", "--balance", "--assumed", "--expires", "2098-01-29")
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertEqual(fixture.grants_path.read_text(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

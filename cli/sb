@@ -7564,7 +7564,7 @@ sb registry [providers|costs|capabilities|benchmarks|model|probe|score] provider
                              --refresh-if-due uses Rust timing, backoff and a shared refresh lock
   sb costs [on|off|status] | sb costs [--json]
                              estimated token cost per Claude/Codex account from local logs (off by default)
-  sb credits [--json] | sb credits observe PROVIDER --balance USD --expires DATE [--received DATE] [--amount USD] [--reserve USD]
+  sb credits [--json] | sb credits observe PROVIDER --balance USD --expires DATE [--received DATE] [--amount USD] [--reserve USD] [--assumed]
                              prepaid credit grants: estimated balance, expiry and daily pace (also in sb limits)
   sb ai image|video|status|models|hold|release
                              images, video and machine status through a Switchback gateway (sb ai help)
