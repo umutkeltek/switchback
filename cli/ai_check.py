@@ -1847,7 +1847,8 @@ def change_failure(verdicts, checks, growth, repeats):
     return None
 
 
-def keep_or_put_back(checker, ident, before_revision, before_doc, checks, growth, repeats, run_them):
+def keep_or_put_back(checker, ident, before_revision, before_doc, checks, growth, repeats, run_them,
+                     restore=None):
     """Run the checks of a change that is live now (`run_them()` returns
     (truth, verdicts)) and keep it only when they pass. A failed check, or
     checks that stop for any reason (a quiet window, a lost lock, a machine
@@ -1871,7 +1872,7 @@ def keep_or_put_back(checker, ident, before_revision, before_doc, checks, growth
         return OK
     note = f"sb ai check: {failure}; back to revision {before_revision}"[:120]
     try:
-        back = put_back(checker, ident, before_doc, note)
+        back = restore() if restore else put_back(checker, ident, before_doc, note)
     except (CheckError, KeyboardInterrupt) as error:
         why = getattr(error, "message", "interrupted")
         checker.say(f"{failure}; putting the settings of revision {before_revision} back failed "
@@ -2036,7 +2037,7 @@ def pending(gw, fail_types, target):
 
 
 def after_load(gw, args, fail_types, target, revision, keys, poll_secs=None, out=sys.stdout,
-               err=sys.stderr):
+               err=sys.stderr, previous=None, restore=None):
     """The checks a guarded change left pending, run on the model's next
     load through `sb ai load`. The change is live once loaded, so a failed
     check, or checks that cannot start or stop for any reason, write the
@@ -2047,15 +2048,18 @@ def after_load(gw, args, fail_types, target, revision, keys, poll_secs=None, out
         ident = checker.resolve(target)
         if ident["revision"] != revision:
             return OK  # written again since: its own pending checks decide
-        try:
-            history = gw.call("GET", checker.model_path(target, "settings/history"), timeout=30,
-                              headers={})
-        except fail_types as error:
-            raise CheckError(FAIL, f"reading the settings history: {getattr(error, 'message', error)}") from None
-        rows = sorted(history.get("history") or [], key=lambda r: r.get("revision") or 0, reverse=True)
-        before = next((r for r in rows if (r.get("revision") or 0) < revision), None)
-        before_doc = history_doc(before) if before else {}
-        before_revision = before.get("revision") if before else 0
+        if previous is None:
+            try:
+                history = gw.call("GET", checker.model_path(target, "settings/history"), timeout=30,
+                                  headers={})
+            except fail_types as error:
+                raise CheckError(FAIL, f"reading settings history: {getattr(error, 'message', error)}") from None
+            rows = sorted(history.get("history") or [], key=lambda r: r.get("revision") or 0, reverse=True)
+            before = next((r for r in rows if (r.get("revision") or 0) < revision), None)
+            before_revision = before.get("revision") if before else 0
+            before_doc = history_doc(before) if before else {}
+        else:
+            before_revision, before_doc = previous
         growth = pool_growth(before_doc, ident["document"])
         repeats = pool_repeats_for(args, growth)
         runs = int(getattr(args, "runs", None) or PICTURE_RUNS)
@@ -2077,7 +2081,7 @@ def after_load(gw, args, fail_types, target, revision, keys, poll_secs=None, out
 
         try:
             return keep_or_put_back(checker, ident, before_revision, before_doc, checks, growth,
-                                    repeats, run_them)
+                                    repeats, run_them, restore=restore)
         finally:
             checker.release()
     except CheckError as error:

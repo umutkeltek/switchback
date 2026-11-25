@@ -279,6 +279,21 @@ class Fake:
 
     def route(self, method, path, body):
         base = f"/v1/models/{TARGET}"
+        if method == "POST" and path == "/v1/setup/apply":
+            request = json.loads(body["setup"]) if "setup" in body else body
+            doc = request["models"][TARGET]
+            expected = request.get("if_match", {}).get("models", {}).get(TARGET, self.revision)
+            if expected != self.revision:
+                return 200, {"items": [{"status": "refused", "reason": "stale"}]}
+            prior, before = self.doc, self.revision
+            changed = ai_check.guarded_changes(prior, doc)
+            self.write(doc, "setup")
+            return 200, {"items": [{
+                "kind": "model", "name": TARGET, "status": "update", "changed": changed,
+                "revision_before": before, "revision_after": self.revision,
+                "undo": {"schema": "switchback/setup@1", "models": {TARGET: prior}, "unlock": [TARGET],
+                         "if_match": {"models": {TARGET: self.revision}}},
+            }], "not_in_file": []}
         if method == "GET" and path == base + "/settings":
             return 200, {"model": TARGET, "targets": [self.view()], "revision": self.revision}
         if method == "PUT" and path == base + "/settings":
@@ -715,6 +730,27 @@ class CheckTests(Base):
 
 
 class GuardTests(Base):
+    def test_setup_apply_runs_guarded_checks_and_rolls_back_at_the_written_revision(self):
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        before = json.loads(json.dumps(self.fake.doc))
+        doc = dict(before, engine_args={"kv-unified": False}, locked=["engine_args.kv-unified"])
+        path = self.root / "setup.json"
+        path.write_text(json.dumps({"schema": "switchback/setup@1", "models": {TARGET: doc}}))
+        run = self.sb("apply", str(path), "--check", "--json")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        row, = json.loads(run.stdout)["items"]
+        self.assertEqual(row["status"], "refused", row)
+        self.assertEqual(row["revision_before"], 1)
+        self.assertEqual(row["revision_after"], 3)
+        self.assertEqual(row["guarded_checks"]["restored"]["revision"], 3)
+        self.assertEqual(self.fake.doc, before)
+        restores = [b for m, p, b, _ in self.fake.seen if m == "POST" and p == "/v1/setup/apply"]
+        self.assertEqual(restores[-1]["if_match"]["models"], {TARGET: 2})
+        self.assertEqual(restores[-1]["unlock"], [TARGET])
+        self.assertFalse(restores[-1]["wake"])
+        self.assertTrue(any(r["suite"] == "check-long" and r["passed"] == 0 for r in self.fake.ledger))
+        self.released()
+
     def test_set_check_keeps_a_change_that_passes(self):
         self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}})
         run = self.sb("set", TARGET, "engine_args.kv-unified=true", "--load", "--check",

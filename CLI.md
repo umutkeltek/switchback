@@ -613,8 +613,10 @@ already supplied by the config leaves it there. Set `--unlock TARGET` for each m
 lock the apply should remove or change. Use the route name to authorize changing a locked
 route. Existing load locks still protect values while those locks are present.
 
-`--check` checks changed items. A failed check refuses the route or restores the model's
-previous settings. A sleeping executor stays asleep unless you supply `--wake`. Changes
+`--check` checks changed items. The gateway verifies engine apply and sends a short
+request to the changed target. The CLI also runs the `sb ai set --load` checks for guarded
+memory and context settings. A failed check refuses the route or restores the previous
+model settings. A sleeping executor stays asleep unless you supply `--wake`. Changes
 saved for a sleeping executor report pending engine apply or checks.
 
 `--json` exposes per-item status, revision before and after, and an undo request for each

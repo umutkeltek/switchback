@@ -40,6 +40,7 @@ struct SetupRequest {
     models: BTreeMap<String, Value>,
     unlock: BTreeSet<String>,
     check: bool,
+    apply_now: bool,
     wake: bool,
     if_match: Revisions,
 }
@@ -343,7 +344,7 @@ impl Run<'_> {
             expected,
             actor: self.actor,
             action: if unlock { "setup:unlock" } else { "setup" },
-            apply: if self.request.check || self.request.wake {
+            apply: if self.request.check || self.request.wake || self.request.apply_now {
                 ApplyMode::Now
             } else {
                 ApplyMode::NextLoad
@@ -477,14 +478,28 @@ impl Run<'_> {
                     })
             });
         let before = current.as_ref().map(|entry| entry.doc.as_ref());
-        if same_config || before == Some(&doc) {
+        if same_config || before.is_some_and(|old| old.equivalent(&doc)) {
             item.status = Status::Unchanged;
             return item;
         }
         let empty = RouteRoleDoc::default();
         let before = before.unwrap_or(&empty);
-        let comparison = config_name(self.config, name).filter(|_| revision == 0);
-        item.changed = RouteRoleDoc::changed(comparison.as_ref().unwrap_or(before), &doc);
+        item.changed = match base.filter(|_| revision == 0) {
+            Some(base) => {
+                let prior = config_name(self.config, name).unwrap_or_default();
+                let route = doc.route_over(name, Some(base));
+                let route = route.as_ref().unwrap_or(base);
+                let effective = RouteRoleDoc {
+                    targets: route.targets.clone(),
+                    pin_order: Some(route.pin_order),
+                    prefer_awake: route.prefer_awake,
+                    locked: doc.locked,
+                    lock_reason: doc.lock_reason.clone(),
+                };
+                RouteRoleDoc::changed(&prior, &effective)
+            }
+            None => RouteRoleDoc::changed(before, &doc),
+        };
         if source == Some("config") {
             item.status = Status::Update;
         }

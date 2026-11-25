@@ -76,6 +76,9 @@ api_keys:
   - key: "sk-admin"
     tenant: ops
     role: admin
+  - key: "sk-operator"
+    tenant: ops
+    role: operator
   - key: "sk-client"
     tenant: ops
     role: client
@@ -600,6 +603,16 @@ async fn setup_plans_and_partially_applies_with_lock_protection_and_cas_undo() {
     assert_eq!(svc.status(), 200);
     let yaml_plan: Value = svc.json().await.unwrap();
     assert_eq!(yaml_plan["items"][0]["status"], "unchanged", "{yaml_plan}");
+    let duplicate = reqwest::Client::new()
+        .post(format!("{}/v1/setup/apply", gw.url))
+        .bearer_auth("sk-operator")
+        .header("content-type", "application/yaml")
+        .body("schema: switchback/setup@1\nmodels:\n  one/m: {}\n  one/m: {}\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), 400);
+    assert_eq!(gw.state.engine.model_settings().revision("one/m"), 3);
 
     let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
 }

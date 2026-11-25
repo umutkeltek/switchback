@@ -28,6 +28,7 @@ use sb_core::{
     config_route_for_role, role_name_problem, Config, PreferAwakeOverride, RouteRoleDoc,
 };
 use sb_runtime::model_settings::SettingsWriteError;
+use sb_runtime::revisioned::RevisionedDoc;
 use sb_runtime::route_roles::{RoleEntry, RouteRoles};
 use sb_runtime::ExecOutcome;
 
@@ -213,7 +214,7 @@ pub(crate) async fn get(
             )
         }
     }
-    Json(row).into_response()
+    with_etag(row, entry.as_ref().map_or(0, |entry| entry.revision))
 }
 
 /// The revision a write edits: `If-Match` (quotes and `W/` allowed, `*`
@@ -448,7 +449,7 @@ pub(crate) async fn put(
         locked: prior.is_some_and(|doc| doc.locked),
         lock_reason: prior.and_then(|doc| doc.lock_reason.clone()),
     };
-    if prior == Some(&doc) {
+    if prior.is_some_and(|old| old.equivalent(&doc)) {
         let mut row = role_row(
             &snap.config,
             &snap.registry,

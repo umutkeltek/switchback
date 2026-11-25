@@ -2712,7 +2712,61 @@ def cmd_revert(gw, args):
 ROLE_ACTIONS = ("set", "revert", "lock", "unlock")
 
 
-def cmd_setup(gw, args):
+def check_setup_load(gw, args, row, poll_secs):
+    guarded_keys = {f"load.{key}" for key in ai_check.GUARDED_LOAD}
+    guarded_keys.update(f"engine_args.{key}" for key in ai_check.GUARDED_ARGS)
+    keys = sorted(guarded_keys.intersection(row["changed"]))
+    if row["kind"] != "model" or not keys or not row.get("undo") or row.get("pending"):
+        return
+
+    target = row["name"]
+    undo = row["undo"]
+    previous = row["revision_before"], undo["models"][target]
+    restore_attempted = False
+
+    def restore():
+        nonlocal restore_attempted
+        restore_attempted = True
+        try:
+            answer = gw.post("/v1/setup/apply", dict(undo, apply_now=True, wake=args.wake), timeout=900)
+        except (Fail, GatewayError) as error:
+            raise ai_check.CheckError(ai_check.FAIL, error.message) from None
+        back, = answer["items"]
+        if back["status"] in ("refused", "invalid"):
+            raise ai_check.CheckError(ai_check.FAIL, back["reason"])
+        row["revision_after"] = back["revision_after"]
+        row.pop("undo", None)
+        row["pending"] = back.get("pending", False)
+        row["guarded_checks"]["restored"] = {
+            "revision": back["revision_after"], "apply": back.get("apply"),
+        }
+        return {"revision": back["revision_after"], "apply": back.get("apply")}
+
+    row["guarded_checks"] = {"keys": keys}
+    try:
+        code = ai_check.after_load(
+            gw, args, (Fail, GatewayError), target, row["revision_after"], keys,
+            poll_secs=poll_secs, out=sys.stderr, err=sys.stderr, previous=previous, restore=restore,
+        )
+    except KeyboardInterrupt:
+        code = ai_check.INTERRUPTED
+    except Exception as error:
+        print(f"sb ai check: {gw.scrub(error)}", file=sys.stderr)
+        code = GATEWAY_ERROR
+    row["guarded_checks"]["ok"] = code == OK
+    if code != OK:
+        row["status"] = "refused"
+        row["reason"] = "guarded load checks did not pass"
+        if not restore_attempted:
+            try:
+                restore()
+            except ai_check.CheckError as error:
+                row["reason"] += f"; could not restore settings: {error.message}"
+        elif row.get("undo"):
+            row["reason"] += "; could not restore settings"
+
+
+def cmd_setup(gw, args, poll_secs=None):
     if args.command == "export":
         path = "/v1/setup" + ("?effective=true" if args.effective else "")
         document = gw.get(path)
@@ -2743,6 +2797,10 @@ def cmd_setup(gw, args):
     except GatewayError as error:
         raise Fail(GATEWAY_ERROR, error.message) from None
     rows = answer["items"]
+    if applying and args.check:
+        for row in rows:
+            if row["status"] in ("create", "update"):
+                check_setup_load(gw, args, row, poll_secs)
     if args.json:
         print(json.dumps(answer, indent=2, ensure_ascii=False))
     else:
@@ -3372,7 +3430,7 @@ def main(argv=None, environ=None):
         if args.command == "engines":
             return cmd_engines(gw, args)
         if args.command in ("export", "plan", "apply"):
-            return cmd_setup(gw, args)
+            return cmd_setup(gw, args, poll_secs=float(environ.get("SB_AI_POLL_SECS") or 2))
         if args.command == "roles":
             return cmd_roles(gw, args)
         if args.command == "role":

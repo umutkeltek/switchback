@@ -26,6 +26,17 @@ impl RevisionedDoc for RouteRoleDoc {
         self.validate().map_err(|e| e.0)
     }
 
+    fn equivalent(&self, other: &Self) -> bool {
+        let preference = |value: Option<PreferAwakeOverride>| {
+            value.filter(|value| *value != PreferAwakeOverride::default())
+        };
+        self.targets == other.targets
+            && self.pin_order == other.pin_order
+            && preference(self.prefer_awake) == preference(other.prefer_awake)
+            && self.locked == other.locked
+            && self.lock_reason == other.lock_reason
+    }
+
     fn changed(before: &Self, after: &Self) -> Vec<String> {
         let mut changed = Vec::new();
         if before.targets != after.targets {
