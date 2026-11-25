@@ -182,7 +182,11 @@ impl AppState {
             .eval_evidence
             .write()
             .map_err(|_| "eval evidence lock poisoned".to_string())?;
-        *guard = snapshot;
+        let current_id = guard.as_ref().map(|current| &current.snapshot_id);
+        let requested_id = snapshot.as_ref().map(|next| &next.snapshot_id);
+        if current_id != requested_id {
+            *guard = snapshot;
+        }
         Ok(())
     }
 

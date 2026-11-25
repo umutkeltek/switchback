@@ -816,12 +816,6 @@ pub async fn reload_endpoint(
         "config file reload",
         &principal,
     )) {
-        Ok(result) if result.unchanged => Json(json!({
-            "ok": true,
-            "revision": result.revision,
-            "unchanged": true,
-            "eval_evidence_snapshot_id": state.eval_evidence_snapshot().map(|snapshot| snapshot.snapshot_id.clone()),
-        })).into_response(),
         Ok(result) => match crate::serve::open_eval_evidence_snapshot(&state.snapshot().config) {
             Ok(eval_evidence) => {
                 let eval_evidence_snapshot_id = eval_evidence
@@ -831,7 +825,7 @@ pub async fn reload_endpoint(
                     Ok(()) => Json(json!({
                         "ok": true,
                         "revision": result.revision,
-                        "unchanged": false,
+                        "unchanged": result.unchanged,
                         "eval_evidence_snapshot_id": eval_evidence_snapshot_id,
                     }))
                     .into_response(),

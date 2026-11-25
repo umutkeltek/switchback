@@ -1915,6 +1915,8 @@ fn eval_published_snapshot_activation_is_startup_and_reload_bounded() {
     let (status, reload) = http_json("POST", &format!("{base}/v1/reload"), None).unwrap();
     assert_eq!(status, 200);
     assert_eq!(reload["ok"], true);
+    assert_eq!(reload["revision"], 1);
+    assert_eq!(reload["unchanged"], true);
     assert_eq!(reload["eval_evidence_snapshot_id"], second_id);
 
     let (status, current) =
