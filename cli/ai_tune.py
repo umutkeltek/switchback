@@ -80,6 +80,8 @@ except ImportError:  # the module sits next to this file
 
 OK, FAIL, USAGE = 0, 1, 2
 INTERRUPTED = 130
+UNREACHABLE = 3     # ai_gateway.Fail's code for a gateway this machine did not reach
+UNREACHED_TRIES = 3  # sends of a request that never reached the gateway
 
 # The noise is the standard deviation (SD) of one run, relative to the
 # runs' mean, per metric: the sample SD of the noise runs, then pooled with
@@ -188,8 +190,10 @@ CATALOGUE = {
                  "searched in 4096-token steps up to --ctx-max or the model's trained "
                  "context; kept when speed holds"},
         {"lever": "n_gpu_layers", "keys": ["n_gpu_layers", "fit"], "metric": "decode",
-         "gate": "greedy",
-         "note": "every layer on the GPU against the engine's own fit"},
+         "gate": "soak",
+         "note": "every layer on the GPU against the engine's own fit; it moves weights onto "
+                 "the card, so it must pass the long and pool checks (a vision model once "
+                 "loaded this way and ran out of memory on its first real request)"},
         {"lever": "threads", "keys": ["threads"], "metric": "decode", "gate": "greedy",
          "explicit_only": True,
          "note": "CPU threads; matters on unified-memory machines (Apple)"},
@@ -213,6 +217,27 @@ CHAT_PROMPT = ("You are a careful assistant. Read the notes, then answer in one 
 READ_PROMPT = ("Read the document. Reply with one line about what it is about.\n\nDocument:\n"
                + " ".join(FILLER * 120))
 GREEDY_PROMPT = "List the first ten prime numbers, separated by commas, and nothing else."
+
+# The decode runs' fixed workload: the same prompts in the same order with
+# the same seed every run (the model's own sampling settings otherwise), each
+# asking for far more than DECODE_TOKENS, so every answer is the same text
+# and runs to the cap. Measured on a speculative-decoding model: fresh
+# prompts with free sampling gave answers of 36 to 92 tokens and draft
+# acceptance from 46% to 87%, so one sample's decode moved by about ±12% and
+# a run's median by several percent while the machine itself moved 0.2%;
+# with these prompts and a fixed seed, runs of the same settings agreed to
+# 0.2%. Three kinds of text (prose, a list, code), because a draft model's
+# acceptance differs by kind: the run's decode is their throughput together.
+DECODE_SET = (
+    "Write a long, detailed essay of at least 900 words about how rivers shape the land over "
+    "time. Use plain paragraphs, no headings.",
+    "Write a numbered list of 80 practical tips for keeping a small vegetable garden healthy, "
+    "one full sentence each.",
+    "Write a complete Python module for a small command-line to-do list app with add, list, done "
+    "and delete commands that saves to a JSON file. Include docstrings and comments.",
+)
+DECODE_TOKENS = 128
+TUNE_SEED = 1
 
 
 # Lane states of a machine that is up and serves requests.
@@ -330,6 +355,58 @@ def switch_on(value):
     return str(value).strip().lower() in ("true", "on", "1", "enabled")
 
 
+# Load keys and the engine keys a llama.cpp router preset names them by (the
+# gateway's own mapping): a value the settings document does not set comes
+# from the machine file, and the settings view lists it under
+# `load.engine_keys`. A lever's current value is the one in force, never a
+# guess: on 11-22 three trials set values the machine file already had.
+PRESET_KEYS = {"ctx_size": "ctx-size", "n_gpu_layers": "n-gpu-layers",
+               "cache_type_k": "cache-type-k", "cache_type_v": "cache-type-v",
+               "flash_attn": "flash-attn", "batch_size": "batch-size", "ubatch_size": "ubatch-size",
+               "parallel": "parallel", "threads": "threads", "spec_type": "spec-type",
+               "spec_draft_model": "spec-draft-model", "draft_max": "spec-draft-n-max",
+               "draft_min": "spec-draft-n-min", "mmproj": "mmproj",
+               "sleep_idle_seconds": "sleep-idle-seconds", "fit": "fit"}
+INT_KEYS = ("ctx_size", "batch_size", "ubatch_size", "parallel", "threads", "draft_max",
+            "draft_min", "sleep_idle_seconds")
+
+
+def in_force(load, engine_keys):
+    """The load settings in force: the document's, and for every key it does
+    not set, the value the engine keys list (the machine file's)."""
+    out = dict(load or {})
+    for key, engine_key in PRESET_KEYS.items():
+        if key in out:
+            continue
+        entry = (engine_keys or {}).get(engine_key)
+        value = entry.get("value") if isinstance(entry, dict) else None
+        if value is None:
+            continue
+        if key in INT_KEYS or (key == "n_gpu_layers" and str(value).lstrip("-").isdigit()):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+        out[key] = value
+    return out
+
+
+def same_value(a, b):
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, bool) or isinstance(b, bool):
+        return switch_on(a) == switch_on(b)
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+def all_on_gpu(load):
+    """Every layer already on the GPU: n_gpu_layers all (or 999 and up) and
+    the engine's own fit off."""
+    layers = str(load.get("n_gpu_layers", "")).strip().lower()
+    on = layers == "all" or (layers.isdigit() and int(layers) >= 999)
+    return on and not switch_on(load.get("fit", "off"))
+
+
 def doc_truth(doc):
     """What a settings document asks the engine for, in the shape of
     `ai_check.truth_from_args` (when the engine lists no arguments)."""
@@ -349,6 +426,31 @@ def doc_truth(doc):
 
 def median(values):
     return statistics.median(values) if values else None
+
+
+def _positive(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def set_decode(answers):
+    """A decode run's speed over the fixed prompt set: per prompt the median
+    of its answers, then those prompts' throughput together (the harmonic
+    mean: each prompt decodes the same number of tokens). Answers carry their
+    prompt's index as `prompt`; answers without one count as one prompt."""
+    by_prompt = {}
+    for answer in answers:
+        by_prompt.setdefault(answer.get("prompt", 0), []).append(answer["decode_tps"])
+    medians = [statistics.median(values) for values in by_prompt.values()]
+    if not medians or any(value <= 0 for value in medians):
+        return median([answer["decode_tps"] for answer in answers])
+    return len(medians) / sum(1 / value for value in medians)
+
+
+def clock_of(answers):
+    """`engine` when every answer was timed by the engine, `client` when
+    none was, else `mixed`."""
+    clocks = {answer.get("clock", "client") for answer in answers}
+    return clocks.pop() if len(clocks) == 1 else "mixed"
 
 
 def short_hash(text):
@@ -450,6 +552,15 @@ class Tuner:
         self.picture_baseline = None
         self.check_calibrated = False
         self._checker = None
+        # `switchback.no_cache` on fixed prompts (set from the engine listing:
+        # gateways that list `effective` know it); the engine's own clock,
+        # None until the first answer's trace says whether it has one.
+        self.no_cache = False
+        self.engine_clock = None
+        # Fresh processes the run loaded for its own measurements (noise
+        # runs, candidates after a check gate), and what each took.
+        self.fresh_runs = 0
+        self.fresh_secs = []
         poll = getattr(args, "poll_secs", None)
         # Test runs pass a short poll; every wait scales with it.
         self.scale = 1.0 if poll is None else max(0.001, float(poll) / 2.0)
@@ -496,6 +607,7 @@ class Tuner:
         engine = load_view.get("engine") or {}
         self.lane = engine.get("lane") or self.provider
         self.unload_timeout = lane_unload_timeout(engine)
+        self.engine_keys = load_view.get("engine_keys") or {}
         self.kind = engine.get("kind") or "llama_cpp_router"
         if self.kind not in CATALOGUE:
             raise TuneError(FAIL, f"no lever catalogue for engine kind {self.kind}")
@@ -553,8 +665,24 @@ class Tuner:
         return plan
 
     def candidates(self, entry, load, listing_row):
-        """Candidate values for a lever, from the current best load settings.
-        Returns (list of {key: value} changes, why-none)."""
+        """Candidate values for a lever, from the load settings in force (the
+        best document's, else the machine file's). A candidate that would set
+        what is already in force is dropped. Returns (list of {key: value}
+        changes, why-none)."""
+        load = in_force(load, getattr(self, "engine_keys", {}))
+        changes, why = self.raw_candidates(entry, load, listing_row)
+        if why or entry.get("kind") == "sweep":
+            # A sweep keeps the value in force: it is the comparison.
+            return changes, why
+        kept = [change for change in changes
+                if not all(same_value(value, load.get(key)) for key, value in change.items()
+                           if not key.startswith("engine_args."))
+                or any(key.startswith("engine_args.") for key in change)]
+        if changes and not kept:
+            return [], "every candidate is the value already in force"
+        return kept, None
+
+    def raw_candidates(self, entry, load, listing_row):
         lever = entry["lever"]
         if lever == "spec_type":
             current = self.spec_type_now(load, listing_row)
@@ -583,16 +711,27 @@ class Tuner:
             return [{"ubatch_size": v, "batch_size": max(batch, v)}
                     for v in entry["values"] if v != current], None
         if lever == "parallel":
-            slots = int(load.get("parallel") or 1)
-            ctx = int(load.get("ctx_size") or listing_row.get("n_ctx") or 4096)
-            per_slot = max(512, ctx // slots)
+            truth = self.truth_now(listing_row) or {}
+            slots = int(load.get("parallel") or truth.get("slots") or 1)
+            ctx = load.get("ctx_size") or truth.get("ctx_size")
             top = max(self.concurrency)
             if top <= 1:
                 return [], "--concurrency is 1, so more slots cannot help"
+            if not ctx:
+                return [], "the context in force is unknown, so a slot count cannot be sized"
+            ctx = int(ctx)
+            unified = bool(truth.get("kv_unified")) or switch_on(
+                (self.best.get("engine_args") or {}).get("kv-unified"))
+            per_slot = max(512, ctx // slots)
             out = []
             estimate = (self.best.get("request_load") or {}).get("estimate")
             for n in range(1, top + 1):
                 if n == slots:
+                    continue
+                if unified:
+                    # The slots share one pool: its size, and what one
+                    # request may use, stay; only the slot count changes.
+                    out.append({"parallel": n})
                     continue
                 change = {"parallel": n, "ctx_size": n * per_slot}
                 if estimate and not self.fits(estimate, n * per_slot, load):
@@ -625,9 +764,9 @@ class Tuner:
                 return [{"engine_args.n-cpu-moe": 0}], None
             return [], "no expert layers on the CPU (n-cpu-moe 0)"
         if lever == "n_gpu_layers":
-            if load.get("n_gpu_layers") == "all":
-                return [{"n_gpu_layers": None, "fit": "on"}], None
-            return [{"n_gpu_layers": "all", "fit": None}], None
+            if all_on_gpu(load):
+                return [], "every layer is on the GPU already (n_gpu_layers all, fit off)"
+            return [{"n_gpu_layers": "all", "fit": "off"}], None
         if lever == "threads":
             current = int(load.get("threads") or 8)
             return [{"threads": v} for v in sorted({max(1, current // 2), current * 2}) if v != current], None
@@ -792,7 +931,13 @@ class Tuner:
             raise Interrupted()
         return results
 
-    def chat(self, prompt, max_tokens, temperature=None, fresh=True):
+    def chat(self, prompt, max_tokens, temperature=None, fresh=True, timed=True):
+        """One streamed answer. `fresh`: a new first line, so no cache can
+        answer and the engine reads the whole prompt. Not fresh: the same
+        prompt every time with a fixed seed, so the answer is the same text
+        run after run; then no cache may answer (`no_cache_block`), and the
+        engine reads the prompt again (it keeps no prompt cache for it).
+        `timed`: the engine's own timings of the answer are read."""
         if fresh:
             prompt = f"Run {uuid.uuid4().hex[:12]}.\n" + prompt
         body = {"model": self.target, "messages": [{"role": "user", "content": prompt}],
@@ -800,25 +945,56 @@ class Tuner:
                 "reasoning_effort": "none"}
         if temperature is not None:
             body["temperature"] = temperature
-            body["seed"] = 1
+        if not fresh or temperature is not None:
+            body["seed"] = TUNE_SEED
+        if not fresh:
+            body["switchback"] = self.no_cache_block()
         headers = {"x-switchback-tune-lock": self.lock_id} if self.lock_id else {}
         deadline = time.monotonic() + PAUSED_WAIT_S * self.scale
+        unreached = 0
         while True:
             try:
-                return self.chat_once(body, headers)
+                return self.chat_once(body, headers, timed)
             except self.fail_types as error:
-                paused = getattr(error, "status", None) == 503 and "model_paused" in (
-                    getattr(error, "reason", ""), getattr(error, "error_type", ""))
+                status = getattr(error, "status", None)
+                reason = (getattr(error, "reason", ""), getattr(error, "error_type", ""))
+                if getattr(error, "code", None) == UNREACHABLE and "does not answer" in str(
+                        getattr(error, "message", error)) and unreached < UNREACHED_TRIES - 1:
+                    # The request never reached the gateway (a name lookup
+                    # or a connection that failed on this machine): nothing
+                    # was measured, so it is sent again. One such failure
+                    # once ended a 45-minute run.
+                    unreached += 1
+                    time.sleep(max(0.01, 2.0 * unreached * self.scale))
+                    continue
+                if status == 400 and "invalid_settings" in reason and self.no_cache:
+                    # A gateway without `switchback.no_cache`: the settings
+                    # block alone keeps its cache out.
+                    self.no_cache = False
+                    body["switchback"] = self.no_cache_block()
+                    continue
+                paused = status == 503 and "model_paused" in reason
                 if not paused or time.monotonic() >= deadline or self.stopping:
                     raise
                 # The gateway closed the model's gate (an apply or an unload
                 # runs): ask again later; never a failed answer.
                 time.sleep(max(0.05, 5.0 * self.scale))
 
-    def chat_once(self, body, headers):
+    def no_cache_block(self):
+        """The request's `switchback` block for a prompt sent again and again:
+        a request settings block is never answered from the gateway's cache
+        (old gateways too), `cache_prompt: false` makes the engine read the
+        prompt again, and `no_cache` (gateways that know it) says so outright."""
+        block = {"settings": {"extra": {"cache_prompt": False}}}
+        if getattr(self, "no_cache", False):
+            block["no_cache"] = True
+        return block
+
+    def chat_once(self, body, headers, timed=True):
         started = time.monotonic()
-        first, usage, text = None, None, []
+        first, usage, text, request_id = None, None, [], None
         for when, chunk in self.gw.stream("/v1/chat/completions", body, timeout=900, headers=headers):
+            request_id = request_id or chunk.get("id")
             if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
                 usage = chunk["usage"]
             for choice in chunk.get("choices") or []:
@@ -835,10 +1011,45 @@ class Tuner:
         prompt_tokens = int(usage.get("prompt_tokens") or 0)
         completion = int(usage.get("completion_tokens") or 0)
         decoded = ended - first
-        return {"ttft_ms": ttft, "prompt_tps": prompt_tokens / (ttft / 1000) if ttft > 0 else 0.0,
-                "decode_tps": completion / decoded if decoded > 0 else 0.0,
-                "completion_tokens": completion, "started": started, "ended": ended,
-                "text": "".join(text)}
+        out = {"ttft_ms": ttft, "prompt_tps": prompt_tokens / (ttft / 1000) if ttft > 0 else 0.0,
+               "decode_tps": completion / decoded if decoded > 0 else 0.0,
+               "completion_tokens": completion, "started": started, "ended": ended,
+               "text": "".join(text), "clock": "client"}
+        timings = self.engine_timings(request_id) if timed else None
+        if timings:
+            # The engine's own clock: what the settings change, without the
+            # network and the gateway between this machine and the engine
+            # (time to first token stays what a caller waits).
+            decode_ms, decode_n = timings.get("decode_ms"), timings.get("decode_tokens")
+            prompt_ms, prompt_n = timings.get("prompt_ms"), timings.get("prompt_tokens")
+            if _positive(decode_ms) and _positive(decode_n):
+                out["decode_tps"] = decode_n / (decode_ms / 1000)
+                out["clock"] = "engine"
+            if _positive(prompt_ms) and _positive(prompt_n):
+                out["prompt_tps"] = prompt_n / (prompt_ms / 1000)
+            if _positive(timings.get("draft_tokens")) and isinstance(timings.get("draft_accepted"), (int, float)):
+                out["draft_accept"] = timings["draft_accepted"] / timings["draft_tokens"]
+        return out
+
+    def engine_timings(self, request_id):
+        """The engine's timings of one answer, from the gateway's trace of it
+        (`usage.engine_timings`: decode and prompt milliseconds and tokens,
+        draft tokens tried and accepted), or None. A gateway or engine that
+        has none for the first answer asked is not asked again."""
+        if not request_id or getattr(self, "engine_clock", None) is False:
+            return None
+        try:
+            trace = self.gw.call("GET", f"/v1/traces/{urllib.parse.quote(str(request_id), safe='')}",
+                                 timeout=15, headers={})
+        except self.fail_types:
+            trace = None
+        timings = ((trace or {}).get("usage") or {}).get("engine_timings")
+        if not isinstance(timings, dict) or not timings:
+            if getattr(self, "engine_clock", None) is None:
+                self.engine_clock = False
+            return None
+        self.engine_clock = True
+        return timings
 
     def check_answers(self, answers):
         failed = [a["error"] for a in answers if "error" in a]
@@ -863,13 +1074,23 @@ class Tuner:
         self.run_parallel([lambda: self.chat(CHAT_PROMPT, 64)])  # warm-up, discarded
         out = {}
         answers = []
-        for _ in range(self.samples):
-            answers.extend(self.run_parallel([lambda: self.chat(CHAT_PROMPT, 128)]))
+        for i in range(self.samples):
+            index = i % len(DECODE_SET)
+            batch = self.run_parallel([lambda index=index: self.chat(DECODE_SET[index], DECODE_TOKENS,
+                                                                     fresh=False)])
+            for answer in batch:
+                answer["prompt"] = index
+            answers.extend(batch)
         problem = self.check_answers(answers)
         if problem:
             return None, problem
-        out["decode"] = median([a["decode_tps"] for a in answers])
+        out["decode"] = set_decode(answers)
         out["ttft_ms"] = median([a["ttft_ms"] for a in answers])
+        out["clock"] = clock_of(answers)
+        out["answer_tokens"] = median([a["completion_tokens"] for a in answers])
+        accepts = [a["draft_accept"] for a in answers if "draft_accept" in a]
+        if accepts:
+            out["draft_accept"] = round(statistics.fmean(accepts), 4)
         if "prefill" in metrics or self.workload in ("read", "mixed"):
             reads = []
             for _ in range(self.samples):
@@ -882,8 +1103,14 @@ class Tuner:
             per = {}
             for n in self.concurrency:
                 values = []
-                for _ in range(max(2, self.samples // 3)):
-                    batch = self.run_parallel([lambda: self.chat(CHAT_PROMPT, 128)] * n)
+                # Fixed prompts and seed here too (each batch the same texts
+                # every run), and more batches than before: two gave the
+                # concurrent throughput a ±12-21% noise between runs.
+                for b in range(max(3, self.samples // 2)):
+                    prompts = [DECODE_SET[(b + j) % len(DECODE_SET)] for j in range(n)]
+                    batch = self.run_parallel([lambda p=p: self.chat(p, DECODE_TOKENS, fresh=False,
+                                                                     timed=False)
+                                               for p in prompts])
                     problem = self.check_answers(batch)
                     if problem:
                         return None, problem
@@ -1307,6 +1534,12 @@ class Tuner:
         if gate:
             started = self.clock()
             problem = self.gate(entry["gate"], doc)
+            if not problem and entry["gate"] in ("needle", "soak"):
+                # The checks' long and concurrent requests leave the engine
+                # slower for one stream until it restarts (`fresh_process`):
+                # measured right after them, a candidate would lose to its
+                # controls by that alone.
+                self.fresh_process()
             self.gate_secs.setdefault(entry["gate"], []).append(self.clock() - started)
             if problem:
                 return None, problem
@@ -1428,8 +1661,8 @@ class Tuner:
         if not scored:
             return None
         best_change, _ = max(scored, key=lambda item: item[1])
-        current = {key: (self.best.get("load") or {}).get(key) for key in best_change}
-        if current == best_change:
+        force = in_force(self.best.get("load") or {}, getattr(self, "engine_keys", {}))
+        if all(same_value(value, force.get(key)) for key, value in best_change.items()):
             return None
         return best_change
 
@@ -1438,6 +1671,7 @@ class Tuner:
     def preflight(self):
         self.resolve()
         self.build, self.model_file, self.listing_row = self.engine_identity()
+        self.no_cache = isinstance((self.listing_row or {}).get("effective"), dict)
         self.plan = self.levers()
         lane = self.lane_state()
         if lane and lane.get("experiments") is False:
@@ -1549,7 +1783,32 @@ class Tuner:
                 return row.get("ceiling") or {}
         return {}
 
+    def fresh_process(self):
+        """Unload the model and load it again, so the next run measures a
+        new process, as every experiment run does (each follows the apply of
+        its settings). An engine keeps state after concurrent requests that
+        slows one stream until its process restarts: on the box, decode on
+        the same fixed prompts went from 284.6 to 267.4 tok/s after about 70
+        three-way batches and stayed there after 45 s idle, the card cooled
+        to 49 C at the same clock; a reload gave 284 again. Noise runs one
+        after another (each ends with concurrent batches) measured 268 while
+        the controls between them measured 284: an offset of 6% that is
+        neither noise nor the lever."""
+        path = f"/v1/models/{urllib.parse.quote(self.target, safe='/')}"
+        started = self.clock()
+        try:
+            self.call("POST", path + "/unload", body={}, timeout=self.unload_timeout, doing="unloading")
+        except TuneError as error:
+            # Not loaded (a write or an idle timer unloaded it): the load
+            # below starts the fresh process all the same.
+            if "not running" not in error.message and "not loaded" not in error.message:
+                raise
+        self.call("POST", path + "/load", body={"wake": False}, timeout=900, doing="loading")
+        self.fresh_secs.append(self.clock() - started)
+        self.fresh_runs += 1
+
     def noise_run(self, runs):
+        self.fresh_process()
         metrics, problem = self.measure(*self.noise_metrics)
         if problem:
             raise TuneError(FAIL, f"the baseline run failed: {problem}")
@@ -1575,7 +1834,8 @@ class Tuner:
             self.noise_run(runs)
         self.noise = noise_sds(runs)
         if len(runs) == NOISE_RUNS and self.noise.get(metric, 0.0) > NOISE_FLOOR:
-            per_sample = (self.clock() - started) / (len(runs) * (self.samples + 1))
+            reloading = sum(self.fresh_secs[-len(runs):])
+            per_sample = max(0.0, self.clock() - started - reloading) / (len(runs) * (self.samples + 1))
             self.raise_samples(per_sample, metric)
             for _ in range(NOISE_MORE):
                 if self.out_of_budget():
@@ -1810,13 +2070,16 @@ class Tuner:
 
     def summary(self, stop, final):
         ceiling = self.ceiling_row
-        how = f"median of {self.samples}, warm, fresh prompts, through the gateway (client clock)"
+        clock = "engine clock" if self.engine_clock else "client clock, through the gateway"
+        workload = (f"{len(DECODE_SET)} fixed prompts, fixed seed, {DECODE_TOKENS}-token answers "
+                    f"(prefill: fresh prompts), warm, {clock}")
+        how = f"{self.samples} samples per run; {workload}"
         counts = sorted(set(self.sample_counts))
         if len(counts) > 1:
             # The noise rule raised the samples after the first runs.
             first = self.sample_counts.count(counts[0])
-            how = (f"median of {self.samples} ({counts[0]} in the first {first} baseline runs), "
-                   "warm, fresh prompts, through the gateway (client clock)")
+            how = (f"{self.samples} samples per run ({counts[0]} in the first {first} baseline "
+                   f"runs); {workload}")
         table = []
         # Decode is measured one request at a time (concurrency 1): a c1
         # figure. The aggregate row is the concurrent one.
@@ -1833,7 +2096,11 @@ class Tuner:
             "greedy equality on one fixed prompt only",
             "needle checks at two depths, not a full long-context evaluation",
             "quality beyond these checks (reasoning, tools) was not measured",
-            "numbers include the network and the gateway between this machine and the engine",
+            ("time to first token and aggregate include the network and the gateway; decode and "
+             "prefill are the engine's own timings" if self.engine_clock else
+             "numbers include the network and the gateway between this machine and the engine"),
+            f"decode on {len(DECODE_SET)} fixed prompts with one seed: a caller's own texts "
+            "can draft faster or slower",
         ]
         result = {"target": self.target, "run_id": self.run_id, "engine_build": self.build,
                   "model_file": self.model_file, "tuned": self.untuned_reason is None,
@@ -1856,7 +2123,18 @@ class Tuner:
         SD of one run (in % of the runs' mean) on the baseline metric."""
         metric = "prefill" if self.workload == "read" else "decode"
         sd = self.noise.get(metric, 0.0)
+        # What could make runs of the same settings differ, besides the
+        # machine: answers of other lengths or other draft acceptance mean
+        # the text changed between runs (the fixed workload should keep it).
+        spread = {}
+        for key in ("answer_tokens", "draft_accept"):
+            values = [run[key] for run in self.noise_data if isinstance(run.get(key), (int, float))]
+            if values:
+                spread[key] = [min(values), max(values)]
         return {"metric": metric, "sd_pct": round(sd * 100, 1),
+                "clock": "engine" if self.engine_clock else "client",
+                "workload_spread": spread,
+                "fresh_process_runs": getattr(self, "fresh_runs", 0),
                 "by_metric_sd_pct": {key: round(value * 100, 1) for key, value in sorted(self.noise.items())},
                 "runs": self.noise_runs, "samples_per_run": self.samples,
                 "win_needs_pct": round(WIN_SD * self.noise_sd(metric) * 100, 1),

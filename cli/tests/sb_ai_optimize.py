@@ -155,6 +155,17 @@ class Fake:
         self.report_findings = []
         self.chat_started = threading.Event()
         self.chats = 0
+        # The gateway's trace of each answer (`/v1/traces/{id}`): off unless a
+        # test sets `engine_decode` (tok/s the engine reports, whatever the
+        # client clock says); then each streamed answer's trace carries
+        # `usage.engine_timings` with decode and prompt times.
+        self.engine_decode = None
+        self.traces = {}
+        # What the machine file (the router's preset) sets, as the settings
+        # view lists it: {engine key: {"value": text, "source": ...}}.
+        self.engine_keys = {}
+        # The engine's truth view (`effective`) in the engine listing.
+        self.effective = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.handler())
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -170,7 +181,7 @@ class Fake:
         return {"target": TARGET, "revision": self.revision, "durable": True,
                 "effective": {}, "profiles": {}, "document": self.doc,
                 "load": {"engine": {"lane": "box", "kind": "llama_cpp_router", "status": "loaded"},
-                         "settings": {}}}
+                         "settings": {}, "engine_keys": self.engine_keys}}
 
     def put_settings(self, body):
         if body.get("revision") != self.revision:
@@ -277,18 +288,25 @@ class Fake:
                 handler.wfile.write(payload)
                 completed = True
                 return
+            with self.lock:
+                request_id = f"req_{self.chats}"
+                if self.engine_decode:
+                    self.traces[request_id] = {"request_id": request_id, "usage": {"engine_timings": {
+                        "decode_ms": completion / (self.engine_decode * engine.factor("decode")) * 1000,
+                        "decode_tokens": completion, "prompt_ms": ttft, "prompt_tokens": prompt_tokens,
+                        "draft_tokens": 40, "draft_accepted": 30}}}
             handler.send_response(200)
             handler.send_header("Content-Type", "text/event-stream")
             handler.end_headers()
             try:
                 time.sleep(ttft / 1000)
-                handler.wfile.write(b"data: " + json.dumps({"choices": [{"index": 0, "delta": {
+                handler.wfile.write(b"data: " + json.dumps({"id": request_id, "choices": [{"index": 0, "delta": {
                     "content": text[:10]}, "finish_reason": None}]}).encode() + b"\n\n")
                 handler.wfile.flush()
                 time.sleep(decode_s)
-                handler.wfile.write(b"data: " + json.dumps({"choices": [{"index": 0, "delta": {
+                handler.wfile.write(b"data: " + json.dumps({"id": request_id, "choices": [{"index": 0, "delta": {
                     "content": text[10:]}, "finish_reason": "stop"}]}).encode() + b"\n\n")
-                handler.wfile.write(b"data: " + json.dumps({"choices": [], "usage": {
+                handler.wfile.write(b"data: " + json.dumps({"id": request_id, "choices": [], "usage": {
                     "prompt_tokens": prompt_tokens, "completion_tokens": completion,
                     "total_tokens": prompt_tokens + completion}}).encode() + b"\n\n")
                 handler.wfile.write(b"data: [DONE]\n\n")
@@ -360,6 +378,11 @@ class Fake:
             return 201, {"id": row["id"], "durable": True}
         if method == "GET" and path.startswith("/v1/optimize/quality"):
             return 200, {"object": "list", "data": self.quality[::-1]}
+        if method == "GET" and path.startswith("/v1/traces/"):
+            trace = self.traces.get(path.rsplit("/", 1)[1])
+            if trace is None:
+                return 404, {"error": {"message": "no trace", "type": "not_found"}}
+            return 200, trace
         if method == "GET" and path.startswith("/v1/optimize/report"):
             return 200, {"object": "optimize.report", "targets": self.report_targets,
                          "findings": self.report_findings, "hosts": []}
@@ -374,8 +397,9 @@ class Fake:
             return 200, {"object": "list", "data": [
                 {"lane": "box", "build": self.build, "pending_apply": self.pending_apply,
                  "deferred": ["m"] if self.pending_apply else [],
-                 "models": [{"id": "m", "file": self.model_file, "sidecars": self.sidecars,
-                             "speculative": self.speculative}]}]}
+                 "models": [dict({"id": "m", "file": self.model_file, "sidecars": self.sidecars,
+                                  "speculative": self.speculative},
+                                 **({"effective": self.effective} if self.effective else {}))]}]}
         return 404, None
 
     def handler(self):
@@ -569,6 +593,44 @@ class TuneTests(Base):
         # The soak: two long requests at once at the full per-slot context.
         longs = [r for r in self.fake.engine.requests if r[0] == "long"]
         self.assertGreaterEqual(len(longs), 2)
+
+    def test_more_slots_on_a_shared_pool_keep_the_pool_and_its_request_size(self):
+        # kv-unified, 3 slots sharing 196,608 tokens: fewer or more slots
+        # leave every request its 196,608. The old lever set ctx 65,536 for
+        # one slot, a third of what callers had.
+        self.fake.doc = {"load": {"ctx_size": 196608, "parallel": 3},
+                         "engine_args": {"kv-unified": True}}
+        self.fake.effective = {"ctx_size": 196608, "slots": 3, "kv_unified": True,
+                               "per_request_ctx": 196608, "pool_ctx": 196608}
+        run = self.sb("tune", TARGET, "--levers", "parallel", "--concurrency", "1,2,3,4",
+                      "--dry-run", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        plan = {row["lever"]: row for row in json.loads(run.stdout)["levers"]}
+        self.assertEqual(plan["parallel"]["candidates"], [{"parallel": 1}, {"parallel": 2}, {"parallel": 4}])
+
+    def test_values_the_machine_file_already_sets_are_not_tried(self):
+        # The document sets none of these; the machine file does. A trial of
+        # q8_0 KV, ubatch 1024 or flash attention on would change nothing.
+        self.fake.engine_keys = {"cache-type-k": {"value": "q8_0", "source": "machine file"},
+                                 "cache-type-v": {"value": "q8_0", "source": "machine file"},
+                                 "ubatch-size": {"value": "1024", "source": "machine file"},
+                                 "batch-size": {"value": "2048", "source": "machine file"},
+                                 "flash-attn": {"value": "on", "source": "machine file"},
+                                 "n-gpu-layers": {"value": "999", "source": "machine file"},
+                                 "fit": {"value": "off", "source": "machine file"},
+                                 "spec-type": {"value": "draft-mtp", "source": "machine file"},
+                                 "spec-draft-n-max": {"value": "3", "source": "machine file"}}
+        run = self.sb("tune", TARGET, "--levers", "cache_type,ubatch_size,flash_attn,n_gpu_layers,draft_max",
+                      "--dry-run", "--json")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        plan = {row["lever"]: row for row in json.loads(run.stdout)["levers"]}
+        self.assertEqual(plan["cache_type"]["candidates"], [{"cache_type_k": "f16", "cache_type_v": "f16"}])
+        self.assertEqual(plan["ubatch_size"]["candidates"],
+                         [{"ubatch_size": 512, "batch_size": 2048}, {"ubatch_size": 2048, "batch_size": 2048}])
+        self.assertEqual(plan["flash_attn"]["candidates"], [{"flash_attn": "off"}])
+        self.assertIn("on the GPU already", plan["n_gpu_layers"]["skipped"])
+        # A sweep keeps the value in force: it is the comparison.
+        self.assertIn({"draft_max": 3}, plan["draft_max"]["candidates"])
 
     def test_a_failed_soak_rejects_more_slots(self):
         self.fake.doc = {"load": {"ctx_size": 4096}}
@@ -1051,6 +1113,84 @@ class TuneTests(Base):
         self.assertEqual(self.fake.doc["load"], {"ctx_size": 4096},
                          "Ctrl-C during the trial's apply left the candidate in place: " + err[-600:])
 
+    # ------------------------------------------------------------ the measurement
+
+    def decode_requests(self):
+        return [b for m, p, b in self.fake.calls("POST", "/v1/chat/completions")
+                if b.get("max_tokens") == ai_tune_module().DECODE_TOKENS]
+
+    def test_decode_runs_send_the_same_fixed_prompts_with_one_seed(self):
+        # Fresh prompts with free sampling made one answer differ from the
+        # next (length, draft acceptance): the decode noise was the text,
+        # not the machine. Every decode request is one of the fixed prompts,
+        # with the same seed, the gateway cache off, and every prompt of the
+        # set is sent in every run.
+        tune = ai_tune_module()
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        sent = self.decode_requests()
+        self.assertTrue(sent)
+        prompts = {b["messages"][0]["content"] for b in sent}
+        self.assertEqual(prompts, set(tune.DECODE_SET))
+        self.assertEqual({b.get("seed") for b in sent}, {tune.TUNE_SEED})
+        self.assertTrue(all(b["switchback"]["settings"]["extra"]["cache_prompt"] is False for b in sent))
+        self.assertTrue(all("temperature" not in b for b in sent),
+                        "decode runs must keep the model's own sampling settings")
+        result = json.loads(run.stdout)
+        self.assertEqual(result["noise"]["clock"], "client")
+        self.assertTrue(any("fixed prompts" in row["how"] for row in result["table"]), result["table"])
+
+    def test_decode_is_read_from_the_engine_clock_when_the_trace_has_it(self):
+        # The engine says 250 tok/s while the client clock sees about 400:
+        # the run reports the engine's number and says which clock it read.
+        self.fake.engine_decode = 250.0
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(result["noise"]["clock"], "engine")
+        decode = next(row for row in result["table"] if row["metric"].startswith("decode"))
+        self.assertAlmostEqual(decode["baseline"], 250.0, delta=2.0)
+        baselines = [row for row in self.fake.ledger if row.get("role") == "baseline"]
+        self.assertTrue(all(row["metrics"]["clock"] == "engine" for row in baselines))
+        self.assertTrue(all(row["metrics"]["draft_accept"] == 0.75 for row in baselines))
+
+    def test_a_gateway_without_traces_is_asked_once_then_the_client_clock_is_used(self):
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(len(self.fake.calls("GET", "/v1/traces/")), 1)
+
+    def test_every_noise_run_starts_on_a_fresh_process(self):
+        # An engine keeps state after concurrent requests that slows decode
+        # until its process restarts (the box: 284.6 -> 267.4 tok/s, the
+        # same at 49 C after 45 s idle). Experiment runs each follow a
+        # reload; so must every noise run, or the noise runs and the
+        # controls measure two different engines.
+        run = self.tune("--levers", "flash_attn")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        seen = [(m, p) for m, p, _ in self.fake.calls()
+                if p.endswith("/unload") or p.endswith("/load") or
+                (m == "POST" and p == "/v1/chat/completions")]
+        baselines = [row for row in self.fake.ledger if row.get("role") == "baseline"]
+        reloads = [i for i, (m, p) in enumerate(seen) if p.endswith("/load")]
+        self.assertGreaterEqual(len(reloads), len(baselines))
+        result = json.loads(run.stdout)
+        self.assertEqual(result["noise"]["fresh_process_runs"], len(baselines))
+
+    def test_a_gated_candidate_is_measured_on_a_fresh_process(self):
+        # The pool check sends long concurrent requests; measured right
+        # after it, a memory lever would look slower than its controls.
+        self.fake.doc = {"load": {"ctx_size": 8192, "parallel": 2}}
+        run = self.tune("--levers", "kv_unified")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        calls = [(m, p, b) for m, p, b in self.fake.calls()]
+        firsts = [i for i, (m, p, b) in enumerate(calls) if m == "POST" and p == "/v1/chat/completions"
+                  and "vault access code" in b["messages"][0]["content"]]
+        self.assertTrue(firsts, "no check ran")
+        after = calls[max(firsts) + 1:]
+        load_at = next(i for i, (m, p, b) in enumerate(after) if p.endswith("/load"))
+        chat_at = next(i for i, (m, p, b) in enumerate(after) if p == "/v1/chat/completions")
+        self.assertLess(load_at, chat_at, "the candidate was measured before a fresh load")
+
     def test_plateau_stops_after_three_flat_levers(self):
         self.fake.doc = {"load": {"spec_type": "draft-mtp"}}
         run = self.tune("--levers", "spec_type,flash_attn,ubatch_size,mmap")
@@ -1147,6 +1287,109 @@ def load_tuner_module():
         sys.path.insert(0, str(CLI))
     import ai_tune
     return ai_tune
+
+
+def ai_tune_module():
+    return load_tuner_module()
+
+
+class DecodeSetUnitTests(unittest.TestCase):
+    """A decode run over the fixed prompt set: per prompt the median, then
+    the prompts' throughput together."""
+
+    def test_the_set_speed_is_the_harmonic_mean_of_per_prompt_medians(self):
+        tune = load_tuner_module()
+        answers = [{"prompt": 0, "decode_tps": v} for v in (300, 310, 900)] + \
+                  [{"prompt": 1, "decode_tps": v} for v in (200, 205, 10)]
+        # Medians 310 and 200; one wild sample per prompt changes nothing.
+        self.assertAlmostEqual(tune.set_decode(answers), 2 / (1 / 310 + 1 / 200))
+
+    def test_a_shift_in_one_prompt_moves_the_set_less_than_that_prompt(self):
+        tune = load_tuner_module()
+        before = [{"prompt": i % 3, "decode_tps": (330, 260, 270)[i % 3]} for i in range(6)]
+        after = [{"prompt": i % 3, "decode_tps": (330 * 1.3, 260, 270)[i % 3]} for i in range(6)]
+        gain = tune.set_decode(after) / tune.set_decode(before) - 1
+        self.assertGreater(gain, 0.05)
+        self.assertLess(gain, 0.30)
+
+    def test_the_clock_names_mixed_sources(self):
+        tune = load_tuner_module()
+        self.assertEqual(tune.clock_of([{"clock": "engine"}, {"clock": "engine"}]), "engine")
+        self.assertEqual(tune.clock_of([{"clock": "engine"}, {}]), "mixed")
+
+
+class FreshProcessUnitTests(unittest.TestCase):
+    def tuner(self, unload_error):
+        tune = load_tuner_module()
+        calls = []
+
+        def call(method, path, body=None, timeout=120, headers=None, doing=""):
+            calls.append(path.rsplit("/", 1)[1])
+            if path.endswith("/unload") and unload_error:
+                raise tune.TuneError(tune.FAIL, f"unloading: {unload_error}")
+            return {}
+
+        tuner = tune.Tuner.__new__(tune.Tuner)
+        tuner.target, tuner.unload_timeout, tuner.clock = "box/m", 60, time.monotonic
+        tuner.fresh_secs, tuner.fresh_runs, tuner.call = [], 0, call
+        return tune, tuner, calls
+
+    def test_a_model_that_is_not_running_is_loaded_fresh(self):
+        # A settings write unloads an idle model: 11-25 04:01 a repeat run
+        # stopped at its first reload on "model is not running".
+        _, tuner, calls = self.tuner("the engine answered 400 Bad Request: model is not running")
+        tuner.fresh_process()
+        self.assertEqual((calls, tuner.fresh_runs), (["unload", "load"], 1))
+
+    def test_another_unload_failure_still_stops_the_run(self):
+        tune, tuner, calls = self.tuner("the engine answered 500: CUDA error")
+        with self.assertRaises(tune.TuneError):
+            tuner.fresh_process()
+        self.assertEqual(calls, ["unload"])
+
+
+class UnreachableUnitTests(unittest.TestCase):
+    def test_a_request_that_never_reached_the_gateway_is_sent_again(self):
+        # 11-25 03:38: one DNS failure on this machine ended a 45-minute run.
+        tune = load_tuner_module()
+        import ai_gateway
+
+        class Gateway:
+            calls = 0
+
+            def stream(self, path, body, timeout=900, headers=None):
+                Gateway.calls += 1
+                if Gateway.calls < 3:
+                    raise ai_gateway.Fail(ai_gateway.UNREACHABLE, "the gateway does not answer (dns)")
+                yield 1.0, {"id": "r", "choices": [{"delta": {"content": "hi"}}]}
+                yield 2.0, {"id": "r", "choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 4}}
+
+            def call(self, *args, **kwargs):
+                raise ai_gateway.Fail(ai_gateway.UNREACHABLE, "no traces here")
+
+        tuner = tune.Tuner.__new__(tune.Tuner)
+        tuner.gw, tuner.fail_types = Gateway(), (ai_gateway.Fail, ai_gateway.GatewayError)
+        tuner.target, tuner.lock_id, tuner.stopping, tuner.scale = "box/m", None, False, 0.001
+        tuner.no_cache, tuner.engine_clock = False, None
+        answer = tuner.chat("hello", 8)
+        self.assertEqual(answer["completion_tokens"], 4)
+        self.assertEqual(Gateway.calls, 3)
+
+    def test_a_gateway_that_stays_unreachable_still_fails(self):
+        tune = load_tuner_module()
+        import ai_gateway
+
+        class Gateway:
+            def stream(self, *args, **kwargs):
+                raise ai_gateway.Fail(ai_gateway.UNREACHABLE, "the gateway does not answer")
+                yield  # noqa: unreachable - a generator
+
+        tuner = tune.Tuner.__new__(tune.Tuner)
+        tuner.gw, tuner.fail_types = Gateway(), (ai_gateway.Fail, ai_gateway.GatewayError)
+        tuner.target, tuner.lock_id, tuner.stopping, tuner.scale = "box/m", None, False, 0.001
+        tuner.no_cache, tuner.engine_clock = False, None
+        with self.assertRaises(ai_gateway.Fail):
+            tuner.chat("hello", 8)
 
 
 class RestoreUnitTests(unittest.TestCase):
@@ -1275,8 +1518,15 @@ def sim_tuner(seed, sd=0.07, effect=1.0, levers=("flash_attn",), concurrency="1"
         tuner.apply_secs.append(apply_s)
         tuner.state = dict(doc.get("load") or {})
         tuner.applied_doc = json.loads(json.dumps(doc))
+
+    def fresh_process():
+        # A reload costs what an apply does.
+        clock.now += apply_s
+        tuner.fresh_secs.append(apply_s)
+        tuner.fresh_runs += 1
     tuner.measure = fake_measure
     tuner.put_doc = put_doc
+    tuner.fresh_process = fresh_process
     tuner.plan = tuner.levers()
     return ai_tune, tuner
 
@@ -1428,7 +1678,9 @@ class KeepRuleUnitTests(unittest.TestCase):
         result = json.loads(tuner.out.getvalue())
         self.assertFalse(result["tuned"])
         self.assertIn("budget ran out while measuring the noise", result["reason"])
-        self.assertLessEqual(clock.now, 70 + 40)
+        # At most one noise run past the budget: its fresh load (20 s) and
+        # its run (40 s).
+        self.assertLessEqual(clock.now, 70 + 20 + 40)
 
     def test_the_printed_bar_is_the_judges_bar(self):
         """The bar the run prints after the noise runs, the `--json` bar
