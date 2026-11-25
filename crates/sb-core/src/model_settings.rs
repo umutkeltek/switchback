@@ -514,7 +514,7 @@ pub fn validate_profile_name(name: &str) -> Result<(), SettingsError> {
 
 /// The per-request load policy (variants): which load-time keys a request
 /// may ask for, within which bounds, and how many variants may exist.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RequestLoadPolicy {
     /// Load-time keys a client key may set per request. Operator and admin
@@ -548,7 +548,7 @@ fn is_zero_u64(n: &u64) -> bool {
 /// not measured it: weights, the KV cache shape (`sb ai fit --json` gives
 /// `model.kv_layers`, `kv_heads`, `head_dim`, `value_dim`), and the bytes
 /// the machine has for it.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FitEstimate {
     pub weights_bytes: u64,
@@ -593,7 +593,7 @@ pub enum ApplyMode {
 }
 
 /// The settings document of one target model (`provider/model`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSettingsDoc {
     /// Request-time settings for every request that reaches the target.

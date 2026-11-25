@@ -149,10 +149,13 @@ enum Cmd {
         #[command(subcommand)]
         action: SchemaCmd,
     },
-    /// Run a minimal stdio MCP server over local Switchback control tools.
+    /// Run a stdio MCP server for local config or a running gateway.
     Mcp {
         #[arg(long, default_value_os_t = default_runtime_config_path())]
         config: PathBuf,
+        /// Gateway base URL. Authentication uses SWITCHBACK_AI_KEY from the environment.
+        #[arg(long)]
+        gateway: Option<String>,
     },
     /// Add provider config for a supported official/provider-compatible API.
     Provider {
@@ -400,7 +403,15 @@ async fn async_run() -> anyhow::Result<()> {
         Cmd::Serve { config, .. } => Some(Config::from_path(config)?),
         _ => None,
     };
-    init_tracing(otlp_export_config(serve_cfg.as_ref()));
+    if !matches!(
+        &cli.cmd,
+        Cmd::Mcp {
+            gateway: Some(_),
+            ..
+        }
+    ) {
+        init_tracing(otlp_export_config(serve_cfg.as_ref()));
+    }
 
     match cli.cmd {
         Cmd::Init {
@@ -492,8 +503,8 @@ async fn async_run() -> anyhow::Result<()> {
             action: SchemaCmd::Docs,
         } => println!("{}", schema_docs_markdown()),
         Cmd::Schema { action } => print_json(&schema_json(action))?,
-        Cmd::Mcp { config } => {
-            run_mcp_stdio(&config)?;
+        Cmd::Mcp { config, gateway } => {
+            run_mcp_stdio(&config, gateway.as_deref()).await?;
         }
         Cmd::Provider { action, config } => match action {
             ProviderCmd::Presets => {

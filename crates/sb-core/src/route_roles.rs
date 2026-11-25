@@ -25,7 +25,7 @@ const MAX_ROLE_TARGETS: usize = 16;
 const MAX_LOCK_REASON: usize = 200;
 
 /// The store document of one role (route name).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRoleDoc {
     /// Ordered targets (`provider/model`): the first is the first choice,

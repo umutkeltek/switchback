@@ -3920,7 +3920,9 @@ pub struct RouteConfig {
 
 /// A route's `prefer_awake`: each field set replaces the server default's
 /// ([`PreferAwakeConfig`]); a field left out keeps the server's value.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreferAwakeOverride {
     #[serde(skip_serializing_if = "Option::is_none")]

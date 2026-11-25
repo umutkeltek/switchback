@@ -656,3 +656,514 @@ async fn setup_failed_model_check_restores_even_a_newly_locked_document() {
     assert_eq!(rows[0].action, "setup:check_failed");
     let _ = std::fs::remove_dir_all(config_path.parent().unwrap());
 }
+
+struct McpChild {
+    child: tokio::process::Child,
+    input: tokio::process::ChildStdin,
+    output: tokio::io::BufReader<tokio::process::ChildStdout>,
+    next_id: u64,
+}
+
+impl McpChild {
+    fn start(gateway: &Gateway) -> Self {
+        use std::process::Stdio;
+
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_switchback"))
+            .args(["mcp", "--gateway", &gateway.url])
+            .env("SWITCHBACK_AI_KEY", "sk-operator")
+            .env("RUST_LOG", "trace")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            input,
+            output,
+            next_id: 1,
+        }
+    }
+
+    async fn write(&mut self, message: Value) {
+        use tokio::io::AsyncWriteExt;
+
+        let mut line = message.to_string();
+        line.push('\n');
+        self.input.write_all(line.as_bytes()).await.unwrap();
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        use tokio::io::AsyncBufReadExt;
+
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .await;
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.output.read_line(&mut line),
+        )
+        .await
+        .expect("MCP request timed out")
+        .unwrap();
+        assert!(!line.is_empty());
+        assert!(
+            !line.contains("sk-operator"),
+            "MCP stdout contained its bearer key"
+        );
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], id);
+        assert!(response["result"].is_object(), "{response}");
+        response["result"].clone()
+    }
+
+    async fn call(&mut self, tool: &str, arguments: Value) -> Value {
+        let result = self
+            .request("tools/call", json!({"name": tool, "arguments": arguments}))
+            .await;
+        let data = &result["structuredContent"];
+        assert!(data.is_object(), "{result}");
+        assert_eq!(
+            result["isError"] == true,
+            data["error"].is_object(),
+            "{result}"
+        );
+        data.clone()
+    }
+
+    async fn undo(&mut self, result: &Value) -> Value {
+        self.call(
+            result["undo"]["tool"].as_str().unwrap(),
+            result["undo"]["arguments"].clone(),
+        )
+        .await
+    }
+
+    async fn finish(self) {
+        drop(self.input);
+        let output = self.child.wait_with_output().await.unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("sk-operator"));
+    }
+}
+
+#[tokio::test]
+async fn gateway_agent_door_over_real_stdio() {
+    let (one, seen) = spawn_engine("one").await;
+    let (two, _) = spawn_engine("two").await;
+    let (config_path, db) = temp_paths("mcp");
+    std::fs::write(&config_path, config(&one, &two, "one/m")).unwrap();
+    let gw = spawn_gateway(&config_path, &db).await;
+
+    let mut mcp = McpChild::start(&gw);
+    let hello = mcp
+        .request(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "gateway-agent-door-test", "version": "1"}}),
+        )
+        .await;
+    assert_eq!(hello["protocolVersion"], "2025-06-18");
+    mcp.write(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .await;
+    let listed = mcp.request("tools/list", json!({})).await;
+    let tools = listed["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 16);
+    for tool in tools {
+        assert!(tool["description"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()));
+        assert_eq!(tool["inputSchema"]["type"], "object");
+    }
+    let apply_definition = tools
+        .iter()
+        .find(|tool| tool["name"] == "switchback_setup_apply")
+        .unwrap();
+    assert_eq!(
+        apply_definition["inputSchema"]["required"],
+        json!(["document", "confirm"])
+    );
+    assert_eq!(
+        apply_definition["inputSchema"]["properties"]["confirm"]["const"],
+        true
+    );
+    let original = mcp.call("switchback_setup_export", json!({})).await;
+    assert_eq!(
+        original,
+        json!({"schema": "switchback/setup@1", "names": {}, "models": {}})
+    );
+    let history_args = json!({"target": "one/m"});
+    let history = mcp
+        .call("switchback_settings_history", history_args.clone())
+        .await;
+    assert_eq!(history["history"], json!([]));
+
+    let mut document = original.clone();
+    document["models"]["one/m"] = json!({"defaults": {"temperature": 0.4}});
+    document["names"]["fast"] = json!({"targets": ["two/m"]});
+    document["if_match"] = json!({"models": {"one/m": 0}, "names": {"fast": 0}});
+    let plan = mcp
+        .call("switchback_setup_plan", json!({"document": document}))
+        .await;
+    assert_eq!(plan["applied"], false);
+    assert_eq!(plan["items"][0]["status"], "create");
+    assert_eq!(
+        mcp.call("switchback_settings_history", history_args.clone())
+            .await,
+        history
+    );
+
+    for args in [
+        json!({"document": document}),
+        json!({"document": document, "confirm": false}),
+    ] {
+        let refused = mcp.call("switchback_setup_apply", args).await;
+        assert!(refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("confirm: true"));
+    }
+    mcp.write(json!({"jsonrpc": "2.0", "method": "tools/call", "params": {
+        "name": "switchback_setup_apply", "arguments": {"document": document, "confirm": true}
+    }}))
+    .await;
+    assert_eq!(
+        mcp.call("switchback_settings_history", history_args.clone())
+            .await,
+        history
+    );
+    let dangerous_wrapper = mcp
+        .call(
+            "switchback_setup_apply",
+            json!({
+                "document": {"setup": {"schema": "switchback/setup@1", "apply_now": true}},
+                "confirm": true
+            }),
+        )
+        .await;
+    assert!(dangerous_wrapper["error"].is_object());
+
+    let args = json!({"document": document, "confirm": true});
+    let applied = mcp.call("switchback_setup_apply", args.clone()).await;
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["items"][0]["revision_after"], 1);
+    assert_eq!(applied["items"][1]["revision_after"], 1);
+    let history = mcp
+        .call("switchback_settings_history", history_args.clone())
+        .await;
+    assert_eq!(history["history"].as_array().unwrap().len(), 1);
+    let retried = mcp.call("switchback_setup_apply", args).await;
+    assert_eq!(retried["items"][0]["status"], "unchanged");
+    assert_eq!(retried["items"][1]["status"], "unchanged");
+    assert_eq!(retried["undo"], Value::Null);
+    assert_eq!(
+        mcp.call("switchback_settings_history", history_args.clone())
+            .await,
+        history
+    );
+
+    let selected = mcp
+        .call("switchback_names_get", json!({"name": "fast"}))
+        .await;
+    assert_eq!(selected["targets"], json!(["two/m"]));
+    let restored = mcp.undo(&applied).await;
+    assert_eq!(restored["items"][0]["revision_after"], 2);
+    assert_eq!(restored["items"][1]["revision_after"], 2);
+    let saved = mcp.call("switchback_setup_export", json!({})).await;
+    assert_eq!(saved["models"]["one/m"], json!({}));
+    let selected = mcp
+        .call("switchback_names_get", json!({"name": "fast"}))
+        .await;
+    assert_eq!(selected["targets"], json!(["one/m"]));
+    assert_eq!(selected["source"], "config");
+
+    let change = mcp
+        .call(
+            "switchback_settings_set",
+            json!({
+                "target": "one/m", "revision": 2, "patch": {"defaults": {"temperature": 0.4}}
+            }),
+        )
+        .await;
+    assert_eq!(change["document"]["defaults"]["temperature"], 0.4);
+    assert_eq!(change["revision"], 3);
+    let switched = mcp
+        .call(
+            "switchback_settings_revert",
+            json!({
+                "target": "one/m", "revision": 3, "to": 2
+            }),
+        )
+        .await;
+    assert_eq!(switched["document"], json!({}));
+    assert_eq!(switched["revision"], 4);
+    assert_eq!(mcp.undo(&switched).await["items"][0]["revision_after"], 5);
+    let settings = mcp.call("switchback_settings_get", history_args).await;
+    assert_eq!(
+        settings["targets"][0]["effective"]["temperature"]["value"],
+        0.4
+    );
+
+    let switched = mcp
+        .call(
+            "switchback_names_set",
+            json!({
+                "name": "fast", "revision": 2, "targets": ["two/m"]
+            }),
+        )
+        .await;
+    assert_eq!(switched["revision"], 3);
+    assert_eq!(switched["targets"], json!(["two/m"]));
+    let reverted = mcp.undo(&switched).await;
+    assert_eq!(reverted["targets"], json!(["one/m"]));
+    assert_eq!(reverted["undo"]["arguments"]["to"], 3);
+
+    let failure = mcp
+        .call("switchback_settings_get", json!({"target": "sk-operator"}))
+        .await;
+    assert_eq!(failure["status"], 404);
+    assert!(failure["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("[redacted]"));
+    assert!(failure["error"]["next"]
+        .as_str()
+        .unwrap()
+        .contains("/v1/models"));
+    for tool in [
+        "switchback_setup_schema",
+        "switchback_names_list",
+        "switchback_models_list",
+        "switchback_engines_list",
+        "switchback_status",
+    ] {
+        let result = mcp.call(tool, json!({})).await;
+        assert!(result.get("error").is_none(), "{tool}: {result}");
+    }
+    let preview = mcp
+        .call("switchback_route_preview", json!({"model": "fast"}))
+        .await;
+    assert!(preview.get("decision").is_some(), "{preview}");
+    assert_eq!(*seen.lock().unwrap(), 0);
+    mcp.finish().await;
+    println!("stdio: 16 tools; plan and unconfirmed apply kept history at 0; confirmed apply and retry kept it at 1; undo restored settings and configured routing at revision 2; bearer redacted from stdout/stderr.");
+}
+
+#[tokio::test]
+async fn gateway_agent_door_http_error_hints_and_schema() {
+    use reqwest::Method;
+
+    let (one, _) = spawn_engine("one").await;
+    let (two, _) = spawn_engine("two").await;
+    let (config_path, db) = temp_paths("hints");
+    std::fs::write(&config_path, config(&one, &two, "one/m")).unwrap();
+    let gw = spawn_gateway(&config_path, &db).await;
+    let (status, _) = send(
+        &gw,
+        Method::PUT,
+        "/v1/models/one/m/settings",
+        "sk-operator",
+        Some(0),
+        Some(json!({"defaults": {"temperature": 0.4}})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = send(
+        &gw,
+        Method::POST,
+        "/v1/roles/fast/lock",
+        "sk-operator",
+        Some(0),
+        Some(json!({"reason": "test lock"})),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let cases = [
+        (
+            Method::PATCH,
+            "/v1/models/one/m/settings",
+            "sk-operator",
+            Some(0),
+            Some(json!({"defaults": {"temperature": 0.5}})),
+            409,
+            "revision_conflict",
+            "current document",
+        ),
+        (
+            Method::PUT,
+            "/v1/roles/fast",
+            "sk-operator",
+            Some(1),
+            Some(json!({"targets": ["two/m"]})),
+            423,
+            "locked",
+            "/unlock",
+        ),
+        (
+            Method::GET,
+            "/v1/models/absent/m/settings",
+            "sk-operator",
+            None,
+            None,
+            404,
+            "model_not_found",
+            "/v1/engines",
+        ),
+        (
+            Method::PUT,
+            "/v1/roles/spare",
+            "sk-operator",
+            Some(0),
+            Some(json!({"targets": ["absent/m"]})),
+            400,
+            "unknown_target",
+            "/v1/models",
+        ),
+        (
+            Method::POST,
+            "/v1/setup/plan",
+            "sk-operator",
+            None,
+            Some(json!({"schema": "switchback/setup@1", "mystery": true})),
+            400,
+            "invalid_setup",
+            "/v1/setup/schema",
+        ),
+        (
+            Method::POST,
+            "/v1/setup/apply",
+            "sk-operator",
+            None,
+            Some(json!({"schema": "switchback/setup@9"})),
+            400,
+            "invalid_setup",
+            "/v1/setup/schema",
+        ),
+        (
+            Method::POST,
+            "/v1/setup/plan",
+            "sk-operator",
+            None,
+            Some(json!({"setup": {"schema": "switchback/setup@1", "models": []}})),
+            400,
+            "invalid_setup",
+            "/v1/setup/schema",
+        ),
+        (
+            Method::POST,
+            "/v1/setup/plan",
+            "sk-client",
+            None,
+            Some(json!({})),
+            403,
+            "permission_error",
+            "operator or admin",
+        ),
+        (
+            Method::GET,
+            "/v1/setup/schema",
+            "wrong",
+            None,
+            None,
+            401,
+            "invalid_request_error",
+            "Authorization",
+        ),
+        (
+            Method::PATCH,
+            "/v1/models/one/m/settings",
+            "sk-operator",
+            Some(1),
+            None,
+            415,
+            "invalid_request_error",
+            "Content-Type",
+        ),
+        (
+            Method::GET,
+            "/v1/roles/fast?limit=oops",
+            "sk-operator",
+            None,
+            None,
+            400,
+            "invalid_request_error",
+            "/v1/roles",
+        ),
+        (
+            Method::PUT,
+            "/v1/setup",
+            "sk-admin",
+            None,
+            None,
+            405,
+            "invalid_request_error",
+            "Allow",
+        ),
+    ];
+    for (method, path, key, revision, body, expected, kind, hint) in cases {
+        let (status, payload) = send(&gw, method, path, key, revision, body).await;
+        assert_eq!(status, expected, "{path}: {payload}");
+        let error = &payload["error"];
+        assert_eq!(error["type"], kind, "{payload}");
+        assert!(error["next"].as_str().unwrap().contains(hint), "{payload}");
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            !message.is_empty() && !message.contains("untagged enum"),
+            "{payload}"
+        );
+        if status == 409 {
+            assert_eq!(error["current_revision"], 1);
+            assert_eq!(error["reason"], "revision_conflict");
+        }
+        if path == "/v1/setup/plan" && status == 400 {
+            assert!(
+                message.contains("mystery")
+                    || message.contains("models")
+                    || message.contains("map"),
+                "{message}"
+            );
+        }
+    }
+
+    let (status, schema) = send(
+        &gw,
+        Method::GET,
+        "/v1/setup/schema",
+        "sk-operator",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(schema["title"], "switchback/setup@1");
+    let schema = jsonschema::validator_for(&schema).unwrap();
+    let example: Value =
+        serde_yaml::from_str(include_str!("../../../config/setup.example.yaml")).unwrap();
+    assert!(schema.is_valid(&example));
+    for path in ["/v1/setup", "/v1/setup?effective=true"] {
+        let (status, exported) = send(&gw, Method::GET, path, "sk-operator", None, None).await;
+        assert_eq!(status, 200);
+        assert!(
+            schema.is_valid(&exported),
+            "{exported}: {:?}",
+            schema.iter_errors(&exported).collect::<Vec<_>>()
+        );
+    }
+    for invalid in [
+        json!({"models": {}}),
+        json!({"schema": "switchback/setup@9"}),
+        json!({"schema": "switchback/setup@1", "models": {"one/m": {"unknown": true}}}),
+        json!({"schema": "switchback/setup@1", "models": {"one/m": {"defaults": []}}}),
+        json!({"schema": "switchback/setup@1", "names": {"fast": {"targets": "one/m"}}}),
+        json!({"schema": "switchback/setup@1", "names": {"fast": {"typo": true}}}),
+    ] {
+        assert!(!schema.is_valid(&invalid), "{invalid}");
+    }
+    println!("HTTP: 12 error cases preserved type/message and added next; schema accepted the example and both exports, and rejected six invalid documents.");
+}

@@ -23,39 +23,39 @@ use crate::engine_control::{validate_for_target, EngineCtx};
 use crate::tenancy::Principal;
 use crate::AppState;
 
-const SCHEMA: &str = "switchback/setup@1";
+pub(crate) const SCHEMA: &str = "switchback/setup@1";
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 struct Revisions {
     names: BTreeMap<String, u64>,
     models: BTreeMap<String, u64>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct SetupRequest {
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetupRequest<Name = Value, Model = Value> {
     schema: String,
-    names: BTreeMap<String, Value>,
-    models: BTreeMap<String, Value>,
+    #[serde(default)]
+    names: BTreeMap<String, Name>,
+    #[serde(default)]
+    models: BTreeMap<String, Model>,
+    #[serde(default)]
     unlock: BTreeSet<String>,
+    #[serde(default)]
     check: bool,
+    #[serde(default)]
     apply_now: bool,
+    #[serde(default)]
     wake: bool,
+    #[serde(default)]
     if_match: Revisions,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SetupFile {
-    Text(String),
-    Document(SetupRequest),
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileRequest {
-    setup: SetupFile,
+    setup: serde_yaml::Value,
     #[serde(default)]
     unlock: BTreeSet<String>,
     #[serde(default)]
@@ -64,11 +64,15 @@ struct FileRequest {
     wake: bool,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Request {
-    File(FileRequest),
-    Direct(SetupRequest),
+pub(crate) async fn schema(Extension(principal): Extension<Principal>) -> Response {
+    if !principal.is_operator_or_admin() {
+        return crate::tenancy::forbidden();
+    }
+    let mut schema = json!(schemars::schema_for!(SetupRequest<RouteRoleDoc, ModelSettingsDoc>));
+    schema["title"] = json!(SCHEMA);
+    schema["properties"]["schema"]["const"] = json!(SCHEMA);
+    schema["$defs"]["RouteRoleDoc"]["properties"]["source"] = json!({"const": "config"});
+    Json(schema).into_response()
 }
 
 #[derive(Default, Deserialize)]
@@ -127,23 +131,28 @@ pub(crate) async fn export(
 }
 
 fn parse_request(body: &[u8]) -> Result<SetupRequest, String> {
-    let input: serde_yaml::Value = serde_yaml::from_slice(body).map_err(|e| e.to_string())?;
-    let request: Request = serde_yaml::from_value(input).map_err(|e| e.to_string())?;
-    let request = match request {
-        Request::Direct(request) => request,
-        Request::File(file) => {
-            let mut document = match file.setup {
-                SetupFile::Text(text) => {
-                    let input = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
-                    serde_yaml::from_value(input).map_err(|e| e.to_string())?
-                }
-                SetupFile::Document(document) => document,
-            };
-            document.unlock = file.unlock;
-            document.check = file.check;
-            document.wake = file.wake;
-            document
-        }
+    let input: serde_yaml::Value = serde_yaml::from_slice(body)
+        .map_err(|e| format!("expected a JSON or YAML setup object: {e}"))?;
+    if !input.is_mapping() {
+        return Err("expected a setup object with schema, names and models".to_string());
+    }
+    let request: SetupRequest = if input.get("setup").is_some() {
+        let file: FileRequest =
+            serde_path_to_error::deserialize(input).map_err(|e| format!("setup wrapper: {e}"))?;
+        let document = match file.setup {
+            serde_yaml::Value::String(text) => serde_yaml::from_str(&text).map_err(|e| {
+                format!("setup must contain a document object or YAML/JSON text: {e}")
+            })?,
+            value => value,
+        };
+        let mut document: SetupRequest = serde_path_to_error::deserialize(document)
+            .map_err(|e| format!("setup must contain a document object or YAML/JSON text: {e}"))?;
+        document.unlock = file.unlock;
+        document.check = file.check;
+        document.wake = file.wake;
+        document
+    } else {
+        serde_path_to_error::deserialize(input).map_err(|e| format!("setup document: {e}"))?
     };
     if request.schema != SCHEMA {
         return Err(format!("setup documents need schema: {SCHEMA}"));
@@ -241,13 +250,22 @@ impl Item {
         } else {
             "names"
         };
-        self.undo = Some(json!({
-            "schema": SCHEMA,
-            (family): { (&self.name): before },
-            "if_match": { (family): { (&self.name): revision } },
-            "unlock": [&self.name],
-        }));
+        self.undo = Some(undo_document(family, &self.name, revision, before));
     }
+}
+
+pub(super) fn undo_document(
+    family: &str,
+    name: &str,
+    revision: u64,
+    before: &impl Serialize,
+) -> Value {
+    json!({
+        "schema": SCHEMA,
+        (family): { (name): before },
+        "if_match": { (family): { (name): revision } },
+        "unlock": [name],
+    })
 }
 
 struct Run<'a> {
@@ -361,11 +379,12 @@ impl Run<'_> {
             None
         };
         let written = match mutate(self.state, target, doc, options).await {
-            Ok((written, applied)) => {
-                item.pending = applied.as_ref().is_some_and(|result| {
+            Ok(result) => {
+                let written = result.written;
+                item.pending = result.applied.as_ref().is_some_and(|result| {
                     result["pending"] == true || (sleeping.is_some() && result["reloaded"] != true)
                 });
-                item.apply = applied;
+                item.apply = result.applied;
                 item.written(written.revision, written.unchanged, before);
                 if written.unchanged || !self.request.check {
                     return item;
@@ -409,10 +428,11 @@ impl Run<'_> {
         options.action = "setup:check_failed";
         options.locks = LockPolicy::Restore;
         match mutate(self.state, target, before.clone(), options).await {
-            Ok((restored, restored_apply)) => {
+            Ok(result) => {
+                let restored = result.written;
                 item.check = Some(json!({
                     "ok": false, "reason": why,
-                    "restored": {"revision": restored.revision, "apply": restored_apply},
+                    "restored": {"revision": restored.revision, "apply": result.applied},
                 }));
                 item.revision_after = Some(restored.revision);
                 item.undo = None;

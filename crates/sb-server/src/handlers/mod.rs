@@ -11,3 +11,4 @@ pub(crate) mod route_roles;
 pub(crate) mod workloads;
 
 pub(crate) mod setup;
+pub(crate) mod setup_errors;

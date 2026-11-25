@@ -22,6 +22,7 @@ pub fn build_app(state: AppState) -> Router {
                 .post(handlers::model_settings::post),
         )
         .route("/v1/setup", get(handlers::setup::export))
+        .route("/v1/setup/schema", get(handlers::setup::schema))
         .route("/v1/setup/plan", post(handlers::setup::plan))
         .route("/v1/setup/apply", post(handlers::setup::apply))
         .route("/v1/roles", get(handlers::route_roles::list))
@@ -172,6 +173,7 @@ pub fn build_app(state: AppState) -> Router {
             auth::require_auth,
         ))
         .layer(body_limit)
+        .layer(middleware::from_fn(handlers::setup_errors::add_next))
         .with_state(state)
 }
 

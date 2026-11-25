@@ -5,6 +5,7 @@ use sb_core::Config;
 
 use crate::config_cli::config_validate_json;
 use crate::doctor_cli::doctor_report_json;
+use crate::mcp_gateway::{self, GatewayTools};
 use crate::provider_cli::provider_certify_config_file;
 use crate::provider_preset::provider_presets_json;
 use crate::{controlplane, route_preview_json};
@@ -155,17 +156,41 @@ fn mcp_error(id: serde_json::Value, code: i64, message: impl Into<String>) -> se
     })
 }
 
-fn mcp_handle_request(config: &Path, req: serde_json::Value) -> Option<serde_json::Value> {
+async fn mcp_handle_request(
+    config: &Path,
+    gateway: Option<&GatewayTools>,
+    req: serde_json::Value,
+) -> Option<serde_json::Value> {
+    if gateway.is_some() && req.get("id").is_none() {
+        return None;
+    }
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(serde_json::Value::as_str);
     let id_for_response = id.clone().unwrap_or(serde_json::Value::Null);
+    let protocol = match req
+        .pointer("/params/protocolVersion")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(version @ ("2025-11-25" | "2025-06-18" | "2025-03-26")) if gateway.is_some() => {
+            version
+        }
+        _ => "2024-11-05",
+    };
     let result = match method {
         Some("initialize") => Ok(serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": protocol,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "switchback", "version": env!("CARGO_PKG_VERSION")}
         })),
-        Some("tools/list") => Ok(serde_json::json!({"tools": mcp_tool_defs()})),
+        Some("ping") if gateway.is_some() => Ok(serde_json::json!({})),
+        Some("tools/list") => {
+            let tools = if gateway.is_some() {
+                mcp_gateway::definitions()
+            } else {
+                mcp_tool_defs()
+            };
+            Ok(serde_json::json!({"tools": tools}))
+        }
         Some("tools/call") => {
             let params = req
                 .get("params")
@@ -181,7 +206,17 @@ fn mcp_handle_request(config: &Path, req: serde_json::Value) -> Option<serde_jso
                         .get("arguments")
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!({}));
-                    mcp_call_tool(config, name, &args)
+                    if let Some(gateway) = gateway {
+                        let value = gateway.call(name, args).await;
+                        let is_error = value.get("error").is_some();
+                        let mut content = mcp_content(value);
+                        if is_error {
+                            content["isError"] = serde_json::json!(true);
+                        }
+                        Ok(content)
+                    } else {
+                        mcp_call_tool(config, name, &args)
+                    }
                 }
                 Err(e) => Err(e),
             }
@@ -197,7 +232,8 @@ fn mcp_handle_request(config: &Path, req: serde_json::Value) -> Option<serde_jso
     }
 }
 
-pub(crate) fn run_mcp_stdio(config: &Path) -> anyhow::Result<()> {
+pub(crate) async fn run_mcp_stdio(config: &Path, gateway: Option<&str>) -> anyhow::Result<()> {
+    let gateway = gateway.map(GatewayTools::new).transpose()?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -217,7 +253,7 @@ pub(crate) fn run_mcp_stdio(config: &Path) -> anyhow::Result<()> {
                 continue;
             }
         };
-        if let Some(response) = mcp_handle_request(config, parsed) {
+        if let Some(response) = mcp_handle_request(config, gateway.as_ref(), parsed).await {
             writeln!(stdout, "{response}")?;
             stdout.flush()?;
         }

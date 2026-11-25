@@ -727,6 +727,12 @@ pub(super) struct SettingsMutation<'a> {
     pub locks: LockPolicy,
 }
 
+pub(super) struct SettingsWrite {
+    pub written: DocWrite<ModelSettingsDoc>,
+    pub applied: Option<Value>,
+    previous: Option<SettingsEntry>,
+}
+
 /// The one write path of PUT, PATCH, revert and setup apply: a document
 /// equal to the current one is `unchanged` (no revision, no engine apply,
 /// whatever revision the caller sent); otherwise the revision check, the
@@ -738,19 +744,20 @@ pub(super) async fn mutate(
     target: &str,
     doc: ModelSettingsDoc,
     options: SettingsMutation<'_>,
-) -> Result<(DocWrite<ModelSettingsDoc>, Option<Value>), SettingsWriteError> {
+) -> Result<SettingsWrite, SettingsWriteError> {
     let ctx = crate::engine_control::EngineCtx::from(state);
     let registry = state.engine.model_settings();
     let before = registry.current(target)?;
     let prior = before.as_ref().map(|entry| entry.doc.as_ref());
     if let Some(entry) = before.as_ref().filter(|entry| entry.doc.equivalent(&doc)) {
-        return Ok((
-            DocWrite {
+        return Ok(SettingsWrite {
+            written: DocWrite {
                 entry: entry.clone(),
                 unchanged: true,
             },
-            None,
-        ));
+            applied: None,
+            previous: before,
+        });
     }
     {
         let current = before.as_ref().map_or(0, |entry| entry.revision);
@@ -786,7 +793,11 @@ pub(super) async fn mutate(
         )
         .await
     };
-    Ok((written, applied))
+    Ok(SettingsWrite {
+        written,
+        applied,
+        previous: before,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -802,7 +813,7 @@ async fn commit_write(
     wake: bool,
 ) -> Response {
     let actor = actor_for(principal, headers);
-    let (written, applied) = match mutate(
+    let result = match mutate(
         state,
         &named.target,
         doc,
@@ -830,9 +841,20 @@ async fn commit_write(
         }
         Err(e) => return write_error(e),
     };
+    let written = result.written;
     let mut view = target_view(state, named, Some(&written), None, true);
+    view["undo"] = if written.unchanged {
+        Value::Null
+    } else {
+        let empty = ModelSettingsDoc::default();
+        let before = result
+            .previous
+            .as_ref()
+            .map_or(&empty, |entry| entry.doc.as_ref());
+        super::setup::undo_document("models", &named.target, written.revision, before)
+    };
     view["unchanged"] = json!(written.unchanged);
-    if let Some(applied) = applied {
+    if let Some(applied) = result.applied {
         view["apply"] = applied;
     }
     with_etag(view, written.revision)

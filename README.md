@@ -390,6 +390,7 @@ the [Releases](https://github.com/umutkeltek/switchback/releases) page.
 | [`CLI.md`](CLI.md) | The operator & agent-facing CLI contract |
 | [`PROVIDER_SETUP.md`](PROVIDER_SETUP.md) | Real provider recipes |
 | [`MULTIMODAL_WORKLOAD_BRIEF.md`](MULTIMODAL_WORKLOAD_BRIEF.md) | Design direction for image/video/workflow workload planes |
+| [`AGENT_GUIDE.md`](AGENT_GUIDE.md) | Manage a running gateway from an agent over MCP or HTTP |
 | [`DASHBOARD_DESIGN_RECAP.md`](DASHBOARD_DESIGN_RECAP.md) | Operator-console redesign direction for setup, lanes, and future jobs |
 | [`SECURITY.md`](SECURITY.md) | Security model + how to report a vulnerability |
 | [`AGENTS.md`](AGENTS.md) | Invariants, conventions, contribution recipes |

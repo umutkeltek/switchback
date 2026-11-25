@@ -431,7 +431,7 @@ impl RouteOptimize {
 /// The reasoning guard of a target that thinks (`reasoning: true` in its
 /// settings): a request with a small `max_tokens` gets thinking off, so the
 /// budget is not spent on thinking with an empty answer at the end.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReasoningGuard {
     pub enabled: bool,
@@ -451,7 +451,7 @@ impl Default for ReasoningGuard {
 /// The theoretical speed limit of a target on its machine (the skill's
 /// "ceilings first"): decode is memory-bound (bandwidth / bytes per
 /// token), prefill compute-bound.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ceiling {
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -54,8 +54,10 @@ reqwest.workspace = true
 tokio-tungstenite.workspace = true
 tokio-rustls.workspace = true
 serde.workspace = true
+schemars.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+serde_path_to_error = "0.1"
 toml.workspace = true
 rcgen.workspace = true
 sha2.workspace = true
@@ -74,6 +76,7 @@ opentelemetry-otlp = { version = "0.32", optional = true, default-features = fal
 tracing-opentelemetry = { version = "0.33", optional = true }
 
 [dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 base64.workspace = true
