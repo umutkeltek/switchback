@@ -94,15 +94,12 @@ pub(crate) struct CandidateResolution {
     /// when the route has any trick on; every plan of the request applies
     /// it the same way.
     pub(crate) optimize: Option<crate::optimize::Hints>,
-    /// A store role made this route: the decision's reason line saying
-    /// which and at what revision (or that its targets are unknown and the
-    /// config's route answered).
-    pub(crate) role: Option<String>,
+    pub(crate) source_reason: Option<String>,
 }
 
 /// What a model resolved to before candidates are stamped: route name,
 /// requirements, candidates, unknown target ids, combo, `pin_order`, the
-/// route's own `prefer_awake`, and the store role's reason line.
+/// route's own `prefer_awake`, and the source reason line.
 type ResolvedRoute = (
     String,
     RouteRequire,
@@ -324,7 +321,7 @@ pub(crate) fn combine_allowed_accounts(
 
 /// Resolve a model to ordered candidate targets — the routing front-half shared
 /// by `execute` and `preview_route`. Precedence: execution profile route →
-/// exact route → combo profile → explicit `provider/model` → wildcard route →
+/// exact route → combo profile → engine name → explicit `provider/model` → wildcard route →
 /// default pass-through provider → 404. Each candidate is stamped with its
 /// non-secret account-pool health so the router can demote locked pools, and
 /// (outcome-routing-v1 §1 read seam) its rolling outcome-scorecard evidence —
@@ -336,6 +333,7 @@ pub(crate) fn resolve_candidates(
     scorecard: &crate::scorecard::Scorecard,
     lanes: Option<&dyn crate::LaneStatus>,
     roles: &crate::route_roles::RouteRoles,
+    engine_models: &crate::engine_models::EngineModels,
 ) -> Result<CandidateResolution, ExecError> {
     let profile = ExecutionProfile::from_model(model);
     // The exact route of this name, with a store role over it (read now:
@@ -410,7 +408,20 @@ pub(crate) fn resolve_candidates(
             None,
             None,
         )
-    } else if let Some(target) = snap.registry.target_for(model) {
+    } else if let Some(discovered) = engine_models.route(snap, model) {
+        let route = discovered.route_config(model);
+        let (candidates, unknown) = route_candidates(snap, &route);
+        (
+            route.name,
+            route.require,
+            candidates,
+            unknown,
+            None,
+            route.pin_order,
+            route.prefer_awake,
+            Some(format!("engine listing: targets for `{model}`")),
+        )
+    } else if let Some(target) = snap.registry.target_for(model).filter(|_| !engine_models.missing(snap, model)) {
         (
             "direct".to_string(),
             RouteRequire::default(),
@@ -517,7 +528,7 @@ pub(crate) fn resolve_candidates(
         lane_down,
         prefer_awake,
         optimize: None,
-        role,
+        source_reason: role,
     })
 }
 
@@ -757,8 +768,8 @@ pub(crate) fn plan_candidates(
         &resolved.candidates,
         &policy,
     );
-    if let Some(role) = &resolved.role {
-        plan.decision.add_reason(role.clone());
+    if let Some(reason) = &resolved.source_reason {
+        plan.decision.add_reason(reason.clone());
     }
     if let Some(hints) = &resolved.optimize {
         crate::optimize::apply_hints(&mut plan, hints, resolved.pin_order);

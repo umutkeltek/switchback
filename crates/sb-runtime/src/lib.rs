@@ -24,12 +24,14 @@ mod audit;
 mod collect;
 mod denial;
 mod embeddings;
+mod engine_models;
 mod execute;
 mod execution_meta;
 mod finish_attempt;
 mod hedge;
 mod helpers;
 mod lanes;
+pub use engine_models::EngineModelRoute;
 pub mod model_settings;
 pub mod optimize;
 mod outcome;
@@ -225,7 +227,9 @@ pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T
 /// config publish (hot-swap) never tears a request across revisions.
 pub struct Snapshot {
     pub revision: u64,
+    config_hash: String,
     pub config: Arc<Config>,
+    engine_model_lanes: Vec<engine_models::EngineModelLane>,
     pub registry: Arc<sb_adapters::AdapterRegistry>,
     pub resolver: Arc<sb_credentials::CredentialResolver>,
     pub runtime: Runtime,
@@ -284,6 +288,7 @@ pub struct Engine {
     /// routes. State, not config: survives a publish or reload, durable in
     /// the state store when one is attached, read by routing per request.
     route_roles: Arc<route_roles::RouteRoles>,
+    engine_models: engine_models::EngineModels,
     /// Engine variants for per-request load settings (`sb-server`'s engine
     /// control). Unset = such requests are refused.
     model_variants: OnceLock<Arc<dyn model_settings::ModelVariants>>,
@@ -293,6 +298,12 @@ pub struct Engine {
     /// Token pools of local engine models (token-pool admission). State,
     /// not config: reservations and queues survive a publish.
     token_pools: Arc<token_pool::TokenPools>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigPublication {
+    pub revision: u64,
+    pub unchanged: bool,
 }
 
 /// Outcome of an optimistic-concurrency publish ([`Engine::publish_with_audit`]).

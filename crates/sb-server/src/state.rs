@@ -122,17 +122,9 @@ impl AppState {
         Self::from_engine(Engine::new(config, registry, resolver, ledger))
     }
 
-    /// Start the engine listing poller: every `every`, the loaded models of
-    /// each engine lane that is up (never one that is off, waking, powering
-    /// off or draining; never a wake). `serve` starts it every 30 s.
-    /// Returns whether it started: with no lane that has an engine control
-    /// at start-up there is nothing to poll and no task is spawned (a
-    /// reload that adds the first such lane is polled after a restart; the
-    /// served requests keep its loaded-model view meanwhile).
-    pub fn spawn_engine_listing_poller(&self, every: std::time::Duration) -> bool {
-        crate::engine_control::spawn_listing_poller(self, every)
+    pub fn spawn_engine_listing_poller(&self, every: std::time::Duration) {
+        crate::engine_control::spawn_listing_poller(self, every);
     }
-
     /// Prune the experiment ledger now and start its daily pruner when an
     /// optimizer feature is configured or rows are left. Returns whether
     /// the daily task started; `serve` calls it at start-up.
@@ -206,6 +198,24 @@ impl AppState {
         self.engine.snapshot()
     }
 
+    pub(crate) fn effective_routing_config(
+        &self,
+        snap: &Snapshot,
+    ) -> (
+        Config,
+        std::collections::BTreeMap<String, sb_runtime::EngineModelRoute>,
+    ) {
+        let mut config = self.engine.route_roles().effective_config(&snap.config);
+        let mut discovered = self.engine.engine_model_routes(snap);
+        discovered.retain(|name, model| {
+            if config.exact_route_for(name).is_some() {
+                return false;
+            }
+            config.routes.push(model.route_config(name));
+            true
+        });
+        (config, discovered)
+    }
     pub fn revision(&self) -> u64 {
         self.engine.revision()
     }
@@ -218,7 +228,7 @@ impl AppState {
     pub fn reload_from_file_with_audit(
         &self,
         audit: sb_runtime::AuditContext,
-    ) -> Result<u64, String> {
+    ) -> Result<sb_runtime::ConfigPublication, String> {
         self.engine.reload_from_file_with_audit(audit)
     }
 

@@ -215,11 +215,15 @@ async fn noop(State(_): State<Machine>, Json(_): Json<Value>) -> Json<Value> {
     Json(json!({"success": true}))
 }
 
-async fn listen(app: Router) -> String {
+async fn launch(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), task)
+}
+
+async fn listen(app: Router) -> String {
+    launch(app).await.0
 }
 
 async fn serve(machine: &Machine) -> String {
@@ -916,42 +920,13 @@ async fn the_listing_poller_never_calls_a_sleeping_lane() {
     assert!(!fx.wakes.exists(), "the poller woke the machine");
 }
 
-// With no lane that has an engine control, the poller is not spawned.
-#[tokio::test]
-async fn no_poller_without_an_engine_lane() {
-    let cfg = sb_core::Config::from_yaml(
-        r#"
-server:
-  bind: "127.0.0.1:0"
-providers:
-  - id: mock
-    type: mock
-local_executors:
-  - name: mock
-    base_url: "http://127.0.0.1:9"
-    health_endpoint: "http://127.0.0.1:9/health"
-"#,
-    )
-    .unwrap();
-    let registry = sb_adapters::AdapterRegistry::from_config(&cfg).unwrap();
-    let resolver = sb_credentials::CredentialResolver::from_config(&cfg).unwrap();
-    let state = sb_server::AppState::new(
-        Arc::new(cfg),
-        Arc::new(registry),
-        Arc::new(resolver),
-        Arc::new(sb_ledger::UsageLedger::in_memory()),
-    );
-    assert!(!state.spawn_engine_listing_poller(Duration::from_millis(20)));
-}
-
 #[tokio::test]
 async fn the_spawned_poller_refreshes_up_lanes_only() {
     let fx = fixture("    loaded_aware: true").await;
     send(&fx.gw, convo("gpu-box/a", "hello", 1)).await;
     let before = listings(&fx.gpu);
-    assert!(fx
-        .state
-        .spawn_engine_listing_poller(Duration::from_millis(20)));
+    fx.state
+        .spawn_engine_listing_poller(Duration::from_millis(20));
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(listings(&fx.gpu) > before, "an up lane was not polled");
     fx.gpu.sleep();
@@ -1020,4 +995,373 @@ async fn the_engine_view_reads_build_and_speculation_from_a_real_shaped_router()
     assert_eq!(a["speculative"]["draft_model"], true);
     assert_eq!(a["speculative"]["mtp"], false);
     assert_eq!(a["speculative"]["sources"], json!(["settings", "args"]));
+}
+
+fn app_on_store(
+    config_path: &std::path::Path,
+    store: Arc<sb_store::SqliteStore>,
+) -> sb_server::AppState {
+    let cfg = sb_core::Config::from_path(config_path).unwrap();
+    sb_runtime::Engine::validate_config(&cfg).unwrap();
+    let registry = Arc::new(sb_adapters::AdapterRegistry::from_config(&cfg).unwrap());
+    let resolver = Arc::new(sb_credentials::CredentialResolver::from_config(&cfg).unwrap());
+    let engine = sb_runtime::Engine::new(
+        Arc::new(cfg),
+        registry,
+        resolver,
+        Arc::new(sb_ledger::UsageLedger::in_memory().with_store_lazy(store.clone())),
+    )
+    .with_store_policy(store, true)
+    .unwrap();
+    sb_server::AppState::from_engine(engine).with_config_path(config_path.to_path_buf())
+}
+
+async fn gateway_json(gw: &str, path: &str) -> Value {
+    reqwest::get(format!("{gw}{path}"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+fn row_named<'a>(rows: &'a Value, key: &str, value: &str) -> &'a Value {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row[key] == value)
+        .unwrap()
+}
+
+async fn route_preview(gw: &str, name: &str) -> Value {
+    reqwest::Client::new()
+        .post(format!("{gw}/cp/v1/route-preview"))
+        .json(&convo(name, "preview", 1))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn engine_named_example_serves_refreshes_and_wakes_a_model_after_restart() {
+    use sb_store::StateStore;
+
+    let scratch = temp("engine-names");
+    std::fs::create_dir(&scratch).unwrap();
+    let store_path = scratch.join("state.sqlite");
+    let config_path = scratch.join("gateway.yaml");
+    let wakes = scratch.join("wakes");
+    let small = Machine::new(
+        "always-on",
+        &["small-model", "shared-model"],
+        &["small-model"],
+    );
+    let large = Machine::new(
+        "on-demand",
+        &["large-model", "shared-model"],
+        &["large-model"],
+    );
+    let small_url = serve(&small).await;
+    let large_url = serve(&large).await;
+    let example = include_str!("../../../config/engine-model-names.example.yaml")
+        .replace("http://always-on.example.invalid:8080", &small_url)
+        .replace("http://on-demand.example.invalid:8080", &large_url)
+        .replace("./engine-model-names.sqlite", store_path.to_str().unwrap())
+        .replace(
+            "wakeonlan 02:00:00:00:00:01",
+            &format!(
+                "echo wake >> '{}' && touch '{}'",
+                wakes.display(),
+                large.up.display()
+            ),
+        )
+        .replace("ssh on-demand.example.invalid sudo poweroff", "true");
+    std::fs::write(&config_path, &example).unwrap();
+
+    let store = Arc::new(sb_store::SqliteStore::open(store_path.to_str().unwrap()).unwrap());
+    let state = app_on_store(&config_path, store.clone());
+    assert!(state.snapshot().config.routes.is_empty());
+    let (gw, running) = launch(sb_server::build_app(state.clone())).await;
+    for model in ["small-model", "large-model", "shared-model"] {
+        assert_eq!(
+            send(&gw, convo(model, "before discovery", 1)).await.status,
+            404
+        );
+    }
+    state.spawn_engine_listing_poller(Duration::from_millis(35));
+    let index = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let index = gateway_json(&gw, "/v1/models").await;
+            if index["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == "on-demand/large-model")
+            {
+                break index;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        row_named(&index["data"], "id", "large-model")["source"],
+        "engine"
+    );
+    let roles = gateway_json(&gw, "/v1/roles").await;
+    let shared = row_named(&roles["data"], "name", "shared-model");
+    assert_eq!(
+        shared["targets"],
+        json!(["always-on/shared-model", "on-demand/shared-model"])
+    );
+    assert_eq!(shared["source"], "engine");
+    assert!(shared["seen_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(shared["target_seen_at_ms"].as_object().unwrap().len(), 2);
+    let preview = route_preview(&gw, "shared-model").await;
+    assert_eq!(preview["candidates"], shared["targets"]);
+    assert!(preview["decision"]["reason"]
+        .to_string()
+        .contains("engine listing"));
+    for (model, owner) in [
+        ("small-model", "always-on"),
+        ("large-model", "on-demand"),
+        ("shared-model", "always-on"),
+        ("on-demand/shared-model", "on-demand"),
+    ] {
+        let answer = send(&gw, convo(model, "discover me", 1)).await;
+        assert_eq!(answer.status, 200, "{model}: {}", answer.body);
+        assert_eq!(answer.served_by(), owner);
+    }
+    println!(
+        "example: each bare model served; shared candidates = {}",
+        shared["targets"]
+    );
+    let setup = gateway_json(&gw, "/v1/setup?effective=true").await;
+    assert_eq!(setup["names"]["shared-model"]["source"], "engine");
+    assert!(setup["names"]["shared-model"]["seen_at_ms"].is_number());
+    let applied: Value = reqwest::Client::new()
+        .post(format!("{gw}/v1/setup/apply"))
+        .json(&setup)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        applied["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "shared-model")
+            .unwrap()["status"],
+        "unchanged"
+    );
+    assert!(store.route_role_list().unwrap().is_empty());
+
+    state.capacity.observe_all().await;
+    small
+        .state
+        .lock()
+        .unwrap()
+        .models
+        .push("fresh-model".to_string());
+    state.poll_engine_listings().await;
+    let added = send(&gw, convo("fresh-model", "added without reload", 1)).await;
+    assert_eq!(added.status, 200, "{}", added.body);
+    assert_eq!(added.served_by(), "always-on");
+    assert_eq!(state.revision(), 1);
+    let pinned = reqwest::Client::new()
+        .put(format!("{gw}/v1/roles/pinned-fresh"))
+        .header("if-match", "0")
+        .json(&json!({"targets": ["always-on/fresh-model"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pinned.status(), 200, "{}", pinned.text().await.unwrap());
+    small
+        .state
+        .lock()
+        .unwrap()
+        .models
+        .retain(|model| model != "fresh-model");
+    state.poll_engine_listings().await;
+    assert_eq!(
+        send(&gw, convo("fresh-model", "removed again", 1))
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        send(
+            &gw,
+            convo("always-on/fresh-model", "removed qualified name", 1)
+        )
+        .await
+        .status,
+        404
+    );
+    let role = gateway_json(&gw, "/v1/roles/pinned-fresh").await;
+    assert_eq!(role["source"], "store");
+    assert_eq!(role["targets"], json!(["always-on/fresh-model"]));
+    assert_eq!(role["unknown_targets"], role["targets"]);
+    println!("one refresh added and removed fresh-model at config revision 1");
+
+    let with_config_route = format!("{example}\nroutes:\n  - name: shared-model\n    match: {{ model: shared-model }}\n    targets: [on-demand/large-model]\n  - name: fallback\n    match: {{ model: '*' }}\n    targets: [always-on/small-model]\n");
+    std::fs::write(&config_path, &with_config_route).unwrap();
+    assert_eq!(state.reload_from_file().unwrap(), 2);
+    assert_eq!(
+        route_preview(&gw, "shared-model").await["candidates"],
+        json!(["on-demand/large-model"])
+    );
+    assert_eq!(
+        route_preview(&gw, "large-model").await["candidates"],
+        json!(["on-demand/large-model"])
+    );
+    assert_eq!(
+        route_preview(&gw, "unknown-model").await["candidates"],
+        json!(["always-on/small-model"])
+    );
+    let put = reqwest::Client::new()
+        .put(format!("{gw}/v1/roles/shared-model"))
+        .header("if-match", "0")
+        .json(&json!({"targets": ["always-on/small-model"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200, "{}", put.text().await.unwrap());
+    let changed = with_config_route.replace(
+        "targets: [on-demand/large-model]",
+        "targets: [on-demand/shared-model]",
+    );
+    std::fs::write(&config_path, &changed).unwrap();
+    assert_eq!(state.reload_from_file().unwrap(), 3);
+    assert_eq!(
+        route_preview(&gw, "shared-model").await["candidates"],
+        json!(["always-on/small-model"])
+    );
+    println!("precedence: config overrides engine, role overrides config after reload, engine overrides *");
+
+    large.sleep();
+    state.capacity.observe_all().await;
+    let before = listings(&large);
+    assert!(!wakes.exists());
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    drop(state);
+    drop(store);
+    let restarted = app_on_store(
+        &config_path,
+        Arc::new(sb_store::SqliteStore::open(store_path.to_str().unwrap()).unwrap()),
+    );
+    restarted.capacity.observe_all().await;
+    restarted.poll_engine_listings().await;
+    let (restarted_gw, running) = launch(sb_server::build_app(restarted)).await;
+    let engines = gateway_json(&restarted_gw, "/v1/engines").await;
+    let engine = row_named(&engines["data"], "lane", "on-demand");
+    assert_eq!(engine["source"], "engine");
+    assert!(engine["seen_at_ms"].is_number());
+    assert_eq!(
+        row_named(&engine["models"], "id", "large-model")["source"],
+        "engine"
+    );
+    assert_eq!(listings(&large), before);
+    assert!(!wakes.exists(), "discovery or an engine view woke the lane");
+    let answer = send(&restarted_gw, convo("large-model", "wake now please", 1)).await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.served_by(), "on-demand");
+    assert_eq!(std::fs::read_to_string(&wakes).unwrap(), "wake\n");
+    println!("restart: cached large-model, zero sleeping listing calls, one wake, HTTP 200 from on-demand");
+
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    small.sleep();
+    large.sleep();
+    std::fs::remove_dir_all(scratch).unwrap();
+}
+
+#[tokio::test]
+async fn identical_reloads_and_draft_publish_keep_snapshot_and_revision_row() {
+    use sb_store::StateStore;
+
+    let scratch = temp("equal-config");
+    std::fs::create_dir(&scratch).unwrap();
+    let path = scratch.join("gateway.yaml");
+    let cfg = "providers: [{id: echo, type: mock}]\n";
+    std::fs::write(&path, cfg).unwrap();
+    let store = Arc::new(
+        sb_store::SqliteStore::open(scratch.join("state.sqlite").to_str().unwrap()).unwrap(),
+    );
+    let state = app_on_store(&path, store.clone());
+    let gw = listen(sb_server::build_app(state.clone())).await;
+    let client = reqwest::Client::new();
+    let original = state.snapshot();
+    let reload = || client.post(format!("{gw}/v1/reload")).send();
+    for _ in 0..2 {
+        let result: Value = reload()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(result["revision"], 1);
+        assert_eq!(result["unchanged"], true);
+    }
+    let draft: Value = client
+        .post(format!("{gw}/cp/v1/drafts"))
+        .json(original.config.as_ref())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = draft["id"].as_str().unwrap();
+    let published: Value = client
+        .post(format!("{gw}/cp/v1/drafts/{id}/publish"))
+        .header("if-match", "1")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        published,
+        json!({"ok": true, "revision": 1, "unchanged": true})
+    );
+    assert!(Arc::ptr_eq(&original, &state.snapshot()));
+    assert_eq!(store.list_revisions(10).unwrap().len(), 1);
+    assert_eq!(store.list_audit(10).unwrap().len(), 1);
+    std::fs::write(&path, "providers: [{id: revised, type: mock}]\n").unwrap();
+    let result: Value = reload()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(result["revision"], 2);
+    assert_eq!(result["unchanged"], false);
+    assert!(!Arc::ptr_eq(&original, &state.snapshot()));
+    assert_eq!(store.list_revisions(10).unwrap().len(), 2);
+    println!("reload, reload, draft publish: unchanged at revision 1, one row and same snapshot; changed reload: revision 2, two rows");
+    std::fs::remove_dir_all(scratch).unwrap();
 }

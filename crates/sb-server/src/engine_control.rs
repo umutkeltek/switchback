@@ -1234,18 +1234,7 @@ pub(crate) fn engine_lane(config: &Config, provider: &str) -> Option<EngineLane>
         .iter()
         .find(|lane| lane.name == provider)?;
     let engine = lane.engine.clone()?;
-    let base = engine.base_url.clone().or_else(|| {
-        config
-            .providers
-            .iter()
-            .find(|p| p.id == provider)
-            .and_then(|p| match &p.kind {
-                sb_core::ProviderKind::OpenaiCompatible { base_url, .. } => Some(base_url.clone()),
-                _ => None,
-            })
-    })?;
-    let base = base.trim_end_matches('/');
-    let base = base.strip_suffix("/v1").unwrap_or(base).to_string();
+    let base = config.engine_base_url(lane)?.to_string();
     Some(EngineLane {
         name: lane.name.clone(),
         engine,
@@ -1296,7 +1285,7 @@ struct ControlState {
     /// off with it).
     apply_failures: BTreeMap<String, u32>,
     /// Per lane: the engine's last model listing, and when.
-    models: BTreeMap<String, (i64, Vec<Value>)>,
+    models: BTreeMap<String, (String, i64, Vec<Value>)>,
     /// Per target: the settings revision whose load part last changed.
     load_changed: HashMap<String, u64>,
     /// Per target: the settings revision it was last loaded with by us.
@@ -1686,6 +1675,8 @@ impl EngineControls {
         lane: &EngineLane,
         timeout: Duration,
     ) -> Result<Vec<Value>, String> {
+        let snap = state.snapshot();
+        let seen_at_ms = now_ms();
         let listing = self
             .call(state, lane, reqwest::Method::GET, "/models", None, timeout)
             .await?;
@@ -1693,10 +1684,27 @@ impl EngineControls {
             .get("data")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default();
-        self.lock()
-            .models
-            .insert(lane.name.clone(), (now_ms(), models.clone()));
+            .ok_or("engine model listing is missing its data array")?;
+        if lane.engine.model_names != sb_core::EngineModelNames::Disabled {
+            let ids = models
+                .iter()
+                .map(|row| row["id"].as_str())
+                .collect::<Option<Vec<_>>>();
+            if let Some(ids) = ids {
+                let ids = ids
+                    .into_iter()
+                    .filter(|id| public_engine_model_id(&lane.name, id))
+                    .map(str::to_string)
+                    .collect();
+                state
+                    .engine
+                    .record_engine_models(&snap, &lane.name, &lane.base, seen_at_ms, ids);
+            }
+        }
+        self.lock().models.insert(
+            lane.name.clone(),
+            (lane.base.clone(), seen_at_ms, models.clone()),
+        );
         Ok(models)
     }
 
@@ -1720,9 +1728,17 @@ impl EngineControls {
             .local_executors
             .iter()
             .filter_map(|lane| engine_lane(&snap.config, &lane.name))
-            .filter(|lane| listing_pollable(state, &lane.name))
             .collect();
-        futures::future::join_all(lanes.iter().map(|lane| self.refresh_listing(state, lane))).await;
+        futures::future::join_all(lanes.iter().map(|lane| async {
+            if listing_pollable(state, &lane.name)
+                || (lane.engine.model_names != sb_core::EngineModelNames::Disabled
+                    && listing_needs_first_probe(state, &lane.name)
+                    && matches!(self.awake(state, lane).await, Awake::Up))
+            {
+                self.refresh_listing(state, lane).await;
+            }
+        }))
+        .await;
     }
 
     /// The engine's build (`GET /props` `build_info`, e.g. `b12359-b1b770d90`),
@@ -1790,7 +1806,16 @@ impl EngineControls {
     }
 
     pub(crate) fn cached_models(&self, lane: &str) -> Option<(i64, Vec<Value>)> {
-        self.lock().models.get(lane).cloned()
+        self.lock()
+            .models
+            .get(lane)
+            .map(|(_, at, models)| (*at, models.clone()))
+    }
+
+    fn cached_models_for_engine(&self, lane: &EngineLane) -> Option<(i64, Vec<Value>)> {
+        let state = self.lock();
+        let (base, at, models) = state.models.get(&lane.name)?;
+        (base == &lane.base).then(|| (*at, models.clone()))
     }
 
     /// The engine's model listing read now (bounded by `timeout`) for
@@ -3692,19 +3717,17 @@ fn listing_pollable(state: &EngineCtx, lane: &str) -> bool {
     })
 }
 
+fn listing_needs_first_probe(state: &EngineCtx, lane: &str) -> bool {
+    use crate::activator::LaneState;
+    state.capacity.executor(lane).is_some_and(|executor| {
+        let report = executor.report();
+        report.state == LaneState::Offline && report.observed_healthy.is_none()
+    })
+}
+
 /// Keep the loaded-model view fresh: every `every`, one
 /// [`EngineControls::poll_listings`] pass. Stops when the engine is gone.
-pub(crate) fn spawn_listing_poller(app: &AppState, every: Duration) -> bool {
-    // No lane with an engine control: nothing to poll, so no task.
-    if !app
-        .snapshot()
-        .config
-        .local_executors
-        .iter()
-        .any(|lane| lane.engine.is_some())
-    {
-        return false;
-    }
+pub(crate) fn spawn_listing_poller(app: &AppState, every: Duration) {
     let weak = Arc::downgrade(&app.engine);
     let (capacity, engines) = (app.capacity.clone(), app.engines.clone());
     tokio::spawn(async move {
@@ -3723,7 +3746,6 @@ pub(crate) fn spawn_listing_poller(app: &AppState, every: Duration) -> bool {
             engines.poll_listings(&ctx).await;
         }
     });
-    true
 }
 
 /// Wire the engine control's retries: when a lane comes up, and when the
@@ -4643,11 +4665,25 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
                 .await
             {
                 Ok(models) => ("up", Some((now_ms(), models)), None),
-                Err(e) => ("up", controls.cached_models(&lane.name), Some(e)),
+                Err(e) => ("up", controls.cached_models_for_engine(&lane), Some(e)),
             }
         }
-        Awake::Asleep(why) => (why, controls.cached_models(&lane.name), None),
+        Awake::Asleep(why) => (why, controls.cached_models_for_engine(&lane), None),
     };
+    let snap = state.snapshot();
+    let named = state.engine.engine_model_listing(&snap, &lane.name);
+    let models = models.or_else(|| {
+        named.as_ref().map(|listing| {
+            (
+                listing.seen_at_ms,
+                listing
+                    .model_ids
+                    .iter()
+                    .map(|id| json!({"id": id}))
+                    .collect(),
+            )
+        })
+    });
     let rows: Vec<Value> = models
         .as_ref()
         .map(|(_, models)| models.as_slice())
@@ -4663,7 +4699,7 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
                 .as_str()
                 .map(|path| sb_core::fnv_hex(&[path])[..12].to_string());
             let doc = registry.get(&target).map(|entry| entry.doc);
-            json!({
+            let mut view = json!({
                 "id": id,
                 "target": target,
                 "file": file,
@@ -4678,7 +4714,15 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
                 "pending": controls.load_pending(&target, status),
                 "in_flight": registry.in_flight(&target),
                 "dispatched": registry.dispatched(&target),
-            })
+            });
+            if let Some(listing) = named
+                .as_ref()
+                .filter(|listing| listing.model_ids.iter().any(|model| model == id))
+            {
+                view["source"] = json!("engine");
+                view["seen_at_ms"] = json!(listing.seen_at_ms);
+            }
+            view
         })
         .collect();
     let variants: Vec<Value> = controls
@@ -4733,9 +4777,13 @@ async fn engine_lane_view(state: &EngineCtx, lane: EngineLane) -> Value {
         "machine_file_command": lane.engine.machine_file_command.is_some(),
         "build": controls.lock().builds.get(&lane.name).cloned(),
     });
+    if lane.engine.model_names != sb_core::EngineModelNames::Disabled {
+        view["source"] = json!("engine");
+        view["model_names"] = json!(lane.engine.model_names);
+        view["seen_at_ms"] = json!(named.map(|listing| listing.seen_at_ms));
+    }
     // The lane's machine and its memory facts (`server.optimize.hosts`),
     // for `sb ai check`'s margin rule on any client.
-    let snap = state.snapshot();
     if let Some(host) = snap
         .config
         .local_executors
@@ -4806,6 +4854,14 @@ pub(crate) fn machines_of(config: &Config) -> Vec<Value> {
         .collect()
 }
 
+fn public_engine_model_id(lane: &str, model: &str) -> bool {
+    model != "*"
+        && !model
+            .rsplit_once('~')
+            .is_some_and(|(_, hash)| hash.len() == 8 && hash.bytes().all(|c| c.is_ascii_hexdigit()))
+        && sb_core::target_shape_problem(&format!("{lane}/{model}")).is_none()
+}
+
 /// The model ids a lane's engine lists, without waking its machine: a
 /// fresh listing (3 s) while the lane is up, else the last listing the
 /// gateway kept. `None` when the lane has no engine control or its engine
@@ -4817,7 +4873,7 @@ pub(crate) async fn engine_model_ids(app: &AppState, lane: &str) -> Option<Vec<S
     let cached = || {
         state
             .engines
-            .cached_models(&lane.name)
+            .cached_models_for_engine(&lane)
             .map(|(_, models)| models)
     };
     let models = match state.engines.awake(&state, &lane).await {
@@ -4830,7 +4886,14 @@ pub(crate) async fn engine_model_ids(app: &AppState, lane: &str) -> Option<Vec<S
             Err(_) => cached(),
         },
         Awake::Asleep(_) => cached(),
-    }?;
+    };
+    if models.is_none() {
+        return state
+            .engine
+            .engine_model_listing(&snap, &lane.name)
+            .map(|listing| listing.model_ids);
+    }
+    let models = models?;
     Some(
         models
             .iter()

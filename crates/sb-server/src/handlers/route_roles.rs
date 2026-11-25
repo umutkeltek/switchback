@@ -53,29 +53,52 @@ pub(super) fn role_names(config: &Config, roles: &RouteRoles) -> Vec<String> {
     names.into_iter().collect()
 }
 
+pub(super) fn engine_source(
+    row: &mut Value,
+    discovered: &sb_runtime::EngineModelRoute,
+    targets: &[String],
+) {
+    let seen_at: std::collections::BTreeMap<_, _> = targets
+        .iter()
+        .filter_map(|target| {
+            discovered
+                .target_seen_at_ms
+                .get(target)
+                .map(|at| (target, at))
+        })
+        .collect();
+    row["source"] = json!("engine");
+    row["seen_at_ms"] = json!(seen_at.values().copied().max());
+    row["target_seen_at_ms"] = json!(seen_at);
+}
+
 /// One name as `sb ai roles` shows it.
 fn role_row(
-    config: &Config,
-    registry: &sb_adapters::AdapterRegistry,
+    state: &AppState,
+    snap: &sb_runtime::Snapshot,
     name: &str,
     entry: Option<&RoleEntry>,
-    durable: bool,
+    engine_route: Option<&sb_runtime::EngineModelRoute>,
 ) -> Value {
-    let base = config_route_for_role(config, name);
+    let base = config_route_for_role(&snap.config, name);
     let doc = entry.map(|entry| entry.doc.as_ref());
     let over = doc.and_then(|doc| doc.route_over(name, base));
-    let route = over.as_ref().or(base);
+    let derived = engine_route.map(|model| model.route_config(name));
+    let route = over.as_ref().or(base).or(derived.as_ref());
     let targets: Vec<String> = route.map(|route| route.targets.clone()).unwrap_or_default();
     let unknown: Vec<&String> = targets
         .iter()
-        .filter(|target| registry.target_for(target).is_none())
+        .filter(|target| {
+            snap.registry.target_for(target).is_none()
+                || state.engine.engine_model_missing(snap, target)
+        })
         .collect();
     let source = match (&over, base) {
         (Some(_), _) => "store",
         (None, Some(_)) => "config",
         (None, None) => "none",
     };
-    json!({
+    let mut row = json!({
         "name": name,
         "targets": targets,
         "source": source,
@@ -87,8 +110,14 @@ fn role_row(
         "locked": doc.is_some_and(|doc| doc.locked),
         "lock_reason": doc.and_then(|doc| doc.lock_reason.clone()),
         "unknown_targets": unknown,
-        "durable": durable,
-    })
+        "durable": state.engine.route_roles().durable(),
+    });
+    if source == "none" {
+        if let Some(discovered) = engine_route {
+            engine_source(&mut row, discovered, &targets);
+        }
+    }
+    row
 }
 
 /// `GET /v1/roles`.
@@ -99,9 +128,9 @@ pub(crate) async fn list(
     let snap = state.snapshot();
     let roles = state.engine.route_roles();
     let durable = roles.durable();
+    let (effective, discovered) = state.effective_routing_config(&snap);
     if !principal.is_operator_or_admin() {
         // A client key: the names and targets its tenant reaches.
-        let effective = roles.effective_config(&snap.config);
         let scoped = crate::controlplane::scoped_config_for_principal(&effective, &principal);
         let data: Vec<Value> = scoped
             .routes
@@ -116,20 +145,27 @@ pub(crate) async fn list(
                 } else {
                     "config"
                 };
-                json!({"name": route.name, "targets": route.targets, "source": source})
+                let mut row =
+                    json!({"name": route.name, "targets": route.targets, "source": source});
+                if let Some(model) = discovered.get(&route.name) {
+                    engine_source(&mut row, model, &route.targets);
+                }
+                row
             })
             .collect();
         return Json(json!({"object": "list", "data": data})).into_response();
     }
-    let data: Vec<Value> = role_names(&snap.config, &roles)
+    let mut names: BTreeSet<_> = role_names(&snap.config, &roles).into_iter().collect();
+    names.extend(discovered.keys().cloned());
+    let data: Vec<Value> = names
         .iter()
         .map(|name| {
             role_row(
-                &snap.config,
-                &snap.registry,
+                &state,
+                &snap,
                 name,
                 roles.get(name).as_ref(),
-                durable,
+                discovered.get(name),
             )
         })
         .collect();
@@ -163,25 +199,25 @@ pub(crate) async fn get(
     }
     let snap = state.snapshot();
     let roles = state.engine.route_roles();
+    let (_, discovered) = state.effective_routing_config(&snap);
     let key = match role_key(&snap.config, &name) {
         Ok(key) => key,
+        Err(_) if discovered.contains_key(&name) => name.clone(),
         Err(response) => return response,
     };
+    let engine_route = discovered.get(&key);
     let entry = roles.get(&key);
-    if entry.is_none() && config_route_for_role(&snap.config, &key).is_none() {
+    if entry.is_none()
+        && config_route_for_role(&snap.config, &key).is_none()
+        && engine_route.is_none()
+    {
         return error(
             StatusCode::NOT_FOUND,
             "role_not_found",
             format!("no role `{name}`: the config has no such route and the store no such role"),
         );
     }
-    let mut row = role_row(
-        &snap.config,
-        &snap.registry,
-        &key,
-        entry.as_ref(),
-        roles.durable(),
-    );
+    let mut row = role_row(&state, &snap, &key, entry.as_ref(), engine_route);
     let limit = query
         .limit
         .unwrap_or(HISTORY_LIMIT)
@@ -451,11 +487,11 @@ pub(crate) async fn put(
     };
     if prior.is_some_and(|old| old.equivalent(&doc)) {
         let mut row = role_row(
-            &snap.config,
-            &snap.registry,
+            &state,
+            &snap,
             &key,
             entry.as_ref(),
-            roles.durable(),
+            state.engine.engine_model_route(&snap, &key).as_ref(),
         );
         row["unchanged"] = json!(true);
         row["check"] = Value::Null;
@@ -492,11 +528,11 @@ pub(crate) async fn put(
     match roles.replace(&key, doc, expected, &actor, "set", false) {
         Ok(entry) => {
             let mut row = role_row(
-                &snap.config,
-                &snap.registry,
+                &state,
+                &snap,
                 &key,
                 Some(&entry),
-                roles.durable(),
+                state.engine.engine_model_route(&snap, &key).as_ref(),
             );
             row["check"] = check.unwrap_or(Value::Null);
             row["unchanged"] = json!(entry.unchanged);
@@ -601,7 +637,13 @@ pub(crate) async fn post(
         }
         "unlock" => {
             if entry.is_none() {
-                let mut row = role_row(&snap.config, &snap.registry, &key, None, roles.durable());
+                let mut row = role_row(
+                    &state,
+                    &snap,
+                    &key,
+                    None,
+                    state.engine.engine_model_route(&snap, &key).as_ref(),
+                );
                 row["unchanged"] = json!(true);
                 return with_etag(row, current);
             }
@@ -622,11 +664,11 @@ pub(crate) async fn post(
     match written {
         Ok(entry) => {
             let mut row = role_row(
-                &snap.config,
-                &snap.registry,
+                &state,
+                &snap,
                 &key,
                 Some(&entry),
-                roles.durable(),
+                state.engine.engine_model_route(&snap, &key).as_ref(),
             );
             row["unchanged"] = json!(entry.unchanged);
             with_etag(row, entry.revision)

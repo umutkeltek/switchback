@@ -635,10 +635,13 @@ def catalog(gw, every_id=False):
                 result["test"].add(row["id"])
     media = set(result["image"]) | set(result["video"]) | set(result["segment"])
     media_providers = {str(row.get("provider")) for row in workflows.get("data") or [] if row.get("provider")}
+    engine_names = set()
     for row in models.get("data") or []:
         model_id = row.get("id") if isinstance(row, dict) else None
         if not model_id or model_id in media or model_id in media_providers:
             continue  # a media provider's bare id is listed as a model, but it is not one
+        if row.get("source") == "engine":
+            engine_names.add(model_id)
         if row.get("kind") in AUDIO_KINDS:
             result["audio"].append(model_id)
             if row["kind"] == "audio_speech":
@@ -651,15 +654,15 @@ def catalog(gw, every_id=False):
         else:
             result["text"].append(model_id)
     if not every_id:
-        result["text"] = plain_text_names(result["text"])
-        result["audio"] = plain_text_names(result["audio"])
+        result["text"] = plain_text_names(result["text"], engine_names)
+        result["audio"] = plain_text_names(result["audio"], engine_names)
         # /v1/models marks a speech route's targets and provider as speech
         # too; only the names people use are speech models to choose from.
         result["speech"] = {m for m in result["audio"] if m in result["speech"]}
     return result
 
 
-def plain_text_names(ids):
+def plain_text_names(ids, engine_names=()):
     """/v1/models lists each text route (`fast`), each provider's own model
     names (`<provider>/<engine name>`) and the provider itself (`<provider>`).
     People use the route names; the rest are internal and repeat them. Drop
@@ -671,9 +674,9 @@ def plain_text_names(ids):
     for model_id in ids:
         if "/" in model_id:
             provider, name = model_id.split("/", 1)
-            if name in listed or provider in listed:
+            if name in listed or (provider in listed and model_id not in engine_names):
                 continue
-        elif model_id in prefixes:
+        elif model_id in prefixes and model_id not in engine_names:
             continue
         keep.append(model_id)
     return keep
@@ -905,8 +908,11 @@ def cmd_models(gw, args):
     if args.json:
         if roles:
             groups = dict(groups)
-            groups["routes"] = {name: {"targets": row.get("targets") or [], "source": row.get("source")}
-                                for name, row in roles.items()}
+            groups["routes"] = {
+                name: {"targets": row.get("targets") or [], "source": row.get("source"),
+                       **{key: row[key] for key in ("seen_at_ms", "target_seen_at_ms") if key in row}}
+                for name, row in roles.items()
+            }
         print(json.dumps(groups, indent=2))
         return OK
     for name, ids in groups.items():
@@ -917,7 +923,11 @@ def cmd_models(gw, args):
             note += " (speech)" if model_id in cat["speech"] else ""
             row = roles.get(model_id)
             if row and row.get("targets"):
-                where = " (role store)" if row.get("source") == "store" else ""
+                where = ""
+                if row.get("source") == "store":
+                    where = " (role store)"
+                if row.get("source") == "engine":
+                    where = f" ({role_source_words(row)})"
                 note += " " * (width - len(model_id)) + f"  -> {', '.join(row['targets'])}{where}"
             print(f"  {model_id}{note}")
         if not ids:
@@ -2842,6 +2852,10 @@ def role_source_words(row):
         return f"role store, revision {row.get('revision', 0)}"
     if source == "config":
         return "config"
+    if source == "engine":
+        seen = row.get("seen_at_ms")
+        return "engine" + (", last seen " + time.strftime("%Y-%m-%d %H:%M", time.localtime(seen / 1000))
+                           if seen is not None else "")
     return "no route"
 
 
@@ -2997,7 +3011,10 @@ def cmd_role(gw, args):
             raise Fail(GATEWAY_ERROR, f"no name {name} (sb ai roles lists them)")
         answer = role_write(gw, "POST", role_path(name, "/revert"), {"to": to}, revision,
                             "reverting the role")
-        what = "the config's route" if to == 0 else f"the targets of revision {to}"
+        if to == 0:
+            what = "the engine's route" if answer.get("source") == "engine" else "the config's route"
+        else:
+            what = f"the targets of revision {to}"
         say(f"{name}: revision {answer.get('revision')} ({what}): "
               f"{', '.join(answer.get('targets') or []) or '(no targets)'}")
         if answer.get("unknown_targets"):
@@ -3093,7 +3110,7 @@ def cmd_engines(gw, args):
     for lane in lanes:
         seen = lane.get("seen_at_ms")
         when = (" (last seen " + time.strftime("%H:%M", time.localtime(seen / 1000)) + ")"
-                if seen and lane.get("state") != "up" else "")
+                if seen and (lane.get("state") != "up" or lane.get("source") == "engine") else "")
         print(f"{lane.get('lane')} ({lane.get('kind')}): {lane.get('state')}{when}")
         for row in lane.get("models") or []:
             notes = []
@@ -3101,6 +3118,8 @@ def cmd_engines(gw, args):
             part = memory.get("effective") or memory.get("min") if isinstance(memory, dict) else None
             if isinstance(part, dict) and part.get("bytes"):
                 notes.append(f"{part['bytes'] / 2**30:.1f} GiB at ctx {part.get('n_ctx', '?')}")
+            if row.get("source") == "engine":
+                notes.append("named by engine")
             if row.get("pending"):
                 notes.append("settings pending until reload")
             if row.get("in_flight"):

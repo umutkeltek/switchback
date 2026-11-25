@@ -858,21 +858,16 @@ pub async fn publish_draft(
         None => None,
     };
 
-    if let Err(e) = sb_runtime::Engine::validate_config(&config) {
-        return cp_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("draft invalid: {e}"),
-        );
-    }
     match state.engine.publish_with_audit(
         config,
         audit_context("draft_publish", "control-plane draft publish", &principal)
             .with_object_id(id.clone()),
         expected_revision,
     ) {
-        Ok(revision) => {
+        Ok(result) => {
             state.drafts.remove(&id);
-            Json(json!({ "ok": true, "revision": revision })).into_response()
+            Json(json!({ "ok": true, "revision": result.revision, "unchanged": result.unchanged }))
+                .into_response()
         }
         Err(sb_runtime::PublishError::Conflict { expected, current }) => cp_error(
             StatusCode::CONFLICT,

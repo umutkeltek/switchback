@@ -545,12 +545,30 @@ pub enum QualityJudgmentReserveOutcome {
     BudgetExceeded(QualityJudgmentBudget),
 }
 
+#[derive(Debug, Clone)]
+pub struct EngineModelListing {
+    pub lane: String,
+    pub endpoint_key: String,
+    pub model_ids: Vec<String>,
+    pub seen_at_ms: i64,
+}
+
 /// The persistence seam. Backends: [`SqliteStore`] (local/team), a future
 /// Postgres backend (hosted) — both behind this one trait so the runtime never
 /// knows which it's talking to. Callers decide whether a write is best-effort
 /// local durability or a required control-plane invariant; the trait surfaces
 /// errors for both policies.
 pub trait StateStore: Send + Sync {
+    fn engine_model_listings(&self) -> Result<Vec<EngineModelListing>> {
+        Ok(Vec::new())
+    }
+
+    fn record_engine_model_listing(&self, _listing: &EngineModelListing) -> Result<()> {
+        Err(StoreError(
+            "durable engine model listings are not supported".to_string(),
+        ))
+    }
+
     fn record_revision(&self, rec: &RevisionRecord) -> Result<()>;
     /// Atomically record a revision and its audit entry. Backends should
     /// override this when they can provide a transaction; the default keeps
@@ -1595,6 +1613,17 @@ ON eval_evidence_snapshots(snapshot_id, published_at_ms);",
             )?;
             Ok(())
         })?;
+        Self::apply_migration(&mut conn, 25, "engine_model_listings", |tx| {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS engine_model_listings (
+                    lane TEXT NOT NULL,
+                    endpoint_key TEXT NOT NULL,
+                    model_ids TEXT NOT NULL,
+                    seen_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (lane, endpoint_key)
+                );",
+            )
+        })?;
         Ok(())
     }
 
@@ -2569,6 +2598,46 @@ impl SqliteStore {
 }
 
 impl StateStore for SqliteStore {
+    fn engine_model_listings(&self) -> Result<Vec<EngineModelListing>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT lane, endpoint_key, model_ids, seen_at_ms FROM engine_model_listings",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut listings = Vec::new();
+        while let Some(row) = rows.next()? {
+            let model_ids: String = row.get(2)?;
+            let model_ids = serde_json::from_str(&model_ids)
+                .map_err(|error| StoreError(format!("invalid stored engine model IDs: {error}")))?;
+            listings.push(EngineModelListing {
+                lane: row.get(0)?,
+                endpoint_key: row.get(1)?,
+                model_ids,
+                seen_at_ms: row.get(3)?,
+            });
+        }
+        Ok(listings)
+    }
+
+    fn record_engine_model_listing(&self, listing: &EngineModelListing) -> Result<()> {
+        let model_ids = serde_json::to_string(&listing.model_ids)
+            .map_err(|error| StoreError(format!("encode engine model IDs: {error}")))?;
+        self.conn()?.execute(
+            "INSERT INTO engine_model_listings (lane, endpoint_key, model_ids, seen_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (lane, endpoint_key) DO UPDATE SET
+                 model_ids = excluded.model_ids, seen_at_ms = excluded.seen_at_ms
+             WHERE excluded.seen_at_ms >= engine_model_listings.seen_at_ms",
+            params![
+                listing.lane,
+                listing.endpoint_key,
+                model_ids,
+                listing.seen_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
     fn record_revision(&self, rec: &RevisionRecord) -> Result<()> {
         let conn = self.conn()?;
         // A runtime-knob change bumps the revision with the same config_hash; a
@@ -6232,8 +6301,7 @@ mod model_settings_tests {
                     r.get(0)
                 })
                 .unwrap();
-            // Migration 24 (route roles) ran too: the newest one.
-            assert_eq!(max, 24);
+            assert_eq!(max, 25);
         }
         // And reopening is a no-op (idempotent migrations).
         let store = SqliteStore::open(&path).unwrap();

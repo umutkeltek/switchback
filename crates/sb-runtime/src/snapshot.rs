@@ -11,7 +11,7 @@ use super::execution_meta::{
     preview_cache_receipt,
 };
 use super::profiles::{apply_request_client_profile, plan_resolved_route, resolve_candidates};
-use super::{AuditContext, Engine, ExecError, Runtime, Snapshot};
+use super::{AuditContext, ConfigPublication, Engine, ExecError, Runtime, Snapshot};
 
 /// A stable fingerprint of a config (so drift between revisions is detectable)
 /// without persisting the body — keeps secrets out of the state store.
@@ -54,6 +54,8 @@ impl Engine {
         ));
         let snapshot = Snapshot {
             revision: 1,
+            config_hash: config_hash(&config),
+            engine_model_lanes: crate::engine_models::EngineModelLane::from_config(&config),
             config,
             registry,
             resolver,
@@ -83,6 +85,7 @@ impl Engine {
                 roles.set_history_keep(history_keep);
                 Arc::new(roles)
             },
+            engine_models: Default::default(),
             model_variants: OnceLock::new(),
             optimize: Arc::new(crate::optimize::OptimizeState::new()),
             token_pools: Arc::new(crate::token_pool::TokenPools::default()),
@@ -144,12 +147,15 @@ impl Engine {
         self.quality_eval.attach_store(store.clone());
         self.model_settings.attach_store(store.clone());
         self.route_roles.attach_store(store.clone());
+        if let Err(error) = self.engine_models.restore(store.as_ref()) {
+            tracing::warn!(%error, "engine model listings could not be restored");
+        }
         self.store = Some(store);
         self.store_required = required;
         self.hydrate_scorecard_from_store();
         self.recover_quality_eval_from_store();
         let cur = self.snapshot.load();
-        let hash = config_hash(&cur.config);
+        let hash = cur.config_hash.clone();
         let revision = cur.revision;
         drop(cur);
         let audit = AuditContext::new("bootstrap", "engine start");
@@ -286,9 +292,14 @@ impl Engine {
     /// action); ledger + traces persist.
     pub fn reload(&self, config: Config) -> Result<u64, String> {
         self.reload_with_audit(config, AuditContext::new("reload", "config file reload"))
+            .map(|result| result.revision)
     }
 
-    pub fn reload_with_audit(&self, config: Config, audit: AuditContext) -> Result<u64, String> {
+    pub fn reload_with_audit(
+        &self,
+        config: Config,
+        audit: AuditContext,
+    ) -> Result<ConfigPublication, String> {
         let _guard = self
             .reload_lock
             .lock()
@@ -306,7 +317,7 @@ impl Engine {
         config: Config,
         audit: AuditContext,
         expected_revision: Option<u64>,
-    ) -> Result<u64, crate::PublishError> {
+    ) -> Result<ConfigPublication, crate::PublishError> {
         let _guard = self
             .reload_lock
             .lock()
@@ -324,15 +335,29 @@ impl Engine {
     /// The actual config compile + atomic swap. **The caller must hold
     /// `reload_lock`** so the revision read→build→store sequence can't interleave
     /// with another publish.
-    fn swap_config_locked(&self, config: Config, audit: AuditContext) -> Result<u64, String> {
+    fn swap_config_locked(
+        &self,
+        config: Config,
+        audit: AuditContext,
+    ) -> Result<ConfigPublication, String> {
+        let hash = config_hash(&config);
+        let cur = self.snapshot.load();
+        if hash == cur.config_hash {
+            return Ok(ConfigPublication {
+                revision: cur.revision,
+                unchanged: true,
+            });
+        }
+        let revision = cur.revision + 1;
+        drop(cur);
         Self::validate_config(&config)?;
         let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
-        let revision = self.snapshot.load().revision + 1;
-        let hash = config_hash(&config);
         let plugins = sb_plugin::PluginHost::try_from_config(&config.plugins)?;
         let next = Arc::new(Snapshot {
             revision,
+            config_hash: hash.clone(),
+            engine_model_lanes: crate::engine_models::EngineModelLane::from_config(&config),
             runtime: Runtime::from_config(&config),
             config: Arc::new(config),
             registry: Arc::new(registry),
@@ -353,7 +378,10 @@ impl Engine {
         if let Some(lanes) = &self.lanes {
             lanes.config_published(&published);
         }
-        Ok(revision)
+        Ok(ConfigPublication {
+            revision,
+            unchanged: false,
+        })
     }
 
     /// Re-read the config file and reload (for `POST /v1/reload`).
@@ -366,9 +394,13 @@ impl Engine {
             AuditContext::new("file_reload", "config file reload")
                 .with_object_id(path.display().to_string()),
         )
+        .map(|result| result.revision)
     }
 
-    pub fn reload_from_file_with_audit(&self, audit: AuditContext) -> Result<u64, String> {
+    pub fn reload_from_file_with_audit(
+        &self,
+        audit: AuditContext,
+    ) -> Result<ConfigPublication, String> {
         let path = self
             .config_path
             .get()
@@ -400,7 +432,7 @@ impl Engine {
         let revision = cur.revision + 1;
         // Same config (knobs only), so the hash is unchanged — the revision row
         // records that knobs changed; the audit detail is the new knob state.
-        let hash = config_hash(&cur.config);
+        let hash = cur.config_hash.clone();
         let detail = serde_json::to_string(&runtime).unwrap_or_default();
         let mut audit = audit.unwrap_or_else(|| AuditContext::new("runtime_patch", detail.clone()));
         if audit.detail.is_empty() {
@@ -408,6 +440,8 @@ impl Engine {
         }
         let next = Arc::new(Snapshot {
             revision,
+            config_hash: hash.clone(),
+            engine_model_lanes: cur.engine_model_lanes.clone(),
             runtime,
             config: cur.config.clone(),
             registry: cur.registry.clone(),
@@ -444,6 +478,7 @@ impl Engine {
             &self.scorecard,
             self.lanes.as_deref(),
             &self.route_roles,
+            &self.engine_models,
         )?;
         let (_route_name, mut plan) = plan_resolved_route(
             &self.combo_rr,
