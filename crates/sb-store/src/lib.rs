@@ -4244,13 +4244,13 @@ mod tests {
         {
             vec![
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24,
+                24, 25,
             ]
         }
         #[cfg(not(feature = "eval"))]
         {
             vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
             ]
         }
     }
@@ -5198,6 +5198,28 @@ mod tests {
             vec![("acme".to_string(), 2, 150)],
             "first usage event for req-1 is retained before the unique index is created"
         );
+    }
+
+    #[test]
+    fn engine_listings_replace_older_rows_and_keep_an_observed_empty_list() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut listing = EngineModelListing {
+            lane: "local".to_string(),
+            endpoint_key: "engine".to_string(),
+            model_ids: vec!["model-a".to_string()],
+            seen_at_ms: 1,
+        };
+        store.record_engine_model_listing(&listing).unwrap();
+        let first = store.engine_model_listings().unwrap().pop().unwrap();
+        assert_eq!(first.model_ids, ["model-a"]);
+
+        listing.model_ids.clear();
+        listing.seen_at_ms = 2;
+        store.record_engine_model_listing(&listing).unwrap();
+        store.record_engine_model_listing(&first).unwrap();
+        let current = store.engine_model_listings().unwrap().pop().unwrap();
+        assert!(current.model_ids.is_empty());
+        assert_eq!(current.seen_at_ms, 2);
     }
 
     #[test]
