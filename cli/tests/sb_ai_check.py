@@ -624,6 +624,19 @@ class CheckTests(Base):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertTrue(all(b["switchback"].get("no_cache") is True for b, _ in self.fake.chats()))
 
+    def test_a_refused_lock_lets_the_hold_go(self):
+        # The lane got busy between the preflight and the lock: the check
+        # stops, and the hold it took first is released (it once stayed an
+        # hour, keeping the machine on).
+        self.fake.write({"load": {"ctx_size": 16384, "parallel": 1}})
+        self.fake.lock_refused = "lane_busy"
+        run = self.sb("check", TARGET, "--checks", "long")
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("refused", run.stderr)
+        holds = [p for m, p, b, h in self.fake.seen if m == "POST" and p.startswith("/v1/hosts/")]
+        self.assertEqual(len(holds), 1, "no hold was taken")
+        self.released()
+
     def test_the_pool_check_asks_a_thinking_model_not_to_think_and_judges_it(self):
         # A model that thinks past any answer room unless told not to (the
         # 11-24 pool check on a 26B model: cut at 4,096 tokens twice). The

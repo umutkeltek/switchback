@@ -824,7 +824,15 @@ class Checker:
             self.wait_awake(ident)
         else:
             self.take_hold(ident, why, ttl, wake=False)
-            self.take_lock(ident, why, ttl, self.hold[1])
+            try:
+                self.take_lock(ident, why, ttl, self.hold[1])
+            except BaseException:
+                # A refused lock (the lane is busy, a quiet window began)
+                # must not leave the hold behind: it would keep the machine
+                # on for its whole time (seen 11-25: an hour's hold left by
+                # a check that never ran).
+                self.release()
+                raise
 
     def take_hold(self, ident, why, ttl, wake):
         hold = self.call("POST", f"/v1/hosts/{urllib.parse.quote(ident['host'])}/holds",
