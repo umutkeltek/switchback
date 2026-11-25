@@ -786,7 +786,7 @@ pub trait StateStore: Send + Sync {
         ))
     }
 
-    /// Every stored settings document.
+    /// One target's stored settings document, if any.
     fn model_settings_get(&self, target: &str) -> Result<Option<ModelSettingsRecord>> {
         Ok(self
             .model_settings_list()?
@@ -794,6 +794,7 @@ pub trait StateStore: Send + Sync {
             .find(|record| record.target == target))
     }
 
+    /// Every stored settings document.
     fn model_settings_list(&self) -> Result<Vec<ModelSettingsRecord>> {
         Ok(Vec::new())
     }
@@ -826,7 +827,7 @@ pub trait StateStore: Send + Sync {
         ))
     }
 
-    /// Every stored role document.
+    /// One name's stored role document, if any.
     fn route_role_get(&self, name: &str) -> Result<Option<ModelSettingsRecord>> {
         Ok(self
             .route_role_list()?
@@ -834,6 +835,7 @@ pub trait StateStore: Send + Sync {
             .find(|record| record.target == name))
     }
 
+    /// Every stored role document.
     fn route_role_list(&self) -> Result<Vec<ModelSettingsRecord>> {
         Ok(Vec::new())
     }

@@ -727,6 +727,12 @@ pub(super) struct SettingsMutation<'a> {
     pub locks: LockPolicy,
 }
 
+/// The one write path of PUT, PATCH, revert and setup apply: a document
+/// equal to the current one is `unchanged` (no revision, no engine apply,
+/// whatever revision the caller sent); otherwise the revision check, the
+/// store locks, the engine checks, the revisioned write, then the apply of
+/// changed load settings. The write stands whatever the engine does; the
+/// returned apply value says what that was.
 pub(super) async fn mutate(
     state: &AppState,
     target: &str,
