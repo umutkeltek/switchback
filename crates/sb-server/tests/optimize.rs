@@ -1353,7 +1353,14 @@ async fn identical_reloads_and_draft_publish_keep_snapshot_and_revision_row() {
         published,
         json!({"ok": true, "revision": 1, "unchanged": true})
     );
-    assert!(Arc::ptr_eq(&original, &state.snapshot()));
+    // Same revision and config; the snapshot itself is rebuilt so a rotated
+    // key or plugin file outside the config takes effect.
+    let now = state.snapshot();
+    assert_eq!(now.revision, 1);
+    assert_eq!(
+        serde_json::to_value(now.config.as_ref()).unwrap(),
+        serde_json::to_value(original.config.as_ref()).unwrap()
+    );
     assert_eq!(store.list_revisions(10).unwrap().len(), 1);
     assert_eq!(store.list_audit(10).unwrap().len(), 1);
     std::fs::write(&path, "providers: [{id: revised, type: mock}]\n").unwrap();
@@ -1369,6 +1376,6 @@ async fn identical_reloads_and_draft_publish_keep_snapshot_and_revision_row() {
     assert_eq!(result["unchanged"], false);
     assert!(!Arc::ptr_eq(&original, &state.snapshot()));
     assert_eq!(store.list_revisions(10).unwrap().len(), 2);
-    println!("reload, reload, draft publish: unchanged at revision 1, one row and same snapshot; changed reload: revision 2, two rows");
+    println!("reload, reload, draft publish: unchanged at revision 1, one row and the same config; changed reload: revision 2, two rows");
     std::fs::remove_dir_all(scratch).unwrap();
 }
