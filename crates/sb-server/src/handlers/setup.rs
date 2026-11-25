@@ -71,7 +71,12 @@ pub(crate) async fn schema(Extension(principal): Extension<Principal>) -> Respon
     let mut schema = json!(schemars::schema_for!(SetupRequest<RouteRoleDoc, ModelSettingsDoc>));
     schema["title"] = json!(SCHEMA);
     schema["properties"]["schema"]["const"] = json!(SCHEMA);
-    schema["$defs"]["RouteRoleDoc"]["properties"]["source"] = json!({"const": "config"});
+    // Marks an effective export adds; apply reads them and writes nothing for them.
+    let name = &mut schema["$defs"]["RouteRoleDoc"]["properties"];
+    name["source"] = json!({"enum": ["config", "engine"]});
+    name["seen_at_ms"] = json!({"type": ["integer", "null"]});
+    name["target_seen_at_ms"] =
+        json!({"type": "object", "additionalProperties": {"type": "integer"}});
     Json(schema).into_response()
 }
 

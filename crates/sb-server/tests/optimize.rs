@@ -1147,6 +1147,13 @@ async fn engine_named_example_serves_refreshes_and_wakes_a_model_after_restart()
     let setup = gateway_json(&gw, "/v1/setup?effective=true").await;
     assert_eq!(setup["names"]["shared-model"]["source"], "engine");
     assert!(setup["names"]["shared-model"]["seen_at_ms"].is_number());
+    let schema = gateway_json(&gw, "/v1/setup/schema").await;
+    let schema = jsonschema::validator_for(&schema).unwrap();
+    assert!(
+        schema.is_valid(&setup),
+        "an effective export with engine names must match the served schema: {:?}",
+        schema.iter_errors(&setup).collect::<Vec<_>>()
+    );
     let applied: Value = reqwest::Client::new()
         .post(format!("{gw}/v1/setup/apply"))
         .json(&setup)
