@@ -98,7 +98,17 @@ DEPTHS = (0.10, 0.50, 0.90)
 PLACES = ("Larkspur", "Wrenfield", "Ostmark")
 CODE_WORDS = ("QUILL", "EMBER", "FJORD", "LUMEN", "CEDAR", "ONYX", "BASALT", "HERON", "TALON",
               "SORREL", "MAPLE", "COBALT", "SPRUCE", "AMBER", "GARNET", "OSPREY")
-LONG_MAX_TOKENS = 4096   # room for a thinking model; a cut answer is reported as capped
+# The long and pool checks test memory and context, not reasoning: their
+# requests ask the model not to think (`reasoning_effort: none`, which the
+# gateway turns into each engine's own switch) and keep room only for the
+# three code lines, so the prompts themselves fill the context or pool. A
+# thinking model once spent all 4,096 answer tokens of the pool check
+# thinking, twice, and the check could judge nothing. A model that thinks
+# anyway (its answer carries reasoning) gets the thinking room back
+# (LONG_MAX_TOKENS, FILL_MAX_TOKENS) and that check runs once more.
+ANSWER_TOKENS = 512
+FILL_ANSWER_TOKENS = 256
+LONG_MAX_TOKENS = 4096   # room for a model that thinks anyway; a cut answer is reported as capped
 FILL_MAX_TOKENS = 1024
 PICTURE_MAX_TOKENS = 2048
 PICTURE_RUNS = 12
@@ -677,6 +687,9 @@ class Checker:
         self.hold = None
         self.chars_per_token = FIRST_GUESS_CHARS
         self.no_cache = None  # whether the gateway takes `switchback.no_cache`
+        # True once a model thought although asked not to: the long and pool
+        # checks then give it the thinking room (see ANSWER_TOKENS).
+        self.thinks = False
         self.ident = None
         self.truth = None
         self.row = None
@@ -1102,9 +1115,21 @@ class Checker:
 
     # ------------------------------------------------------------ requests
 
-    def body(self, ident, content, max_tokens):
+    def long_room(self):
+        """Most answer tokens a long request (and the probe) gets."""
+        return LONG_MAX_TOKENS if self.thinks else ANSWER_TOKENS
+
+    def fill_room(self):
+        """Most answer tokens a pool filler gets."""
+        return FILL_MAX_TOKENS if self.thinks else FILL_ANSWER_TOKENS
+
+    def body(self, ident, content, max_tokens, think=True):
+        """A check request. `think` False: the model is asked not to think
+        (memory and context checks; the picture check keeps the model's way)."""
         body = {"model": ident["target"], "messages": [{"role": "user", "content": content}],
                 "max_tokens": max_tokens, "temperature": 0, "stream": False}
+        if not think:
+            body["reasoning_effort"] = "none"
         # Fresh text already keeps the engine from reusing a prompt; this
         # also keeps the gateway from answering from a cache, on gateways
         # old (a request settings block is never cached) and new.
@@ -1114,8 +1139,8 @@ class Checker:
         body["switchback"] = block
         return body
 
-    def ask(self, ident, content, max_tokens, prompt_tokens_hint=0):
-        body = self.body(ident, content, max_tokens)
+    def ask(self, ident, content, max_tokens, prompt_tokens_hint=0, think=True):
+        body = self.body(ident, content, max_tokens, think)
         headers = {LOCK_HEADER: self.lock_id} if self.lock_id else {}
         deadline = time.monotonic() + PAUSED_WAIT_S * self.scale
         while True:
@@ -1133,7 +1158,7 @@ class Checker:
                     # A gateway without `switchback.no_cache`: the settings
                     # block alone keeps its cache out.
                     self.no_cache = False
-                    body = self.body(ident, content, max_tokens)
+                    body = self.body(ident, content, max_tokens, think)
                     continue
                 return {"status": status or 0, "error": str(getattr(error, "message", error))[:300],
                         "seconds": round(time.monotonic() - started, 2)}
@@ -1159,11 +1184,29 @@ class Checker:
         not loaded and measures how many characters a token takes."""
         rng = fresh_rng()
         prompt, codes = long_prompt(rng, PROBE_TOKENS, self.chars_per_token)
-        result = self.ask(ident, prompt, LONG_MAX_TOKENS)
+        result = self.ask(ident, prompt, self.long_room(), think=False)
         if result.get("status") == 200 and result.get("prompt_tokens"):
             self.chars_per_token = max(1.5, len(prompt) / max(1, result["prompt_tokens"] - 20))
         result["result"] = classify(result, codes)
+        self.learn_thinking([result])
         return result
+
+    def learn_thinking(self, results):
+        """True when an answer asked not to think carried reasoning: from
+        now on the long and pool checks give the model the thinking room."""
+        if self.thinks or not any((r or {}).get("reasoning_chars") for r in results):
+            return False
+        self.thinks = True
+        self.say(f"{(self.ident or {}).get('target', 'the model')} thinks although asked not to: "
+                 f"the long and pool checks give it {LONG_MAX_TOKENS:,} answer tokens")
+        return True
+
+    def thinking_rerun(self, verdict):
+        """A check whose answers were cut while the model thought although
+        asked not to: worth one more run with the thinking room."""
+        if verdict.get("result") != "length_capped":
+            return False
+        return self.learn_thinking(verdict.get("requests") or [])
 
     # ------------------------------------------------------------ watching the engine
 
@@ -1196,16 +1239,22 @@ class Checker:
     # ------------------------------------------------------------ the checks
 
     def check_long(self, ident, truth):
+        verdict = self.check_long_once(ident, truth)
+        if self.thinking_rerun(verdict):
+            verdict = self.check_long_once(ident, truth)
+        return verdict
+
+    def check_long_once(self, ident, truth):
         ctx = self.long_ctx(truth)
         if not ctx:
             return self.cannot("long", "the model's context is unknown (no --ctx-size in its "
                                        "arguments); pass --ctx N")
-        room = answer_room(ctx, LONG_MAX_TOKENS)
+        room = answer_room(ctx, self.long_room())
         tokens = int(ctx * LONG_SHARE) - room
         rng = fresh_rng()
         prompt, codes = long_prompt(rng, tokens, self.chars_per_token)
         watch = self.watch_start(ident)
-        result = self.ask(ident, prompt, room, prompt_tokens_hint=tokens)
+        result = self.ask(ident, prompt, room, prompt_tokens_hint=tokens, think=False)
         events = self.watch_stop(watch, ident)
         result["result"] = over_context(classify(result, codes), result, tokens + room, truth)
         result["codes_found"] = len(codes_found(result.get("text"), codes))
@@ -1233,12 +1282,12 @@ class Checker:
         if not pool or not per:
             return None, []
         others = slots - 1
-        fill_room = answer_room(per, FILL_MAX_TOKENS)
+        fill_room = answer_room(per, self.fill_room())
         # Room for every other slot's filler first: a pool shared by the
         # slots is no fuller with one long request than the long check.
         long_total = min(int(per * LONG_SHARE),
                          int(pool * POOL_SHARE) - others * (MIN_FILL_TOKENS + fill_room))
-        long_tokens = long_total - answer_room(long_total, LONG_MAX_TOKENS)
+        long_tokens = long_total - answer_room(long_total, self.long_room())
         room = int(pool * POOL_SHARE) - long_total
         fillers = []
         if others > 0 and room > 0:
@@ -1248,6 +1297,12 @@ class Checker:
         return long_tokens, fillers
 
     def check_pool(self, ident, truth):
+        verdict = self.check_pool_once(ident, truth)
+        if self.thinking_rerun(verdict):
+            verdict = self.check_pool_once(ident, truth)
+        return verdict
+
+    def check_pool_once(self, ident, truth):
         if not truth:
             return self.cannot("pool", "the engine lists no arguments for the model")
         long_tokens, fillers = self.pool_plan(truth)
@@ -1258,8 +1313,8 @@ class Checker:
         for i, tokens in enumerate([long_tokens] + fillers):
             rng = fresh_rng()
             prompt, codes = long_prompt(rng, tokens, self.chars_per_token)
-            room = (answer_room(per * LONG_SHARE, LONG_MAX_TOKENS) if i == 0
-                    else answer_room(per, FILL_MAX_TOKENS))
+            room = (answer_room(per * LONG_SHARE, self.long_room()) if i == 0
+                    else answer_room(per, self.fill_room()))
             jobs.append(("long" if i == 0 else f"fill{i}", tokens, prompt, codes, room))
         watch = self.watch_start(ident)
         results = [None] * len(jobs)
@@ -1269,7 +1324,7 @@ class Checker:
             # The long one first, the fillers a moment later: they all read
             # their prompts at the same time, as a busy pool does.
             time.sleep(index * 0.3 * self.scale)
-            out = self.ask(ident, prompt, max_tokens, prompt_tokens_hint=tokens)
+            out = self.ask(ident, prompt, max_tokens, prompt_tokens_hint=tokens, think=False)
             out["name"] = name
             out["result"] = over_context(classify(out, codes), out, tokens + max_tokens, truth)
             out["codes_found"] = len(codes_found(out.get("text"), codes))
@@ -1384,7 +1439,8 @@ class Checker:
         capped = [w for w in words if w in ("length_capped", "empty_reply")]
         if capped:
             out.update(passed=None, result="length_capped" if "length_capped" in capped else "empty_reply",
-                       why=f"{len(capped)} answer(s) cut at max_tokens or empty: thinking ran out of room, "
+                       why=f"{len(capped)} answer(s) cut at max_tokens or empty: thinking ran out of room "
+                           f"({'with' if self.thinks else 'asked not to think, without'} the thinking room), "
                            "not a memory or context fault; nothing to judge")
             return out
         top = max((r.get("prompt_tokens") or 0 for r in results), default=0)

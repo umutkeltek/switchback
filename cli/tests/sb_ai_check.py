@@ -100,6 +100,12 @@ class Engine:
         self.crash_rule = None   # cfg, tokens -> True: the request crashes the process
         self.cache_answers = False
         self.capped = False
+        # Thinking: "unless_asked" thinks past any answer room unless the
+        # request says `reasoning_effort: none`; "anyway" thinks whatever
+        # the request says, `think_tokens` long, then answers when the room
+        # allows it.
+        self.thinking = None
+        self.think_tokens = 2000
         self.misread = None      # cfg -> True: every 6th picture loses its last digit
         self.read_tps = 30000.0
         self.prompts = []
@@ -247,7 +253,10 @@ class Fake:
         usage = {"prompt_tokens": tokens, "completion_tokens": 40, "total_tokens": tokens + 40}
         if engine.cache_answers:
             usage["prompt_tokens_details"] = {"cached_tokens": tokens}
-        if engine.capped:
+        thinking = engine.thinking == "anyway" or (
+            engine.thinking == "unless_asked" and body.get("reasoning_effort") != "none")
+        room = int(body.get("max_tokens") or 0)
+        if engine.capped or (thinking and (engine.thinking == "unless_asked" or room < engine.think_tokens + 64)):
             message, finish = {"content": "", "reasoning_content": "thinking " * 300}, "length"
         elif picture is not None:
             number, shape, colour = picture
@@ -614,6 +623,45 @@ class CheckTests(Base):
         run, report = self.check("--checks", "long")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertTrue(all(b["switchback"].get("no_cache") is True for b, _ in self.fake.chats()))
+
+    def test_the_pool_check_asks_a_thinking_model_not_to_think_and_judges_it(self):
+        # A model that thinks past any answer room unless told not to (the
+        # 11-24 pool check on a 26B model: cut at 4,096 tokens twice). The
+        # long and pool requests say `reasoning_effort: none`, keep room only
+        # for the code lines, and the check judges the memory.
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 3}, "engine_args": {"kv-unified": True}})
+        self.fake.engine.thinking = "unless_asked"
+        run, report = self.check("--checks", "long,pool")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        checks = self.by_check(report)
+        self.assertTrue(checks["long"]["passed"], checks["long"])
+        self.assertTrue(checks["pool"]["passed"], checks["pool"])
+        sent = [b for b, _ in self.fake.chats() if isinstance(b["messages"][0]["content"], str)]
+        self.assertTrue(all(b.get("reasoning_effort") == "none" for b in sent))
+        self.assertLessEqual(max(b["max_tokens"] for b in sent), ai_check.ANSWER_TOKENS)
+        # The prompts fill the pool: answer room no longer takes its share.
+        pool = checks["pool"]
+        self.assertGreater(pool["sent_tokens"], 0.95 * 24576, pool)
+
+    def test_a_model_that_thinks_anyway_gets_the_thinking_room(self):
+        # It thinks whatever the request says (2,000 tokens), then answers:
+        # the first request shows reasoning, so the checks give it the room.
+        self.fake.write({"load": {"ctx_size": 24576, "parallel": 1}})
+        self.fake.engine.thinking = "anyway"
+        run, report = self.check("--checks", "long")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        long = self.by_check(report)["long"]
+        self.assertTrue(long["passed"], long)
+        self.assertEqual(long["requests"][0]["result"], "ok")
+        self.assertIn("thinks although asked not to", run.stderr)
+
+    def test_the_picture_check_keeps_the_models_own_thinking(self):
+        self.fake.engine.projector = True
+        self.fake.write({"load": {"ctx_size": 16384, "parallel": 1}})
+        run, report = self.check("--checks", "picture", "--runs", "2")
+        pictures = [b for b, _ in self.fake.chats() if isinstance(b["messages"][0]["content"], list)]
+        self.assertTrue(pictures)
+        self.assertTrue(all("reasoning_effort" not in b for b in pictures))
 
     def test_thinking_cut_at_max_tokens_is_its_own_result_not_a_failure(self):
         self.fake.write({"load": {"ctx_size": 16384, "parallel": 1}})
