@@ -501,6 +501,49 @@ fn publish_if_match_is_monotonic_and_rejects_stale() {
 }
 
 #[test]
+fn an_equal_reload_keeps_its_revision_but_reads_a_rotated_key() {
+    // The key lives outside the config text: a reload of the same file is
+    // how a rotated key takes effect, so "unchanged" must not skip it.
+    let var = format!("SWITCHBACK_TEST_ROTATED_KEY_{}", std::process::id());
+    let yaml = BASIC_CONFIG.replace(
+        r#"auth: { kind: api_key, inline: "k" }"#,
+        &format!(r#"auth: {{ kind: api_key, env: "{var}" }}"#),
+    );
+    assert_ne!(
+        yaml, BASIC_CONFIG,
+        "the test config must read the key from the environment"
+    );
+    let key_now = |engine: &crate::Engine| match engine.snapshot().resolver.resolve(
+        "mock",
+        "echo",
+        &std::collections::HashSet::new(),
+    ) {
+        sb_credentials::ResolveOutcome::Selected { lease, .. } => lease.secret.expose().to_string(),
+        _ => panic!("the mock account must resolve"),
+    };
+    std::env::set_var(&var, "old-key");
+    let engine = engine_from_config(Config::from_yaml(&yaml).unwrap());
+    let revision = engine.revision();
+    assert_eq!(key_now(&engine), "old-key");
+
+    std::env::set_var(&var, "new-key");
+    let reloaded = engine.reload_with_audit(
+        Config::from_yaml(&yaml).unwrap(),
+        crate::AuditContext::new("t", "same file, rotated key"),
+    );
+    std::env::remove_var(&var);
+    assert_eq!(
+        reloaded.unwrap(),
+        crate::ConfigPublication {
+            revision,
+            unchanged: true
+        }
+    );
+    assert_eq!(engine.revision(), revision);
+    assert_eq!(key_now(&engine), "new-key");
+}
+
+#[test]
 fn concurrent_publish_with_same_if_match_lets_only_one_win() {
     // Two publishers race with the same expected revision. The reload lock makes
     // the check-and-swap atomic, so exactly one wins and the other sees the new
