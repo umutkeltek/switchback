@@ -342,15 +342,23 @@ impl Engine {
     ) -> Result<ConfigPublication, String> {
         let hash = config_hash(&config);
         let cur = self.snapshot.load();
-        if hash == cur.config_hash {
-            return Ok(ConfigPublication {
-                revision: cur.revision,
-                unchanged: true,
-            });
-        }
-        let revision = cur.revision + 1;
+        let unchanged = hash == cur.config_hash;
+        let revision = if unchanged {
+            cur.revision
+        } else {
+            cur.revision + 1
+        };
+        // An equal config keeps its revision and its live knobs.
+        let runtime = if unchanged {
+            cur.runtime.clone()
+        } else {
+            Runtime::from_config(&config)
+        };
         drop(cur);
         Self::validate_config(&config)?;
+        // Built even for an equal config: secrets, vault entries and plugin
+        // files live outside the config text, and a reload is how a rotated
+        // key or a changed plugin takes effect.
         let registry = sb_adapters::AdapterRegistry::from_config(&config)?;
         let resolver = sb_credentials::CredentialResolver::from_config(&config)?;
         let plugins = sb_plugin::PluginHost::try_from_config(&config.plugins)?;
@@ -358,12 +366,20 @@ impl Engine {
             revision,
             config_hash: hash.clone(),
             engine_model_lanes: crate::engine_models::EngineModelLane::from_config(&config),
-            runtime: Runtime::from_config(&config),
+            runtime,
             config: Arc::new(config),
             registry: Arc::new(registry),
             resolver: Arc::new(resolver),
             plugins,
         });
+        if unchanged {
+            // No revision row and no lane change: the config is the same.
+            self.snapshot.store(next);
+            return Ok(ConfigPublication {
+                revision,
+                unchanged: true,
+            });
+        }
         let published = next.config.clone();
         if self.store_required {
             self.persist_for_publish(revision, hash, &audit)?;
